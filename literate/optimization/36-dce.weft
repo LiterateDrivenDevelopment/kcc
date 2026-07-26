@@ -95,10 +95,33 @@ _kcc_opt_dce:
     cmp x2, #IR_CONST
     b.eq .Ldce_mark_dest
 
+    // IR_CALL: SRC2 is a pointer to args array, mark each arg vreg
+    cmp x2, #IR_CALL
+    b.eq .Ldce_mark_call_args
+
     cmp x1, x20
     b.ge .Ldce_mark_dest
     mov x3, #1
     str x3, [x21, x1, lsl #3]
+    b .Ldce_mark_dest
+
+.Ldce_mark_call_args:
+    // x1 = SRC2 = pointer to [count, vreg0, vreg1, ...]
+    cbz x1, .Ldce_mark_dest
+    ldr x4, [x1]                 // count
+    mov x5, #0                    // index
+.Ldce_mark_call_arg_loop:
+    cmp x5, x4
+    b.ge .Ldce_mark_dest
+    add x6, x5, #1
+    ldr x7, [x1, x6, lsl #3]    // vreg = args[index+1]
+    cmp x7, x20
+    b.ge .Ldce_mark_call_arg_next
+    mov x3, #1
+    str x3, [x21, x7, lsl #3]   // mark vreg as used
+.Ldce_mark_call_arg_next:
+    add x5, x5, #1
+    b .Ldce_mark_call_arg_loop
 
 .Ldce_mark_dest:
     // Also mark DEST for br_cond (dest=condition vreg)

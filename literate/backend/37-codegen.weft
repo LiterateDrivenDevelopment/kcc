@@ -387,12 +387,13 @@ _kcc_cg_store_vreg:
 .globl _kcc_codegen_instr
 .p2align 2
 _kcc_codegen_instr:
-    stp x29, x30, [sp, #-96]!
+    stp x29, x30, [sp, #-112]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
-    str x25, [sp, #64]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
 
     mov x19, x0                    // instr
     mov x20, x1                    // bb_labels
@@ -939,9 +940,9 @@ _kcc_codegen_instr:
     ldr x23, [x19, #IR_SRC1]      // target BB_ID
 
     // Look up target in bb_labels
-    str x23, [sp, #72]            // store bb_id for key
+    str x23, [sp, #88]            // store bb_id for key
     mov x0, x20                    // ht
-    add x1, sp, #72               // key = &bb_id
+    add x1, sp, #88               // key = &bb_id
     mov x2, #8                     // keylen
     bl _kcc_ht_get
     cbz x0, .Lcgi_br_forward
@@ -953,7 +954,7 @@ _kcc_codegen_instr:
 
     // Look up again (we lost the value)
     mov x0, x20
-    add x1, sp, #72
+    add x1, sp, #88
     mov x2, #8
     bl _kcc_ht_get
     sub x23, x0, #1               // target offset
@@ -974,12 +975,12 @@ _kcc_codegen_instr:
     bl _kcc_code_emit32
 
     // Add to patch list: {code_offset, target_bb_id}
-    str x24, [sp, #72]            // PATCH_OFFSET
+    str x24, [sp, #88]            // PATCH_OFFSET
     ldr x0, [x19, #IR_SRC1]
-    str x0, [sp, #72+8]           // PATCH_TARGET = bb_id
+    str x0, [sp, #96]           // PATCH_TARGET = bb_id
 
     mov x0, x21                    // patch vec
-    add x1, sp, #72               // entry pointer
+    add x1, sp, #88               // entry pointer
     bl _kcc_vec_push
     b .Lcgi_done
 
@@ -993,9 +994,9 @@ _kcc_codegen_instr:
     ldr x23, [x19, #IR_SRC1]      // true BB_ID
 
     // Check if true target is known
-    str x23, [sp, #72]
+    str x23, [sp, #88]
     mov x0, x20
-    add x1, sp, #72
+    add x1, sp, #88
     mov x2, #8
     bl _kcc_ht_get
     cbz x0, .Lcgi_brcond_fwd_true
@@ -1022,19 +1023,19 @@ _kcc_codegen_instr:
     bl _kcc_code_emit32
 
     // Record patch: type CBNZ
-    str x24, [sp, #72]
+    str x24, [sp, #88]
     ldr x0, [x19, #IR_SRC1]
-    str x0, [sp, #72+8]
+    str x0, [sp, #96]
     mov x0, x21
-    add x1, sp, #72
+    add x1, sp, #88
     bl _kcc_vec_push
 
 .Lcgi_brcond_false:
     // Now emit B to false BB_ID
     ldr x23, [x19, #IR_SRC2]      // false BB_ID
-    str x23, [sp, #72]
+    str x23, [sp, #88]
     mov x0, x20
-    add x1, sp, #72
+    add x1, sp, #88
     mov x2, #8
     bl _kcc_ht_get
     cbz x0, .Lcgi_brcond_fwd_false
@@ -1052,11 +1053,11 @@ _kcc_codegen_instr:
     mov x24, x0
     mov x0, #0x14000000
     bl _kcc_code_emit32
-    str x24, [sp, #72]
+    str x24, [sp, #88]
     ldr x0, [x19, #IR_SRC2]
-    str x0, [sp, #72+8]
+    str x0, [sp, #96]
     mov x0, x21
-    add x1, sp, #72
+    add x1, sp, #88
     bl _kcc_vec_push
     b .Lcgi_done
 
@@ -1096,10 +1097,28 @@ _kcc_codegen_instr:
     b .Lcgi_done
 
 .Lcgi_call:
-    // Call: SRC1 = callee name (string ptr), DEST = result vreg
-    // For now: emit BL with relocation (offset patched by linker)
+    // Call: SRC1 = callee name, SRC2 = args array [count, vreg0, ...], DEST = result vreg
     ldr x23, [x19, #IR_SRC1]      // callee name
     ldr x24, [x19, #IR_DEST]      // result vreg
+    ldr x26, [x19, #IR_SRC2]      // args array (or 0 if no args)
+
+    // Marshal arguments: load each arg vreg from stack into x0-x7
+    cbz x26, .Lcgi_call_no_args
+    ldr x25, [x26]                 // arg count
+    cbz x25, .Lcgi_call_no_args
+    mov x27, #0                    // arg index
+.Lcgi_call_arg_loop:
+    cmp x27, x25
+    b.ge .Lcgi_call_no_args
+    cmp x27, #8                    // max 8 register args
+    b.ge .Lcgi_call_no_args
+    add x0, x27, #1
+    ldr x0, [x26, x0, lsl #3]     // vreg = args[index+1]
+    mov x1, x27                    // target reg = x0-x7
+    bl _kcc_cg_load_vreg
+    add x27, x27, #1
+    b .Lcgi_call_arg_loop
+.Lcgi_call_no_args:
 
     // Build Mach-O name with underscore prefix: "_" + name
     mov x0, x23
@@ -1140,11 +1159,12 @@ _kcc_codegen_instr:
     b .Lcgi_done
 
 .Lcgi_done:
-    ldr x25, [sp, #64]
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #96
+    ldp x29, x30, [sp], #112
     ret
 @}
 

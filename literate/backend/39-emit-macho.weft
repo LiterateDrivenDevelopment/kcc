@@ -557,6 +557,60 @@ _kcc_macho_finalize:
     mov x0, #4
     bl _kcc_macho_pad_to
 
+    // ---- Build symbol index remapping (original → sorted output) ----
+    // Output order: defined first, then undefined. Need remap[old] = new.
+    lsl x0, x20, #3               // nsyms * 8 bytes
+    bl _kcc_arena_alloc
+    str x0, [sp, #120]            // remap array ptr
+
+    // Pass 1: assign output indices to defined symbols
+    mov x28, #0                    // original index
+    str xzr, [sp, #96]            // output index counter (on stack, survives calls)
+.Lmf_remap_def:
+    cmp x28, x20
+    b.ge .Lmf_remap_undef_start
+    adrp x0, _kcc_linker_syms@@PAGE
+    add  x0, x0, _kcc_linker_syms@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x28
+    bl _kcc_vec_get
+    ldr x4, [x0, #SYM_SECTION]
+    cbz x4, .Lmf_remap_def_skip   // skip undefined
+    // Defined: remap[x28] = output_idx
+    ldr x5, [sp, #120]
+    ldr x3, [sp, #96]             // load output counter
+    str x3, [x5, x28, lsl #3]
+    add x3, x3, #1
+    str x3, [sp, #96]             // store back
+.Lmf_remap_def_skip:
+    add x28, x28, #1
+    b .Lmf_remap_def
+.Lmf_remap_undef_start:
+
+    // Pass 2: assign output indices to undefined symbols
+    // output counter continues from where pass 1 left off
+    mov x28, #0
+.Lmf_remap_undef:
+    cmp x28, x20
+    b.ge .Lmf_remap_done
+    adrp x0, _kcc_linker_syms@@PAGE
+    add  x0, x0, _kcc_linker_syms@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x28
+    bl _kcc_vec_get
+    ldr x4, [x0, #SYM_SECTION]
+    cbnz x4, .Lmf_remap_undef_skip // skip defined
+    // Undefined: remap[x28] = output_idx
+    ldr x5, [sp, #120]
+    ldr x3, [sp, #96]             // load output counter
+    str x3, [x5, x28, lsl #3]
+    add x3, x3, #1
+    str x3, [sp, #96]             // store back
+.Lmf_remap_undef_skip:
+    add x28, x28, #1
+    b .Lmf_remap_undef
+.Lmf_remap_done:
+
     // ---- Write relocations ----
     // For each reloc: pack into relocation_info format
     // r_address (32 bits) | r_symbolnum(24)|r_pcrel(1)|r_length(2)|r_extern(1)|r_type(4)
@@ -578,12 +632,16 @@ _kcc_macho_finalize:
 
     // r_info: sym_idx(24) | pcrel(1) | length(2) | extern(1) | type(4)
     ldr x2, [sp, #112]            // reload reloc entry ptr
-    ldr x3, [x2, #RELOC_SYM]      // sym_index
+    ldr x3, [x2, #RELOC_SYM]      // original sym_index
     ldr x4, [x2, #RELOC_TYPE]     // reloc type
+
+    // Remap sym_index to sorted output index
+    ldr x5, [sp, #120]            // remap array
+    ldr x3, [x5, x3, lsl #3]     // x3 = remap[original_index]
 
     // For ARM64_RELOC_BRANCH26: pcrel=1, length=2, extern=1, type=2
     // Pack: (sym_idx & 0xFFFFFF) | (pcrel<<24) | (length<<25) | (extern<<27) | (type<<28)
-    and w0, w3, #0xFFFFFF          // r_symbolnum
+    and w0, w3, #0xFFFFFF          // r_symbolnum (remapped)
     orr w0, w0, #(1 << 24)        // r_pcrel = 1
     orr w0, w0, #(2 << 25)        // r_length = 2 (4 bytes)
     orr w0, w0, #(1 << 27)        // r_extern = 1

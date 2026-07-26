@@ -102,6 +102,21 @@ physical assembly files under \texttt{tmp/src/}.
 @<Strtab: data@>
 @}
 
+\noindent\textbf{diag.s} --- diagnostic engine:
+
+@o tmp/src/diag.s @{
+@<ARM64: common macros@>
+@<Diag: constants@>
+@<Diag: putu stderr@>
+@<Diag: emit@>
+@<Diag: error@>
+@<Diag: warning@>
+@<Diag: note@>
+@<Diag: had errors@>
+@<Diag: reset@>
+@<Diag: data@>
+@}
+
 \noindent\textbf{source.s} --- source file management:
 
 @o tmp/src/source.s @{
@@ -109,6 +124,8 @@ physical assembly files under \texttt{tmp/src/}.
 @<Syscall: constants@>
 @<Source: constants@>
 @<Source: open file@>
+@<Encoding: translate@>
+@<Splice: translate@>
 @<Source: data@>
 @}
 
@@ -137,4 +154,34 @@ physical assembly files under \texttt{tmp/src/}.
 @<Lexer: keyword data@>
 @<Lexer: keyword init@>
 @<Lexer: token names@>
+@}
+
+\bigskip
+\noindent\textbf{Test binaries} --- test runner and conformance tests
+(assembled separately; linked into \texttt{tmp/test\_kcc}):
+
+\medskip
+\noindent\textbf{test\_runner.s} --- test harness entry point:
+
+@o tmp/tests/test_runner.s @{
+@<ARM64: common macros@>
+@<Test: runner entry@>
+@<Test: assert helpers@>
+@<Test: runner data@>
+@}
+
+\noindent\textbf{test\_lexer.s} --- lexer conformance tests:
+
+@o tmp/tests/test_lexer.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Test: lex keywords@>
+@<Test: lex numbers@>
+@<Test: lex strings@>
+@<Test: lex punctuators@>
+@<Test: lex comments@>
+@<Test: lex trigraphs@>
+@<Test: lex line splice@>
+@<Test: registration@>
+@<Test: lex data@>
 @}

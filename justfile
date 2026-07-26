@@ -4,7 +4,13 @@
 set quiet
 
 # All assembly source basenames (order doesn't matter for linking)
-sources := "main syscalls arena strings io hashtab vec strtab source lexer lexer_tables"
+sources := "main syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag"
+
+# Library sources (everything except main — shared with test binary)
+lib_sources := "syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag"
+
+# Test source basenames (in tmp/tests/)
+test_sources := "test_runner test_lexer"
 
 # Default: build everything
 default: build
@@ -33,6 +39,32 @@ build: assemble
     ld -o tmp/kcc $OBJ \
         -lSystem -syslibroot $(xcrun --show-sdk-path) \
         -e _main -arch arm64
+
+# Test: build and run the test suite
+test: tangle
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Assemble library sources
+    for f in {{lib_sources}}; do
+        as -o tmp/src/${f}.o tmp/src/${f}.s
+    done
+    # Assemble test sources
+    for f in {{test_sources}}; do
+        as -o tmp/tests/${f}.o tmp/tests/${f}.s
+    done
+    # Link test binary
+    OBJ=""
+    for f in {{lib_sources}}; do
+        OBJ="$OBJ tmp/src/${f}.o"
+    done
+    for f in {{test_sources}}; do
+        OBJ="$OBJ tmp/tests/${f}.o"
+    done
+    ld -o tmp/test_kcc $OBJ \
+        -lSystem -syslibroot $(xcrun --show-sdk-path) \
+        -e _main -arch arm64
+    echo ""
+    ./tmp/test_kcc
 
 # Weave: generate LaTeX source
 doc:

@@ -78,7 +78,13 @@ _main:
     ldr x0, [x20, #16]           // argv[2] = source file path
     bl _kcc_source_open
 
-    // Initialize lexer with the mapped source
+    // Translation Phase 1: trigraph replacement (§5.1.1.2 para 1)
+    bl _kcc_source_encode
+
+    // Translation Phase 2: line splicing (§5.1.1.2 para 2)
+    bl _kcc_source_splice
+
+    // Initialize lexer with the translated source
     adrp x0, _kcc_src_base@@PAGE
     add  x0, x0, _kcc_src_base@@PAGEOFF
     ldr  x0, [x0]
@@ -91,6 +97,10 @@ _main:
 
     // Dump all tokens
     bl _kcc_lex_dump_all
+
+    // Check if any errors occurred during lexing
+    bl _kcc_diag_had_errors
+    cbnz x0, .Lmain_error_exit
     b .Lmain_exit
 
 .Lmain_dump_usage:
@@ -104,6 +114,12 @@ _main:
     adrp x0, _kcc_msg_usage@@PAGE
     add  x0, x0, _kcc_msg_usage@@PAGEOFF
     bl _kcc_io_puts
+    b .Lmain_exit
+
+.Lmain_error_exit:
+    bl _kcc_io_flush
+    mov x0, #1
+    bl _kcc_sys_exit
 
 .Lmain_exit:
     // Flush buffered output

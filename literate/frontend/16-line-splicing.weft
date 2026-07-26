@@ -1,0 +1,96 @@
+% 16-line-splicing.weft — Translation Phase 2: Line Splicing
+%
+% ISO 9899:2018 §5.1.1.2 paragraph 2 specifies the second phase
+% of translation: "Each instance of a backslash character (\)
+% immediately followed by a new-line character is deleted, splicing
+% physical source lines to form logical source lines."
+%
+% This enables macros and string literals to span multiple physical
+% lines in the source file.  Phase 2 must occur after Phase 1
+% (trigraph replacement), because the trigraph ??/ produces a
+% backslash that participates in line splicing.
+
+\chapter{Line Splicing --- Translation Phase 2}
+\label{ch:line-splicing}
+
+\section{Design}
+
+Line splicing removes every \texttt{\textbackslash}\texttt{\\n} pair
+from the source.  Since this operation can only \emph{shrink} the
+buffer (deleting 2 characters per splice), it can be performed
+in-place on the writable arena buffer produced by Phase~1.
+
+The function uses a read pointer and a write pointer, both starting
+at \texttt{src\_base}.  When the read pointer encounters
+\texttt{\textbackslash} followed by \texttt{\\n} (0x0A), both
+characters are skipped.  Otherwise, the byte is copied from read
+to write position.  The final buffer size is the write pointer's
+offset from the base.
+
+@d Splice: translate @{
+// -- kcc_source_splice --------------------------------------------------
+// void kcc_source_splice(void)
+// Translation Phase 2: removes backslash-newline sequences in-place.
+// Requires that _kcc_src_base points to a writable buffer (as
+// guaranteed by Phase 1's arena copy).
+// Updates _kcc_src_size to reflect the (possibly shorter) buffer.
+.globl _kcc_source_splice
+.p2align 2
+_kcc_source_splice:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Load source base and size
+    adrp x19, _kcc_src_base@@PAGE
+    add  x19, x19, _kcc_src_base@@PAGEOFF
+    ldr  x20, [x19]              // x20 = base (read pointer)
+
+    adrp x21, _kcc_src_size@@PAGE
+    add  x21, x21, _kcc_src_size@@PAGEOFF
+    ldr  x22, [x21]              // x22 = size
+
+    // Compute read end
+    add x1, x20, x22             // x1 = read end
+    mov x2, x20                  // x2 = write pointer
+    mov x3, x20                  // x3 = read pointer
+
+.Lspl_loop:
+    cmp x3, x1
+    b.hs .Lspl_done
+
+    ldrb w4, [x3]
+
+    // Check for backslash
+    cmp w4, #'\\'
+    b.ne .Lspl_copy
+
+    // Check if next character is newline
+    add x5, x3, #1
+    cmp x5, x1
+    b.hs .Lspl_copy              // backslash at very end — keep it
+
+    ldrb w6, [x5]
+    cmp w6, #0x0A                // newline?
+    b.ne .Lspl_copy
+
+    // Skip the backslash-newline pair
+    add x3, x3, #2
+    b .Lspl_loop
+
+.Lspl_copy:
+    strb w4, [x2], #1           // copy byte, advance write pointer
+    add x3, x3, #1              // advance read pointer
+    b .Lspl_loop
+
+.Lspl_done:
+    // Update size = write pointer - base
+    sub x2, x2, x20
+    str x2, [x21]                // _kcc_src_size = new size
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}

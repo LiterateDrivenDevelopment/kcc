@@ -1,0 +1,239 @@
+% 44-test-harness.weft — Test Runner
+%
+% A separate test binary (tmp/test_kcc) that exercises the compiler's
+% subsystems.  Each test function returns 0 for pass and non-zero for
+% failure.  The runner iterates through a registration table, calls
+% each test, and reports pass/fail results.
+%
+% The test runner is linked against all library modules (syscalls,
+% arena, strings, io, hashtab, vec, strtab, source, lexer,
+% lexer_tables, diag) but uses its own _main instead of the driver's.
+
+\chapter{Test Harness}
+\label{ch:test-harness}
+
+\section{Runner Entry Point}
+
+The test runner's \texttt{\_main} initializes the arena and keyword
+table, then iterates through the test registration table.  Each
+entry contains a test name string and a function pointer.  The table
+is terminated by a null name sentinel.
+
+For each test, the runner prints the test name, calls the function,
+and prints \texttt{PASS} or \texttt{FAIL} based on the return value.
+After all tests, a summary line reports the pass/fail counts and the
+process exits with status~0 (all passed) or~1 (any failed).
+
+@d Test: runner entry @{
+// -- test_kcc _main -----------------------------------------------------
+// Entry point for the test binary.
+.text
+.globl _main
+.p2align 2
+_main:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Initialize subsystems
+    bl _kcc_arena_init
+    bl _kcc_lex_kw_init
+
+    // Print header
+    adrp x0, _test_header@@PAGE
+    add  x0, x0, _test_header@@PAGEOFF
+    bl _kcc_io_puts
+    bl _kcc_io_flush
+
+    mov x19, #0                   // x19 = pass count
+    mov x20, #0                   // x20 = fail count
+
+    // Load test table pointer
+    adrp x21, _kcc_test_table@@PAGE
+    add  x21, x21, _kcc_test_table@@PAGEOFF
+
+.Ltest_loop:
+    ldr x0, [x21]                // test name
+    cbz x0, .Ltest_summary       // null sentinel → done
+    ldr x22, [x21, #8]           // test function pointer
+
+    // Print "  name... "
+    adrp x0, _test_prefix@@PAGE
+    add  x0, x0, _test_prefix@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x21]                // test name
+    bl _kcc_io_puts
+    adrp x0, _test_dots@@PAGE
+    add  x0, x0, _test_dots@@PAGEOFF
+    bl _kcc_io_puts
+    bl _kcc_io_flush
+
+    // Reset diagnostic counters before each test
+    bl _kcc_diag_reset
+
+    // Call test function
+    blr x22
+
+    // Check result: 0 = pass, non-zero = fail
+    cbnz x0, .Ltest_fail
+
+    // PASS
+    adrp x0, _test_pass@@PAGE
+    add  x0, x0, _test_pass@@PAGEOFF
+    bl _kcc_io_puts
+    bl _kcc_io_flush
+    add x19, x19, #1
+    b .Ltest_next
+
+.Ltest_fail:
+    adrp x0, _test_fail@@PAGE
+    add  x0, x0, _test_fail@@PAGEOFF
+    bl _kcc_io_puts
+    bl _kcc_io_flush
+    add x20, x20, #1
+
+.Ltest_next:
+    add x21, x21, #16            // advance to next table entry
+    b .Ltest_loop
+
+.Ltest_summary:
+    // Print summary: "\nResults: N passed, M failed\n"
+    adrp x0, _test_results@@PAGE
+    add  x0, x0, _test_results@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, x19
+    bl _kcc_io_putu
+    adrp x0, _test_passed_str@@PAGE
+    add  x0, x0, _test_passed_str@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, x20
+    bl _kcc_io_putu
+    adrp x0, _test_failed_str@@PAGE
+    add  x0, x0, _test_failed_str@@PAGEOFF
+    bl _kcc_io_puts
+
+    bl _kcc_io_flush
+
+    // Exit: 0 if all passed, 1 if any failed
+    cmp x20, #0
+    b.ne .Ltest_exit_fail
+    mov x0, #0
+    bl _kcc_sys_exit
+.Ltest_exit_fail:
+    mov x0, #1
+    bl _kcc_sys_exit
+@}
+
+\section{Test Assertion Helpers}
+
+Two helper functions simplify test writing:
+
+\texttt{kcc\_test\_lex\_setup} initializes the lexer with a test
+source string, applying translation phases~1 and~2.  It also sets
+\texttt{\_kcc\_src\_path} to \texttt{<test>} for diagnostic output.
+
+\texttt{kcc\_test\_expect\_tok} calls \texttt{lex\_next} and checks
+whether the resulting token type matches the expected value.  Returns
+0 on match, 1 on mismatch.
+
+@d Test: assert helpers @{
+// -- kcc_test_lex_setup -------------------------------------------------
+// void kcc_test_lex_setup(const char *src, size_t len)
+//   x0 = pointer to test source string
+//   x1 = length in bytes (excluding null terminator)
+// Sets up the lexer with translation phases 1 and 2.
+.globl _kcc_test_lex_setup
+.p2align 2
+_kcc_test_lex_setup:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                   // src pointer
+    mov x20, x1                   // src length
+
+    // Set source path to "<test>"
+    adrp x2, _kcc_test_path@@PAGE
+    add  x2, x2, _kcc_test_path@@PAGEOFF
+    adrp x3, _kcc_src_path@@PAGE
+    add  x3, x3, _kcc_src_path@@PAGEOFF
+    str  x2, [x3]
+
+    // Set src_base and src_size for translation phases
+    adrp x3, _kcc_src_base@@PAGE
+    add  x3, x3, _kcc_src_base@@PAGEOFF
+    str  x19, [x3]
+
+    adrp x3, _kcc_src_size@@PAGE
+    add  x3, x3, _kcc_src_size@@PAGEOFF
+    str  x20, [x3]
+
+    // Apply translation phase 1 (trigraphs → arena copy)
+    bl _kcc_source_encode
+
+    // Apply translation phase 2 (line splicing, in-place)
+    bl _kcc_source_splice
+
+    // Initialize lexer with the translated buffer
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_lex_init
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_test_expect_tok ------------------------------------------------
+// int kcc_test_expect_tok(int expected_type)
+//   x0 = expected token type code
+// Calls lex_next, checks tok_type against expected.
+// Returns 0 if match, 1 if mismatch.
+.globl _kcc_test_expect_tok
+.p2align 2
+_kcc_test_expect_tok:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                   // save expected type
+
+    bl _kcc_lex_next
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp x0, x19
+    b.eq .Lexpect_match
+    mov x0, #1                   // FAIL
+    b .Lexpect_done
+.Lexpect_match:
+    mov x0, #0                   // PASS
+.Lexpect_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Runner Data}
+
+String constants for the test runner's output formatting.
+
+@d Test: runner data @{
+// -- Test runner string constants ---------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_test_header:     .asciz "kcc test suite\n==============\n"
+_test_prefix:     .asciz "  "
+_test_dots:       .asciz "... "
+_test_pass:       .asciz "PASS\n"
+_test_fail:       .asciz "FAIL\n"
+_test_results:    .asciz "\nResults: "
+_test_passed_str: .asciz " passed, "
+_test_failed_str: .asciz " failed\n"
+_kcc_test_path:   .asciz "<test>"
+@}

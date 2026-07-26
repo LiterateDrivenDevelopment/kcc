@@ -307,9 +307,14 @@ _kcc_lex_next:
     b .Llex_bc_loop
 
 .Llex_bc_unterminated:
-    adrp x0, _kcc_err_unterm_comment@@PAGE
-    add  x0, x0, _kcc_err_unterm_comment@@PAGEOFF
-    bl _kcc_io_err
+    // Report error at current position via diagnostic engine
+    adrp x0, _kcc_lex_line@@PAGE
+    add  x0, x0, _kcc_lex_line@@PAGEOFF
+    ldr  x0, [x0]                // line
+    mov  x1, #1                  // col (approximate — comment start unknown)
+    adrp x2, _kcc_err_unterm_comment@@PAGE
+    add  x2, x2, _kcc_err_unterm_comment@@PAGEOFF
+    bl _kcc_diag_error
     // Treat as EOF
     b .Llex_eof
 
@@ -738,11 +743,17 @@ _kcc_lex_scan_string:
     ret
 
 .Lstr_unterminated:
-    // Error: unterminated string
+    // Error: unterminated string — report via diagnostic engine
     str x20, [x19]
-    adrp x0, _kcc_err_unterm_string@@PAGE
-    add  x0, x0, _kcc_err_unterm_string@@PAGEOFF
-    bl _kcc_io_err
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]                // line (recorded at opening quote)
+    adrp x1, _kcc_tok_col@@PAGE
+    add  x1, x1, _kcc_tok_col@@PAGEOFF
+    ldr  x1, [x1]                // col (recorded at opening quote)
+    adrp x2, _kcc_err_unterm_string@@PAGE
+    add  x2, x2, _kcc_err_unterm_string@@PAGEOFF
+    bl _kcc_diag_error
 
     sub x2, x20, x22
     adrp x1, _kcc_tok_start@@PAGE
@@ -832,9 +843,15 @@ _kcc_lex_scan_char:
 
 .Lchr_unterminated:
     str x20, [x19]
-    adrp x0, _kcc_err_unterm_char@@PAGE
-    add  x0, x0, _kcc_err_unterm_char@@PAGEOFF
-    bl _kcc_io_err
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]                // line (recorded at opening quote)
+    adrp x1, _kcc_tok_col@@PAGE
+    add  x1, x1, _kcc_tok_col@@PAGEOFF
+    ldr  x1, [x1]                // col (recorded at opening quote)
+    adrp x2, _kcc_err_unterm_char@@PAGE
+    add  x2, x2, _kcc_err_unterm_char@@PAGEOFF
+    bl _kcc_diag_error
 
     sub x2, x20, x22
     adrp x1, _kcc_tok_start@@PAGE
@@ -1804,20 +1821,25 @@ _kcc_lex_end:        .quad 0  // one past end of source buffer
 _kcc_lex_line:       .quad 1  // current line number (1-based)
 _kcc_lex_line_start: .quad 0  // pointer to start of current line
 
-// Current token
+// Current token (exported for test harness access)
+.globl _kcc_tok_type
 _kcc_tok_type:       .quad 0  // token type code
+.globl _kcc_tok_start
 _kcc_tok_start:      .quad 0  // pointer to token text in source
+.globl _kcc_tok_len
 _kcc_tok_len:        .quad 0  // token text length
+.globl _kcc_tok_line
 _kcc_tok_line:       .quad 0  // line where token starts
+.globl _kcc_tok_col
 _kcc_tok_col:        .quad 0  // column where token starts
 
 // Keyword hash table
 .globl _kcc_kw_table
 _kcc_kw_table:       .quad 0  // pointer to keyword hash table
 
-// Error messages
+// Error messages (bare text — diagnostic engine adds file:line:col prefix)
 .section __TEXT,__cstring,cstring_literals
-_kcc_err_unterm_string:  .asciz "kcc: error: unterminated string literal\n"
-_kcc_err_unterm_char:    .asciz "kcc: error: unterminated character constant\n"
-_kcc_err_unterm_comment: .asciz "kcc: error: unterminated block comment\n"
+_kcc_err_unterm_string:  .asciz "unterminated string literal"
+_kcc_err_unterm_char:    .asciz "unterminated character constant"
+_kcc_err_unterm_comment: .asciz "unterminated block comment"
 @}

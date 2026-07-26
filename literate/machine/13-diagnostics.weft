@@ -1,0 +1,364 @@
+% 13-diagnostics.weft — Diagnostic Engine
+%
+% ISO 9899:2018 §5.1.1.3 requires that a conforming implementation
+% produce at least one diagnostic message if a preprocessing translation
+% unit or translation unit contains a violation of any syntax rule or
+% constraint.
+%
+% The diagnostic engine provides structured error reporting in the
+% format universally adopted by compilers:
+%
+%     file:line:col: severity: message
+%
+% Three severity levels are supported: error (constraint violation),
+% warning (suspicious but permitted construct), and note (additional
+% context for a preceding diagnostic).  An error count is maintained,
+% and compilation aborts if it exceeds a configurable fatal limit.
+
+\chapter{Diagnostic Engine}
+\label{ch:diagnostics}
+
+\section{Severity Levels}
+
+The C standard distinguishes only ``diagnostic message'' from other
+output, but modern practice recognizes three levels: errors that prevent
+translation, warnings that flag suspicious code, and notes that provide
+supplementary context.  We encode these as integer constants.
+
+The fatal error limit prevents the compiler from drowning the user
+in cascading errors.  After \texttt{DIAG\_MAX\_ERRORS} errors, the
+engine prints a summary and calls \texttt{sys\_exit(1)}.
+
+@d Diag: constants @{
+// -- Diagnostic severity codes ------------------------------------------
+.equ DIAG_ERROR,       0
+.equ DIAG_WARNING,     1
+.equ DIAG_NOTE,        2
+
+// Maximum errors before aborting
+.equ DIAG_MAX_ERRORS, 20
+@}
+
+\section{Stderr Integer Output}
+
+The diagnostic engine needs to print line and column numbers to stderr.
+This helper converts a \texttt{uint64\_t} to decimal ASCII and writes
+it directly to file descriptor~2 via \texttt{sys\_write}.  The algorithm
+mirrors \texttt{kcc\_io\_putu} (Chapter~\ref{ch:io}) but bypasses the
+stdout buffer.
+
+@d Diag: putu stderr @{
+// -- _kcc_diag_putu -----------------------------------------------------
+// void _kcc_diag_putu(uint64_t n)
+//   x0 = unsigned integer to print
+// Outputs the decimal representation directly to stderr (fd=2).
+.p2align 2
+_kcc_diag_putu:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                  // x19 = number
+    add x3, sp, #48              // x3 = one past end of digit buffer
+    mov x4, x3                   // x4 = saved end pointer
+
+    // Handle zero specially
+    cbnz x19, .Ldiag_putu_nonzero
+    mov w1, #'0'
+    sub x3, x3, #1
+    strb w1, [x3]
+    b .Ldiag_putu_print
+
+.Ldiag_putu_nonzero:
+    mov x5, #10
+.Ldiag_putu_loop:
+    udiv x1, x19, x5            // x1 = n / 10
+    msub x2, x1, x5, x19        // x2 = n % 10
+    add  w2, w2, #'0'           // convert to ASCII digit
+    sub  x3, x3, #1
+    strb w2, [x3]
+    mov  x19, x1
+    cbnz x19, .Ldiag_putu_loop
+
+.Ldiag_putu_print:
+    // sys_write(2, digits, count)
+    mov x0, #2                  // fd = stderr
+    mov x1, x3                  // buffer
+    sub x2, x4, x3              // length
+    bl _kcc_sys_write
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Core Emission}
+
+The heart of the diagnostic engine is \texttt{kcc\_diag\_emit}.  Given
+a severity level, source location, and message string, it writes the
+full diagnostic to stderr in the standard format.
+
+Each component (file path, colon, number, severity label, message) is
+written as a separate string to stderr.  This avoids the need for
+\texttt{sprintf}-style formatting.  Stderr writes are unbuffered, so
+diagnostics appear immediately even if the program crashes.
+
+After an error diagnostic, the error counter is incremented.  If it
+reaches \texttt{DIAG\_MAX\_ERRORS}, a ``too many errors'' message is
+printed and the process exits with status~1.
+
+@d Diag: emit @{
+// -- kcc_diag_emit ------------------------------------------------------
+// void kcc_diag_emit(int severity, uint64_t line, uint64_t col,
+//                    const char *msg)
+//   x0 = severity (DIAG_ERROR/DIAG_WARNING/DIAG_NOTE)
+//   x1 = line number (1-based)
+//   x2 = column number (1-based)
+//   x3 = pointer to null-terminated message string
+// Writes: file:line:col: severity: message\n   to stderr.
+.globl _kcc_diag_emit
+.p2align 2
+_kcc_diag_emit:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // x19 = severity
+    mov x20, x1                  // x20 = line
+    mov x21, x2                  // x21 = column
+    mov x22, x3                  // x22 = message
+
+    // Print file path (from source manager)
+    adrp x0, _kcc_src_path@@PAGE
+    add  x0, x0, _kcc_src_path@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Ldiag_no_path
+    bl _kcc_io_err
+    b .Ldiag_colon1
+.Ldiag_no_path:
+    adrp x0, _kcc_diag_unknown_file@@PAGE
+    add  x0, x0, _kcc_diag_unknown_file@@PAGEOFF
+    bl _kcc_io_err
+
+.Ldiag_colon1:
+    // Print ":"
+    adrp x0, _kcc_diag_colon@@PAGE
+    add  x0, x0, _kcc_diag_colon@@PAGEOFF
+    bl _kcc_io_err
+
+    // Print line number
+    mov x0, x20
+    bl _kcc_diag_putu
+
+    // Print ":"
+    adrp x0, _kcc_diag_colon@@PAGE
+    add  x0, x0, _kcc_diag_colon@@PAGEOFF
+    bl _kcc_io_err
+
+    // Print column number
+    mov x0, x21
+    bl _kcc_diag_putu
+
+    // Print ": "
+    adrp x0, _kcc_diag_colon_space@@PAGE
+    add  x0, x0, _kcc_diag_colon_space@@PAGEOFF
+    bl _kcc_io_err
+
+    // Print severity string based on level
+    cmp x19, #DIAG_WARNING
+    b.eq .Ldiag_sev_warn
+    cmp x19, #DIAG_NOTE
+    b.eq .Ldiag_sev_note
+    // Default: error
+    adrp x0, _kcc_diag_str_error@@PAGE
+    add  x0, x0, _kcc_diag_str_error@@PAGEOFF
+    b .Ldiag_sev_done
+.Ldiag_sev_warn:
+    adrp x0, _kcc_diag_str_warning@@PAGE
+    add  x0, x0, _kcc_diag_str_warning@@PAGEOFF
+    b .Ldiag_sev_done
+.Ldiag_sev_note:
+    adrp x0, _kcc_diag_str_note@@PAGE
+    add  x0, x0, _kcc_diag_str_note@@PAGEOFF
+.Ldiag_sev_done:
+    bl _kcc_io_err
+
+    // Print ": "
+    adrp x0, _kcc_diag_colon_space@@PAGE
+    add  x0, x0, _kcc_diag_colon_space@@PAGEOFF
+    bl _kcc_io_err
+
+    // Print message
+    mov x0, x22
+    bl _kcc_io_err
+
+    // Print newline
+    adrp x0, _kcc_diag_newline@@PAGE
+    add  x0, x0, _kcc_diag_newline@@PAGEOFF
+    bl _kcc_io_err
+
+    // Update counters based on severity
+    cmp x19, #DIAG_ERROR
+    b.ne .Ldiag_check_warn
+
+    // Increment error count
+    adrp x0, _kcc_diag_error_count@@PAGE
+    add  x0, x0, _kcc_diag_error_count@@PAGEOFF
+    ldr  x1, [x0]
+    add  x1, x1, #1
+    str  x1, [x0]
+
+    // Check fatal error limit
+    cmp x1, #DIAG_MAX_ERRORS
+    b.lt .Ldiag_done
+
+    // Too many errors — abort
+    adrp x0, _kcc_diag_too_many@@PAGE
+    add  x0, x0, _kcc_diag_too_many@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
+.Ldiag_check_warn:
+    cmp x19, #DIAG_WARNING
+    b.ne .Ldiag_done
+
+    // Increment warning count
+    adrp x0, _kcc_diag_warn_count@@PAGE
+    add  x0, x0, _kcc_diag_warn_count@@PAGEOFF
+    ldr  x1, [x0]
+    add  x1, x1, #1
+    str  x1, [x0]
+
+.Ldiag_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Convenience Wrappers}
+
+Three wrappers provide a simpler calling convention for the common
+case where the caller already has line, column, and message:
+
+\begin{center}
+\begin{tabular}{ll}
+\texttt{kcc\_diag\_error(line, col, msg)} & emits an error \\
+\texttt{kcc\_diag\_warning(line, col, msg)} & emits a warning \\
+\texttt{kcc\_diag\_note(line, col, msg)} & emits a note \\
+\end{tabular}
+\end{center}
+
+These are tail-call wrappers: they rearrange the arguments and branch
+(not \texttt{bl}) to \texttt{kcc\_diag\_emit}, so the return address
+in \reg{x30} passes through untouched.
+
+@d Diag: error @{
+// -- kcc_diag_error -----------------------------------------------------
+// void kcc_diag_error(uint64_t line, uint64_t col, const char *msg)
+//   x0 = line, x1 = col, x2 = msg
+.globl _kcc_diag_error
+.p2align 2
+_kcc_diag_error:
+    mov x3, x2                   // msg → x3
+    mov x2, x1                   // col → x2
+    mov x1, x0                   // line → x1
+    mov x0, #DIAG_ERROR          // severity → x0
+    b _kcc_diag_emit             // tail call
+@}
+
+@d Diag: warning @{
+// -- kcc_diag_warning ---------------------------------------------------
+// void kcc_diag_warning(uint64_t line, uint64_t col, const char *msg)
+.globl _kcc_diag_warning
+.p2align 2
+_kcc_diag_warning:
+    mov x3, x2
+    mov x2, x1
+    mov x1, x0
+    mov x0, #DIAG_WARNING
+    b _kcc_diag_emit
+@}
+
+@d Diag: note @{
+// -- kcc_diag_note ------------------------------------------------------
+// void kcc_diag_note(uint64_t line, uint64_t col, const char *msg)
+.globl _kcc_diag_note
+.p2align 2
+_kcc_diag_note:
+    mov x3, x2
+    mov x2, x1
+    mov x1, x0
+    mov x0, #DIAG_NOTE
+    b _kcc_diag_emit
+@}
+
+\section{Error Count Query}
+
+\texttt{kcc\_diag\_had\_errors} returns the current error count.
+The driver uses this after tokenization to decide whether to continue
+with subsequent phases or exit with a failure status.
+
+@d Diag: had errors @{
+// -- kcc_diag_had_errors ------------------------------------------------
+// uint64_t kcc_diag_had_errors(void)
+// Returns the error count in x0.
+.globl _kcc_diag_had_errors
+.p2align 2
+_kcc_diag_had_errors:
+    adrp x0, _kcc_diag_error_count@@PAGE
+    add  x0, x0, _kcc_diag_error_count@@PAGEOFF
+    ldr  x0, [x0]
+    ret
+@}
+
+\section{Reset}
+
+\texttt{kcc\_diag\_reset} clears both error and warning counters.
+This is used by the test harness between individual tests to prevent
+counters from one test affecting the next.
+
+@d Diag: reset @{
+// -- kcc_diag_reset -----------------------------------------------------
+// void kcc_diag_reset(void)
+// Resets error and warning counts to zero.
+.globl _kcc_diag_reset
+.p2align 2
+_kcc_diag_reset:
+    adrp x0, _kcc_diag_error_count@@PAGE
+    add  x0, x0, _kcc_diag_error_count@@PAGEOFF
+    str  xzr, [x0]
+    adrp x0, _kcc_diag_warn_count@@PAGE
+    add  x0, x0, _kcc_diag_warn_count@@PAGEOFF
+    str  xzr, [x0]
+    ret
+@}
+
+\section{Global State}
+
+The diagnostic engine maintains two counters and a set of format
+strings.  The counters are initialized to zero by the \texttt{.data}
+section.
+
+@d Diag: data @{
+// -- Diagnostic global state --------------------------------------------
+.data
+.p2align 3
+_kcc_diag_error_count:  .quad 0    // running error count
+_kcc_diag_warn_count:   .quad 0    // running warning count
+
+// Format strings (read-only)
+.section __TEXT,__cstring,cstring_literals
+_kcc_diag_colon:         .asciz ":"
+_kcc_diag_colon_space:   .asciz ": "
+_kcc_diag_newline:       .asciz "\n"
+_kcc_diag_str_error:     .asciz "error"
+_kcc_diag_str_warning:   .asciz "warning"
+_kcc_diag_str_note:      .asciz "note"
+_kcc_diag_unknown_file:  .asciz "<input>"
+_kcc_diag_too_many:      .asciz "kcc: fatal: too many errors emitted, stopping\n"
+@}

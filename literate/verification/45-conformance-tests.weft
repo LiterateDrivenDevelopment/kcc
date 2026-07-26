@@ -1,0 +1,482 @@
+% 45-conformance-tests.weft — Lexer Conformance Tests
+%
+% Each test function sets up a small source string, runs the lexer,
+% and verifies the resulting token stream.  Tests return 0 (pass)
+% or 1 (fail).  All tests are registered in a global table read by
+% the test runner (Chapter~\ref{ch:test-harness}).
+
+\chapter{Conformance Tests}
+\label{ch:conformance-tests}
+
+\section{Keyword Recognition}
+
+Tests that representative keywords from all categories are correctly
+identified, and that identifiers resembling keyword prefixes are
+\emph{not} misidentified.
+
+@d Test: lex keywords @{
+// -- test_lex_keywords --------------------------------------------------
+// Source: "auto int return _Static_assert foo"
+// Expected: AUTO, INT, RETURN, _STATIC_ASSERT, IDENT, EOF
+.text
+.globl _test_lex_keywords
+.p2align 2
+_test_lex_keywords:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _test_src_kw@@PAGE
+    add  x0, x0, _test_src_kw@@PAGEOFF
+    mov  x1, #TEST_SRC_KW_LEN
+    bl _kcc_test_lex_setup
+
+    mov x0, #TOK_AUTO
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltkw_fail
+
+    mov x0, #TOK_INT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltkw_fail
+
+    mov x0, #TOK_RETURN
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltkw_fail
+
+    mov x0, #TOK__STATIC_ASSERT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltkw_fail
+
+    mov x0, #TOK_IDENT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltkw_fail
+
+    mov x0, #TOK_EOF
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltkw_fail
+
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Ltkw_fail:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Numeric Literals}
+
+Tests that decimal, hexadecimal, floating-point, and scientific
+notation numbers are all classified as \texttt{TOK\_NUMBER} (pp-number).
+
+@d Test: lex numbers @{
+// -- test_lex_numbers ---------------------------------------------------
+// Source: "42 0xFF 3.14 1e10 0x1p2"
+// Expected: NUMBER, NUMBER, NUMBER, NUMBER, NUMBER, EOF
+.text
+.globl _test_lex_numbers
+.p2align 2
+_test_lex_numbers:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _test_src_num@@PAGE
+    add  x0, x0, _test_src_num@@PAGEOFF
+    mov  x1, #TEST_SRC_NUM_LEN
+    bl _kcc_test_lex_setup
+
+    mov x0, #TOK_NUMBER
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltnum_fail
+
+    mov x0, #TOK_NUMBER
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltnum_fail
+
+    mov x0, #TOK_NUMBER
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltnum_fail
+
+    mov x0, #TOK_NUMBER
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltnum_fail
+
+    mov x0, #TOK_NUMBER
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltnum_fail
+
+    mov x0, #TOK_EOF
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltnum_fail
+
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Ltnum_fail:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{String and Character Literals}
+
+Tests that string literals and character constants are correctly
+classified.
+
+@d Test: lex strings @{
+// -- test_lex_strings ---------------------------------------------------
+// Source: "hello" 'x'
+// (The outer quotes in the .asciz are assembler string delimiters;
+//  the inner \" produce the actual " character in the test source.)
+// Expected: STRING_LIT, CHAR_LIT, EOF
+.text
+.globl _test_lex_strings
+.p2align 2
+_test_lex_strings:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _test_src_str@@PAGE
+    add  x0, x0, _test_src_str@@PAGEOFF
+    mov  x1, #TEST_SRC_STR_LEN
+    bl _kcc_test_lex_setup
+
+    mov x0, #TOK_STRING_LIT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltstr_fail
+
+    mov x0, #TOK_CHAR_LIT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltstr_fail
+
+    mov x0, #TOK_EOF
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltstr_fail
+
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Ltstr_fail:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Punctuators}
+
+Tests that single-character and multi-character punctuators are
+correctly recognized.
+
+@d Test: lex punctuators @{
+// -- test_lex_punctuators -----------------------------------------------
+// Source: "(){};,+-*/"
+// Expected: LPAREN RPAREN LBRACE RBRACE SEMI COMMA PLUS MINUS STAR SLASH EOF
+.text
+.globl _test_lex_punctuators
+.p2align 2
+_test_lex_punctuators:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _test_src_punct@@PAGE
+    add  x0, x0, _test_src_punct@@PAGEOFF
+    mov  x1, #TEST_SRC_PUNCT_LEN
+    bl _kcc_test_lex_setup
+
+    mov x0, #TOK_LPAREN
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_RPAREN
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_LBRACE
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_RBRACE
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_SEMI
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_COMMA
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_PLUS
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_MINUS
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_STAR
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_SLASH
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #TOK_EOF
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltpunct_fail
+
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Ltpunct_fail:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Comments}
+
+Tests that both line comments (\texttt{//}) and block comments
+(\texttt{/* */}) are correctly skipped by the lexer.
+
+@d Test: lex comments @{
+// -- test_lex_comments --------------------------------------------------
+// Source: "x /* comment */ y // line\nz"
+// Expected: IDENT(x) IDENT(y) IDENT(z) EOF
+.text
+.globl _test_lex_comments
+.p2align 2
+_test_lex_comments:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _test_src_comments@@PAGE
+    add  x0, x0, _test_src_comments@@PAGEOFF
+    mov  x1, #TEST_SRC_COMMENTS_LEN
+    bl _kcc_test_lex_setup
+
+    mov x0, #TOK_IDENT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltcmt_fail
+
+    mov x0, #TOK_IDENT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltcmt_fail
+
+    mov x0, #TOK_IDENT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltcmt_fail
+
+    mov x0, #TOK_EOF
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltcmt_fail
+
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Ltcmt_fail:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Trigraph Replacement}
+
+Tests that trigraph sequences are correctly replaced before
+tokenization.  The source \texttt{??=} becomes \texttt{\#},
+which the lexer should tokenize as \texttt{TOK\_HASH}.
+
+@d Test: lex trigraphs @{
+// -- test_lex_trigraphs -------------------------------------------------
+// Source: "??= x ??( ??) ??< ??>"
+// After trigraph replacement: "# x [ ] { }"
+// Expected: HASH IDENT LBRACKET RBRACKET LBRACE RBRACE EOF
+.text
+.globl _test_lex_trigraphs
+.p2align 2
+_test_lex_trigraphs:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _test_src_trigraph@@PAGE
+    add  x0, x0, _test_src_trigraph@@PAGEOFF
+    mov  x1, #TEST_SRC_TRIGRAPH_LEN
+    bl _kcc_test_lex_setup
+
+    mov x0, #TOK_HASH
+    bl _kcc_test_expect_tok
+    cbnz x0, .Lttrig_fail
+
+    mov x0, #TOK_IDENT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Lttrig_fail
+
+    mov x0, #TOK_LBRACKET
+    bl _kcc_test_expect_tok
+    cbnz x0, .Lttrig_fail
+
+    mov x0, #TOK_RBRACKET
+    bl _kcc_test_expect_tok
+    cbnz x0, .Lttrig_fail
+
+    mov x0, #TOK_LBRACE
+    bl _kcc_test_expect_tok
+    cbnz x0, .Lttrig_fail
+
+    mov x0, #TOK_RBRACE
+    bl _kcc_test_expect_tok
+    cbnz x0, .Lttrig_fail
+
+    mov x0, #TOK_EOF
+    bl _kcc_test_expect_tok
+    cbnz x0, .Lttrig_fail
+
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Lttrig_fail:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Line Splicing}
+
+Tests that backslash-newline sequences are removed before tokenization.
+The source \texttt{in\textbackslash\textbackslash{}n\_t x} (with a physical newline
+after the backslash) becomes \texttt{int x} after splicing, so
+\texttt{int} is recognized as a keyword.
+
+@d Test: lex line splice @{
+// -- test_lex_line_splice -----------------------------------------------
+// Source: "in\<newline>t x" (stored as bytes: i n \ 0x0A t space x)
+// After line splicing: "int x"
+// Expected: INT IDENT(x) EOF
+.text
+.globl _test_lex_line_splice
+.p2align 2
+_test_lex_line_splice:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _test_src_splice@@PAGE
+    add  x0, x0, _test_src_splice@@PAGEOFF
+    mov  x1, #TEST_SRC_SPLICE_LEN
+    bl _kcc_test_lex_setup
+
+    mov x0, #TOK_INT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltspl_fail
+
+    mov x0, #TOK_IDENT
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltspl_fail
+
+    mov x0, #TOK_EOF
+    bl _kcc_test_expect_tok
+    cbnz x0, .Ltspl_fail
+
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Ltspl_fail:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Test Registration Table}
+
+The test table is a flat array of (name, function-pointer) pairs,
+terminated by a null sentinel.  The test runner in
+Chapter~\ref{ch:test-harness} iterates through this table.
+
+@d Test: registration @{
+// -- Test registration table --------------------------------------------
+.data
+.p2align 3
+.globl _kcc_test_table
+_kcc_test_table:
+    .quad _test_name_keywords
+    .quad _test_lex_keywords
+    .quad _test_name_numbers
+    .quad _test_lex_numbers
+    .quad _test_name_strings
+    .quad _test_lex_strings
+    .quad _test_name_punctuators
+    .quad _test_lex_punctuators
+    .quad _test_name_comments
+    .quad _test_lex_comments
+    .quad _test_name_trigraphs
+    .quad _test_lex_trigraphs
+    .quad _test_name_line_splice
+    .quad _test_lex_line_splice
+    .quad 0                       // sentinel: null name
+    .quad 0
+@}
+
+\section{Test Source Data}
+
+Source strings and test names used by the conformance tests above.
+Each string has a companion \texttt{.equ} that computes its length
+(excluding the null terminator) for passing to \texttt{kcc\_lex\_init}.
+
+@d Test: lex data @{
+// -- Test source strings ------------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+
+_test_src_kw:       .asciz "auto int return _Static_assert foo"
+_test_src_kw_end:
+.equ TEST_SRC_KW_LEN, _test_src_kw_end - _test_src_kw - 1
+
+_test_src_num:      .asciz "42 0xFF 3.14 1e10 0x1p2"
+_test_src_num_end:
+.equ TEST_SRC_NUM_LEN, _test_src_num_end - _test_src_num - 1
+
+_test_src_str:
+    .byte '"'
+    .ascii "hello"
+    .byte '"'
+    .ascii " "
+    .byte '\''
+    .ascii "x"
+    .byte '\''
+    .byte 0
+_test_src_str_end:
+.equ TEST_SRC_STR_LEN, _test_src_str_end - _test_src_str - 1
+
+_test_src_punct:    .asciz "(){};,+-*/"
+_test_src_punct_end:
+.equ TEST_SRC_PUNCT_LEN, _test_src_punct_end - _test_src_punct - 1
+
+_test_src_comments:
+    .ascii "x /* comment */ y // line"
+    .byte 0x0A
+    .ascii "z"
+    .byte 0
+_test_src_comments_end:
+.equ TEST_SRC_COMMENTS_LEN, _test_src_comments_end - _test_src_comments - 1
+
+_test_src_trigraph: .asciz "??= x ??( ??) ??< ??>"
+_test_src_trigraph_end:
+.equ TEST_SRC_TRIGRAPH_LEN, _test_src_trigraph_end - _test_src_trigraph - 1
+
+_test_src_splice:
+    .ascii "in"
+    .byte '\\'
+    .byte 0x0A
+    .ascii "t x"
+    .byte 0
+_test_src_splice_end:
+.equ TEST_SRC_SPLICE_LEN, _test_src_splice_end - _test_src_splice - 1
+
+// Test name strings
+_test_name_keywords:     .asciz "lex_keywords"
+_test_name_numbers:      .asciz "lex_numbers"
+_test_name_strings:      .asciz "lex_strings"
+_test_name_punctuators:  .asciz "lex_punctuators"
+_test_name_comments:     .asciz "lex_comments"
+_test_name_trigraphs:    .asciz "lex_trigraphs"
+_test_name_line_splice:  .asciz "lex_line_splice"
+@}

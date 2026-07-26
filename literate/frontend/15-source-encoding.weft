@@ -1,0 +1,180 @@
+% 15-source-encoding.weft — Translation Phase 1: Trigraph Replacement
+%
+% ISO 9899:2018 §5.1.1.2 paragraph 1 specifies the first phase of
+% translation: "Physical source file multibyte characters are mapped,
+% in an implementation-defined manner, to the source character set
+% [...] if necessary.  Trigraph sequences (§5.2.1.1) are replaced by
+% corresponding single-character internal representations."
+%
+% Trigraphs are a historical artifact from an era when some keyboards
+% lacked certain characters.  Each trigraph is a three-character sequence
+% beginning with ?? that maps to a single replacement character.  While
+% rare in modern code, conformance requires handling them.
+
+\chapter{Source Encoding --- Translation Phase 1}
+\label{ch:source-encoding}
+
+\section{Trigraph Sequences}
+
+\stdref{5.2.1.1} defines exactly nine trigraph sequences:
+
+\begin{center}
+\begin{tabular}{cl@@{\qquad}cl@@{\qquad}cl}
+\hline
+Trigraph & Replacement & Trigraph & Replacement & Trigraph & Replacement \\
+\hline
+\texttt{??=} & \texttt{\#} & \texttt{??(} & \texttt{[} & \texttt{??/} & \texttt{\textbackslash} \\
+\texttt{??)} & \texttt{]} & \texttt{??'} & \texttt{\^{}} & \texttt{??<} & \texttt{\{} \\
+\texttt{??>} & \texttt{\}} & \texttt{??!} & \texttt{|} & \texttt{??-} & \texttt{\~{}} \\
+\hline
+\end{tabular}
+\end{center}
+
+The replacement must occur before any other processing.  In particular,
+\texttt{??/} produces a backslash that participates in line splicing
+(Phase~2), so Phase~1 must complete before Phase~2 begins.
+
+\section{Implementation}
+
+\texttt{kcc\_source\_encode} performs trigraph replacement on the
+source buffer.  Because the mmap'd file is read-only
+(\texttt{PROT\_READ}), we always copy the source into a writable
+arena-allocated buffer.  This copy also prepares the buffer for
+in-place line splicing in Phase~2.
+
+The function scans the source with a read pointer and writes to the
+new buffer.  When \texttt{??} is encountered, the third character is
+checked against the nine trigraph mappings.  If a match is found, the
+single replacement character is written and the read pointer advances
+by~3.  Otherwise, a single \texttt{?} is written and the read pointer
+advances by~1.
+
+@d Encoding: translate @{
+// -- kcc_source_encode --------------------------------------------------
+// void kcc_source_encode(void)
+// Translation Phase 1: replaces trigraphs in the source buffer.
+// Allocates a writable arena copy of the mmap'd source, performs
+// trigraph replacement during the copy, and updates _kcc_src_base
+// and _kcc_src_size to point to the new buffer.
+.globl _kcc_source_encode
+.p2align 2
+_kcc_source_encode:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    // Load source base and size
+    adrp x19, _kcc_src_base@@PAGE
+    add  x19, x19, _kcc_src_base@@PAGEOFF
+    ldr  x20, [x19]              // x20 = read pointer (old base)
+
+    adrp x21, _kcc_src_size@@PAGE
+    add  x21, x21, _kcc_src_size@@PAGEOFF
+    ldr  x22, [x21]              // x22 = source size
+
+    // Allocate writable buffer from arena (same size as original)
+    mov x0, x22
+    bl _kcc_arena_alloc
+    mov x23, x0                  // x23 = write base (new buffer)
+    mov x24, x0                  // x24 = write pointer
+
+    // Compute end of source
+    add x22, x20, x22            // x22 = read end
+
+.Lenc_loop:
+    cmp x20, x22
+    b.hs .Lenc_done
+
+    ldrb w0, [x20]
+
+    // Check for '?' — potential trigraph start
+    cmp w0, #'?'
+    b.ne .Lenc_copy_byte
+
+    // Need at least 2 more characters for a trigraph
+    add x1, x20, #2
+    cmp x1, x22
+    b.hs .Lenc_copy_byte
+
+    // Check second '?'
+    ldrb w1, [x20, #1]
+    cmp w1, #'?'
+    b.ne .Lenc_copy_byte
+
+    // Check third character for trigraph match
+    ldrb w1, [x20, #2]
+
+    cmp w1, #'='
+    b.eq .Lenc_trig_hash       // ??= → #
+    cmp w1, #'('
+    b.eq .Lenc_trig_lbracket   // ??( → [
+    cmp w1, #'/'
+    b.eq .Lenc_trig_backslash  // ??/ → backslash
+    cmp w1, #')'
+    b.eq .Lenc_trig_rbracket   // ??) → ]
+    cmp w1, #'\''
+    b.eq .Lenc_trig_caret      // ??' → ^
+    cmp w1, #'<'
+    b.eq .Lenc_trig_lbrace     // ??< → {
+    cmp w1, #'!'
+    b.eq .Lenc_trig_pipe       // ??! → |
+    cmp w1, #'>'
+    b.eq .Lenc_trig_rbrace     // ??> → }
+    cmp w1, #'-'
+    b.eq .Lenc_trig_tilde      // ??- → ~
+
+    // Not a valid trigraph — copy the first '?' and advance by 1
+    b .Lenc_copy_byte
+
+.Lenc_trig_hash:
+    mov w0, #'#'
+    b .Lenc_write_trig
+.Lenc_trig_lbracket:
+    mov w0, #'['
+    b .Lenc_write_trig
+.Lenc_trig_backslash:
+    mov w0, #'\\'
+    b .Lenc_write_trig
+.Lenc_trig_rbracket:
+    mov w0, #']'
+    b .Lenc_write_trig
+.Lenc_trig_caret:
+    mov w0, #'^'
+    b .Lenc_write_trig
+.Lenc_trig_lbrace:
+    mov w0, #'{'
+    b .Lenc_write_trig
+.Lenc_trig_pipe:
+    mov w0, #'|'
+    b .Lenc_write_trig
+.Lenc_trig_rbrace:
+    mov w0, #'}'
+    b .Lenc_write_trig
+.Lenc_trig_tilde:
+    mov w0, #'~'
+    // fall through to write_trig
+
+.Lenc_write_trig:
+    strb w0, [x24], #1          // write replacement character
+    add x20, x20, #3            // skip 3 source characters
+    b .Lenc_loop
+
+.Lenc_copy_byte:
+    ldrb w0, [x20], #1          // read and advance
+    strb w0, [x24], #1          // write and advance
+    b .Lenc_loop
+
+.Lenc_done:
+    // Update global source state
+    str x23, [x19]               // _kcc_src_base = new buffer
+    sub x24, x24, x23           // compute actual output size
+    str x24, [x21]               // _kcc_src_size = output size
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}

@@ -133,8 +133,6 @@
 \makeatletter
 \newcommand{\forwardlabel}[1]{\immediate\write\@@auxout{\string\newlabel{#1}{{??}{??}{}{}{}}}}
 \makeatother
-\forwardlabel{ch:diagnostics}
-
 % ═══════════════════════════════════════════════════════════════════
 % Part I: Foundations
 % ═══════════════════════════════════════════════════════════════════
@@ -154,6 +152,7 @@
 @i literate/machine/10-data-structures.weft
 @i literate/machine/11-string-operations.weft
 @i literate/machine/12-io.weft
+@i literate/machine/13-diagnostics.weft
 @i literate/machine/14-source-manager.weft
 
 % ═══════════════════════════════════════════════════════════════════
@@ -161,6 +160,8 @@
 % ═══════════════════════════════════════════════════════════════════
 \part{The Frontend}
 
+@i literate/frontend/15-source-encoding.weft
+@i literate/frontend/16-line-splicing.weft
 @i literate/frontend/17-lexer.weft
 
 % ═══════════════════════════════════════════════════════════════════
@@ -169,6 +170,14 @@
 \part{The Driver}
 
 @i literate/driver/43-main.weft
+
+% ═══════════════════════════════════════════════════════════════════
+% Part V: Verification
+% ═══════════════════════════════════════════════════════════════════
+\part{Verification}
+
+@i literate/verification/44-test-harness.weft
+@i literate/verification/45-conformance-tests.weft
 
 % ═══════════════════════════════════════════════════════════════════
 % Output Routing

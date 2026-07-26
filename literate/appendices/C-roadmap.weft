@@ -95,6 +95,8 @@ a stream of C17 preprocessing tokens (\stdref{6.4}).
       diagnostics on stderr.
 \end{enumerate}
 
+\textbf{Status.} Complete.
+
 % ────────────────────────────────────────────────────────────────
 \section{Phase 2 --- Complete Lexer and Diagnostics}
 \label{sec:phase2}
@@ -132,6 +134,8 @@ build the diagnostic engine required by \stdref{5.1.1.3}.
 \item The lexer correctly tokenizes the GCC torture test suite's
       lexer-visible subset (no preprocessing yet).
 \end{enumerate}
+
+\textbf{Status.} Complete.
 
 % ────────────────────────────────────────────────────────────────
 \section{Phase 3 --- Preprocessor}

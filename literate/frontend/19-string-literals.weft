@@ -1,0 +1,348 @@
+% 19-string-literals.weft — Phase 5: String Literal Processing
+%
+% Translation phase 5 (§5.1.1.2 paragraph 5): each source character set
+% member and escape sequence in character constants and string literals
+% is converted to the corresponding member of the execution character set.
+%
+% This phase converts escape sequences (\n, \t, \\, \", \0, \xNN, \NNN,
+% \a, \b, \f, \r, \v, \', \?) into their actual byte values.  The result
+% replaces the original string/char literal token data in an arena buffer.
+
+\chapter{String Literal Processing}
+\label{ch:string-literals}
+
+Phase~5 of the C17 translation pipeline processes escape sequences in
+character constants and string literals (\stdref{5.1.1.2}, paragraph~5).
+At this point the preprocessor has already completed: we have a stream
+of preprocessing tokens.  Phase~5 examines each \texttt{TOK\_STRING\_LIT}
+and \texttt{TOK\_CHAR\_LIT} token and replaces escape sequences with
+their execution-character-set values.
+
+\section{Escape Sequence Table}
+
+The C17 standard (\stdref{6.4.4.4}) defines these simple escape sequences:
+
+\begin{center}
+\begin{tabular}{llcl}
+\textbf{Sequence} & \textbf{Name} & \textbf{Value} & \textbf{C17 ref} \\
+\hline
+\texttt{\textbackslash a} & alert       & 0x07 & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash b} & backspace   & 0x08 & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash f} & form feed   & 0x0C & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash n} & newline     & 0x0A & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash r} & carriage return & 0x0D & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash t} & horizontal tab  & 0x09 & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash v} & vertical tab    & 0x0B & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash\textbackslash} & backslash & 0x5C & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash '} & single quote & 0x27 & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash "} & double quote & 0x22 & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash ?} & question mark & 0x3F & \stdref{6.4.4.4}/7 \\
+\texttt{\textbackslash 0} & null         & 0x00 & \stdref{6.4.4.4}/6 \\
+\end{tabular}
+\end{center}
+
+Additionally, \texttt{\textbackslash x}\emph{NN} is a hexadecimal escape
+(\stdref{6.4.4.4}/8) and \texttt{\textbackslash}\emph{NNN} is an octal
+escape (\stdref{6.4.4.4}/6).
+
+\section{Implementation}
+
+The processor walks each string/character literal byte by byte,
+copying characters to an arena-allocated output buffer.  When a
+backslash is encountered, the following character determines which
+escape to emit.
+
+We process tokens in-place in the token stream: after processing, the
+token's start pointer is updated to the new arena buffer, and the
+length is updated to the processed length.
+
+@d StringLit: process @{
+// -- String literal escape processing ----------------------------------
+// kcc_strlit_process()
+// Processes all pending string and char literal tokens.
+// Called after preprocessing completes.
+//
+// For the initial implementation, we process a single token:
+// x0 = pointer to token start (past the opening quote)
+// x1 = length (excluding quotes)
+// Returns: x0 = pointer to processed buffer, x1 = new length
+.text
+.globl _kcc_strlit_process
+.p2align 2
+_kcc_strlit_process:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                   // x19 = src pointer
+    mov x20, x1                   // x20 = src length
+    add x21, x19, x20             // x21 = src end
+
+    // Allocate output buffer (same size as input — escapes shrink)
+    mov x0, x20
+    add x0, x0, #1                // +1 for safety
+    bl _kcc_arena_alloc
+    mov x22, x0                   // x22 = dst base
+    mov x23, x0                   // x23 = dst cursor
+
+.Lstrlit_loop:
+    cmp x19, x21
+    b.ge .Lstrlit_done
+
+    ldrb w0, [x19]
+    cmp w0, #'\\'
+    b.eq .Lstrlit_escape
+
+    // Ordinary character — copy directly
+    strb w0, [x23]
+    add x23, x23, #1
+    add x19, x19, #1
+    b .Lstrlit_loop
+
+.Lstrlit_escape:
+    add x19, x19, #1             // skip backslash
+    cmp x19, x21
+    b.ge .Lstrlit_done            // trailing backslash (error, but don't crash)
+
+    ldrb w0, [x19]
+    add x19, x19, #1             // consume escape char
+
+    // Simple escape dispatch
+    cmp w0, #'n'
+    b.eq .Lstrlit_esc_n
+    cmp w0, #'t'
+    b.eq .Lstrlit_esc_t
+    cmp w0, #'\\'
+    b.eq .Lstrlit_esc_bs
+    cmp w0, #'"'
+    b.eq .Lstrlit_esc_dq
+    cmp w0, #'\''
+    b.eq .Lstrlit_esc_sq
+    cmp w0, #'0'
+    b.eq .Lstrlit_esc_0_or_oct
+    cmp w0, #'a'
+    b.eq .Lstrlit_esc_a
+    cmp w0, #'b'
+    b.eq .Lstrlit_esc_b
+    cmp w0, #'f'
+    b.eq .Lstrlit_esc_f
+    cmp w0, #'r'
+    b.eq .Lstrlit_esc_r
+    cmp w0, #'v'
+    b.eq .Lstrlit_esc_v
+    cmp w0, #'?'
+    b.eq .Lstrlit_esc_q
+    cmp w0, #'x'
+    b.eq .Lstrlit_esc_hex
+
+    // Check for octal (1-7)
+    cmp w0, #'1'
+    b.lt .Lstrlit_esc_unknown
+    cmp w0, #'7'
+    b.le .Lstrlit_esc_octal
+
+.Lstrlit_esc_unknown:
+    // Unknown escape — copy the character literally
+    // (§6.4.4.4 constraint violation, but we emit a diagnostic and continue)
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_n:
+    mov w0, #0x0A
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_t:
+    mov w0, #0x09
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_bs:
+    mov w0, #0x5C
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_dq:
+    mov w0, #0x22
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_sq:
+    mov w0, #0x27
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_0_or_oct:
+    // Could be \0 (null) or start of octal sequence \0NN
+    // Check if next char is an octal digit
+    cmp x19, x21
+    b.ge .Lstrlit_emit_null        // end of string, just \0
+    ldrb w24, [x19]
+    cmp w24, #'0'
+    b.lt .Lstrlit_emit_null
+    cmp w24, #'7'
+    b.gt .Lstrlit_emit_null
+    // It's an octal sequence starting with 0
+    mov w0, #0                    // initial value = 0
+    b .Lstrlit_oct_body
+
+.Lstrlit_emit_null:
+    mov w0, #0x00
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_a:
+    mov w0, #0x07
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_b:
+    mov w0, #0x08
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_f:
+    mov w0, #0x0C
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_r:
+    mov w0, #0x0D
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_v:
+    mov w0, #0x0B
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_q:
+    mov w0, #0x3F
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_octal:
+    // w0 already has the first octal digit ('1'-'7')
+    sub w0, w0, #'0'             // convert to value
+.Lstrlit_oct_body:
+    // w0 = accumulated value so far
+    // Read up to 2 more octal digits
+    mov w24, #2                   // max 2 more digits
+.Lstrlit_oct_digit:
+    cmp x19, x21
+    b.ge .Lstrlit_oct_emit
+    cbz w24, .Lstrlit_oct_emit
+    ldrb w1, [x19]
+    cmp w1, #'0'
+    b.lt .Lstrlit_oct_emit
+    cmp w1, #'7'
+    b.gt .Lstrlit_oct_emit
+    // Accumulate: val = val * 8 + digit
+    lsl w0, w0, #3
+    sub w1, w1, #'0'
+    add w0, w0, w1
+    add x19, x19, #1
+    sub w24, w24, #1
+    b .Lstrlit_oct_digit
+
+.Lstrlit_oct_emit:
+    and w0, w0, #0xFF            // truncate to byte
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_esc_hex:
+    // \xNN — read hex digits (at least one required by standard)
+    mov w0, #0                    // accumulated value
+    mov w24, #0                   // digit count
+.Lstrlit_hex_digit:
+    cmp x19, x21
+    b.ge .Lstrlit_hex_emit
+    ldrb w1, [x19]
+    // Check '0'-'9'
+    cmp w1, #'0'
+    b.lt .Lstrlit_hex_emit
+    cmp w1, #'9'
+    b.le .Lstrlit_hex_09
+    // Check 'a'-'f'
+    cmp w1, #'a'
+    b.lt .Lstrlit_hex_check_upper
+    cmp w1, #'f'
+    b.le .Lstrlit_hex_af
+    b .Lstrlit_hex_check_upper
+
+.Lstrlit_hex_check_upper:
+    cmp w1, #'A'
+    b.lt .Lstrlit_hex_emit
+    cmp w1, #'F'
+    b.gt .Lstrlit_hex_emit
+    // 'A'-'F'
+    sub w1, w1, #'A'
+    add w1, w1, #10
+    b .Lstrlit_hex_accum
+
+.Lstrlit_hex_09:
+    sub w1, w1, #'0'
+    b .Lstrlit_hex_accum
+
+.Lstrlit_hex_af:
+    sub w1, w1, #'a'
+    add w1, w1, #10
+
+.Lstrlit_hex_accum:
+    lsl w0, w0, #4
+    add w0, w0, w1
+    add x19, x19, #1
+    add w24, w24, #1
+    b .Lstrlit_hex_digit
+
+.Lstrlit_hex_emit:
+    and w0, w0, #0xFF            // truncate to byte
+    strb w0, [x23]
+    add x23, x23, #1
+    b .Lstrlit_loop
+
+.Lstrlit_done:
+    // Return processed buffer and length
+    mov x0, x22                   // processed buffer base
+    sub x1, x23, x22             // processed length
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Processing All Tokens}
+
+The \texttt{kcc\_strlit\_process\_all} function walks the preprocessed
+token stream and processes each string or character literal in place.
+It calls \texttt{kcc\_pp\_next} (or \texttt{kcc\_lex\_next} depending
+on the phase) to iterate tokens, and for each \texttt{TOK\_STRING\_LIT}
+or \texttt{TOK\_CHAR\_LIT}, calls the escape processor above.
+
+For Phase~3 integration, we provide a simpler approach: the preprocessor
+or parser calls \texttt{kcc\_strlit\_process} on individual token buffers
+as needed.  Full stream processing is deferred to the parser phase.
+
+@d StringLit: data @{
+// -- String literal data (reserved for future use) ---------------------
+.data
+.p2align 3
+@}

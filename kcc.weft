@@ -163,6 +163,9 @@
 @i literate/frontend/15-source-encoding.weft
 @i literate/frontend/16-line-splicing.weft
 @i literate/frontend/17-lexer.weft
+@i literate/frontend/18-preprocessor.weft
+@i literate/frontend/19-string-literals.weft
+@i literate/frontend/20-concatenation.weft
 
 % ═══════════════════════════════════════════════════════════════════
 % Part IV: Driver

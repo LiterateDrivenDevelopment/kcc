@@ -1,0 +1,128 @@
+% 20-concatenation.weft — Phase 6: Adjacent String Literal Concatenation
+%
+% Translation phase 6 (§5.1.1.2 paragraph 6): adjacent string literal
+% tokens are concatenated.  For example, "hello " "world" becomes
+% "hello world".
+%
+% This is a simple left-to-right pass over the token stream.
+
+\chapter{String Literal Concatenation}
+\label{ch:concatenation}
+
+Phase~6 of the C17 translation pipeline concatenates adjacent string
+literal tokens (\stdref{5.1.1.2}, paragraph~6; \stdref{6.4.5}/4).
+After Phase~5 has processed escape sequences, any sequence of adjacent
+\texttt{TOK\_STRING\_LIT} tokens is merged into a single string literal.
+
+\section{Algorithm}
+
+The concatenation algorithm is straightforward: when we encounter a
+string literal token, we peek ahead.  If the next token is also a
+string literal, we concatenate their contents into a new arena buffer.
+We repeat until the next token is not a string literal.
+
+The caller's token globals (\texttt{\_kcc\_tok\_start},
+\texttt{\_kcc\_tok\_len}) are updated to point at the concatenated result.
+
+@d Concat: adjacent strings @{
+// -- Adjacent string literal concatenation -----------------------------
+// kcc_concat_strings()
+// After the preprocessor produces a token, check if the current token
+// is a string literal.  If so, peek for adjacent string literals and
+// concatenate them.
+//
+// This function is designed to be called by the parser when it sees
+// a TOK_STRING_LIT.  It consumes all adjacent string literals.
+//
+// Input:  current token globals set to a TOK_STRING_LIT
+//         x0 = pointer to start of string content (past opening quote)
+//         x1 = length of string content (excluding quotes)
+// Output: x0 = pointer to concatenated result
+//         x1 = total length
+.text
+.globl _kcc_concat_strings
+.p2align 2
+_kcc_concat_strings:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                   // x19 = current content ptr
+    mov x20, x1                   // x20 = current content len
+
+    // Allocate a concatenation buffer — start with current content
+    // We use a generous initial size; grow via arena if needed
+    mov x0, #4096
+    bl _kcc_arena_alloc
+    mov x21, x0                   // x21 = concat buffer base
+    mov x22, x0                   // x22 = concat cursor
+
+    // Copy first string's content
+    mov x0, x22                   // dst
+    mov x1, x19                   // src
+    mov x2, x20                   // len
+    bl _kcc_memcpy
+    add x22, x22, x20            // advance cursor
+
+.Lconcat_peek:
+    // Save lexer state so we can un-peek if next isn't a string
+    adrp x23, _kcc_lex_cursor@@PAGE
+    add  x23, x23, _kcc_lex_cursor@@PAGEOFF
+    ldr  x24, [x23]              // x24 = saved cursor position
+
+    // Get next token
+    bl _kcc_lex_next
+
+    // Check if it's a string literal
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #4                   // TOK_STRING_LIT = 4
+    b.ne .Lconcat_unpeek
+
+    // It's another string literal — get its content (skip opening quote)
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]                // token start (includes quote)
+    add x19, x0, #1              // skip opening "
+
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]               // token length (includes both quotes)
+    sub x20, x20, #2             // content length
+
+    // Copy this string's content
+    mov x0, x22                   // dst = cursor
+    mov x1, x19                   // src = content
+    mov x2, x20                   // len
+    bl _kcc_memcpy
+    add x22, x22, x20
+
+    b .Lconcat_peek               // check for more
+
+.Lconcat_unpeek:
+    // Restore lexer cursor — we consumed a non-string token
+    str x24, [x23]
+
+    // Return the concatenated result
+    mov x0, x21                   // buffer base
+    sub x1, x22, x21             // total length
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Data}
+
+Reserved for future use (e.g., wide string concatenation tracking).
+
+@d Concat: data @{
+// -- Concatenation data (reserved) -------------------------------------
+.data
+.p2align 3
+@}

@@ -58,6 +58,13 @@ _main:
     bl _kcc_strcmp
     cbz x0, .Lmain_dump_tokens
 
+    // Check if argv[1] is "-E" (preprocess only)
+    ldr x0, [x20, #8]            // argv[1]
+    adrp x1, _kcc_opt_preprocess@@PAGE
+    add  x1, x1, _kcc_opt_preprocess@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmain_preprocess
+
     // Not a flag: treat as source file (legacy Phase 0 behavior)
     adrp x0, _kcc_msg_source@@PAGE
     add  x0, x0, _kcc_msg_source@@PAGEOFF
@@ -103,6 +110,50 @@ _main:
     cbnz x0, .Lmain_error_exit
     b .Lmain_exit
 
+.Lmain_preprocess:
+    // -E requires a source file argument
+    cmp x19, #3
+    b.lt .Lmain_preprocess_usage
+
+    // Open and mmap the source file
+    ldr x0, [x20, #16]           // argv[2] = source file path
+    bl _kcc_source_open
+
+    // Translation Phase 1: trigraph replacement
+    bl _kcc_source_encode
+
+    // Translation Phase 2: line splicing
+    bl _kcc_source_splice
+
+    // Initialize lexer with the translated source
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    ldr  x1, [x1]
+
+    bl _kcc_lex_init
+
+    // Initialize preprocessor
+    bl _kcc_pp_init
+
+    // Dump preprocessed tokens
+    bl _kcc_pp_dump_all
+
+    // Check for errors
+    bl _kcc_diag_had_errors
+    cbnz x0, .Lmain_error_exit
+    b .Lmain_exit
+
+.Lmain_preprocess_usage:
+    adrp x0, _kcc_err_preprocess_usage@@PAGE
+    add  x0, x0, _kcc_err_preprocess_usage@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
 .Lmain_dump_usage:
     adrp x0, _kcc_err_dump_usage@@PAGE
     add  x0, x0, _kcc_err_dump_usage@@PAGEOFF
@@ -146,11 +197,15 @@ _kcc_banner:
 _kcc_msg_source:
     .asciz "source: "
 _kcc_msg_usage:
-    .asciz "usage: kcc [--dump-tokens] <source.c>\n"
+    .asciz "usage: kcc [--dump-tokens|-E] <source.c>\n"
 _kcc_msg_newline:
     .asciz "\n"
 _kcc_opt_dump_tokens:
     .asciz "--dump-tokens"
+_kcc_opt_preprocess:
+    .asciz "-E"
 _kcc_err_dump_usage:
     .asciz "kcc: error: --dump-tokens requires a source file\n"
+_kcc_err_preprocess_usage:
+    .asciz "kcc: error: -E requires a source file\n"
 @}

@@ -1,0 +1,2795 @@
+% 18-preprocessor.weft — The C17 Preprocessor
+%
+% Translation phase 4 (§5.1.1.2 paragraph 4): preprocessing directives
+% are executed, macro invocations are expanded, and _Pragma operators
+% are executed.  The result is a stream of preprocessing tokens ready
+% for the parser.
+%
+% The preprocessor wraps the lexer: the parser calls kcc_pp_next()
+% instead of kcc_lex_next() directly.  Directives and macro expansion
+% are handled transparently.
+
+\chapter{The Preprocessor}
+\label{ch:preprocessor}
+
+The C preprocessor is a text-transformation engine defined by
+\stdref{6.10}.  It processes directives (\texttt{\#define},
+\texttt{\#include}, conditionals) and expands macros before the
+translation unit reaches the parser.
+
+Our preprocessor wraps the Phase~3 lexer: it calls
+\texttt{kcc\_lex\_next} internally, processes any directive or macro
+it encounters, and presents the caller with a fully preprocessed
+token stream.
+
+\section{Data Structures}
+
+A \emph{macro definition} records the macro's name, replacement body,
+and (for function-like macros) parameter list.  Macros are stored in
+a hash table mapping name text to a pointer to the definition
+structure.
+
+The \emph{context stack} supports nested \texttt{\#include} and macro
+expansion by saving and restoring the lexer's scanning state.  The
+\emph{conditional stack} tracks nested \texttt{\#if}/\texttt{\#endif}
+groups.
+
+@d PP: constants @{
+// -- Preprocessor constants -----------------------------------------
+
+// Macro definition layout (arena-allocated)
+.equ PP_MACRO_NAME,      0    // pointer to macro name text
+.equ PP_MACRO_NAMELEN,   8    // length of name
+.equ PP_MACRO_FLAGS,    16    // bit flags (see below)
+.equ PP_MACRO_NPARAMS,  24   // parameter count (func-like)
+.equ PP_MACRO_BODY,     32   // pointer to replacement text
+.equ PP_MACRO_BODYLEN,  40   // replacement text length
+.equ PP_MACRO_PARAMS,   48   // pointer to param name array
+.equ PP_MACRO_SIZE,     56
+
+// Macro flags
+.equ PP_FLAG_FUNCLIKE,   1   // function-like macro
+.equ PP_FLAG_EXPANDING,  2   // currently being expanded (anti-recursion)
+.equ PP_FLAG_BUILTIN,    4   // predefined, cannot #undef
+
+// Parameter entry (16 bytes each)
+.equ PP_PARAM_NAME,      0
+.equ PP_PARAM_LEN,       8
+.equ PP_PARAM_SIZE,     16
+
+// Context stack entry (for #include and macro expansion)
+.equ PP_CTX_TYPE,        0   // 0=include, 1=expand
+.equ PP_CTX_CURSOR,      8   // saved _kcc_lex_cursor
+.equ PP_CTX_END,        16   // saved _kcc_lex_end
+.equ PP_CTX_LINE,       24   // saved _kcc_lex_line
+.equ PP_CTX_LSTART,     32   // saved _kcc_lex_line_start
+.equ PP_CTX_SRC_BASE,   40   // saved _kcc_src_base (include only)
+.equ PP_CTX_SRC_SIZE,   48   // saved _kcc_src_size (include only)
+.equ PP_CTX_SRC_PATH,   56   // saved _kcc_src_path (include only)
+.equ PP_CTX_MACRO,      64   // macro_def ptr to unmark (expand only)
+.equ PP_CTX_PREVLINE,   72   // saved prev_line
+.equ PP_CTX_SIZE,       80
+
+.equ PP_CTX_INCLUDE,     0
+.equ PP_CTX_EXPAND,      1
+
+// Limits
+.equ PP_MAX_CTX_DEPTH, 256   // max include + expansion depth
+.equ PP_MAX_COND,       64   // max conditional nesting
+.equ PP_MAX_ARGS,       64   // max function-like macro args
+
+// Conditional stack states
+.equ PP_COND_ACTIVE,     0   // in the active branch
+.equ PP_COND_SKIP,       1   // skipping (branch not taken)
+.equ PP_COND_DONE,       2   // active branch already found
+@}
+
+\section{Initialization}
+
+\texttt{kcc\_pp\_init} creates the macro hash table and registers the
+predefined macros required by \stdref{6.10.8}.
+
+@d PP: init @{
+.text
+// -- kcc_pp_init ----------------------------------------------------
+// void kcc_pp_init(void)
+// Initializes the preprocessor: creates macro table, sets up
+// predefined macros, clears all state.
+.globl _kcc_pp_init
+.p2align 2
+_kcc_pp_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Create macro hash table (capacity 256)
+    mov x0, #256
+    bl _kcc_ht_init
+    adrp x1, _kcc_pp_macros@@PAGE
+    add  x1, x1, _kcc_pp_macros@@PAGEOFF
+    str  x0, [x1]
+
+    // Clear context depth
+    adrp x0, _kcc_pp_ctx_depth@@PAGE
+    add  x0, x0, _kcc_pp_ctx_depth@@PAGEOFF
+    str  xzr, [x0]
+
+    // Clear conditional depth
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    str  xzr, [x0]
+
+    // Clear prev_line (0 means "beginning of file" → first # is BOL)
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  xzr, [x0]
+
+    // Clear has_pending
+    adrp x0, _kcc_pp_has_pending@@PAGE
+    add  x0, x0, _kcc_pp_has_pending@@PAGEOFF
+    str  xzr, [x0]
+
+    // Register predefined macros
+    bl _kcc_pp_predefine
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{The Preprocessor Loop}
+
+\texttt{kcc\_pp\_next} is the main entry point.  It replaces
+\texttt{kcc\_lex\_next} in the compilation pipeline.  Each call
+returns one preprocessed token in the \texttt{\_kcc\_tok\_*} globals.
+
+The loop handles three concerns:
+\begin{enumerate}
+\item \textbf{Conditional skip.}  If we are inside a false
+      \texttt{\#if}/\texttt{\#ifdef} branch, all tokens are discarded
+      except directive-introducing \texttt{\#} at the start of a
+      line, which may toggle the conditional state.
+\item \textbf{Directive processing.}  A \texttt{\#} token at the
+      beginning of a line is a preprocessing directive.  The
+      dispatcher consumes the entire directive and loops.
+\item \textbf{Macro expansion.}  An identifier token is looked up
+      in the macro table; if found, its expansion is pushed onto the
+      context stack and the loop restarts to lex from the expansion.
+\end{enumerate}
+
+``Beginning of line'' is detected by comparing the token's line number
+with the line of the previous token returned to the caller.
+
+@d PP: next token @{
+.text
+// -- kcc_pp_next ----------------------------------------------------
+// void kcc_pp_next(void)
+// Returns next preprocessed token in _kcc_tok_* globals.
+.globl _kcc_pp_next
+.p2align 2
+_kcc_pp_next:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+.Lpp_loop:
+    // Check for pending token (set by directive/expansion overflow)
+    adrp x0, _kcc_pp_has_pending@@PAGE
+    add  x0, x0, _kcc_pp_has_pending@@PAGEOFF
+    ldr  x1, [x0]
+    cbz  x1, .Lpp_call_lex
+    str  xzr, [x0]            // clear pending flag
+    b .Lpp_got_token
+
+.Lpp_call_lex:
+    bl _kcc_lex_next
+
+.Lpp_got_token:
+    // Load token type and line
+    adrp x19, _kcc_tok_type@@PAGE
+    add  x19, x19, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x19]           // x20 = tok_type
+
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x21, [x0]            // x21 = tok_line
+
+    // ----- Handle EOF -----
+    cbz  x20, .Lpp_eof
+
+    // ----- Conditional skip -----
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lpp_active      // no conditionals → always active
+
+    // Check top of conditional stack
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+    ldrb w3, [x2, x1]
+    cmp  w3, #PP_COND_ACTIVE
+    b.eq .Lpp_active
+
+    // --- Skipping: only look for # at BOL ---
+    cmp  x20, #TOK_HASH
+    b.ne .Lpp_skip_tok
+    // Check BOL
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x21, x0
+    b.ls .Lpp_skip_tok         // same or earlier line → not BOL
+    // Directive while skipping — update prev_line
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  x21, [x0]
+    bl _kcc_pp_skip_directive
+    b .Lpp_loop
+
+.Lpp_skip_tok:
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  x21, [x0]
+    b .Lpp_loop
+
+    // ----- Active processing -----
+.Lpp_active:
+    // Check for # directive at BOL
+    cmp  x20, #TOK_HASH
+    b.ne .Lpp_not_directive
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x21, x0
+    b.ls .Lpp_not_directive    // not BOL
+    // Process directive (consumes the line)
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  x21, [x0]
+    bl _kcc_pp_dispatch
+    b .Lpp_loop
+
+.Lpp_not_directive:
+    // Check for macro expansion
+    cmp  x20, #TOK_IDENT
+    b.ne .Lpp_return
+    bl _kcc_pp_try_expand
+    cbnz x0, .Lpp_loop        // expanded → loop to get token from expansion
+
+.Lpp_return:
+    // Update prev_line and return
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  x21, [x0]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lpp_eof:
+    // Pop context stack if non-empty
+    adrp x0, _kcc_pp_ctx_depth@@PAGE
+    add  x0, x0, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lpp_real_eof
+    bl _kcc_pp_ctx_pop
+    b .Lpp_loop
+
+.Lpp_real_eof:
+    // Check for unterminated conditionals
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lpp_eof_ok
+    // Emit warning
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_unterm_cond@@PAGE
+    add  x2, x2, _kcc_pp_err_unterm_cond@@PAGEOFF
+    bl _kcc_diag_error
+.Lpp_eof_ok:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Directive Dispatch}
+
+When we encounter \texttt{\#} at the beginning of a line, the next
+token is the directive name.  We dispatch to the appropriate handler
+by comparing the name against the twelve C17 directives.
+
+@d PP: directive dispatch @{
+.text
+// -- _kcc_pp_dispatch -----------------------------------------------
+// Internal: dispatches a preprocessing directive.
+// Called after '#' has been consumed. Reads directive name and routes.
+.p2align 2
+_kcc_pp_dispatch:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Save directive line number
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x19, [x0]
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    str  x19, [x0]
+
+    // Read directive name
+    bl _kcc_lex_next
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    // Directive name can be TOK_IDENT(1) or a keyword(10-53)
+    // since "if" and "else" are C keywords the lexer recognizes
+    cmp  x0, #TOK_IDENT
+    b.eq .Ldir_has_name
+    cmp  x0, #10               // TOK_AUTO (first keyword)
+    b.lt .Ldir_null
+    cmp  x0, #53               // TOK__THREAD_LOCAL (last keyword)
+    b.gt .Ldir_null
+.Ldir_has_name:
+
+    // Load name ptr and len into callee-saved regs
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x20, [x0]            // x20 = name ptr
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x21, [x0]            // x21 = name len
+
+    // Dispatch by length, then memcmp
+    cmp x21, #2
+    b.eq .Ldir_l2
+    cmp x21, #4
+    b.eq .Ldir_l4
+    cmp x21, #5
+    b.eq .Ldir_l5
+    cmp x21, #6
+    b.eq .Ldir_l6
+    cmp x21, #7
+    b.eq .Ldir_l7
+    b .Ldir_unknown
+
+.Ldir_l2:  // "if"
+    mov x0, x20
+    adrp x1, _kcc_pp_s_if@@PAGE
+    add  x1, x1, _kcc_pp_s_if@@PAGEOFF
+    mov x2, #2
+    bl _kcc_memcmp
+    cbz x0, .Ldir_if
+    b .Ldir_unknown
+
+.Ldir_l4:  // elif, else, line
+    mov x0, x20
+    adrp x1, _kcc_pp_s_elif@@PAGE
+    add  x1, x1, _kcc_pp_s_elif@@PAGEOFF
+    mov x2, #4
+    bl _kcc_memcmp
+    cbz x0, .Ldir_elif
+
+    mov x0, x20
+    adrp x1, _kcc_pp_s_else@@PAGE
+    add  x1, x1, _kcc_pp_s_else@@PAGEOFF
+    mov x2, #4
+    bl _kcc_memcmp
+    cbz x0, .Ldir_else
+
+    mov x0, x20
+    adrp x1, _kcc_pp_s_line@@PAGE
+    add  x1, x1, _kcc_pp_s_line@@PAGEOFF
+    mov x2, #4
+    bl _kcc_memcmp
+    cbz x0, .Ldir_line_ctrl
+    b .Ldir_unknown
+
+.Ldir_l5:  // undef, ifdef, endif, error
+    mov x0, x20
+    adrp x1, _kcc_pp_s_ifdef@@PAGE
+    add  x1, x1, _kcc_pp_s_ifdef@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Ldir_ifdef
+
+    mov x0, x20
+    adrp x1, _kcc_pp_s_undef@@PAGE
+    add  x1, x1, _kcc_pp_s_undef@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Ldir_undef
+
+    mov x0, x20
+    adrp x1, _kcc_pp_s_endif@@PAGE
+    add  x1, x1, _kcc_pp_s_endif@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Ldir_endif
+
+    mov x0, x20
+    adrp x1, _kcc_pp_s_error@@PAGE
+    add  x1, x1, _kcc_pp_s_error@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Ldir_error
+    b .Ldir_unknown
+
+.Ldir_l6:  // define, ifndef, pragma
+    mov x0, x20
+    adrp x1, _kcc_pp_s_define@@PAGE
+    add  x1, x1, _kcc_pp_s_define@@PAGEOFF
+    mov x2, #6
+    bl _kcc_memcmp
+    cbz x0, .Ldir_define
+
+    mov x0, x20
+    adrp x1, _kcc_pp_s_ifndef@@PAGE
+    add  x1, x1, _kcc_pp_s_ifndef@@PAGEOFF
+    mov x2, #6
+    bl _kcc_memcmp
+    cbz x0, .Ldir_ifndef
+
+    mov x0, x20
+    adrp x1, _kcc_pp_s_pragma@@PAGE
+    add  x1, x1, _kcc_pp_s_pragma@@PAGEOFF
+    mov x2, #6
+    bl _kcc_memcmp
+    cbz x0, .Ldir_pragma
+    b .Ldir_unknown
+
+.Ldir_l7:  // include
+    mov x0, x20
+    adrp x1, _kcc_pp_s_include@@PAGE
+    add  x1, x1, _kcc_pp_s_include@@PAGEOFF
+    mov x2, #7
+    bl _kcc_memcmp
+    cbz x0, .Ldir_include
+    b .Ldir_unknown
+
+// Dispatch targets
+.Ldir_define:
+    bl _kcc_pp_do_define
+    b .Ldir_done
+.Ldir_undef:
+    bl _kcc_pp_do_undef
+    b .Ldir_done
+.Ldir_ifdef:
+    mov x0, #0                 // negate=0 → ifdef
+    bl _kcc_pp_do_ifdef
+    b .Ldir_done
+.Ldir_ifndef:
+    mov x0, #1                 // negate=1 → ifndef
+    bl _kcc_pp_do_ifdef
+    b .Ldir_done
+.Ldir_if:
+    bl _kcc_pp_do_if
+    b .Ldir_done
+.Ldir_elif:
+    bl _kcc_pp_do_elif
+    b .Ldir_done
+.Ldir_else:
+    bl _kcc_pp_do_else
+    b .Ldir_done
+.Ldir_endif:
+    bl _kcc_pp_do_endif
+    b .Ldir_done
+.Ldir_include:
+    bl _kcc_pp_do_include
+    b .Ldir_done
+.Ldir_error:
+    bl _kcc_pp_do_error
+    b .Ldir_done
+.Ldir_line_ctrl:
+    bl _kcc_pp_skip_line       // #line: skip for now
+    b .Ldir_done
+.Ldir_pragma:
+    bl _kcc_pp_skip_line       // #pragma: ignore
+    b .Ldir_done
+.Ldir_null:
+    bl _kcc_pp_skip_line
+    b .Ldir_done
+.Ldir_unknown:
+    mov x0, x19
+    mov x1, #1
+    adrp x2, _kcc_pp_err_unknown_dir@@PAGE
+    add  x2, x2, _kcc_pp_err_unknown_dir@@PAGEOFF
+    bl _kcc_diag_warning
+    bl _kcc_pp_skip_line
+
+.Ldir_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Macro Definition (\texttt{\#define})}
+
+A \texttt{\#define} directive creates a macro.  If the identifier is
+immediately followed by \texttt{(} (no intervening whitespace), it is
+a function-like macro with parameters (\stdref{6.10.3}).  Otherwise
+it is an object-like macro.
+
+The replacement body is the text from after the macro name (or
+parameter list) to the end of the directive line.
+
+@d PP: define @{
+.text
+// -- _kcc_pp_do_define ----------------------------------------------
+// Handles #define: reads macro name, optional params, body.
+.p2align 2
+_kcc_pp_do_define:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+
+    // Read macro name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Ldef_err_name
+
+    // Save macro name (callee-saved)
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]             // x19 = name ptr
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]             // x20 = name len
+
+    // Check if function-like: '(' immediately after name (no space)
+    // Peek at the character right after the identifier in source
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x0, x1
+    b.hs .Ldef_object          // at end → object-like
+    ldrb w2, [x0]
+    cmp  w2, #'('
+    b.eq .Ldef_funclike
+
+.Ldef_object:
+    // Object-like macro
+    mov x21, #0                // x21 = flags (not function-like)
+    mov x22, #0                // x22 = param count
+    mov x23, #0                // x23 = params ptr (none)
+
+    // Get rest of line as replacement body
+    bl _kcc_pp_rest_of_line
+    mov x24, x0                // x24 = body ptr
+    mov x25, x1                // x25 = body len
+    b .Ldef_store
+
+.Ldef_funclike:
+    // Function-like macro
+    mov x21, #PP_FLAG_FUNCLIKE
+    mov x22, #0                // param count
+    mov x23, #0                // params ptr
+
+    // Consume the '(' by calling lex_next, then read first param/rparen
+    bl _kcc_lex_next           // reads '(' token
+    bl _kcc_lex_next           // reads first param or ')'
+
+    // Allocate param array (max PP_MAX_ARGS entries)
+    mov x0, #PP_MAX_ARGS
+    mov x1, #PP_PARAM_SIZE
+    mul x0, x0, x1
+    bl _kcc_arena_alloc
+    mov x23, x0                // x23 = params array
+
+    // Read parameters
+    // Check for empty parameter list: )
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.eq .Ldef_params_done
+
+.Ldef_param_loop:
+    // Expect identifier
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Ldef_err_param
+
+    // Store parameter name
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+
+    // params[param_count] = {name, len}
+    mov x2, #PP_PARAM_SIZE
+    mul x3, x22, x2
+    add x3, x23, x3
+    str x0, [x3, #PP_PARAM_NAME]
+    str x1, [x3, #PP_PARAM_LEN]
+    add x22, x22, #1
+
+    // Read next: ',' or ')'
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Ldef_check_rparen
+
+    // Comma: read next parameter
+    bl _kcc_lex_next
+    b .Ldef_param_loop
+
+.Ldef_check_rparen:
+    cmp  x0, #TOK_RPAREN
+    b.ne .Ldef_err_param
+
+.Ldef_params_done:
+    // Get rest of line as replacement body
+    bl _kcc_pp_rest_of_line
+    mov x24, x0                // x24 = body ptr
+    mov x25, x1                // x25 = body len
+    b .Ldef_store
+
+.Ldef_store:
+    // Allocate macro definition in arena
+    mov x0, #PP_MACRO_SIZE
+    bl _kcc_arena_alloc
+    mov x26, x0                // x26 = macro_def ptr
+
+    // Fill in the definition
+    str x19, [x26, #PP_MACRO_NAME]
+    str x20, [x26, #PP_MACRO_NAMELEN]
+    str x21, [x26, #PP_MACRO_FLAGS]
+    str x22, [x26, #PP_MACRO_NPARAMS]
+    str x24, [x26, #PP_MACRO_BODY]
+    str x25, [x26, #PP_MACRO_BODYLEN]
+    str x23, [x26, #PP_MACRO_PARAMS]
+
+    // Store in macro hash table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]             // hash table
+    mov  x1, x19              // key = name
+    mov  x2, x20              // keylen
+    mov  x3, x26              // value = macro_def ptr
+    bl _kcc_ht_put
+
+    // Skip remaining text on directive line
+    bl _kcc_pp_skip_line
+
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+.Ldef_err_name:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_def_name@@PAGE
+    add  x2, x2, _kcc_pp_err_def_name@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+.Ldef_err_param:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_def_param@@PAGE
+    add  x2, x2, _kcc_pp_err_def_param@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+\section{Macro Undefine (\texttt{\#undef})}
+
+\texttt{\#undef} removes a macro from the table by storing zero as
+its value.
+
+@d PP: undef @{
+.text
+// -- _kcc_pp_do_undef -----------------------------------------------
+.p2align 2
+_kcc_pp_do_undef:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Read macro name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Lundef_done
+
+    // Put 0 in the hash table for this name
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+
+    mov  x3, #0                // value = 0 (removed)
+    bl _kcc_ht_put
+
+.Lundef_done:
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Conditional Compilation}
+
+The conditional directives \texttt{\#ifdef}, \texttt{\#ifndef},
+\texttt{\#if}, \texttt{\#elif}, \texttt{\#else}, and
+\texttt{\#endif} control which sections of the source are processed.
+
+A conditional stack records the state of each nested group.  States
+are \texttt{ACTIVE} (processing tokens), \texttt{SKIP} (discarding
+tokens), and \texttt{DONE} (active branch already seen, skip rest).
+
+@d PP: conditional @{
+.text
+// -- _kcc_pp_do_ifdef -----------------------------------------------
+// x0 = negate (0 for ifdef, 1 for ifndef)
+.p2align 2
+_kcc_pp_do_ifdef:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0               // x19 = negate flag
+
+    // Read macro name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Lifdef_err
+
+    // Look up in macro table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+
+    bl _kcc_ht_get             // x0 = value (0 if not found)
+
+    // Determine condition: ifdef → (value != 0), ifndef → (value == 0)
+    cmp  x0, #0
+    cset x0, ne                // x0 = 1 if defined, 0 if not
+    eor  x0, x0, x19          // negate if ifndef
+
+    // Push conditional: ACTIVE if true, SKIP if false
+    cmp  x0, #0
+    mov  x0, #PP_COND_SKIP
+    mov  x1, #PP_COND_ACTIVE
+    csel x0, x1, x0, ne       // x0 = state
+
+    bl _kcc_pp_cond_push
+    bl _kcc_pp_skip_line
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Lifdef_err:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_ifdef_name@@PAGE
+    add  x2, x2, _kcc_pp_err_ifdef_name@@PAGEOFF
+    bl _kcc_diag_error
+    // Push SKIP so we don't process the body
+    mov x0, #PP_COND_SKIP
+    bl _kcc_pp_cond_push
+    bl _kcc_pp_skip_line
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- _kcc_pp_do_if --------------------------------------------------
+// Handles #if with basic expression evaluation.
+.p2align 2
+_kcc_pp_do_if:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Get rest of line as expression text
+    bl _kcc_pp_rest_of_line
+    mov x19, x0               // x19 = expr text
+    mov x20, x1               // x20 = expr len
+
+    // Save lexer state
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x22, [x0]
+
+    // Point lexer at expression text
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x19, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    add  x1, x19, x20
+    str  x1, [x0]
+
+    // Evaluate
+    bl _kcc_lex_next           // get first token
+    bl _kcc_pp_eval_expr       // x0 = result
+    mov x19, x0                // save result
+
+    // Restore lexer state
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    str  x22, [x0]
+
+    // Push conditional
+    cmp  x19, #0
+    mov  x0, #PP_COND_SKIP
+    mov  x1, #PP_COND_ACTIVE
+    csel x0, x1, x0, ne
+
+    bl _kcc_pp_cond_push
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- _kcc_pp_do_elif ------------------------------------------------
+.p2align 2
+_kcc_pp_do_elif:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Check conditional depth
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lelif_stray
+
+    // Check current state
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+    ldrb w3, [x2, x1]
+
+    cmp  w3, #PP_COND_ACTIVE
+    b.eq .Lelif_was_active     // previous branch was active → DONE
+    cmp  w3, #PP_COND_DONE
+    b.eq .Lelif_done_skip      // already found active → stay DONE
+
+    // State is SKIP: evaluate expression to see if this branch is active
+    bl _kcc_pp_rest_of_line
+    mov x19, x0
+    mov x20, x1
+
+    // Save/restore lexer, evaluate
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x22, [x0]
+
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x19, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    add  x1, x19, x20
+    str  x1, [x0]
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_expr
+    mov x19, x0
+
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    str  x22, [x0]
+
+    // Update conditional stack top
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+
+    cmp  x19, #0
+    mov  w3, #PP_COND_SKIP
+    mov  w4, #PP_COND_ACTIVE
+    csel w3, w4, w3, ne
+    strb w3, [x2, x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lelif_was_active:
+    // Previous branch was active → mark DONE, skip rest
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+    mov  w3, #PP_COND_DONE
+    strb w3, [x2, x1]
+    bl _kcc_pp_skip_line
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lelif_done_skip:
+    bl _kcc_pp_skip_line
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lelif_stray:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_stray_elif@@PAGE
+    add  x2, x2, _kcc_pp_err_stray_elif@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- _kcc_pp_do_else ------------------------------------------------
+.p2align 2
+_kcc_pp_do_else:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lelse_stray
+
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+    ldrb w3, [x2, x1]
+
+    cmp  w3, #PP_COND_ACTIVE
+    b.eq .Lelse_was_active
+    cmp  w3, #PP_COND_DONE
+    b.eq .Lelse_keep_done
+
+    // Was SKIP → now ACTIVE
+    mov  w3, #PP_COND_ACTIVE
+    strb w3, [x2, x1]
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lelse_was_active:
+    mov  w3, #PP_COND_DONE
+    strb w3, [x2, x1]
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lelse_keep_done:
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lelse_stray:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_stray_else@@PAGE
+    add  x2, x2, _kcc_pp_err_stray_else@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- _kcc_pp_do_endif -----------------------------------------------
+.p2align 2
+_kcc_pp_do_endif:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x1, [x0]
+    cbz  x1, .Lendif_stray
+
+    sub  x1, x1, #1
+    str  x1, [x0]
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lendif_stray:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_stray_endif@@PAGE
+    add  x2, x2, _kcc_pp_err_stray_endif@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- _kcc_pp_cond_push ----------------------------------------------
+// x0 = state to push
+.p2align 2
+_kcc_pp_cond_push:
+    adrp x1, _kcc_pp_cond_depth@@PAGE
+    add  x1, x1, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x2, [x1]
+    cmp  x2, #PP_MAX_COND
+    b.hs .Lcpush_overflow
+    adrp x3, _kcc_pp_cond_stack@@PAGE
+    add  x3, x3, _kcc_pp_cond_stack@@PAGEOFF
+    strb w0, [x3, x2]
+    add  x2, x2, #1
+    str  x2, [x1]
+    ret
+.Lcpush_overflow:
+    ret                        // silently cap depth
+
+// -- _kcc_pp_skip_directive -----------------------------------------
+// Handle directives encountered while skipping (conditional false).
+// Only #if/#ifdef/#ifndef (push), #elif/#else (toggle), #endif (pop)
+// are meaningful; all others are ignored.
+.p2align 2
+_kcc_pp_skip_directive:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Save directive line
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_pp_dir_line@@PAGE
+    add  x1, x1, _kcc_pp_dir_line@@PAGEOFF
+    str  x0, [x1]
+
+    // Read directive name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    // Directive name can be TOK_IDENT(1) or a keyword(10-53)
+    cmp  x0, #TOK_IDENT
+    b.eq .Lskipd_has_name
+    cmp  x0, #10
+    b.lt .Lskipd_done
+    cmp  x0, #53
+    b.gt .Lskipd_done
+.Lskipd_has_name:
+
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]
+
+    // Check for "if" (2), "ifdef" (5), "ifndef" (6) → push SKIP
+    cmp x20, #2
+    b.ne .Lskipd_not2
+    mov x0, x19
+    adrp x1, _kcc_pp_s_if@@PAGE
+    add  x1, x1, _kcc_pp_s_if@@PAGEOFF
+    mov x2, #2
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_push
+    b .Lskipd_done
+.Lskipd_not2:
+
+    cmp x20, #5
+    b.ne .Lskipd_not5
+    mov x0, x19
+    adrp x1, _kcc_pp_s_ifdef@@PAGE
+    add  x1, x1, _kcc_pp_s_ifdef@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_push
+    mov x0, x19
+    adrp x1, _kcc_pp_s_endif@@PAGE
+    add  x1, x1, _kcc_pp_s_endif@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_endif
+    b .Lskipd_done
+.Lskipd_not5:
+
+    cmp x20, #6
+    b.ne .Lskipd_not6
+    mov x0, x19
+    adrp x1, _kcc_pp_s_ifndef@@PAGE
+    add  x1, x1, _kcc_pp_s_ifndef@@PAGEOFF
+    mov x2, #6
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_push
+    b .Lskipd_check46
+.Lskipd_not6:
+
+.Lskipd_check46:
+    // Check "elif" (4), "else" (4)
+    cmp x20, #4
+    b.ne .Lskipd_done
+    mov x0, x19
+    adrp x1, _kcc_pp_s_elif@@PAGE
+    add  x1, x1, _kcc_pp_s_elif@@PAGEOFF
+    mov x2, #4
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_elif
+    mov x0, x19
+    adrp x1, _kcc_pp_s_else@@PAGE
+    add  x1, x1, _kcc_pp_s_else@@PAGEOFF
+    mov x2, #4
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_else
+    b .Lskipd_done
+
+.Lskipd_push:
+    // Nested #if/#ifdef/#ifndef while skipping: push SKIP
+    mov x0, #PP_COND_SKIP
+    bl _kcc_pp_cond_push
+    b .Lskipd_done
+
+.Lskipd_endif:
+    bl _kcc_pp_do_endif
+    b .Lskipd_ret
+
+.Lskipd_elif:
+    bl _kcc_pp_do_elif
+    b .Lskipd_ret
+
+.Lskipd_else:
+    bl _kcc_pp_do_else
+    b .Lskipd_ret
+
+.Lskipd_done:
+    bl _kcc_pp_skip_line
+.Lskipd_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{File Inclusion (\texttt{\#include})}
+
+\texttt{\#include "file"} opens and processes the named file.  The
+current lexer and source states are pushed onto the context stack.
+When the included file reaches EOF, the state is restored and
+processing continues in the including file.
+
+@d PP: include @{
+.text
+// -- _kcc_pp_do_include ---------------------------------------------
+.p2align 2
+_kcc_pp_do_include:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    // Read include path token
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Accept string literal "file.h" or scan <file.h>
+    cmp  x0, #TOK_STRING_LIT
+    b.eq .Lincl_string
+    cmp  x0, #TOK_LT
+    b.eq .Lincl_angle
+    b .Lincl_err
+
+.Lincl_string:
+    // Token text includes quotes: "file.h"
+    // Strip quotes: start+1, len-2
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]
+    add  x19, x19, #1         // skip opening "
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]
+    sub  x20, x20, #2         // remove both quotes
+    b .Lincl_open
+
+.Lincl_angle:
+    // Scan from cursor to '>' to get the path
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x19, [x0]            // start after <
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x1, [x1]
+    mov  x2, x19
+.Lincl_angle_scan:
+    cmp  x2, x1
+    b.hs .Lincl_err
+    ldrb w3, [x2]
+    cmp  w3, #'>'
+    b.eq .Lincl_angle_found
+    cmp  w3, #0x0A
+    b.eq .Lincl_err            // newline before >
+    add  x2, x2, #1
+    b .Lincl_angle_scan
+.Lincl_angle_found:
+    sub  x20, x2, x19         // path length
+    add  x2, x2, #1           // skip >
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x2, [x0]             // update cursor
+    b .Lincl_open
+
+.Lincl_open:
+    // Create null-terminated path in arena
+    add  x0, x20, #1          // +1 for null
+    bl _kcc_arena_alloc
+    mov  x21, x0              // x21 = path buffer
+
+    mov  x0, x21               // dst
+    mov  x1, x19               // src
+    mov  x2, x20               // len
+    bl _kcc_memcpy
+
+    // Null-terminate
+    strb wzr, [x21, x20]
+
+    // Skip rest of directive line
+    bl _kcc_pp_skip_line
+
+    // Push current state onto context stack
+    mov  x0, #PP_CTX_INCLUDE
+    bl _kcc_pp_ctx_push
+
+    // Open and process the included file
+    mov  x0, x21
+    bl _kcc_source_open
+    bl _kcc_source_encode
+    bl _kcc_source_splice
+
+    // Initialize lexer on included file
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_lex_init
+
+    // Reset prev_line for new file
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  xzr, [x0]
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lincl_err:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_include@@PAGE
+    add  x2, x2, _kcc_pp_err_include@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Error Directive}
+
+\texttt{\#error} emits a diagnostic with the rest of the directive
+line as the message.
+
+@d PP: error directive @{
+.text
+// -- _kcc_pp_do_error -----------------------------------------------
+.p2align 2
+_kcc_pp_do_error:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Get rest of line as message
+    bl _kcc_pp_rest_of_line
+    mov x19, x0               // msg ptr
+    mov x20, x1               // msg len
+
+    // Create null-terminated copy in arena
+    add  x0, x20, #1
+    bl _kcc_arena_alloc
+    mov  x2, x0               // dst
+    mov  x0, x2
+    mov  x1, x19
+    mov  x3, x20
+    // memcpy(dst, src, len)
+    mov  x1, x19
+    mov  x2, x20
+    bl _kcc_memcpy
+
+    // Null terminate
+    add  x1, x0, x20
+    strb wzr, [x1]
+
+    // Emit error
+    adrp x1, _kcc_pp_dir_line@@PAGE
+    add  x1, x1, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x1, [x1]             // line
+    mov  x2, x0               // msg (arena copy, null-terminated)
+    mov  x0, x1                // line
+    mov  x1, #1               // col
+    bl _kcc_diag_error
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Macro Expansion}
+
+When \texttt{kcc\_pp\_next} encounters an identifier, it checks
+the macro table.  If a macro is found and is not currently being
+expanded (anti-recursion per \stdref{6.10.3.4}), the replacement
+text is pushed onto the context stack.
+
+For function-like macros, arguments are collected first, and
+parameter names in the replacement text are substituted with the
+corresponding argument text.
+
+@d PP: expand @{
+.text
+// -- _kcc_pp_try_expand ---------------------------------------------
+// Checks current identifier token against macro table.
+// Returns x0 = 1 if expanded (pushed context), 0 if not.
+.globl _kcc_pp_try_expand
+.p2align 2
+_kcc_pp_try_expand:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    // Get token start and length
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]            // x19 = name ptr
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]            // x20 = name len
+
+    // Look up in macro table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, x19
+    mov  x2, x20
+    bl _kcc_ht_get
+    cbz  x0, .Lexp_no         // not a macro
+    mov  x21, x0              // x21 = macro_def ptr
+
+    // Check anti-recursion flag
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    tst  x0, #PP_FLAG_EXPANDING
+    b.ne .Lexp_no             // already expanding → don't recurse
+
+    // Check if function-like
+    tst  x0, #PP_FLAG_FUNCLIKE
+    b.ne .Lexp_funclike
+
+    // --- Object-like expansion ---
+    ldr  x22, [x21, #PP_MACRO_BODY]     // body ptr
+    ldr  x23, [x21, #PP_MACRO_BODYLEN]  // body len
+    cbz  x23, .Lexp_empty     // empty replacement
+
+    // Copy body to arena buffer (for lexer to scan)
+    mov  x0, x23
+    bl _kcc_arena_alloc
+    mov  x24, x0              // x24 = buffer
+    mov  x0, x24
+    mov  x1, x22
+    mov  x2, x23
+    bl _kcc_memcpy
+
+    // Mark macro as expanding
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    orr  x0, x0, #PP_FLAG_EXPANDING
+    str  x0, [x21, #PP_MACRO_FLAGS]
+
+    // Push expansion context
+    mov  x0, #PP_CTX_EXPAND
+    mov  x1, x21              // macro_def for unmark on pop
+    mov  x2, x24              // buffer start
+    mov  x3, x23              // buffer len
+    bl _kcc_pp_ctx_push_expand
+
+    mov  x0, #1               // expanded
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_empty:
+    // Empty macro body — nothing to expand, return 1 to skip the token
+    mov  x0, #1
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_funclike:
+    // Function-like: peek for '(' after identifier
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x1, [x1]
+
+    // Skip whitespace looking for '('
+.Lexp_peek_ws:
+    cmp  x0, x1
+    b.hs .Lexp_no              // EOF → not a function call
+    ldrb w2, [x0]
+    cmp  w2, #' '
+    b.eq .Lexp_peek_next
+    cmp  w2, #0x09
+    b.eq .Lexp_peek_next
+    cmp  w2, #0x0A
+    b.eq .Lexp_peek_next
+    cmp  w2, #0x0D
+    b.eq .Lexp_peek_next
+    // Non-whitespace found
+    cmp  w2, #'('
+    b.ne .Lexp_no              // not '(' → not a function call
+    b .Lexp_func_call
+.Lexp_peek_next:
+    add  x0, x0, #1
+    b .Lexp_peek_ws
+
+.Lexp_func_call:
+    // Consume the '(' via lexer
+    bl _kcc_lex_next           // should yield TOK_LPAREN
+
+    // Collect arguments
+    ldr  x22, [x21, #PP_MACRO_NPARAMS]  // expected param count
+
+    // Allocate argument array: PP_MAX_ARGS * 16 bytes
+    mov  x0, #PP_MAX_ARGS
+    lsl  x0, x0, #4           // * 16
+    bl _kcc_arena_alloc
+    mov  x23, x0              // x23 = arg array
+
+    // Collect arguments: track paren depth
+    mov  x24, #0              // arg count
+    mov  x3, #1               // paren depth (we already consumed '(')
+
+    // Mark start of first argument
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    // Save arg start in arg array
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    str  x0, [x1, #0]         // arg[0].start = cursor
+    str  xzr, [x1, #8]        // arg[0].len = 0 (placeholder)
+
+.Lexp_arg_loop:
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp  x0, #TOK_EOF
+    b.eq .Lexp_arg_err         // unterminated args
+
+    cmp  x0, #TOK_LPAREN
+    b.ne .Lexp_arg_not_lp
+    add  x3, x3, #1           // depth++
+    b .Lexp_arg_loop
+
+.Lexp_arg_not_lp:
+    cmp  x0, #TOK_RPAREN
+    b.ne .Lexp_arg_not_rp
+    sub  x3, x3, #1           // depth--
+    cbz  x3, .Lexp_arg_end    // matched → done
+    b .Lexp_arg_loop
+
+.Lexp_arg_not_rp:
+    cmp  x0, #TOK_COMMA
+    b.ne .Lexp_arg_loop
+    cmp  x3, #1
+    b.ne .Lexp_arg_loop        // comma inside nested parens
+
+    // End of argument: compute length
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]             // comma position
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    ldr  x2, [x1, #0]         // arg start
+    sub  x2, x0, x2            // length = comma_start - arg_start
+    str  x2, [x1, #8]
+
+    // Start next argument
+    add  x24, x24, #1
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    str  x0, [x1, #0]         // next arg start
+    str  xzr, [x1, #8]
+    b .Lexp_arg_loop
+
+.Lexp_arg_end:
+    // Finalize last argument
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]             // ')' position
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    ldr  x2, [x1, #0]         // arg start
+    sub  x2, x0, x2            // length
+    str  x2, [x1, #8]
+    add  x24, x24, #1         // total arg count
+
+    // Now substitute: build expanded text
+    // For each identifier in body matching a param name, replace with arg text
+    ldr  x0, [x21, #PP_MACRO_BODY]
+    ldr  x1, [x21, #PP_MACRO_BODYLEN]
+    ldr  x2, [x21, #PP_MACRO_PARAMS]
+    mov  x3, x22              // param count
+    mov  x4, x23              // arg array
+    mov  x5, x24              // arg count
+    bl _kcc_pp_substitute
+    // Returns x0 = buffer ptr, x1 = buffer len
+
+    cbz  x1, .Lexp_empty_func
+
+    mov  x22, x0              // buffer
+    mov  x23, x1              // len
+
+    // Mark macro as expanding
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    orr  x0, x0, #PP_FLAG_EXPANDING
+    str  x0, [x21, #PP_MACRO_FLAGS]
+
+    // Push expansion context
+    mov  x0, #PP_CTX_EXPAND
+    mov  x1, x21
+    mov  x2, x22
+    mov  x3, x23
+    bl _kcc_pp_ctx_push_expand
+
+    mov  x0, #1
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_empty_func:
+    mov  x0, #1
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_arg_err:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_unterm_args@@PAGE
+    add  x2, x2, _kcc_pp_err_unterm_args@@PAGEOFF
+    bl _kcc_diag_error
+    mov  x0, #0
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_no:
+    mov  x0, #0               // not expanded
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- _kcc_pp_substitute ---------------------------------------------
+// Substitutes parameters in macro body with argument text.
+// x0=body_ptr, x1=body_len, x2=params, x3=nparam, x4=args, x5=nargs
+// Returns x0=result_ptr, x1=result_len (arena-allocated)
+.p2align 2
+_kcc_pp_substitute:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    mov x19, x0               // body ptr
+    mov x20, x1               // body len
+    mov x21, x2               // params array
+    mov x22, x3               // param count
+    mov x23, x4               // args array
+    mov x24, x5               // arg count
+
+    // Allocate output buffer (generous: 4KB)
+    mov x0, #4096
+    bl _kcc_arena_alloc
+    mov x25, x0               // x25 = output buffer
+    mov x26, #0                // x26 = output position
+
+    // Walk through body text
+    mov x27, #0                // x27 = body position
+.Lsub_loop:
+    cmp x27, x20
+    b.hs .Lsub_done
+
+    // Check for identifier start
+    add x0, x19, x27
+    ldrb w0, [x0]
+
+    // Is it an identifier char? (a-z, A-Z, _)
+    cmp w0, #'_'
+    b.eq .Lsub_ident
+    cmp w0, #'a'
+    b.lo .Lsub_not_lower
+    cmp w0, #'z'
+    b.ls .Lsub_ident
+.Lsub_not_lower:
+    cmp w0, #'A'
+    b.lo .Lsub_copy_char
+    cmp w0, #'Z'
+    b.ls .Lsub_ident
+
+.Lsub_copy_char:
+    // Not an identifier: copy byte
+    add x1, x25, x26
+    strb w0, [x1]
+    add x26, x26, #1
+    add x27, x27, #1
+    b .Lsub_loop
+
+.Lsub_ident:
+    // Found identifier start. Extract the full identifier
+    mov x28, x27               // x28 = ident start position
+.Lsub_ident_cont:
+    add x27, x27, #1
+    cmp x27, x20
+    b.hs .Lsub_ident_end
+    add x0, x19, x27
+    ldrb w0, [x0]
+    cmp w0, #'_'
+    b.eq .Lsub_ident_cont
+    cmp w0, #'a'
+    b.lo .Lsub_id_not_lower
+    cmp w0, #'z'
+    b.ls .Lsub_ident_cont
+.Lsub_id_not_lower:
+    cmp w0, #'A'
+    b.lo .Lsub_id_not_upper
+    cmp w0, #'Z'
+    b.ls .Lsub_ident_cont
+.Lsub_id_not_upper:
+    cmp w0, #'0'
+    b.lo .Lsub_ident_end
+    cmp w0, #'9'
+    b.ls .Lsub_ident_cont
+
+.Lsub_ident_end:
+    // Identifier is body[x28..x27)
+    add  x0, x19, x28         // ident text ptr
+    sub  x1, x27, x28         // ident len
+
+    // Check against each parameter name
+    mov  x2, #0                // param index
+.Lsub_param_check:
+    cmp  x2, x22
+    b.hs .Lsub_not_param      // no match
+
+    // params[x2]
+    mov  x3, #PP_PARAM_SIZE
+    mul  x4, x2, x3
+    add  x4, x21, x4
+    ldr  x5, [x4, #PP_PARAM_NAME]
+    ldr  x6, [x4, #PP_PARAM_LEN]
+
+    // Compare lengths first
+    cmp  x1, x6
+    b.ne .Lsub_param_next
+
+    // Compare text
+    // Save registers we need across memcmp
+    stp  x0, x1, [sp, #-16]!  // push ident ptr, len
+    mov  x7, x2                // save param index
+    mov  x2, x1                // len for memcmp
+    mov  x1, x5                // param name
+    // x0 already = ident text
+    bl _kcc_memcmp
+    ldp  x8, x1, [sp], #16    // restore ident ptr, len
+    mov  x2, x7                // restore param index
+
+    cbz  x0, .Lsub_found_param
+    mov  x0, x8                // restore ident ptr
+    b .Lsub_param_next
+
+.Lsub_param_next:
+    add  x2, x2, #1
+    b .Lsub_param_check
+
+.Lsub_not_param:
+    // Not a parameter: copy identifier text as-is
+    sub  x1, x27, x28         // ident len
+    mov  x2, #0
+.Lsub_copy_ident:
+    cmp  x2, x1
+    b.hs .Lsub_loop
+    add  x3, x19, x28
+    ldrb w4, [x3, x2]
+    add  x3, x25, x26
+    strb w4, [x3]
+    add  x26, x26, #1
+    add  x2, x2, #1
+    b .Lsub_copy_ident
+
+.Lsub_found_param:
+    // Substitute: copy argument text instead
+    // x2 = param index (same as arg index)
+    lsl  x3, x2, #4           // * 16
+    add  x3, x23, x3
+    ldr  x4, [x3, #0]         // arg text ptr
+    ldr  x5, [x3, #8]         // arg text len
+
+    mov  x2, #0
+.Lsub_copy_arg:
+    cmp  x2, x5
+    b.hs .Lsub_loop
+    ldrb w6, [x4, x2]
+    add  x3, x25, x26
+    strb w6, [x3]
+    add  x26, x26, #1
+    add  x2, x2, #1
+    b .Lsub_copy_arg
+
+.Lsub_done:
+    mov  x0, x25               // result ptr
+    mov  x1, x26               // result len
+
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}
+
+\section{Context Stack}
+
+The context stack saves and restores lexer state for macro expansion
+and \texttt{\#include}.  Push saves the current state and points the
+lexer at a new buffer.  Pop restores the saved state and (for
+expansion) clears the anti-recursion flag on the expanded macro.
+
+@d PP: context @{
+.text
+// -- _kcc_pp_ctx_push -----------------------------------------------
+// Push include context. x0 = type (PP_CTX_INCLUDE)
+.p2align 2
+_kcc_pp_ctx_push:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x1, _kcc_pp_ctx_depth@@PAGE
+    add  x1, x1, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x2, [x1]
+    cmp  x2, #PP_MAX_CTX_DEPTH
+    b.hs .Lctx_overflow
+
+    // Calculate stack entry address
+    mov  x3, #PP_CTX_SIZE
+    mul  x4, x2, x3
+    adrp x5, _kcc_pp_ctx_stack@@PAGE
+    add  x5, x5, _kcc_pp_ctx_stack@@PAGEOFF
+    add  x5, x5, x4           // x5 = entry ptr
+
+    // Save type
+    str  x0, [x5, #PP_CTX_TYPE]
+
+    // Save lexer state
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_CURSOR]
+
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_END]
+
+    adrp x0, _kcc_lex_line@@PAGE
+    add  x0, x0, _kcc_lex_line@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_LINE]
+
+    adrp x0, _kcc_lex_line_start@@PAGE
+    add  x0, x0, _kcc_lex_line_start@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_LSTART]
+
+    // Save source state (for include)
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_SRC_BASE]
+
+    adrp x0, _kcc_src_size@@PAGE
+    add  x0, x0, _kcc_src_size@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_SRC_SIZE]
+
+    adrp x0, _kcc_src_path@@PAGE
+    add  x0, x0, _kcc_src_path@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_SRC_PATH]
+
+    // Save prev_line
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x5, #PP_CTX_PREVLINE]
+
+    // Clear macro pointer
+    str  xzr, [x5, #PP_CTX_MACRO]
+
+    // Increment depth
+    add  x2, x2, #1
+    str  x2, [x1]
+
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lctx_overflow:
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_depth@@PAGE
+    add  x2, x2, _kcc_pp_err_depth@@PAGEOFF
+    bl _kcc_diag_error
+    mov  x0, #1
+    bl _kcc_sys_exit
+
+// -- _kcc_pp_ctx_push_expand ----------------------------------------
+// Push expansion context.
+// x0=type(PP_CTX_EXPAND), x1=macro_def, x2=buffer, x3=buflen
+.p2align 2
+_kcc_pp_ctx_push_expand:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x1               // macro_def
+    mov x20, x2               // buffer
+    mov x21, x3               // buflen
+
+    // Push the base context (saves lexer state)
+    mov x0, #PP_CTX_EXPAND
+    bl _kcc_pp_ctx_push
+
+    // Now patch the entry with macro pointer
+    adrp x0, _kcc_pp_ctx_depth@@PAGE
+    add  x0, x0, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x0, [x0]
+    sub  x0, x0, #1           // just-pushed entry
+    mov  x1, #PP_CTX_SIZE
+    mul  x0, x0, x1
+    adrp x1, _kcc_pp_ctx_stack@@PAGE
+    add  x1, x1, _kcc_pp_ctx_stack@@PAGEOFF
+    add  x1, x1, x0
+    str  x19, [x1, #PP_CTX_MACRO]
+
+    // Point lexer at expansion buffer
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x20, [x0]
+
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    add  x1, x20, x21
+    str  x1, [x0]
+
+    // Set line to current token line (for error reporting)
+    // line_start = buffer start
+    adrp x0, _kcc_lex_line_start@@PAGE
+    add  x0, x0, _kcc_lex_line_start@@PAGEOFF
+    str  x20, [x0]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- _kcc_pp_ctx_pop ------------------------------------------------
+// Pop context stack. Restores lexer state. Unmarks macro if expand.
+.p2align 2
+_kcc_pp_ctx_pop:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_pp_ctx_depth@@PAGE
+    add  x0, x0, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x1, [x0]
+    cbz  x1, .Lctx_pop_done   // empty stack (shouldn't happen)
+    sub  x1, x1, #1
+    str  x1, [x0]
+
+    // Get entry
+    mov  x2, #PP_CTX_SIZE
+    mul  x3, x1, x2
+    adrp x4, _kcc_pp_ctx_stack@@PAGE
+    add  x4, x4, _kcc_pp_ctx_stack@@PAGEOFF
+    add  x4, x4, x3           // x4 = entry ptr
+
+    // Check type
+    ldr  x0, [x4, #PP_CTX_TYPE]
+    cmp  x0, #PP_CTX_EXPAND
+    b.eq .Lctx_pop_expand
+
+    // -- Include pop: restore source state too --
+    ldr  x0, [x4, #PP_CTX_SRC_BASE]
+    adrp x1, _kcc_src_base@@PAGE
+    add  x1, x1, _kcc_src_base@@PAGEOFF
+    str  x0, [x1]
+
+    ldr  x0, [x4, #PP_CTX_SRC_SIZE]
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    str  x0, [x1]
+
+    ldr  x0, [x4, #PP_CTX_SRC_PATH]
+    adrp x1, _kcc_src_path@@PAGE
+    add  x1, x1, _kcc_src_path@@PAGEOFF
+    str  x0, [x1]
+    b .Lctx_pop_restore
+
+.Lctx_pop_expand:
+    // Unmark macro anti-recursion flag
+    ldr  x0, [x4, #PP_CTX_MACRO]
+    cbz  x0, .Lctx_pop_restore
+    ldr  x1, [x0, #PP_MACRO_FLAGS]
+    bic  x1, x1, #PP_FLAG_EXPANDING
+    str  x1, [x0, #PP_MACRO_FLAGS]
+
+.Lctx_pop_restore:
+    // Restore lexer state
+    ldr  x0, [x4, #PP_CTX_CURSOR]
+    adrp x1, _kcc_lex_cursor@@PAGE
+    add  x1, x1, _kcc_lex_cursor@@PAGEOFF
+    str  x0, [x1]
+
+    ldr  x0, [x4, #PP_CTX_END]
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    str  x0, [x1]
+
+    ldr  x0, [x4, #PP_CTX_LINE]
+    adrp x1, _kcc_lex_line@@PAGE
+    add  x1, x1, _kcc_lex_line@@PAGEOFF
+    str  x0, [x1]
+
+    ldr  x0, [x4, #PP_CTX_LSTART]
+    adrp x1, _kcc_lex_line_start@@PAGE
+    add  x1, x1, _kcc_lex_line_start@@PAGEOFF
+    str  x0, [x1]
+
+    // Restore prev_line
+    ldr  x0, [x4, #PP_CTX_PREVLINE]
+    adrp x1, _kcc_pp_prev_line@@PAGE
+    add  x1, x1, _kcc_pp_prev_line@@PAGEOFF
+    str  x0, [x1]
+
+.Lctx_pop_done:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Expression Evaluation for \texttt{\#if}}
+
+The \texttt{\#if} and \texttt{\#elif} directives require evaluating
+a constant integer expression.  We support the subset commonly used
+in practice: integer literals, \texttt{defined(NAME)},
+\texttt{defined NAME}, the logical operators \texttt{!}, \texttt{\&\&},
+\texttt{||}, and comparison operators.
+
+Any identifier not recognized as a macro evaluates to~0 per
+\stdref{6.10.1} paragraph~4.
+
+@d PP: eval @{
+.text
+// -- _kcc_pp_eval_expr ----------------------------------------------
+// Evaluates #if expression. Token stream already set up.
+// Returns x0 = integer result.
+.globl _kcc_pp_eval_expr
+.p2align 2
+_kcc_pp_eval_expr:
+    // Entry point: delegate to logical-or
+    b _kcc_pp_eval_lor
+
+// -- Logical OR: expr || expr
+.p2align 2
+_kcc_pp_eval_lor:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    bl _kcc_pp_eval_land
+    mov x19, x0
+
+.Leval_lor_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_OR           // ||
+    b.ne .Leval_lor_done
+
+    bl _kcc_lex_next           // consume ||
+    bl _kcc_pp_eval_land
+    orr  x19, x19, x0
+    cmp  x19, #0
+    cset x19, ne
+    b .Leval_lor_loop
+
+.Leval_lor_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Logical AND: expr && expr
+.p2align 2
+_kcc_pp_eval_land:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    bl _kcc_pp_eval_eq
+    mov x19, x0
+
+.Leval_land_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_AND          // &&
+    b.ne .Leval_land_done
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_eq
+    and  x0, x19, x0
+    cmp  x0, #0
+    cset x19, ne
+    b .Leval_land_loop
+
+.Leval_land_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Equality: expr == expr, expr != expr
+.p2align 2
+_kcc_pp_eval_eq:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    bl _kcc_pp_eval_rel
+    mov x19, x0
+
+.Leval_eq_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x0]
+    cmp  x20, #TOK_EQ
+    b.eq .Leval_eq_op
+    cmp  x20, #TOK_NE
+    b.eq .Leval_eq_op
+    b .Leval_eq_done
+
+.Leval_eq_op:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_rel
+    cmp  x20, #TOK_EQ
+    b.eq .Leval_do_eq
+    // !=
+    cmp  x19, x0
+    cset x19, ne
+    b .Leval_eq_loop
+.Leval_do_eq:
+    cmp  x19, x0
+    cset x19, eq
+    b .Leval_eq_loop
+
+.Leval_eq_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Relational: < > <= >=
+.p2align 2
+_kcc_pp_eval_rel:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    bl _kcc_pp_eval_unary
+    mov x19, x0
+
+.Leval_rel_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x0]
+    cmp  x20, #TOK_LT
+    b.eq .Leval_rel_op
+    cmp  x20, #TOK_GT
+    b.eq .Leval_rel_op
+    cmp  x20, #TOK_LE
+    b.eq .Leval_rel_op
+    cmp  x20, #TOK_GE
+    b.eq .Leval_rel_op
+    b .Leval_rel_done
+
+.Leval_rel_op:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary
+    cmp  x20, #TOK_LT
+    b.eq .Leval_do_lt
+    cmp  x20, #TOK_GT
+    b.eq .Leval_do_gt
+    cmp  x20, #TOK_LE
+    b.eq .Leval_do_le
+    // >=
+    cmp  x19, x0
+    cset x19, ge
+    b .Leval_rel_loop
+.Leval_do_lt:
+    cmp  x19, x0
+    cset x19, lt
+    b .Leval_rel_loop
+.Leval_do_gt:
+    cmp  x19, x0
+    cset x19, gt
+    b .Leval_rel_loop
+.Leval_do_le:
+    cmp  x19, x0
+    cset x19, le
+    b .Leval_rel_loop
+
+.Leval_rel_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Unary: !expr, primary
+.p2align 2
+_kcc_pp_eval_unary:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_BANG
+    b.ne .Leval_primary
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary
+    cmp  x0, #0
+    cset x0, eq                // !x
+    ldp  x29, x30, [sp], #16
+    ret
+
+.Leval_primary:
+    bl _kcc_pp_eval_primary
+    ldp  x29, x30, [sp], #16
+    ret
+
+// -- Primary: number, defined(X), defined X, (expr), ident→0
+.p2align 2
+_kcc_pp_eval_primary:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Number literal
+    cmp  x0, #TOK_NUMBER
+    b.eq .Leval_number
+
+    // Parenthesized expression
+    cmp  x0, #TOK_LPAREN
+    b.eq .Leval_paren
+
+    // Identifier
+    cmp  x0, #TOK_IDENT
+    b.eq .Leval_ident
+
+    // EOF or unknown → 0
+    mov  x0, #0
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_number:
+    // Parse integer from token text
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_pp_atoi
+    mov  x19, x0
+    bl _kcc_lex_next
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_paren:
+    bl _kcc_lex_next           // consume (
+    bl _kcc_pp_eval_expr
+    mov  x19, x0
+    // Expect )
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.ne .Leval_paren_done
+    bl _kcc_lex_next           // consume )
+.Leval_paren_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_ident:
+    // Check for "defined"
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x1, #7
+    b.ne .Leval_ident_macro
+
+    adrp x1, _kcc_pp_s_defined@@PAGE
+    add  x1, x1, _kcc_pp_s_defined@@PAGEOFF
+    mov  x2, #7
+    bl _kcc_memcmp
+    cbnz x0, .Leval_ident_macro
+
+    // "defined" operator
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    b.eq .Leval_defined_paren
+
+    // defined IDENT (without parens)
+    cmp  x0, #TOK_IDENT
+    b.ne .Leval_defined_zero
+    b .Leval_defined_check
+
+.Leval_defined_paren:
+    bl _kcc_lex_next           // get IDENT
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Leval_defined_zero
+
+.Leval_defined_check:
+    // Look up macro
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+    bl _kcc_ht_get
+    cmp  x0, #0
+    cset x19, ne               // 1 if defined, 0 if not
+
+    // Skip closing ) if present
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.ne .Leval_defined_noparen
+    bl _kcc_lex_next
+.Leval_defined_noparen:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_defined_zero:
+    mov  x0, #0
+    bl _kcc_lex_next
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_ident_macro:
+    // Regular identifier → look up as macro, expand to 0 if not found
+    // Per §6.10.1p4: remaining identifiers → 0
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+    bl _kcc_ht_get
+    cbz  x0, .Leval_ident_zero
+
+    // Found macro: get its body, try to parse as integer
+    mov  x19, x0
+    ldr  x0, [x19, #PP_MACRO_BODY]
+    ldr  x1, [x19, #PP_MACRO_BODYLEN]
+    bl _kcc_pp_atoi
+    mov  x19, x0
+    bl _kcc_lex_next
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_ident_zero:
+    mov  x0, #0
+    bl _kcc_lex_next
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- _kcc_pp_atoi ---------------------------------------------------
+// Simple ASCII-to-integer: x0=ptr, x1=len → x0=value
+.p2align 2
+_kcc_pp_atoi:
+    mov  x2, #0                // accumulator
+    mov  x3, #0                // index
+.Latoi_loop:
+    cmp  x3, x1
+    b.hs .Latoi_done
+    ldrb w4, [x0, x3]
+    cmp  w4, #'0'
+    b.lo .Latoi_done
+    cmp  w4, #'9'
+    b.hi .Latoi_done
+    sub  w4, w4, #'0'
+    mov  x5, #10
+    mul  x2, x2, x5
+    add  x2, x2, x4
+    add  x3, x3, #1
+    b .Latoi_loop
+.Latoi_done:
+    mov  x0, x2
+    ret
+@}
+
+\section{Predefined Macros}
+
+ISO C17 requires several predefined macros (\stdref{6.10.8}).  We
+define \texttt{\_\_STDC\_\_} (1), \texttt{\_\_STDC\_VERSION\_\_}
+(201710L), and create entries for \texttt{\_\_FILE\_\_} and
+\texttt{\_\_LINE\_\_} whose expansion is handled specially by the
+preprocessor.
+
+@d PP: predefined @{
+.text
+// -- _kcc_pp_predefine ----------------------------------------------
+// Registers predefined macros in the macro table.
+.p2align 2
+_kcc_pp_predefine:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // __STDC__ = 1
+    adrp x0, _kcc_pp_pre_stdc@@PAGE
+    add  x0, x0, _kcc_pp_pre_stdc@@PAGEOFF
+    mov  x1, #8                // len("__STDC__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1                // len("1")
+    bl _kcc_pp_def_simple
+
+    // __STDC_VERSION__ = 201710L
+    adrp x0, _kcc_pp_pre_stdc_ver@@PAGE
+    add  x0, x0, _kcc_pp_pre_stdc_ver@@PAGEOFF
+    mov  x1, #16               // len("__STDC_VERSION__")
+    adrp x2, _kcc_pp_pre_c17val@@PAGE
+    add  x2, x2, _kcc_pp_pre_c17val@@PAGEOFF
+    mov  x3, #7                // len("201710L")
+    bl _kcc_pp_def_simple
+
+    // __STDC_HOSTED__ = 1
+    adrp x0, _kcc_pp_pre_hosted@@PAGE
+    add  x0, x0, _kcc_pp_pre_hosted@@PAGEOFF
+    mov  x1, #15               // len("__STDC_HOSTED__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- _kcc_pp_def_simple ---------------------------------------------
+// Helper: define a simple object-like macro.
+// x0=name, x1=namelen, x2=body, x3=bodylen
+.p2align 2
+_kcc_pp_def_simple:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0               // name
+    mov x20, x1               // namelen
+    mov x21, x2               // body
+    mov x22, x3               // bodylen
+
+    // Allocate macro definition
+    mov x0, #PP_MACRO_SIZE
+    bl _kcc_arena_alloc
+    mov x23, x0
+
+    str x19, [x23, #PP_MACRO_NAME]
+    str x20, [x23, #PP_MACRO_NAMELEN]
+    mov x0, #PP_FLAG_BUILTIN
+    str x0, [x23, #PP_MACRO_FLAGS]
+    str xzr, [x23, #PP_MACRO_NPARAMS]
+    str x21, [x23, #PP_MACRO_BODY]
+    str x22, [x23, #PP_MACRO_BODYLEN]
+    str xzr, [x23, #PP_MACRO_PARAMS]
+
+    // Store in hash table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, x19
+    mov  x2, x20
+    mov  x3, x23
+    bl _kcc_ht_put
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Helper Functions}
+
+@d PP: helpers @{
+.text
+// -- _kcc_pp_skip_line ----------------------------------------------
+// Advances the lexer cursor past the end of the current line.
+.p2align 2
+_kcc_pp_skip_line:
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x1, [x0]
+    adrp x2, _kcc_lex_end@@PAGE
+    add  x2, x2, _kcc_lex_end@@PAGEOFF
+    ldr  x2, [x2]
+.Lsl_loop:
+    cmp  x1, x2
+    b.hs .Lsl_done
+    ldrb w3, [x1]
+    add  x1, x1, #1
+    cmp  w3, #0x0A
+    b.ne .Lsl_loop
+    // Found newline: update line counter
+    adrp x3, _kcc_lex_line@@PAGE
+    add  x3, x3, _kcc_lex_line@@PAGEOFF
+    ldr  x4, [x3]
+    add  x4, x4, #1
+    str  x4, [x3]
+    adrp x3, _kcc_lex_line_start@@PAGE
+    add  x3, x3, _kcc_lex_line_start@@PAGEOFF
+    str  x1, [x3]
+.Lsl_done:
+    str  x1, [x0]
+    ret
+
+// -- _kcc_pp_rest_of_line -------------------------------------------
+// Returns rest of directive line from cursor.
+// x0 = text start (after leading whitespace), x1 = text length
+// Advances cursor to the newline (lexer will skip it).
+.p2align 2
+_kcc_pp_rest_of_line:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x2, _kcc_lex_cursor@@PAGE
+    add  x2, x2, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x2]             // cursor
+    mov  x4, x2               // save ptr to cursor global
+
+    adrp x2, _kcc_lex_end@@PAGE
+    add  x2, x2, _kcc_lex_end@@PAGEOFF
+    ldr  x1, [x2]             // end
+
+    // Skip leading spaces/tabs
+.Lrol_skip:
+    cmp  x0, x1
+    b.hs .Lrol_empty
+    ldrb w3, [x0]
+    cmp  w3, #' '
+    b.eq .Lrol_sk
+    cmp  w3, #0x09
+    b.eq .Lrol_sk
+    b .Lrol_start
+.Lrol_sk:
+    add  x0, x0, #1
+    b .Lrol_skip
+
+.Lrol_start:
+    mov  x5, x0               // text start
+    // Find newline or end
+.Lrol_scan:
+    cmp  x0, x1
+    b.hs .Lrol_at_end
+    ldrb w3, [x0]
+    cmp  w3, #0x0A
+    b.eq .Lrol_found_nl
+    add  x0, x0, #1
+    b .Lrol_scan
+
+.Lrol_found_nl:
+    // Set cursor to newline (lexer will skip it later)
+    str  x0, [x4]
+    // Trim trailing whitespace
+    mov  x6, x0
+.Lrol_trim:
+    cmp  x6, x5
+    b.ls .Lrol_trimmed
+    sub  x6, x6, #1
+    ldrb w3, [x6]
+    cmp  w3, #' '
+    b.eq .Lrol_trim
+    cmp  w3, #0x09
+    b.eq .Lrol_trim
+    add  x6, x6, #1
+    b .Lrol_ret
+.Lrol_trimmed:
+    mov  x6, x5
+.Lrol_ret:
+    mov  x0, x5               // text start
+    sub  x1, x6, x5           // text length
+    ldp  x29, x30, [sp], #16
+    ret
+
+.Lrol_at_end:
+    str  x1, [x4]             // cursor = end
+    mov  x6, x0
+    b .Lrol_ret
+
+.Lrol_empty:
+    str  x1, [x4]
+    mov  x0, x1
+    mov  x1, #0
+    ldp  x29, x30, [sp], #16
+    ret
+@}
+
+\section{Preprocessed Output (\texttt{-E} Mode)}
+
+\texttt{kcc\_pp\_dump\_all} emits the entire preprocessed token stream
+to stdout, one token per line, in the same format as
+\texttt{kcc\_lex\_dump\_all}.
+
+@d PP: dump @{
+.text
+// -- kcc_pp_dump_all ------------------------------------------------
+// void kcc_pp_dump_all(void)
+// Calls kcc_pp_next in a loop and dumps each token.
+.globl _kcc_pp_dump_all
+.p2align 2
+_kcc_pp_dump_all:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+.Lppdump_loop:
+    bl _kcc_pp_next
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lppdump_done    // TOK_EOF
+
+    bl _kcc_lex_dump_token
+    b .Lppdump_loop
+
+.Lppdump_done:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Global State}
+
+@d PP: data @{
+// -- Preprocessor global state --------------------------------------
+.data
+.p2align 3
+.globl _kcc_pp_macros
+_kcc_pp_macros:      .quad 0     // pointer to macro hash table
+.globl _kcc_pp_ctx_depth
+_kcc_pp_ctx_depth:   .quad 0     // context stack depth
+_kcc_pp_cond_depth:  .quad 0     // conditional stack depth
+_kcc_pp_prev_line:   .quad 0     // line of previous token (BOL detection)
+_kcc_pp_has_pending: .quad 0     // pending token flag
+_kcc_pp_dir_line:    .quad 0     // line of current directive
+
+// Context stack (PP_MAX_CTX_DEPTH * PP_CTX_SIZE bytes)
+// 256 * 80 = 20480 bytes
+.p2align 3
+_kcc_pp_ctx_stack:   .space 20480
+
+// Conditional stack (PP_MAX_COND bytes)
+.p2align 3
+_kcc_pp_cond_stack:  .space 64
+
+// -- Directive name strings -----------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_kcc_pp_s_define:    .asciz "define"
+_kcc_pp_s_undef:     .asciz "undef"
+_kcc_pp_s_ifdef:     .asciz "ifdef"
+_kcc_pp_s_ifndef:    .asciz "ifndef"
+_kcc_pp_s_if:        .asciz "if"
+_kcc_pp_s_elif:      .asciz "elif"
+_kcc_pp_s_else:      .asciz "else"
+_kcc_pp_s_endif:     .asciz "endif"
+_kcc_pp_s_include:   .asciz "include"
+_kcc_pp_s_error:     .asciz "error"
+_kcc_pp_s_line:      .asciz "line"
+_kcc_pp_s_pragma:    .asciz "pragma"
+_kcc_pp_s_defined:   .asciz "defined"
+
+// -- Predefined macro name strings ----------------------------------
+_kcc_pp_pre_stdc:     .asciz "__STDC__"
+_kcc_pp_pre_stdc_ver: .asciz "__STDC_VERSION__"
+_kcc_pp_pre_hosted:   .asciz "__STDC_HOSTED__"
+_kcc_pp_pre_one:      .asciz "1"
+_kcc_pp_pre_c17val:   .asciz "201710L"
+
+// -- Error messages -------------------------------------------------
+_kcc_pp_err_unknown_dir:  .asciz "unknown preprocessing directive"
+_kcc_pp_err_def_name:     .asciz "expected identifier after #define"
+_kcc_pp_err_def_param:    .asciz "expected parameter name or ')' in macro parameter list"
+_kcc_pp_err_ifdef_name:   .asciz "expected identifier after #ifdef/#ifndef"
+_kcc_pp_err_stray_elif:   .asciz "#elif without matching #if"
+_kcc_pp_err_stray_else:   .asciz "#else without matching #if"
+_kcc_pp_err_stray_endif:  .asciz "#endif without matching #if"
+_kcc_pp_err_include:      .asciz "#include expects \"file\" or <file>"
+_kcc_pp_err_unterm_cond:  .asciz "unterminated conditional directive"
+_kcc_pp_err_unterm_args:  .asciz "unterminated macro argument list"
+_kcc_pp_err_depth:        .asciz "maximum include/expansion depth exceeded"
+@}

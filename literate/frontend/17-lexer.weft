@@ -1816,9 +1816,13 @@ end of buffer, current line/column tracking, and the current token.
 // -- Lexer global state ---------------------------------------------
 .data
 .p2align 3
+.globl _kcc_lex_cursor
 _kcc_lex_cursor:     .quad 0  // current position in source buffer
+.globl _kcc_lex_end
 _kcc_lex_end:        .quad 0  // one past end of source buffer
+.globl _kcc_lex_line
 _kcc_lex_line:       .quad 1  // current line number (1-based)
+.globl _kcc_lex_line_start
 _kcc_lex_line_start: .quad 0  // pointer to start of current line
 
 // Current token (exported for test harness access)

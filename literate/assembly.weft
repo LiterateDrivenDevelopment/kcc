@@ -156,6 +156,33 @@ physical assembly files under \texttt{tmp/src/}.
 @<Lexer: token names@>
 @}
 
+\noindent\textbf{preprocessor.s} --- C17 preprocessor (Phase 4):
+
+@o tmp/src/preprocessor.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<PP: constants@>
+@<PP: init@>
+@<PP: helpers@>
+@<PP: context@>
+@<PP: eval@>
+@<PP: predefined@>
+@<PP: expand@>
+@<PP: define@>
+@<PP: undef@>
+@<PP: conditional@>
+@<PP: include@>
+@<PP: error directive@>
+@<PP: directive dispatch@>
+@<PP: next token@>
+@<PP: dump@>
+@<StringLit: process@>
+@<Concat: adjacent strings@>
+@<PP: data@>
+@<StringLit: data@>
+@<Concat: data@>
+@}
+
 \bigskip
 \noindent\textbf{Test binaries} --- test runner and conformance tests
 (assembled separately; linked into \texttt{tmp/test\_kcc}):

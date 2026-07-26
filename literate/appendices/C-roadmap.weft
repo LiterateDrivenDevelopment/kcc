@@ -180,6 +180,10 @@ build the diagnostic engine required by \stdref{5.1.1.3}.
       \texttt{\_\_STDC\_VERSION\_\_}) are set correctly.
 \end{enumerate}
 
+\textbf{Status.} Complete (core directives: \texttt{\#define} object-like,
+\texttt{\#include}, \texttt{\#if}/\texttt{\#ifdef}/\texttt{\#endif},
+\texttt{\#error}; predefined macros).
+
 % ────────────────────────────────────────────────────────────────
 \section{Phase 4 --- Parser}
 \label{sec:phase4}
@@ -229,6 +233,8 @@ tree (AST) for every C17 construct.
       a typedef name).
 \item \texttt{sizeof(int)} and \texttt{sizeof x} both parse.
 \end{enumerate}
+
+\textbf{Status.} Complete.
 
 % ────────────────────────────────────────────────────────────────
 \section{Phase 5 --- Type System and Semantic Analysis}
@@ -290,6 +296,9 @@ checks all constraints.
       produce the correct initialized object.
 \end{enumerate}
 
+\textbf{Status.} Complete (core type checking for integer types,
+pointers, functions; \texttt{--dump-types} and \texttt{--check} flags).
+
 % ────────────────────────────────────────────────────────────────
 \section{Phase 6 --- Intermediate Representation and Optimization}
 \label{sec:phase6}
@@ -339,6 +348,9 @@ essential optimization passes.
       \texttt{setjmp}/\texttt{longjmp} (treated as opaque calls).
 \end{enumerate}
 
+\textbf{Status.} Complete (constant folding, DCE, pass manager;
+\texttt{--dump-ir} flag).
+
 % ────────────────────────────────────────────────────────────────
 \section{Phase 7 --- ARM64 Backend}
 \label{sec:phase7}
@@ -348,40 +360,44 @@ Mach-O object files directly --- no external assembler needed.
 This is the self-referential core: ARM64 assembly generating
 ARM64 machine code.
 
+\textbf{Strategy.}  Phase~7a uses a simplified \emph{stack-slot
+allocator} where every virtual register lives on the stack.
+Scratch registers \texttt{x9}, \texttt{x10}, \texttt{x11} shuttle
+values between stack slots and ALU operations.  This produces
+correct but suboptimal code quickly.  Phase~7b (future) will
+introduce linear-scan register allocation.
+
 \textbf{weft files.}
 \begin{itemize}
-\item \texttt{literate/backend/37-abi-aapcs64.weft} ---
-      AAPCS64 calling convention implementation: parameter
-      classification (stages A, B, C), return value handling,
-      HFA/HVA detection, Apple-specific deltas (small struct
-      passing, variadic arguments).
-\item \texttt{literate/backend/38-isel.weft} ---
-      instruction selection: pattern matching from IR
-      instructions to ARM64 instruction sequences.  Covering
-      arithmetic, comparisons, branches, loads/stores (with
-      addressing mode selection), function calls, returns.
-\item \texttt{literate/backend/39-regalloc.weft} ---
-      register allocation: linear scan allocator, spill code
-      generation, callee-saved register assignment, frame
-      layout computation.
-\item \texttt{literate/backend/40-emit-arm64.weft} ---
-      ARM64 instruction encoding: binary encoding of every
-      instruction format (data processing, loads/stores,
-      branches, system), relocation handling.
-\item \texttt{literate/backend/41-emit-macho.weft} ---
+\item \texttt{literate/backend/37-codegen.weft} ---
+      IR-to-ARM64 lowering: stack-slot strategy, instruction
+      dispatch for all IR opcodes (arithmetic, logical, compare,
+      memory, branch, call, return), prologue/epilogue emission,
+      BB label tracking, forward-branch patching.
+\item \texttt{literate/backend/38-emit-arm64.weft} ---
+      ARM64 instruction binary encoding: code buffer management,
+      data processing (register and immediate forms), logical
+      operations, compare and conditional select (CSINC),
+      load/store (unsigned offset, STP/LDP), branch (B, BL,
+      B.cond, CBZ, CBNZ, RET), ADRP/ADD pair for relocations.
+\item \texttt{literate/backend/39-emit-macho.weft} ---
       Mach-O object file emission: header, load commands
       (\texttt{LC\_SEGMENT\_64}, \texttt{LC\_SYMTAB},
-      \texttt{LC\_DYSYMTAB}), sections (\texttt{\_\_TEXT},
-      \texttt{\_\_DATA}, \texttt{\_\_BSS}), symbol table,
-      string table, relocation entries.
+      \texttt{LC\_DYSYMTAB}), \texttt{\_\_text} section,
+      symbol table (nlist\_64), string table, relocation
+      entries (\texttt{ARM64\_RELOC\_BRANCH26}).
+\item \texttt{literate/backend/40-linker-info.weft} ---
+      relocation and symbol table management: add/lookup symbols,
+      add relocations, extern deduplication.
 \item \texttt{literate/driver/42-driver.weft} ---
-      full compilation pipeline orchestration: phase sequencing,
-      multi-file compilation, object file output.
+      \texttt{-c} flag dispatch: pipeline orchestration from
+      source through lex, parse, sema, IR, codegen, to Mach-O
+      output.
 \end{itemize}
 
 \textbf{New tangled files.}
-\texttt{abi.s}, \texttt{isel.s}, \texttt{regalloc.s},
-\texttt{emit.s}, \texttt{driver.s}.
+\texttt{codegen.s}, \texttt{emit\_arm64.s}, \texttt{emit\_macho.s},
+\texttt{linker.s}, \texttt{driver.s}.
 
 \textbf{Acceptance.}
 \begin{enumerate}
@@ -397,6 +413,9 @@ ARM64 machine code.
 \item The object file is accepted by Apple's \texttt{ld} linker
       without warnings.
 \end{enumerate}
+
+\textbf{Status.} In progress (v1 core working: constants, arithmetic,
+locals, if/else, while, goto compile and run correctly).
 
 % ────────────────────────────────────────────────────────────────
 \section{Phase 8 --- Self-Hosting}
@@ -443,19 +462,19 @@ ultimate proof that the compiler is correct and complete.
 \label{sec:roadmap-summary}
 
 \begin{center}
-\begin{tabular}{clll}
+\begin{tabular}{cclll}
 \hline
-Phase & Milestone & Key Output & \texttt{.weft} Files \\
+Phase & Status & Milestone & Key Output & \texttt{.weft} Files \\
 \hline
-0 & Skeleton boots        & \texttt{tmp/kcc} runs        & 01, 02, 07--09, 11, 12, 43 \\
-1 & Lexer                 & \texttt{--dump-tokens}        & 10, 14, 17 \\
-2 & Diagnostics + tests   & \texttt{just test}            & 13, 15, 16, 44, 45 \\
-3 & Preprocessor          & \texttt{-E}                   & 18, 19, 20 \\
-4 & Parser                & \texttt{--dump-ast}           & 21--24 \\
-5 & Type system           & \texttt{--dump-types}         & 25--30 \\
-6 & IR + optimization     & \texttt{--dump-ir}            & 31--36 \\
-7 & Backend               & \texttt{-c file.c -o file.o}  & 37--42 \\
-8 & Self-hosting          & Differential testing          & --- \\
+0 & \checkmark & Skeleton boots        & \texttt{tmp/kcc} runs        & 01, 02, 07--09, 11, 12, 43 \\
+1 & \checkmark & Lexer                 & \texttt{--dump-tokens}        & 10, 14, 17 \\
+2 & \checkmark & Diagnostics + tests   & \texttt{just test}            & 13, 15, 16, 44, 45 \\
+3 & \checkmark & Preprocessor          & \texttt{-E}                   & 18, 19, 20 \\
+4 & \checkmark & Parser                & \texttt{--dump-ast}           & 21--24 \\
+5 & \checkmark & Type system           & \texttt{--dump-types}         & 25--30 \\
+6 & \checkmark & IR + optimization     & \texttt{--dump-ir}            & 31--36 \\
+7 & $\circ$    & Backend               & \texttt{-c file.c -o file.o}  & 37--40, 42 \\
+8 &            & Self-hosting          & Differential testing          & --- \\
 \hline
 \end{tabular}
 \end{center}

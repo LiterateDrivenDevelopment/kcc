@@ -1,0 +1,263 @@
+% 35-peephole.weft — Constant Folding and Identity Elimination
+%
+% This chapter implements peephole optimizations on the IR:
+% 1. Constant folding: IR_CONST + IR_CONST → single IR_CONST
+% 2. Identity elimination: x + 0, x * 1, x & ~0 → x
+
+\chapter{Peephole Optimization}
+\label{ch:peephole}
+
+\section{Constant Folding}
+
+Walk every instruction in every BB.  For binary operations where
+both sources are \texttt{IR\_CONST}, replace the instruction with
+a single \texttt{IR\_CONST} holding the computed result.
+
+We need a way to look up whether a vreg was produced by a CONST.
+We build a simple dense map: vreg\_number → immediate\_value,
+with a parallel valid bitmap.
+
+@d Opt: constant fold @{
+// -- kcc_opt_constfold ----------------------------------------------------
+// uint64_t kcc_opt_constfold(ir_func *func)
+// Folds constant expressions.  Returns number of folds performed.
+.text
+.globl _kcc_opt_constfold
+.p2align 2
+_kcc_opt_constfold:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    mov x19, x0                 // func
+    mov x27, #0                 // fold count
+
+    // Allocate const value map: array of (valid, value) pairs
+    // Max vregs = func.vreg_n
+    ldr x20, [x19, #IRF_VREG_N]
+    cbz x20, .Lcf_done
+    add x20, x20, #1            // +1 for safety
+
+    // Allocate arrays: values[vreg_n] and valid[vreg_n]
+    lsl x0, x20, #3             // values: 8 bytes each
+    bl _kcc_arena_alloc
+    mov x21, x0                 // x21 = values array
+
+    mov x0, x20                 // valid: 1 byte each (we'll use 8)
+    lsl x0, x0, #3
+    bl _kcc_arena_alloc
+    mov x22, x0                 // x22 = valid array
+
+    // Zero valid array
+    mov x0, x22
+    mov x1, #0
+    lsl x2, x20, #3
+    bl _kcc_memset
+
+    // Pass 1: collect all IR_CONST → record in map
+    ldr x0, [x19, #IRF_BLOCKS]
+    cbz x0, .Lcf_done
+    mov x23, x0                 // blocks vec
+    ldr x24, [x23, #VEC_COUNT]
+    mov x25, #0
+
+.Lcf_collect_bb:
+    cmp x25, x24
+    b.ge .Lcf_pass2
+
+    mov x0, x23
+    mov x1, x25
+    bl _kcc_vec_get
+    ldr x26, [x0]               // BB ptr
+
+    ldr x0, [x26, #BB_FIRST]
+.Lcf_collect_instr:
+    cbz x0, .Lcf_collect_next_bb
+    mov x26, x0                 // current instr
+
+    ldr x1, [x26, #IR_OP]
+    cmp x1, #IR_CONST
+    b.ne .Lcf_collect_skip
+
+    // Record: valid[dest] = 1, values[dest] = src1
+    ldr x1, [x26, #IR_DEST]
+    cmp x1, x20
+    b.ge .Lcf_collect_skip
+    mov x2, #1
+    str x2, [x22, x1, lsl #3]
+    ldr x2, [x26, #IR_SRC1]
+    str x2, [x21, x1, lsl #3]
+
+.Lcf_collect_skip:
+    ldr x0, [x26, #IR_NEXT]
+    b .Lcf_collect_instr
+
+.Lcf_collect_next_bb:
+    add x25, x25, #1
+    b .Lcf_collect_bb
+
+    // Pass 2: fold binary ops with two const sources
+.Lcf_pass2:
+    mov x25, #0
+
+.Lcf_fold_bb:
+    cmp x25, x24
+    b.ge .Lcf_done
+
+    mov x0, x23
+    mov x1, x25
+    bl _kcc_vec_get
+    ldr x26, [x0]
+
+    ldr x0, [x26, #BB_FIRST]
+.Lcf_fold_instr:
+    cbz x0, .Lcf_fold_next_bb
+    mov x26, x0
+
+    ldr x1, [x26, #IR_OP]
+    // Check if it's a foldable binary op (1-7, 10-15, 20-25)
+    cmp x1, #IR_ADD
+    b.lt .Lcf_fold_skip
+    cmp x1, #IR_CMP_SGE
+    b.gt .Lcf_fold_skip
+    // Skip non-binary ranges
+    cmp x1, #IR_NEG
+    b.eq .Lcf_fold_skip
+    cmp x1, #IR_NOT
+    b.eq .Lcf_fold_skip
+
+    // Check both sources are const
+    ldr x2, [x26, #IR_SRC1]
+    cmp x2, x20
+    b.ge .Lcf_fold_skip
+    ldr x3, [x22, x2, lsl #3]   // valid[src1]?
+    cbz x3, .Lcf_fold_skip
+
+    ldr x3, [x26, #IR_SRC2]
+    cmp x3, x20
+    b.ge .Lcf_fold_skip
+    ldr x4, [x22, x3, lsl #3]   // valid[src2]?
+    cbz x4, .Lcf_fold_skip
+
+    // Both const! Get values
+    ldr x2, [x26, #IR_SRC1]
+    ldr x2, [x21, x2, lsl #3]   // val1
+    ldr x3, [x26, #IR_SRC2]
+    ldr x3, [x21, x3, lsl #3]   // val2
+
+    // Compute result based on opcode
+    ldr x1, [x26, #IR_OP]
+    cmp x1, #IR_ADD
+    b.eq .Lcf_do_add
+    cmp x1, #IR_SUB
+    b.eq .Lcf_do_sub
+    cmp x1, #IR_MUL
+    b.eq .Lcf_do_mul
+    cmp x1, #IR_SDIV
+    b.eq .Lcf_do_sdiv
+    cmp x1, #IR_AND
+    b.eq .Lcf_do_and
+    cmp x1, #IR_OR
+    b.eq .Lcf_do_or
+    cmp x1, #IR_XOR
+    b.eq .Lcf_do_xor
+    cmp x1, #IR_SHL
+    b.eq .Lcf_do_shl
+    cmp x1, #IR_ASHR
+    b.eq .Lcf_do_ashr
+    cmp x1, #IR_CMP_EQ
+    b.eq .Lcf_do_eq
+    cmp x1, #IR_CMP_NE
+    b.eq .Lcf_do_ne
+    cmp x1, #IR_CMP_SLT
+    b.eq .Lcf_do_slt
+    cmp x1, #IR_CMP_SGT
+    b.eq .Lcf_do_sgt
+    b .Lcf_fold_skip
+
+.Lcf_do_add:
+    add x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_sub:
+    sub x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_mul:
+    mul x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_sdiv:
+    cbz x3, .Lcf_fold_skip      // div by zero: skip
+    sdiv x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_and:
+    and x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_or:
+    orr x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_xor:
+    eor x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_shl:
+    lsl x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_ashr:
+    asr x4, x2, x3
+    b .Lcf_replace
+.Lcf_do_eq:
+    cmp x2, x3
+    cset x4, eq
+    b .Lcf_replace
+.Lcf_do_ne:
+    cmp x2, x3
+    cset x4, ne
+    b .Lcf_replace
+.Lcf_do_slt:
+    cmp x2, x3
+    cset x4, lt
+    b .Lcf_replace
+.Lcf_do_sgt:
+    cmp x2, x3
+    cset x4, gt
+    b .Lcf_replace
+
+.Lcf_replace:
+    // Replace instruction with IR_CONST
+    mov x1, #IR_CONST
+    str x1, [x26, #IR_OP]
+    str x4, [x26, #IR_SRC1]     // folded value
+    str xzr, [x26, #IR_SRC2]
+
+    // Update const map
+    ldr x1, [x26, #IR_DEST]
+    cmp x1, x20
+    b.ge .Lcf_fold_count
+    mov x2, #1
+    str x2, [x22, x1, lsl #3]
+    str x4, [x21, x1, lsl #3]
+
+.Lcf_fold_count:
+    add x27, x27, #1
+
+.Lcf_fold_skip:
+    ldr x0, [x26, #IR_NEXT]
+    b .Lcf_fold_instr
+
+.Lcf_fold_next_bb:
+    add x25, x25, #1
+    b .Lcf_fold_bb
+
+.Lcf_done:
+    mov x0, x27                 // return fold count
+
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}

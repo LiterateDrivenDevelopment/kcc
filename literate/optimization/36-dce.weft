@@ -1,0 +1,216 @@
+% 36-dce.weft — Dead Code Elimination
+%
+% Removes IR instructions whose results are never used.
+% Phase 1: mark all vregs that appear as sources.
+% Phase 2: sweep instructions whose dest is unmarked and that
+%           have no side effects.
+
+\chapter{Dead Code Elimination}
+\label{ch:dce}
+
+@d Opt: dead code elimination @{
+// -- kcc_opt_dce ----------------------------------------------------------
+// uint64_t kcc_opt_dce(ir_func *func)
+// Eliminates dead instructions.  Returns number of eliminations.
+.text
+.globl _kcc_opt_dce
+.p2align 2
+_kcc_opt_dce:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    mov x19, x0                 // func
+    mov x27, #0                 // elimination count
+
+    ldr x20, [x19, #IRF_VREG_N]
+    cbz x20, .Ldce_done
+    add x20, x20, #1
+
+    // Allocate used bitmap (8 bytes per vreg for simplicity)
+    lsl x0, x20, #3
+    bl _kcc_arena_alloc
+    mov x21, x0                 // used array
+
+    // Zero it
+    mov x0, x21
+    mov x1, #0
+    lsl x2, x20, #3
+    bl _kcc_memset
+
+    // Pass 1: mark used vregs
+    ldr x0, [x19, #IRF_BLOCKS]
+    cbz x0, .Ldce_done
+    mov x22, x0                 // blocks vec
+    ldr x23, [x22, #VEC_COUNT]
+    mov x24, #0
+
+.Ldce_mark_bb:
+    cmp x24, x23
+    b.ge .Ldce_sweep
+
+    mov x0, x22
+    mov x1, x24
+    bl _kcc_vec_get
+    ldr x25, [x0]               // BB ptr
+
+    ldr x0, [x25, #BB_FIRST]
+.Ldce_mark_instr:
+    cbz x0, .Ldce_mark_next_bb
+    mov x26, x0
+
+    // Mark SRC1 as used (if it looks like a vreg — <vreg_n)
+    ldr x1, [x26, #IR_SRC1]
+    ldr x2, [x26, #IR_OP]
+
+    // Skip marking SRC1 for IR_CONST (src1=immediate), IR_CALL (src1=name),
+    // IR_BR (src1=BB id), IR_GLOBAL_REF (src1=name)
+    cmp x2, #IR_CONST
+    b.eq .Ldce_mark_src2
+    cmp x2, #IR_CALL
+    b.eq .Ldce_mark_src2
+    cmp x2, #IR_BR
+    b.eq .Ldce_mark_src2
+    cmp x2, #IR_GLOBAL_REF
+    b.eq .Ldce_mark_src2
+
+    cmp x1, x20
+    b.ge .Ldce_mark_src2
+    mov x3, #1
+    str x3, [x21, x1, lsl #3]
+
+.Ldce_mark_src2:
+    ldr x1, [x26, #IR_SRC2]
+    ldr x2, [x26, #IR_OP]
+
+    // Skip SRC2 for IR_BR_COND (src2=BB id), IR_BR (no src2)
+    cmp x2, #IR_BR_COND
+    b.eq .Ldce_mark_dest
+    cmp x2, #IR_BR
+    b.eq .Ldce_mark_dest
+    cmp x2, #IR_CONST
+    b.eq .Ldce_mark_dest
+
+    cmp x1, x20
+    b.ge .Ldce_mark_dest
+    mov x3, #1
+    str x3, [x21, x1, lsl #3]
+
+.Ldce_mark_dest:
+    // Also mark DEST for br_cond (dest=condition vreg)
+    ldr x2, [x26, #IR_OP]
+    cmp x2, #IR_BR_COND
+    b.ne .Ldce_mark_ret
+    ldr x1, [x26, #IR_DEST]
+    cmp x1, x20
+    b.ge .Ldce_mark_ret
+    mov x3, #1
+    str x3, [x21, x1, lsl #3]
+
+.Ldce_mark_ret:
+    // Mark SRC1 for ret (src1=return value vreg)
+    ldr x2, [x26, #IR_OP]
+    cmp x2, #IR_RET
+    b.ne .Ldce_mark_store
+    ldr x1, [x26, #IR_SRC1]
+    cmp x1, x20
+    b.ge .Ldce_mark_next
+    mov x3, #1
+    str x3, [x21, x1, lsl #3]
+    b .Ldce_mark_next
+
+.Ldce_mark_store:
+    // Mark both src1 and src2 for store
+    ldr x2, [x26, #IR_OP]
+    cmp x2, #IR_STORE
+    b.ne .Ldce_mark_next
+    ldr x1, [x26, #IR_SRC1]
+    cmp x1, x20
+    b.ge .Ldce_mark_store2
+    mov x3, #1
+    str x3, [x21, x1, lsl #3]
+.Ldce_mark_store2:
+    ldr x1, [x26, #IR_SRC2]
+    cmp x1, x20
+    b.ge .Ldce_mark_next
+    mov x3, #1
+    str x3, [x21, x1, lsl #3]
+
+.Ldce_mark_next:
+    ldr x0, [x26, #IR_NEXT]
+    b .Ldce_mark_instr
+
+.Ldce_mark_next_bb:
+    add x24, x24, #1
+    b .Ldce_mark_bb
+
+    // Pass 2: sweep — replace dead non-side-effect instructions with NOP
+.Ldce_sweep:
+    mov x24, #0
+
+.Ldce_sweep_bb:
+    cmp x24, x23
+    b.ge .Ldce_done
+
+    mov x0, x22
+    mov x1, x24
+    bl _kcc_vec_get
+    ldr x25, [x0]
+
+    ldr x0, [x25, #BB_FIRST]
+.Ldce_sweep_instr:
+    cbz x0, .Ldce_sweep_next_bb
+    mov x26, x0
+
+    ldr x1, [x26, #IR_OP]
+    // Skip side-effecting instructions
+    cmp x1, #IR_STORE
+    b.eq .Ldce_sweep_skip
+    cmp x1, #IR_BR
+    b.eq .Ldce_sweep_skip
+    cmp x1, #IR_BR_COND
+    b.eq .Ldce_sweep_skip
+    cmp x1, #IR_RET
+    b.eq .Ldce_sweep_skip
+    cmp x1, #IR_CALL
+    b.eq .Ldce_sweep_skip
+    cmp x1, #IR_NOP
+    b.eq .Ldce_sweep_skip
+    cmp x1, #IR_ALLOCA
+    b.eq .Ldce_sweep_skip       // keep allocas
+
+    // Check if dest vreg is used
+    ldr x2, [x26, #IR_DEST]
+    cmp x2, x20
+    b.ge .Ldce_sweep_skip
+    ldr x3, [x21, x2, lsl #3]
+    cbnz x3, .Ldce_sweep_skip
+
+    // Dead! Replace with NOP
+    mov x1, #IR_NOP
+    str x1, [x26, #IR_OP]
+    add x27, x27, #1
+
+.Ldce_sweep_skip:
+    ldr x0, [x26, #IR_NEXT]
+    b .Ldce_sweep_instr
+
+.Ldce_sweep_next_bb:
+    add x24, x24, #1
+    b .Ldce_sweep_bb
+
+.Ldce_done:
+    mov x0, x27
+
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}

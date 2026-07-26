@@ -1,0 +1,2653 @@
+% 32-ir-builder.weft — AST to IR Lowering and IR Dump
+%
+% This chapter walks the typed AST and produces linear IR with
+% virtual registers and basic blocks.  It also provides the textual
+% dump for --dump-ir.
+
+\chapter{IR Builder}
+\label{ch:ir-builder}
+
+\section{IR Dump}
+
+We implement the dump first so that we can test the builder
+incrementally.  The format mirrors LLVM IR loosely:
+\begin{verbatim}
+func @main() -> i32:
+  bb0:
+    %0 = const i32 42
+    ret i32 %0
+\end{verbatim}
+
+@d IR: dump @{
+// -- kcc_ir_dump ----------------------------------------------------------
+// void kcc_ir_dump(void)
+// Prints all IR functions in textual form.
+.text
+.globl _kcc_ir_dump
+.p2align 2
+_kcc_ir_dump:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+
+    // Load function list vec
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x19, [x0]               // x19 = vec ptr
+    cbz x19, .Lird_done
+
+    ldr x20, [x19, #VEC_COUNT]  // x20 = func count
+    mov x21, #0                 // x21 = index
+
+.Lird_func_loop:
+    cmp x21, x20
+    b.ge .Lird_done
+
+    // Get func pointer: vec_get(vec, index)
+    mov x0, x19
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x22, [x0]              // x22 = IR func ptr (deref pointer elem)
+
+    // Print "func @@"
+    adrp x0, _kcc_ir_str_func@@PAGE
+    add  x0, x0, _kcc_ir_str_func@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Print function name
+    ldr x0, [x22, #IRF_NAME]
+    bl _kcc_io_puts
+
+    // Print "() -> "
+    adrp x0, _kcc_ir_str_arrow@@PAGE
+    add  x0, x0, _kcc_ir_str_arrow@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Print return type
+    ldr x0, [x22, #IRF_RETTYPE]
+    bl _kcc_ir_dump_type_short
+
+    // Print ":"
+    adrp x0, _kcc_ir_str_colon_nl@@PAGE
+    add  x0, x0, _kcc_ir_str_colon_nl@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Walk basic blocks via the blocks vec
+    ldr x0, [x22, #IRF_BLOCKS]
+    cbz x0, .Lird_next_func
+    // Save blocks vec info in callee-saved regs
+    // We reuse x22 temporarily - save func ptr on stack
+    str x22, [sp, #80]          // save func ptr in free stack slot
+    mov x22, x0                 // x22 = blocks vec
+    ldr x23, [x22, #VEC_COUNT]
+    mov x24, #0
+
+.Lird_bb_loop:
+    cmp x24, x23
+    b.ge .Lird_bb_done
+
+    mov x0, x22
+    mov x1, x24
+    bl _kcc_vec_get
+    ldr x25, [x0]              // x25 = BB ptr
+
+    // Print "  bb"
+    adrp x0, _kcc_ir_str_bb@@PAGE
+    add  x0, x0, _kcc_ir_str_bb@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Print BB id
+    ldr x0, [x25, #BB_ID]
+    bl _kcc_io_putu
+
+    // Print ":"
+    adrp x0, _kcc_ir_str_colon_nl@@PAGE
+    add  x0, x0, _kcc_ir_str_colon_nl@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Walk instructions in this BB
+    ldr x26, [x25, #BB_FIRST]
+
+.Lird_instr_loop:
+    cbz x26, .Lird_next_bb
+
+    mov x0, x26
+    bl _kcc_ir_dump_instr
+
+    ldr x26, [x26, #IR_NEXT]
+    b .Lird_instr_loop
+
+.Lird_next_bb:
+    add x24, x24, #1
+    b .Lird_bb_loop
+
+.Lird_bb_done:
+    ldr x22, [sp, #80]         // restore func ptr
+    // Print blank line between functions
+    mov x0, #'\n'
+    bl _kcc_io_putc
+
+.Lird_next_func:
+    add x21, x21, #1
+    b .Lird_func_loop
+
+.Lird_done:
+    bl _kcc_io_flush
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}
+
+\subsection{Dumping a Single Instruction}
+
+@d IR: dump instruction @{
+// -- kcc_ir_dump_instr ----------------------------------------------------
+// void kcc_ir_dump_instr(ir_instr *instr)
+//   x0 = instruction pointer
+// Prints one instruction line with leading "    " indent.
+.text
+.globl _kcc_ir_dump_instr
+.p2align 2
+_kcc_ir_dump_instr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                // x19 = instr
+    ldr x20, [x19, #IR_OP]     // x20 = opcode
+
+    // Print indent
+    adrp x0, _kcc_ir_str_indent@@PAGE
+    add  x0, x0, _kcc_ir_str_indent@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Opcodes that don't produce a dest: store, br, br_cond, ret, nop
+    cmp x20, #IR_STORE
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_BR
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_BR_COND
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_RET
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_NOP
+    b.eq .Lidi_no_dest
+
+    // Print "%N = "
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_DEST]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_eq@@PAGE
+    add  x0, x0, _kcc_ir_str_eq@@PAGEOFF
+    bl _kcc_io_puts
+
+.Lidi_no_dest:
+    // Dispatch on opcode
+    cmp x20, #IR_ADD
+    b.eq .Lidi_add
+    cmp x20, #IR_SUB
+    b.eq .Lidi_sub
+    cmp x20, #IR_MUL
+    b.eq .Lidi_mul
+    cmp x20, #IR_SDIV
+    b.eq .Lidi_sdiv
+    cmp x20, #IR_UDIV
+    b.eq .Lidi_udiv
+    cmp x20, #IR_SMOD
+    b.eq .Lidi_smod
+    cmp x20, #IR_UMOD
+    b.eq .Lidi_umod
+    cmp x20, #IR_NEG
+    b.eq .Lidi_neg
+    cmp x20, #IR_AND
+    b.eq .Lidi_and
+    cmp x20, #IR_OR
+    b.eq .Lidi_or
+    cmp x20, #IR_XOR
+    b.eq .Lidi_xor
+    cmp x20, #IR_SHL
+    b.eq .Lidi_shl
+    cmp x20, #IR_LSHR
+    b.eq .Lidi_lshr
+    cmp x20, #IR_ASHR
+    b.eq .Lidi_ashr
+    cmp x20, #IR_NOT
+    b.eq .Lidi_not
+    cmp x20, #IR_CMP_EQ
+    b.eq .Lidi_cmp_eq
+    cmp x20, #IR_CMP_NE
+    b.eq .Lidi_cmp_ne
+    cmp x20, #IR_CMP_SLT
+    b.eq .Lidi_cmp_slt
+    cmp x20, #IR_CMP_SLE
+    b.eq .Lidi_cmp_sle
+    cmp x20, #IR_CMP_SGT
+    b.eq .Lidi_cmp_sgt
+    cmp x20, #IR_CMP_SGE
+    b.eq .Lidi_cmp_sge
+    cmp x20, #IR_LOAD
+    b.eq .Lidi_load
+    cmp x20, #IR_STORE
+    b.eq .Lidi_store
+    cmp x20, #IR_ALLOCA
+    b.eq .Lidi_alloca
+    cmp x20, #IR_BR
+    b.eq .Lidi_br
+    cmp x20, #IR_BR_COND
+    b.eq .Lidi_br_cond
+    cmp x20, #IR_RET
+    b.eq .Lidi_ret
+    cmp x20, #IR_CALL
+    b.eq .Lidi_call
+    cmp x20, #IR_SEXT
+    b.eq .Lidi_sext
+    cmp x20, #IR_ZEXT
+    b.eq .Lidi_zext
+    cmp x20, #IR_TRUNC
+    b.eq .Lidi_trunc
+    cmp x20, #IR_CONST
+    b.eq .Lidi_const
+    cmp x20, #IR_NOP
+    b.eq .Lidi_nop
+    cmp x20, #IR_GLOBAL_REF
+    b.eq .Lidi_global_ref
+
+    // Unknown opcode
+    adrp x0, _kcc_ir_str_unknown@@PAGE
+    add  x0, x0, _kcc_ir_str_unknown@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lidi_nl
+
+// -- Binary ops: "op type %src1, %src2" -----------------------------------
+.Lidi_add:
+    adrp x0, _kcc_ir_op_add@@PAGE
+    add  x0, x0, _kcc_ir_op_add@@PAGEOFF
+    b .Lidi_binop
+.Lidi_sub:
+    adrp x0, _kcc_ir_op_sub@@PAGE
+    add  x0, x0, _kcc_ir_op_sub@@PAGEOFF
+    b .Lidi_binop
+.Lidi_mul:
+    adrp x0, _kcc_ir_op_mul@@PAGE
+    add  x0, x0, _kcc_ir_op_mul@@PAGEOFF
+    b .Lidi_binop
+.Lidi_sdiv:
+    adrp x0, _kcc_ir_op_sdiv@@PAGE
+    add  x0, x0, _kcc_ir_op_sdiv@@PAGEOFF
+    b .Lidi_binop
+.Lidi_udiv:
+    adrp x0, _kcc_ir_op_udiv@@PAGE
+    add  x0, x0, _kcc_ir_op_udiv@@PAGEOFF
+    b .Lidi_binop
+.Lidi_smod:
+    adrp x0, _kcc_ir_op_smod@@PAGE
+    add  x0, x0, _kcc_ir_op_smod@@PAGEOFF
+    b .Lidi_binop
+.Lidi_umod:
+    adrp x0, _kcc_ir_op_umod@@PAGE
+    add  x0, x0, _kcc_ir_op_umod@@PAGEOFF
+    b .Lidi_binop
+.Lidi_and:
+    adrp x0, _kcc_ir_op_and@@PAGE
+    add  x0, x0, _kcc_ir_op_and@@PAGEOFF
+    b .Lidi_binop
+.Lidi_or:
+    adrp x0, _kcc_ir_op_or@@PAGE
+    add  x0, x0, _kcc_ir_op_or@@PAGEOFF
+    b .Lidi_binop
+.Lidi_xor:
+    adrp x0, _kcc_ir_op_xor@@PAGE
+    add  x0, x0, _kcc_ir_op_xor@@PAGEOFF
+    b .Lidi_binop
+.Lidi_shl:
+    adrp x0, _kcc_ir_op_shl@@PAGE
+    add  x0, x0, _kcc_ir_op_shl@@PAGEOFF
+    b .Lidi_binop
+.Lidi_lshr:
+    adrp x0, _kcc_ir_op_lshr@@PAGE
+    add  x0, x0, _kcc_ir_op_lshr@@PAGEOFF
+    b .Lidi_binop
+.Lidi_ashr:
+    adrp x0, _kcc_ir_op_ashr@@PAGE
+    add  x0, x0, _kcc_ir_op_ashr@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_eq:
+    adrp x0, _kcc_ir_op_cmp_eq@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_eq@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_ne:
+    adrp x0, _kcc_ir_op_cmp_ne@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_ne@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_slt:
+    adrp x0, _kcc_ir_op_cmp_slt@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_slt@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_sle:
+    adrp x0, _kcc_ir_op_cmp_sle@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_sle@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_sgt:
+    adrp x0, _kcc_ir_op_cmp_sgt@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_sgt@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_sge:
+    adrp x0, _kcc_ir_op_cmp_sge@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_sge@@PAGEOFF
+    b .Lidi_binop
+
+.Lidi_binop:
+    bl _kcc_io_puts
+    // Print " type %src1, %src2"
+    mov x0, #' '
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma@@PAGE
+    add  x0, x0, _kcc_ir_str_comma@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC2]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- Unary ops: "op type %src1" -------------------------------------------
+.Lidi_neg:
+    adrp x0, _kcc_ir_op_neg@@PAGE
+    add  x0, x0, _kcc_ir_op_neg@@PAGEOFF
+    b .Lidi_unop
+.Lidi_not:
+    adrp x0, _kcc_ir_op_not@@PAGE
+    add  x0, x0, _kcc_ir_op_not@@PAGEOFF
+    b .Lidi_unop
+.Lidi_sext:
+    adrp x0, _kcc_ir_op_sext@@PAGE
+    add  x0, x0, _kcc_ir_op_sext@@PAGEOFF
+    b .Lidi_unop
+.Lidi_zext:
+    adrp x0, _kcc_ir_op_zext@@PAGE
+    add  x0, x0, _kcc_ir_op_zext@@PAGEOFF
+    b .Lidi_unop
+.Lidi_trunc:
+    adrp x0, _kcc_ir_op_trunc@@PAGE
+    add  x0, x0, _kcc_ir_op_trunc@@PAGEOFF
+    b .Lidi_unop
+
+.Lidi_unop:
+    bl _kcc_io_puts
+    mov x0, #' '
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- load: "load type, ptr %src1" -----------------------------------------
+.Lidi_load:
+    adrp x0, _kcc_ir_op_load@@PAGE
+    add  x0, x0, _kcc_ir_op_load@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    adrp x0, _kcc_ir_str_ptr_pct@@PAGE
+    add  x0, x0, _kcc_ir_str_ptr_pct@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- store: "store type %src1, ptr %src2" ---------------------------------
+.Lidi_store:
+    adrp x0, _kcc_ir_op_store@@PAGE
+    add  x0, x0, _kcc_ir_op_store@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_ptr_pct@@PAGE
+    add  x0, x0, _kcc_ir_str_ptr_pct@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC2]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- alloca: "alloca type" ------------------------------------------------
+.Lidi_alloca:
+    adrp x0, _kcc_ir_op_alloca@@PAGE
+    add  x0, x0, _kcc_ir_op_alloca@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    b .Lidi_nl
+
+// -- br: "br bb<N>" -------------------------------------------------------
+.Lidi_br:
+    adrp x0, _kcc_ir_op_br@@PAGE
+    add  x0, x0, _kcc_ir_op_br@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- br_cond: "br_cond %cond, bb<T>, bb<F>" ------------------------------
+.Lidi_br_cond:
+    adrp x0, _kcc_ir_op_br_cond@@PAGE
+    add  x0, x0, _kcc_ir_op_br_cond@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_DEST]   // cond vreg is in DEST for br_cond
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma_bb@@PAGE
+    add  x0, x0, _kcc_ir_str_comma_bb@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC1]   // true BB id
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma_bb@@PAGE
+    add  x0, x0, _kcc_ir_str_comma_bb@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC2]   // false BB id
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- ret: "ret type %src1" or "ret void" ----------------------------------
+.Lidi_ret:
+    adrp x0, _kcc_ir_op_ret@@PAGE
+    add  x0, x0, _kcc_ir_op_ret@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    // Check if void return
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lidi_nl
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_VOID
+    b.eq .Lidi_nl
+    // Non-void: print " %src1"
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- call: "call type @@name(%src1, ...)" ---------------------------------
+.Lidi_call:
+    adrp x0, _kcc_ir_op_call@@PAGE
+    add  x0, x0, _kcc_ir_op_call@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    // Print " @@<name>"
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'@@'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]   // SRC1 = name pointer
+    cbz x0, .Lidi_nl
+    bl _kcc_io_puts
+    b .Lidi_nl
+
+// -- const: "const type <imm>" -------------------------------------------
+.Lidi_const:
+    adrp x0, _kcc_ir_op_const@@PAGE
+    add  x0, x0, _kcc_ir_op_const@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]   // immediate value
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- nop ------------------------------------------------------------------
+.Lidi_nop:
+    adrp x0, _kcc_ir_op_nop@@PAGE
+    add  x0, x0, _kcc_ir_op_nop@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lidi_nl
+
+// -- global_ref: "global_ref type @@name" ---------------------------------
+.Lidi_global_ref:
+    adrp x0, _kcc_ir_op_global_ref@@PAGE
+    add  x0, x0, _kcc_ir_op_global_ref@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'@@'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]   // name pointer
+    cbz x0, .Lidi_nl
+    bl _kcc_io_puts
+    b .Lidi_nl
+
+.Lidi_nl:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Short Type Name}
+
+For IR output we print compact type names: \texttt{i32}, \texttt{i64},
+\texttt{void}, \texttt{ptr}, etc.
+
+@d IR: dump type short @{
+// -- kcc_ir_dump_type_short -----------------------------------------------
+// void kcc_ir_dump_type_short(type_desc *t)
+//   x0 = type descriptor (may be NULL)
+// Prints a short type label.
+.text
+.globl _kcc_ir_dump_type_short
+.p2align 2
+_kcc_ir_dump_type_short:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    cbz x0, .Lidts_unknown
+    mov x19, x0
+
+    ldr x0, [x19, #TY_KIND]
+
+    cmp x0, #TY_VOID
+    b.eq .Lidts_void
+    cmp x0, #TY_BOOL
+    b.eq .Lidts_i1
+    cmp x0, #TY_CHAR
+    b.eq .Lidts_i8
+    cmp x0, #TY_SHORT
+    b.eq .Lidts_i16
+    cmp x0, #TY_INT
+    b.eq .Lidts_i32
+    cmp x0, #TY_LONG
+    b.eq .Lidts_i64
+    cmp x0, #TY_LLONG
+    b.eq .Lidts_i64
+    cmp x0, #TY_FLOAT
+    b.eq .Lidts_f32
+    cmp x0, #TY_DOUBLE
+    b.eq .Lidts_f64
+    cmp x0, #TY_PTR
+    b.eq .Lidts_ptr
+    cmp x0, #TY_ARRAY
+    b.eq .Lidts_ptr
+    cmp x0, #TY_FUNC
+    b.eq .Lidts_ptr
+    cmp x0, #TY_STRUCT
+    b.eq .Lidts_struct
+    cmp x0, #TY_UNION
+    b.eq .Lidts_struct
+    cmp x0, #TY_ENUM
+    b.eq .Lidts_i32
+    b .Lidts_unknown
+
+.Lidts_void:
+    adrp x0, _kcc_ir_ty_void@@PAGE
+    add  x0, x0, _kcc_ir_ty_void@@PAGEOFF
+    b .Lidts_print
+.Lidts_i1:
+    adrp x0, _kcc_ir_ty_i1@@PAGE
+    add  x0, x0, _kcc_ir_ty_i1@@PAGEOFF
+    b .Lidts_print
+.Lidts_i8:
+    adrp x0, _kcc_ir_ty_i8@@PAGE
+    add  x0, x0, _kcc_ir_ty_i8@@PAGEOFF
+    b .Lidts_print
+.Lidts_i16:
+    adrp x0, _kcc_ir_ty_i16@@PAGE
+    add  x0, x0, _kcc_ir_ty_i16@@PAGEOFF
+    b .Lidts_print
+.Lidts_i32:
+    adrp x0, _kcc_ir_ty_i32@@PAGE
+    add  x0, x0, _kcc_ir_ty_i32@@PAGEOFF
+    b .Lidts_print
+.Lidts_i64:
+    adrp x0, _kcc_ir_ty_i64@@PAGE
+    add  x0, x0, _kcc_ir_ty_i64@@PAGEOFF
+    b .Lidts_print
+.Lidts_f32:
+    adrp x0, _kcc_ir_ty_f32@@PAGE
+    add  x0, x0, _kcc_ir_ty_f32@@PAGEOFF
+    b .Lidts_print
+.Lidts_f64:
+    adrp x0, _kcc_ir_ty_f64@@PAGE
+    add  x0, x0, _kcc_ir_ty_f64@@PAGEOFF
+    b .Lidts_print
+.Lidts_ptr:
+    adrp x0, _kcc_ir_ty_ptr@@PAGE
+    add  x0, x0, _kcc_ir_ty_ptr@@PAGEOFF
+    b .Lidts_print
+.Lidts_struct:
+    adrp x0, _kcc_ir_ty_struct@@PAGE
+    add  x0, x0, _kcc_ir_ty_struct@@PAGEOFF
+    b .Lidts_print
+.Lidts_unknown:
+    adrp x0, _kcc_ir_ty_unknown@@PAGE
+    add  x0, x0, _kcc_ir_ty_unknown@@PAGEOFF
+
+.Lidts_print:
+    bl _kcc_io_puts
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{IR Builder Entry Point}
+
+The builder walks the translation unit, processing each function
+declaration.  Non-function declarations (globals, typedefs) are
+skipped for now.
+
+@d IR: build @{
+// -- kcc_ir_build ---------------------------------------------------------
+// void kcc_ir_build(node *trans_unit)
+//   x0 = AST_TRANS_UNIT node
+// Walks all top-level declarations and builds IR for functions.
+.text
+.globl _kcc_ir_build
+.p2align 2
+_kcc_ir_build:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    ldr x19, [x0, #AST_F0]      // first declaration
+
+.Lirb_loop:
+    cbz x19, .Lirb_done
+
+    // Check if it's a function declaration with a body
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_FUNC_DECL
+    b.ne .Lirb_next
+
+    // F3 = body (compound stmt); skip prototypes
+    ldr x0, [x19, #AST_F3]
+    cbz x0, .Lirb_next
+
+    mov x0, x19
+    bl _kcc_ir_build_func
+
+.Lirb_next:
+    ldr x19, [x19, #AST_F4]     // next sibling
+    b .Lirb_loop
+
+.Lirb_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Building a Function}
+
+For each function, we create an IR function, allocate an entry basic
+block, build alloca instructions for parameters and local variables,
+then lower the body.
+
+@d IR: build function @{
+// -- kcc_ir_build_func ----------------------------------------------------
+// void kcc_ir_build_func(node *func_decl)
+//   x0 = AST_FUNC_DECL node (F0=type, F1=name, F2=params, F3=body)
+// Builds IR for one function.
+.text
+.globl _kcc_ir_build_func
+.p2align 2
+_kcc_ir_build_func:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+
+    mov x19, x0                  // x19 = func_decl AST
+
+    // Get return type from the resolved type (F3 from sema = type desc)
+    // The function type is in F0 (type AST), resolved type should be
+    // obtained from the symbol table entry or from AST_F3 (sema type)
+    // For now, use int as default; check if sema stored type
+    ldr x20, [x19, #AST_F1]     // x20 = name_ptr
+    ldr x21, [x19, #AST_F0]     // x21 = type AST
+
+    // Resolve return type: walk the type AST
+    // The func type node has F0=return_type
+    // If the type AST is AST_TYPE_FUNC, get its return type
+    mov x22, #0                  // default ret type = NULL
+    cbz x21, .Libf_default_ret
+    ldr x0, [x21, #AST_TAG]
+    cmp x0, #AST_TYPE_FUNC
+    b.ne .Libf_default_ret
+    // Get the return type from the func type AST
+    ldr x0, [x21, #AST_F0]      // return type AST node
+    cbz x0, .Libf_default_ret
+    bl _kcc_sema_resolve_type
+    mov x22, x0
+    b .Libf_create
+
+.Libf_default_ret:
+    // Default: signed int
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x22, [x0]
+
+.Libf_create:
+    // Create IR function
+    mov x0, x20                  // name
+    mov x1, x22                  // ret type
+    bl _kcc_ir_alloc_func
+    mov x23, x0                  // x23 = ir_func
+
+    // Set as current function
+    adrp x1, _kcc_ir_cur_func@@PAGE
+    add  x1, x1, _kcc_ir_cur_func@@PAGEOFF
+    str x23, [x1]
+
+    // Reset locals hash table
+    mov x0, #64
+    bl _kcc_ht_init
+    adrp x1, _kcc_ir_locals@@PAGE
+    add  x1, x1, _kcc_ir_locals@@PAGEOFF
+    str x0, [x1]
+
+    // Create entry basic block
+    bl _kcc_ir_alloc_bb
+    mov x24, x0                  // x24 = entry BB
+    str x24, [x23, #IRF_ENTRY]
+    mov x0, x24
+    bl _kcc_ir_set_bb
+
+    // Build alloca for each parameter
+    ldr x25, [x19, #AST_F2]     // x25 = first param decl
+
+.Libf_param_loop:
+    cbz x25, .Libf_body
+
+    // Each param: F0=type, F1=name
+    ldr x0, [x25, #AST_TAG]
+    cmp x0, #AST_PARAM_DECL
+    b.ne .Libf_param_next
+
+    mov x0, x25
+    bl _kcc_ir_build_param
+
+.Libf_param_next:
+    ldr x25, [x25, #AST_F4]
+    b .Libf_param_loop
+
+.Libf_body:
+    // Lower the function body (compound statement)
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_build_stmt
+
+    // Ensure the last BB has a terminator (implicit return)
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libf_register
+
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libf_register
+
+    // Emit implicit return (void or UB for non-void without return)
+    mov x0, #IR_RET
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_TYPE]     // ret type
+    bl _kcc_ir_emit
+
+    // Mark BB terminated
+    adrp x1, _kcc_ir_cur_bb@@PAGE
+    add  x1, x1, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x1, [x1]
+    ldr x2, [x1, #BB_FLAGS]
+    orr x2, x2, #BB_FLAG_TERMINATED
+    str x2, [x1, #BB_FLAGS]
+
+.Libf_register:
+    // Add function to global list
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x0, [x0]
+    str x23, [sp, #72]          // store func ptr as element
+    add x1, sp, #72
+    bl _kcc_vec_push
+
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+\section{Building Parameters}
+
+@d IR: build param @{
+// -- kcc_ir_build_param ---------------------------------------------------
+// void kcc_ir_build_param(node *param_decl)
+//   x0 = AST_PARAM_DECL (F0=type, F1=name)
+// Emits an alloca for the parameter and records it in locals.
+.text
+.globl _kcc_ir_build_param
+.p2align 2
+_kcc_ir_build_param:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // param_decl
+
+    // Resolve type
+    ldr x0, [x19, #AST_F0]
+    cbz x0, .Libp_done
+    bl _kcc_sema_resolve_type
+    mov x20, x0                  // x20 = type desc
+    cbz x20, .Libp_done
+
+    // Get name
+    ldr x21, [x19, #AST_F1]     // x21 = name ptr
+    cbz x21, .Libp_done
+
+    // Emit alloca
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_TYPE]
+    // Assign vreg
+    mov x19, x0                  // save instr
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // x20 = vreg number
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Record in locals: name → vreg
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x21                  // key = name
+    mov x0, x0
+    // Need key length
+    mov x4, x0                   // save ht
+    mov x0, x21
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    mov x0, x4                   // ht
+    mov x1, x21                  // key
+    add x3, x20, #1              // value = vreg + 1 (0 reserved for not-found)
+    bl _kcc_ht_put
+
+.Libp_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Building Statements}
+
+@d IR: build statement @{
+// -- kcc_ir_build_stmt ----------------------------------------------------
+// void kcc_ir_build_stmt(node *stmt)
+//   x0 = AST statement node
+// Dispatches to the appropriate lowering based on AST_TAG.
+.text
+.globl _kcc_ir_build_stmt
+.p2align 2
+_kcc_ir_build_stmt:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    cbz x0, .Libs_done
+    mov x19, x0
+
+    ldr x0, [x19, #AST_TAG]
+
+    cmp x0, #AST_COMPOUND
+    b.eq .Libs_compound
+    cmp x0, #AST_EXPR_STMT
+    b.eq .Libs_expr
+    cmp x0, #AST_RETURN_STMT
+    b.eq .Libs_return
+    cmp x0, #AST_IF_STMT
+    b.eq .Libs_if
+    cmp x0, #AST_WHILE_STMT
+    b.eq .Libs_while
+    cmp x0, #AST_DO_STMT
+    b.eq .Libs_do
+    cmp x0, #AST_FOR_STMT
+    b.eq .Libs_for
+    cmp x0, #AST_VAR_DECL
+    b.eq .Libs_var_decl
+    cmp x0, #AST_BREAK_STMT
+    b.eq .Libs_break
+    cmp x0, #AST_CONTINUE_STMT
+    b.eq .Libs_continue
+    cmp x0, #AST_NULL_STMT
+    b.eq .Libs_done
+
+    // Unhandled statement type — skip
+    b .Libs_done
+
+.Libs_compound:
+    // Walk all items in compound statement
+    ldr x19, [x19, #AST_F0]     // first item
+.Libs_compound_loop:
+    cbz x19, .Libs_done
+    mov x0, x19
+    bl _kcc_ir_build_stmt
+    ldr x19, [x19, #AST_F4]
+    b .Libs_compound_loop
+
+.Libs_expr:
+    ldr x0, [x19, #AST_F0]      // expression
+    bl _kcc_ir_build_expr
+    b .Libs_done
+
+.Libs_return:
+    mov x0, x19
+    bl _kcc_ir_build_return
+    b .Libs_done
+
+.Libs_if:
+    mov x0, x19
+    bl _kcc_ir_build_if
+    b .Libs_done
+
+.Libs_while:
+    mov x0, x19
+    bl _kcc_ir_build_while
+    b .Libs_done
+
+.Libs_do:
+    mov x0, x19
+    bl _kcc_ir_build_do
+    b .Libs_done
+
+.Libs_for:
+    mov x0, x19
+    bl _kcc_ir_build_for
+    b .Libs_done
+
+.Libs_var_decl:
+    mov x0, x19
+    bl _kcc_ir_build_var_decl
+    b .Libs_done
+
+.Libs_break:
+    mov x0, x19
+    bl _kcc_ir_build_break
+    b .Libs_done
+
+.Libs_continue:
+    mov x0, x19
+    bl _kcc_ir_build_continue
+    b .Libs_done
+
+.Libs_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Building Return}
+
+@d IR: build return @{
+// -- kcc_ir_build_return --------------------------------------------------
+// void kcc_ir_build_return(node *ret_stmt)
+//   x0 = AST_RETURN_STMT (F0=expr or 0)
+.text
+.globl _kcc_ir_build_return
+.p2align 2
+_kcc_ir_build_return:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0
+    ldr x0, [x19, #AST_F0]      // return expression
+    cbz x0, .Libret_void
+
+    // Build the return expression
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // x20 = vreg of return value
+
+    // Emit ret with value
+    mov x0, #IR_RET
+    bl _kcc_ir_alloc_instr
+
+    // Get return type from current function
+    adrp x1, _kcc_ir_cur_func@@PAGE
+    add  x1, x1, _kcc_ir_cur_func@@PAGEOFF
+    ldr x1, [x1]
+    ldr x1, [x1, #IRF_RETTYPE]
+    str x1, [x0, #IR_TYPE]
+    str x20, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+
+    // Mark BB as terminated
+    b .Libret_terminate
+
+.Libret_void:
+    mov x0, #IR_RET
+    bl _kcc_ir_alloc_instr
+    // void ret
+    adrp x1, _kcc_type_void@@PAGE
+    add  x1, x1, _kcc_type_void@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    bl _kcc_ir_emit
+
+.Libret_terminate:
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libret_done
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libret_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Building Expressions}
+
+Every expression builder returns the vreg number holding the result.
+
+@d IR: build expression @{
+// -- kcc_ir_build_expr ----------------------------------------------------
+// uint64_t kcc_ir_build_expr(node *expr)
+//   x0 = AST expression node
+// Returns vreg number containing the result.
+.text
+.globl _kcc_ir_build_expr
+.p2align 2
+_kcc_ir_build_expr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    cbz x0, .Libe_zero
+    mov x19, x0
+
+    ldr x0, [x19, #AST_TAG]
+
+    cmp x0, #AST_INT_LIT
+    b.eq .Libe_int_lit
+    cmp x0, #AST_CHAR_LIT
+    b.eq .Libe_char_lit
+    cmp x0, #AST_IDENT_EXPR
+    b.eq .Libe_ident
+    cmp x0, #AST_BINARY_EXPR
+    b.eq .Libe_binary
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Libe_unary
+    cmp x0, #AST_ASSIGN_EXPR
+    b.eq .Libe_assign
+    cmp x0, #AST_CALL_EXPR
+    b.eq .Libe_call
+    cmp x0, #AST_CAST_EXPR
+    b.eq .Libe_cast
+    cmp x0, #AST_COMMA_EXPR
+    b.eq .Libe_comma
+    cmp x0, #AST_COND_EXPR
+    b.eq .Libe_cond
+
+    // Unhandled expression — return 0
+    b .Libe_zero
+
+.Libe_int_lit:
+    mov x0, x19
+    bl _kcc_ir_build_int_lit
+    b .Libe_done
+
+.Libe_char_lit:
+    mov x0, x19
+    bl _kcc_ir_build_int_lit   // same treatment: F0=value
+    b .Libe_done
+
+.Libe_ident:
+    mov x0, x19
+    bl _kcc_ir_build_ident
+    b .Libe_done
+
+.Libe_binary:
+    mov x0, x19
+    bl _kcc_ir_build_binary
+    b .Libe_done
+
+.Libe_unary:
+    mov x0, x19
+    bl _kcc_ir_build_unary
+    b .Libe_done
+
+.Libe_assign:
+    mov x0, x19
+    bl _kcc_ir_build_assign
+    b .Libe_done
+
+.Libe_call:
+    mov x0, x19
+    bl _kcc_ir_build_call
+    b .Libe_done
+
+.Libe_cast:
+    // For now, just build the inner expression
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    b .Libe_done
+
+.Libe_comma:
+    // Evaluate LHS (discard), return RHS
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    b .Libe_done
+
+.Libe_cond:
+    mov x0, x19
+    bl _kcc_ir_build_cond_expr
+    b .Libe_done
+
+.Libe_zero:
+    mov x0, #0
+
+.Libe_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Integer Literal}
+
+@d IR: build int literal @{
+// -- kcc_ir_build_int_lit -------------------------------------------------
+// uint64_t kcc_ir_build_int_lit(node *lit)
+//   x0 = AST_INT_LIT or AST_CHAR_LIT (F0=value)
+// Returns vreg.
+.text
+.globl _kcc_ir_build_int_lit
+.p2align 2
+_kcc_ir_build_int_lit:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = AST node (KEEP)
+    ldr x20, [x19, #AST_F0]     // x20 = value
+
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x21, x0                  // x21 = instr
+
+    // Default type: i32
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x21, #IR_TYPE]
+
+    str x20, [x21, #IR_SRC1]    // immediate value
+
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x20, x0                 // save vreg
+
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    mov x0, x20                  // return vreg
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Identifier (Variable Load)}
+
+@d IR: build ident @{
+// -- kcc_ir_build_ident ---------------------------------------------------
+// uint64_t kcc_ir_build_ident(node *ident)
+//   x0 = AST_IDENT_EXPR (F0=name_ptr)
+// Looks up the variable in locals and emits a load.
+.text
+.globl _kcc_ir_build_ident
+.p2align 2
+_kcc_ir_build_ident:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // name ptr
+    cbz x20, .Libi_zero
+
+    // Look up in locals hash table
+    mov x0, x20
+    bl _kcc_strlen
+    mov x21, x0                  // keylen
+
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20                  // key
+    mov x2, x21                  // keylen
+    bl _kcc_ht_get
+    // x0 = value (vreg+1) or 0 if not found
+    cbz x0, .Libi_global
+    sub x22, x0, #1              // x22 = alloca vreg (stored as vreg+1)
+
+    // Emit load from alloca
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    // Type: default i32 (should get from sema)
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // src = alloca vreg
+
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // save result vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libi_done
+
+.Libi_global:
+    // Not a local — emit global_ref
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]     // name ptr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libi_done
+
+.Libi_zero:
+    mov x0, #0
+
+.Libi_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Binary Expression}
+
+@d IR: build binary @{
+// -- kcc_ir_build_binary --------------------------------------------------
+// uint64_t kcc_ir_build_binary(node *expr)
+//   x0 = AST_BINARY_EXPR (F0=op token, F1=lhs, F2=rhs)
+// Returns vreg.
+.text
+.globl _kcc_ir_build_binary
+.p2align 2
+_kcc_ir_build_binary:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                  // AST node
+    ldr x20, [x19, #AST_F0]     // op token code
+
+    // Check for short-circuit operators
+    cmp x20, #TOK_AND
+    b.eq .Libb_short_and
+    cmp x20, #TOK_OR
+    b.eq .Libb_short_or
+
+    // Build LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // x21 = lhs vreg
+
+    // Build RHS
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x22, x0                  // x22 = rhs vreg
+
+    // Map token to IR opcode
+    cmp x20, #TOK_PLUS
+    b.eq .Libb_op_add
+    cmp x20, #TOK_MINUS
+    b.eq .Libb_op_sub
+    cmp x20, #TOK_STAR
+    b.eq .Libb_op_mul
+    cmp x20, #TOK_SLASH
+    b.eq .Libb_op_sdiv
+    cmp x20, #TOK_PERCENT
+    b.eq .Libb_op_smod
+    cmp x20, #TOK_AMP
+    b.eq .Libb_op_and
+    cmp x20, #TOK_PIPE
+    b.eq .Libb_op_or
+    cmp x20, #TOK_CARET
+    b.eq .Libb_op_xor
+    cmp x20, #TOK_SHL
+    b.eq .Libb_op_shl
+    cmp x20, #TOK_SHR
+    b.eq .Libb_op_ashr
+    cmp x20, #TOK_EQ
+    b.eq .Libb_op_eq
+    cmp x20, #TOK_NE
+    b.eq .Libb_op_ne
+    cmp x20, #TOK_LT
+    b.eq .Libb_op_slt
+    cmp x20, #TOK_LE
+    b.eq .Libb_op_sle
+    cmp x20, #TOK_GT
+    b.eq .Libb_op_sgt
+    cmp x20, #TOK_GE
+    b.eq .Libb_op_sge
+
+    // Default: add
+    b .Libb_op_add
+
+.Libb_op_add:  mov x23, #IR_ADD
+    b .Libb_emit
+.Libb_op_sub:  mov x23, #IR_SUB
+    b .Libb_emit
+.Libb_op_mul:  mov x23, #IR_MUL
+    b .Libb_emit
+.Libb_op_sdiv: mov x23, #IR_SDIV
+    b .Libb_emit
+.Libb_op_smod: mov x23, #IR_SMOD
+    b .Libb_emit
+.Libb_op_and:  mov x23, #IR_AND
+    b .Libb_emit
+.Libb_op_or:   mov x23, #IR_OR
+    b .Libb_emit
+.Libb_op_xor:  mov x23, #IR_XOR
+    b .Libb_emit
+.Libb_op_shl:  mov x23, #IR_SHL
+    b .Libb_emit
+.Libb_op_ashr: mov x23, #IR_ASHR
+    b .Libb_emit
+.Libb_op_eq:   mov x23, #IR_CMP_EQ
+    b .Libb_emit
+.Libb_op_ne:   mov x23, #IR_CMP_NE
+    b .Libb_emit
+.Libb_op_slt:  mov x23, #IR_CMP_SLT
+    b .Libb_emit
+.Libb_op_sle:  mov x23, #IR_CMP_SLE
+    b .Libb_emit
+.Libb_op_sgt:  mov x23, #IR_CMP_SGT
+    b .Libb_emit
+.Libb_op_sge:  mov x23, #IR_CMP_SGE
+    b .Libb_emit
+
+.Libb_emit:
+    mov x0, x23
+    bl _kcc_ir_alloc_instr
+    mov x24, x0
+
+    // Type: default i32
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x24, #IR_TYPE]
+    str x21, [x24, #IR_SRC1]
+    str x22, [x24, #IR_SRC2]
+
+    bl _kcc_ir_next_vreg
+    str x0, [x24, #IR_DEST]
+    mov x23, x0                  // result vreg
+
+    mov x0, x24
+    bl _kcc_ir_emit
+
+    mov x0, x23
+    b .Libb_done
+
+// -- Short-circuit && ----------------------------------------------------
+.Libb_short_and:
+    // Evaluate LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // lhs vreg
+
+    // Create BBs: rhs_bb, merge_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // rhs_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    // Emit br_cond: if lhs, goto rhs_bb, else goto merge_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_DEST]     // condition
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true target
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false target
+    bl _kcc_ir_emit
+
+    // Mark current BB terminated
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Switch to rhs_bb
+    mov x0, x22
+    bl _kcc_ir_set_bb
+
+    // Evaluate RHS
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x24, x0                  // rhs vreg
+
+    // Branch to merge
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Switch to merge_bb — result is the rhs vreg
+    // (simplified: a real compiler would use phi nodes)
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+    mov x0, x24                  // return rhs vreg
+    b .Libb_done
+
+// -- Short-circuit || ----------------------------------------------------
+.Libb_short_or:
+    // Evaluate LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0
+
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // rhs_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    // br_cond: if lhs, goto merge_bb, else goto rhs_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_DEST]
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true → merge (short-circuit)
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → evaluate rhs
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x22
+    bl _kcc_ir_set_bb
+
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x24, x0
+
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+    mov x0, x24
+    b .Libb_done
+
+.Libb_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\subsection{Unary Expression}
+
+@d IR: build unary @{
+// -- kcc_ir_build_unary ---------------------------------------------------
+// uint64_t kcc_ir_build_unary(node *expr)
+//   x0 = AST_UNARY_EXPR (F0=op, F1=operand, F2=prefix/postfix)
+.text
+.globl _kcc_ir_build_unary
+.p2align 2
+_kcc_ir_build_unary:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // op token
+
+    // Build operand
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // operand vreg
+
+    cmp x20, #TOK_MINUS
+    b.eq .Libu_neg
+    cmp x20, #TOK_TILDE
+    b.eq .Libu_not
+    cmp x20, #TOK_BANG
+    b.eq .Libu_lnot
+
+    // Default: return operand as-is
+    mov x0, x21
+    b .Libu_done
+
+.Libu_neg:
+    mov x0, #IR_NEG
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_not:
+    mov x0, #IR_NOT
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_lnot:
+    // Logical not: cmp_eq operand, 0
+    // First emit const 0
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str xzr, [x0, #IR_SRC1]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0                  // zero vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    // Now cmp_eq
+    mov x0, #IR_CMP_EQ
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    str x20, [x0, #IR_SRC2]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Assignment}
+
+@d IR: build assign @{
+// -- kcc_ir_build_assign --------------------------------------------------
+// uint64_t kcc_ir_build_assign(node *expr)
+//   x0 = AST_ASSIGN_EXPR (F0=op, F1=lhs, F2=rhs)
+// For simple assignment (=), evaluates RHS and stores to LHS alloca.
+.text
+.globl _kcc_ir_build_assign
+.p2align 2
+_kcc_ir_build_assign:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // op token
+
+    // Build RHS first
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // rhs vreg
+
+    // Get LHS — must be an identifier for now
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Liba_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Liba_done
+
+    // Look up variable alloca
+    ldr x22, [x0, #AST_F0]      // name ptr
+    cbz x22, .Liba_done
+
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0
+
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22
+    bl _kcc_ht_get
+    cbz x0, .Liba_done
+    sub x22, x0, #1              // alloca vreg (stored as vreg+1)
+
+    // For compound assignment (+=, etc.), load current value first
+    cmp x20, #TOK_ASSIGN
+    b.eq .Liba_store
+
+    // Load current value
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x23, x0                  // current value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Map compound op to IR opcode
+    mov x24, #IR_ADD             // default
+    cmp x20, #TOK_ADD_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SUB
+    cmp x20, #TOK_SUB_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_MUL
+    cmp x20, #TOK_MUL_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SDIV
+    cmp x20, #TOK_DIV_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SMOD
+    cmp x20, #TOK_MOD_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_AND
+    cmp x20, #TOK_AND_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_OR
+    cmp x20, #TOK_OR_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_XOR
+    cmp x20, #TOK_XOR_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SHL
+    cmp x20, #TOK_SHL_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_ASHR
+    cmp x20, #TOK_SHR_ASSIGN
+    b.eq .Liba_compound
+    // Fallthrough: treat as simple assign
+    b .Liba_store
+
+.Liba_compound:
+    // Emit binop: result = current_val op rhs
+    mov x0, x24
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x23, [x0, #IR_SRC1]
+    str x21, [x0, #IR_SRC2]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x21, x0                  // new rhs = result vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+.Liba_store:
+    // Emit store
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]     // value
+    str x22, [x0, #IR_SRC2]     // alloca
+    bl _kcc_ir_emit
+
+    mov x0, x21                  // return the stored value's vreg
+
+.Liba_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Function Call}
+
+@d IR: build call @{
+// -- kcc_ir_build_call ----------------------------------------------------
+// uint64_t kcc_ir_build_call(node *expr)
+//   x0 = AST_CALL_EXPR (F0=callee, F1=first_arg)
+// For now, emits a simplified call with the callee name.
+.text
+.globl _kcc_ir_build_call
+.p2align 2
+_kcc_ir_build_call:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0
+
+    // Get callee name (assume direct call to ident)
+    ldr x0, [x19, #AST_F0]      // callee expr
+    cbz x0, .Libc_done_zero
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libc_done_zero
+    ldr x20, [x0, #AST_F0]      // name ptr
+
+    // Emit call instruction
+    mov x0, #IR_CALL
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]     // callee name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // result vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libc_done
+
+.Libc_done_zero:
+    mov x0, #0
+.Libc_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Conditional Expression}
+
+@d IR: build conditional @{
+// -- kcc_ir_build_cond_expr -----------------------------------------------
+// uint64_t kcc_ir_build_cond_expr(node *expr)
+//   x0 = AST_COND_EXPR (F0=cond, F1=then, F2=else)
+.text
+.globl _kcc_ir_build_cond_expr
+.p2align 2
+_kcc_ir_build_cond_expr:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0
+
+    // Build condition
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // cond vreg
+
+    // Create then/else/merge BBs
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // then_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // else_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    // Branch on condition
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Then branch
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x24, x0                  // then_vreg
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Else branch
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x24, x0                  // else vreg (overwrites then — simplified)
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Merge
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+    mov x0, x24                  // simplified: return last vreg
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Building Variable Declarations}
+
+@d IR: build var decl @{
+// -- kcc_ir_build_var_decl ------------------------------------------------
+// void kcc_ir_build_var_decl(node *decl)
+//   x0 = AST_VAR_DECL (F0=type, F1=name, F2=init)
+.text
+.globl _kcc_ir_build_var_decl
+.p2align 2
+_kcc_ir_build_var_decl:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                  // x19 = decl node (KEEP)
+    ldr x20, [x19, #AST_F1]     // x20 = name
+    cbz x20, .Libvd_done
+
+    // Resolve type
+    ldr x0, [x19, #AST_F0]
+    cbz x0, .Libvd_default_type
+    bl _kcc_sema_resolve_type
+    mov x21, x0
+    cbnz x21, .Libvd_alloca
+.Libvd_default_type:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x21, [x0]
+
+.Libvd_alloca:
+    // Emit alloca
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_TYPE]
+    mov x22, x0                  // x22 = alloca instr
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // x23 = alloca vreg number
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    // Record in locals: name -> alloca vreg
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20                  // key = name
+    add x3, x23, #1              // value = alloca vreg + 1 (0 reserved for not-found)
+    bl _kcc_ht_put
+
+    // Check for initializer (x19 = decl node, still valid)
+    ldr x0, [x19, #AST_F2]      // init expr
+    cbz x0, .Libvd_done
+
+    // Build initializer expression
+    bl _kcc_ir_build_expr
+    mov x24, x0                  // x24 = init value vreg
+
+    // Emit store: value -> alloca
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_TYPE]     // type
+    str x24, [x0, #IR_SRC1]     // value vreg
+    str x23, [x0, #IR_SRC2]     // alloca vreg
+    bl _kcc_ir_emit
+
+.Libvd_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Building Control Flow}
+
+\subsection{If Statement}
+
+@d IR: build if @{
+// -- kcc_ir_build_if ------------------------------------------------------
+// void kcc_ir_build_if(node *stmt)
+//   x0 = AST_IF_STMT (F0=cond, F1=then, F2=else)
+.text
+.globl _kcc_ir_build_if
+.p2align 2
+_kcc_ir_build_if:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // if_stmt
+
+    // Build condition
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // cond vreg
+
+    // Create BBs
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // then_bb
+    ldr x0, [x19, #AST_F2]      // else branch
+    cbz x0, .Libif_no_else
+
+    // Has else
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // else_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    // Emit br_cond
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Then block
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_stmt
+    // Branch to merge (if not already terminated)
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libif_else_block
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libif_else_block:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_stmt
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libif_merge
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libif_merge:
+    mov x0, x23
+    bl _kcc_ir_set_bb
+    b .Libif_done
+
+.Libif_no_else:
+    // No else: branch to then_bb or merge_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_stmt
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libif_merge2
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libif_merge2:
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+.Libif_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\subsection{While Statement}
+
+@d IR: build while @{
+// -- kcc_ir_build_while ---------------------------------------------------
+// void kcc_ir_build_while(node *stmt)
+//   x0 = AST_WHILE_STMT (F0=cond, F1=body)
+.text
+.globl _kcc_ir_build_while
+.p2align 2
+_kcc_ir_build_while:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0
+
+    // Create: cond_bb, body_bb, exit_bb
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // cond_bb
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // body_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // exit_bb
+
+    // Branch to cond_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Cond block
+    mov x0, x20
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x23, x0                  // cond vreg
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x23, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true → body
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → exit
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Body block
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_stmt
+    // Loop back to cond
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libw_exit
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libw_exit:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\subsection{Do-While Statement}
+
+@d IR: build do @{
+// -- kcc_ir_build_do ------------------------------------------------------
+// void kcc_ir_build_do(node *stmt)
+//   x0 = AST_DO_STMT (F0=body, F1=cond)
+.text
+.globl _kcc_ir_build_do
+.p2align 2
+_kcc_ir_build_do:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0
+
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // body_bb
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // cond_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // exit_bb
+
+    // Branch to body
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Body
+    mov x0, x20
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_stmt
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libd_cond
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libd_cond:
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x23, x0
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x23, [x0, #IR_DEST]
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true → body (loop)
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → exit
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x22
+    bl _kcc_ir_set_bb
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\subsection{For Statement}
+
+@d IR: build for @{
+// -- kcc_ir_build_for -----------------------------------------------------
+// void kcc_ir_build_for(node *stmt)
+//   x0 = AST_FOR_STMT (F0=init, F1=cond, F2=incr, F3=body)
+.text
+.globl _kcc_ir_build_for
+.p2align 2
+_kcc_ir_build_for:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0
+
+    // Build init (may be decl or expr)
+    ldr x0, [x19, #AST_F0]
+    cbz x0, .Libfor_bbs
+    bl _kcc_ir_build_stmt
+
+.Libfor_bbs:
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // cond_bb
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // body_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // incr_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // exit_bb
+
+    // Branch to cond
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Cond block
+    mov x0, x20
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libfor_no_cond
+    bl _kcc_ir_build_expr
+    mov x24, x0
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x24, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+    b .Libfor_body
+
+.Libfor_no_cond:
+    // Infinite loop: branch directly to body
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libfor_body:
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F3]
+    cbz x0, .Libfor_incr
+    bl _kcc_ir_build_stmt
+
+.Libfor_incr:
+    // Branch to incr (if not terminated)
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libfor_incr_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libfor_incr_bb:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libfor_loop_back
+    bl _kcc_ir_build_expr        // discard result
+
+.Libfor_loop_back:
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+\subsection{Break and Continue}
+
+@d IR: build break @{
+// -- kcc_ir_build_break ---------------------------------------------------
+// void kcc_ir_build_break(node *stmt)
+// Stub: emits a NOP. Full break/continue requires loop stack tracking.
+.text
+.globl _kcc_ir_build_break
+.p2align 2
+_kcc_ir_build_break:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    mov x0, #IR_NOP
+    bl _kcc_ir_alloc_instr
+    bl _kcc_ir_emit
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+@d IR: build continue @{
+// -- kcc_ir_build_continue ------------------------------------------------
+// void kcc_ir_build_continue(node *stmt)
+// Stub: emits a NOP.
+.text
+.globl _kcc_ir_build_continue
+.p2align 2
+_kcc_ir_build_continue:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    mov x0, #IR_NOP
+    bl _kcc_ir_alloc_instr
+    bl _kcc_ir_emit
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{String Constants}
+
+@d IR: builder data @{
+// -- IR builder string constants ------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+
+_kcc_ir_str_func:       .asciz "func @@"
+_kcc_ir_str_arrow:      .asciz "() -> "
+_kcc_ir_str_colon_nl:   .asciz ":\n"
+_kcc_ir_str_bb:         .asciz "  bb"
+_kcc_ir_str_indent:     .asciz "    "
+_kcc_ir_str_eq:         .asciz " = "
+_kcc_ir_str_comma:      .asciz ", %"
+_kcc_ir_str_ptr_pct:    .asciz ", ptr %"
+_kcc_ir_str_comma_bb:   .asciz ", bb"
+_kcc_ir_str_unknown:    .asciz "???"
+
+// Opcode names
+_kcc_ir_op_add:         .asciz "add"
+_kcc_ir_op_sub:         .asciz "sub"
+_kcc_ir_op_mul:         .asciz "mul"
+_kcc_ir_op_sdiv:        .asciz "sdiv"
+_kcc_ir_op_udiv:        .asciz "udiv"
+_kcc_ir_op_smod:        .asciz "smod"
+_kcc_ir_op_umod:        .asciz "umod"
+_kcc_ir_op_neg:         .asciz "neg"
+_kcc_ir_op_and:         .asciz "and"
+_kcc_ir_op_or:          .asciz "or"
+_kcc_ir_op_xor:         .asciz "xor"
+_kcc_ir_op_shl:         .asciz "shl"
+_kcc_ir_op_lshr:        .asciz "lshr"
+_kcc_ir_op_ashr:        .asciz "ashr"
+_kcc_ir_op_not:         .asciz "not"
+_kcc_ir_op_cmp_eq:      .asciz "cmp_eq"
+_kcc_ir_op_cmp_ne:      .asciz "cmp_ne"
+_kcc_ir_op_cmp_slt:     .asciz "cmp_slt"
+_kcc_ir_op_cmp_sle:     .asciz "cmp_sle"
+_kcc_ir_op_cmp_sgt:     .asciz "cmp_sgt"
+_kcc_ir_op_cmp_sge:     .asciz "cmp_sge"
+_kcc_ir_op_load:        .asciz "load "
+_kcc_ir_op_store:       .asciz "store "
+_kcc_ir_op_alloca:      .asciz "alloca "
+_kcc_ir_op_br:          .asciz "br bb"
+_kcc_ir_op_br_cond:     .asciz "br_cond %"
+_kcc_ir_op_ret:         .asciz "ret "
+_kcc_ir_op_call:        .asciz "call "
+_kcc_ir_op_sext:        .asciz "sext"
+_kcc_ir_op_zext:        .asciz "zext"
+_kcc_ir_op_trunc:       .asciz "trunc"
+_kcc_ir_op_const:       .asciz "const "
+_kcc_ir_op_nop:         .asciz "nop"
+_kcc_ir_op_global_ref:  .asciz "global_ref "
+
+// Short type names
+_kcc_ir_ty_void:        .asciz "void"
+_kcc_ir_ty_i1:          .asciz "i1"
+_kcc_ir_ty_i8:          .asciz "i8"
+_kcc_ir_ty_i16:         .asciz "i16"
+_kcc_ir_ty_i32:         .asciz "i32"
+_kcc_ir_ty_i64:         .asciz "i64"
+_kcc_ir_ty_f32:         .asciz "f32"
+_kcc_ir_ty_f64:         .asciz "f64"
+_kcc_ir_ty_ptr:         .asciz "ptr"
+_kcc_ir_ty_struct:      .asciz "struct"
+_kcc_ir_ty_unknown:     .asciz "?type"
+@}

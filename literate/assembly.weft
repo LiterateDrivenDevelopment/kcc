@@ -345,6 +345,129 @@ physical assembly files under \texttt{tmp/src/}.
 @<Sema: data@>
 @}
 
+\noindent\textbf{ir.s} --- intermediate representation:
+
+@o tmp/src/ir.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Parser: AST constants@>
+@<Types: constants@>
+@<Vec: constants@>
+@<IR: constants@>
+@<IR: init@>
+@<IR: alloc instruction@>
+@<IR: alloc basic block@>
+@<IR: alloc function@>
+@<IR: emit@>
+@<IR: next vreg@>
+@<IR: set current bb@>
+@<IR: build@>
+@<IR: build function@>
+@<IR: build param@>
+@<IR: build statement@>
+@<IR: build return@>
+@<IR: build expression@>
+@<IR: build int literal@>
+@<IR: build ident@>
+@<IR: build binary@>
+@<IR: build unary@>
+@<IR: build assign@>
+@<IR: build call@>
+@<IR: build conditional@>
+@<IR: build var decl@>
+@<IR: build if@>
+@<IR: build while@>
+@<IR: build do@>
+@<IR: build for@>
+@<IR: build break@>
+@<IR: build continue@>
+@<IR: validate@>
+@<IR: dump@>
+@<IR: dump instruction@>
+@<IR: dump type short@>
+@<IR: data@>
+@<IR: builder data@>
+@}
+
+\noindent\textbf{opt.s} --- optimization passes:
+
+@o tmp/src/opt.s @{
+@<ARM64: common macros@>
+@<IR: constants@>
+@<Vec: constants@>
+@<Types: constants@>
+@<Opt: constant fold@>
+@<Opt: dead code elimination@>
+@<Opt: pass manager@>
+@}
+
+\noindent\textbf{emit\_arm64.s} --- ARM64 instruction binary encoding:
+
+@o tmp/src/emit_arm64.s @{
+@<ARM64: common macros@>
+@<Backend: constants@>
+@<Backend: code buffer@>
+@<Backend: encode arithmetic reg@>
+@<Backend: encode arithmetic imm@>
+@<Backend: encode logical@>
+@<Backend: encode compare@>
+@<Backend: encode memory@>
+@<Backend: encode branch@>
+@<Backend: encode system@>
+@<Backend: encode adrp@>
+@<Backend: emit data@>
+@}
+
+\noindent\textbf{linker.s} --- relocation and symbol table management:
+
+@o tmp/src/linker.s @{
+@<ARM64: common macros@>
+@<Vec: constants@>
+@<Linker: constants@>
+@<Linker: init@>
+@<Linker: add symbol@>
+@<Linker: add reloc@>
+@<Linker: lookup or add extern@>
+@<Linker: data@>
+@}
+
+\noindent\textbf{codegen.s} --- IR to ARM64 code generation:
+
+@o tmp/src/codegen.s @{
+@<ARM64: common macros@>
+@<IR: constants@>
+@<Vec: constants@>
+@<Linker: constants@>
+@<CodeGen: constants@>
+@<CodeGen: init@>
+@<CodeGen: compile all@>
+@<CodeGen: compile function@>
+@<CodeGen: vreg slot offset@>
+@<CodeGen: instruction dispatch@>
+@<CodeGen: patch branches@>
+@<CodeGen: data@>
+@}
+
+\noindent\textbf{emit\_macho.s} --- Mach-O object file writer:
+
+@o tmp/src/emit_macho.s @{
+@<ARM64: common macros@>
+@<Vec: constants@>
+@<Linker: constants@>
+@<MachO: constants@>
+@<MachO: output buffer@>
+@<MachO: finalize@>
+@<MachO: data@>
+@}
+
+\noindent\textbf{driver.s} --- compilation driver:
+
+@o tmp/src/driver.s @{
+@<ARM64: common macros@>
+@<Driver: compile@>
+@<Driver: data@>
+@}
+
 \bigskip
 \noindent\textbf{Test binaries} --- test runner and conformance tests
 (assembled separately; linked into \texttt{tmp/test\_kcc}):

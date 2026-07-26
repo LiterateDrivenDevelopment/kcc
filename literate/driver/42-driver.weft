@@ -1,0 +1,109 @@
+% 42-driver.weft — Compilation Driver
+%
+% This chapter implements the full compilation pipeline, invoked when
+% the user passes \texttt{-c} to compile a C source file into a
+% Mach-O object file.
+
+\chapter{Compilation Driver}
+\label{ch:driver}
+
+\section{Full Compilation Pipeline}
+
+@d Driver: compile @{
+// -- kcc_driver_compile -------------------------------------------------------
+// void kcc_driver_compile(const char *src_path, const char *out_path)
+//   x0 = source file path
+//   x1 = output file path
+.text
+.globl _kcc_driver_compile
+.p2align 2
+_kcc_driver_compile:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                    // src_path
+    mov x20, x1                    // out_path
+
+    // 1. Open and read source file
+    mov x0, x19
+    bl _kcc_source_open
+
+    // 2. Translation Phase 1: trigraph replacement
+    bl _kcc_source_encode
+
+    // 3. Translation Phase 2: line splicing
+    bl _kcc_source_splice
+
+    // 4. Initialize lexer
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_lex_init
+
+    // 5. Initialize preprocessor
+    bl _kcc_pp_init
+
+    // 6. Initialize string table and typedef table
+    bl _kcc_strtab_init
+    bl _kcc_typedef_init
+
+    // 7. Parse
+    bl _kcc_parse
+    mov x21, x0                    // trans_unit
+
+    // 8. Initialize type system and symbol table
+    bl _kcc_types_init
+    bl _kcc_symtab_init
+
+    // 9. Semantic analysis
+    mov x0, x21
+    bl _kcc_sema_check
+
+    // 10. Check for errors
+    bl _kcc_diag_had_errors
+    cbnz x0, .Ldc_error
+
+    // 11. Build IR
+    bl _kcc_ir_init
+    mov x0, x21
+    bl _kcc_ir_build
+
+    // 12. Optimize
+    bl _kcc_opt_run
+
+    // 13. Initialize backend
+    bl _kcc_code_init
+    bl _kcc_linker_init
+    bl _kcc_codegen_init
+
+    // 14. Generate code
+    bl _kcc_codegen_all
+
+    // 15. Write Mach-O object file
+    mov x0, x20                    // out_path
+    bl _kcc_macho_init
+    bl _kcc_macho_finalize
+
+    // 16. Success
+    mov x0, #0
+    bl _kcc_sys_exit
+
+.Ldc_error:
+    bl _kcc_io_flush
+    mov x0, #1
+    bl _kcc_sys_exit
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+@d Driver: data @{
+// -- Driver data (none needed beyond main strings) ----------------------------
+@}

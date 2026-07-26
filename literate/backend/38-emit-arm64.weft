@@ -1,0 +1,684 @@
+% 38-emit-arm64.weft — ARM64 Instruction Binary Encoding
+%
+% This chapter provides the low-level machinery for encoding ARM64
+% instructions into their 32-bit binary representations.  The code
+% buffer is arena-allocated and grows as needed.  Each encoding
+% function takes the operand fields and returns the packed 32-bit word,
+% which is then appended to the buffer via kcc_code_emit32.
+
+\chapter{ARM64 Encoding}
+\label{ch:emit-arm64}
+
+\section{Code Buffer}
+
+The code buffer is a simple growable byte array.  Since ARM64
+instructions are fixed-width (4 bytes), we always append in 4-byte
+increments.
+
+@d Backend: constants @{
+// -- Backend constants --------------------------------------------------------
+.equ CODEBUF_INIT_CAP, 4096     // initial code buffer capacity (bytes)
+@}
+
+@d Backend: code buffer @{
+// -- kcc_code_init ------------------------------------------------------------
+// void kcc_code_init(void)
+// Allocates the initial code buffer.
+.text
+.globl _kcc_code_init
+.p2align 2
+_kcc_code_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    mov x0, #CODEBUF_INIT_CAP
+    bl _kcc_arena_alloc
+
+    adrp x1, _kcc_code_buf@@PAGE
+    add  x1, x1, _kcc_code_buf@@PAGEOFF
+    str x0, [x1]
+
+    adrp x1, _kcc_code_pos@@PAGE
+    add  x1, x1, _kcc_code_pos@@PAGEOFF
+    str xzr, [x1]
+
+    mov x2, #CODEBUF_INIT_CAP
+    adrp x1, _kcc_code_cap@@PAGE
+    add  x1, x1, _kcc_code_cap@@PAGEOFF
+    str x2, [x1]
+
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_code_emit32 ----------------------------------------------------------
+// void kcc_code_emit32(uint32_t word)
+//   x0 = 32-bit instruction word
+// Appends a 4-byte instruction to the code buffer.
+.text
+.globl _kcc_code_emit32
+.p2align 2
+_kcc_code_emit32:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                   // save word
+
+    // Check if we need to grow
+    adrp x1, _kcc_code_pos@@PAGE
+    add  x1, x1, _kcc_code_pos@@PAGEOFF
+    ldr x2, [x1]                  // pos
+    add x3, x2, #4
+    adrp x4, _kcc_code_cap@@PAGE
+    add  x4, x4, _kcc_code_cap@@PAGEOFF
+    ldr x5, [x4]                  // cap
+    cmp x3, x5
+    b.le .Lce32_write
+
+    // Grow: allocate new buffer (double capacity)
+    lsl x0, x5, #1               // new cap = old * 2
+    str x0, [x4]                  // update cap
+    mov x5, x0                   // save new cap
+    bl _kcc_arena_alloc
+    mov x6, x0                   // new buf
+
+    // Copy old data
+    adrp x1, _kcc_code_buf@@PAGE
+    add  x1, x1, _kcc_code_buf@@PAGEOFF
+    ldr x7, [x1]                  // old buf
+    str x6, [x1]                  // update buf ptr
+
+    // memcpy(new, old, pos)
+    mov x0, x6
+    mov x1, x7
+    adrp x2, _kcc_code_pos@@PAGE
+    add  x2, x2, _kcc_code_pos@@PAGEOFF
+    ldr x2, [x2]
+    bl _kcc_memcpy
+
+.Lce32_write:
+    adrp x1, _kcc_code_buf@@PAGE
+    add  x1, x1, _kcc_code_buf@@PAGEOFF
+    ldr x1, [x1]                  // buf
+    adrp x2, _kcc_code_pos@@PAGE
+    add  x2, x2, _kcc_code_pos@@PAGEOFF
+    ldr x3, [x2]                  // pos
+    str w19, [x1, x3]             // write word at buf+pos
+    add x3, x3, #4
+    str x3, [x2]                  // pos += 4
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_code_current_pos -----------------------------------------------------
+// uint64_t kcc_code_current_pos(void)
+// Returns the current offset in the code buffer.
+.text
+.globl _kcc_code_current_pos
+.p2align 2
+_kcc_code_current_pos:
+    adrp x0, _kcc_code_pos@@PAGE
+    add  x0, x0, _kcc_code_pos@@PAGEOFF
+    ldr x0, [x0]
+    ret
+
+// -- kcc_code_patch32 ---------------------------------------------------------
+// void kcc_code_patch32(uint64_t offset, uint32_t word)
+//   x0 = offset in code buffer
+//   x1 = new 32-bit word
+// Overwrites the instruction at the given offset.
+.text
+.globl _kcc_code_patch32
+.p2align 2
+_kcc_code_patch32:
+    adrp x2, _kcc_code_buf@@PAGE
+    add  x2, x2, _kcc_code_buf@@PAGEOFF
+    ldr x2, [x2]
+    str w1, [x2, x0]
+    ret
+@}
+
+\section{Arithmetic Encoding (Register)}
+
+@d Backend: encode arithmetic reg @{
+// -- kcc_enc_add_reg ----------------------------------------------------------
+// uint32_t kcc_enc_add_reg(uint32_t rd, uint32_t rn, uint32_t rm, uint32_t sf)
+//   x0=rd, x1=rn, x2=rm, x3=sf (1=64-bit, 0=32-bit)
+.text
+.globl _kcc_enc_add_reg
+.p2align 2
+_kcc_enc_add_reg:
+    // ADD: sf=0 → 0x0B000000, sf=1 → 0x8B000000
+    mov w4, #0x0B000000
+    orr w4, w4, w3, lsl #31       // set sf bit
+    orr w4, w4, w2, lsl #16       // Rm
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_sub_reg ----------------------------------------------------------
+.text
+.globl _kcc_enc_sub_reg
+.p2align 2
+_kcc_enc_sub_reg:
+    // SUB: sf=0 → 0x4B000000, sf=1 → 0xCB000000
+    mov w4, #0x4B000000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16
+    orr w4, w4, w1, lsl #5
+    orr w4, w4, w0
+    mov w0, w4
+    ret
+
+// -- kcc_enc_mul --------------------------------------------------------------
+.text
+.globl _kcc_enc_mul
+.p2align 2
+_kcc_enc_mul:
+    // MUL (MADD Rd,Rn,Rm,XZR): sf=0 → 0x1B007C00, sf=1 → 0x9B007C00
+    mov w4, #0x1B000000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16       // Rm
+    orr w4, w4, #(31 << 10)       // Ra = xzr (31)
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_sdiv -------------------------------------------------------------
+.text
+.globl _kcc_enc_sdiv
+.p2align 2
+_kcc_enc_sdiv:
+    // SDIV: sf=0 → 0x1AC00C00, sf=1 → 0x9AC00C00
+    movz w4, #0x1AC0, lsl #16
+    movk w4, #0x0C00
+    orr w4, w4, w3, lsl #31       // sf
+    orr w4, w4, w2, lsl #16       // Rm
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_udiv -------------------------------------------------------------
+.text
+.globl _kcc_enc_udiv
+.p2align 2
+_kcc_enc_udiv:
+    // UDIV: sf=0 → 0x1AC00800, sf=1 → 0x9AC00800
+    movz w4, #0x1AC0, lsl #16
+    movk w4, #0x0800
+    orr w4, w4, w3, lsl #31       // sf
+    orr w4, w4, w2, lsl #16       // Rm
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_msub -------------------------------------------------------------
+// MSUB Rd, Rn, Rm, Ra: Rd = Ra - Rn*Rm
+// x0=rd, x1=rn, x2=rm, x3=ra, x4=sf
+.text
+.globl _kcc_enc_msub
+.p2align 2
+_kcc_enc_msub:
+    // MSUB: sf=0 → 0x1B008000, sf=1 → 0x9B008000
+    mov w5, #0x1B000000
+    orr w5, w5, w4, lsl #31       // sf
+    orr w5, w5, #0x8000           // o0 bit (distinguishes MSUB from MADD)
+    orr w5, w5, w2, lsl #16       // Rm
+    orr w5, w5, w3, lsl #10       // Ra
+    orr w5, w5, w1, lsl #5        // Rn
+    orr w5, w5, w0                // Rd
+    mov w0, w5
+    ret
+@}
+
+\section{Arithmetic Encoding (Immediate)}
+
+@d Backend: encode arithmetic imm @{
+// -- kcc_enc_add_imm ----------------------------------------------------------
+// uint32_t kcc_enc_add_imm(uint32_t rd, uint32_t rn, uint32_t imm12, uint32_t sf)
+.text
+.globl _kcc_enc_add_imm
+.p2align 2
+_kcc_enc_add_imm:
+    // ADD imm: sf=0 → 0x11000000, sf=1 → 0x91000000
+    mov w4, #0x11000000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #10       // imm12
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_sub_imm ----------------------------------------------------------
+.text
+.globl _kcc_enc_sub_imm
+.p2align 2
+_kcc_enc_sub_imm:
+    // SUB imm: sf=0 → 0x51000000, sf=1 → 0xD1000000
+    mov w4, #0x51000000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #10       // imm12
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_movz -------------------------------------------------------------
+// uint32_t kcc_enc_movz(uint32_t rd, uint32_t imm16, uint32_t hw, uint32_t sf)
+//   hw = shift amount / 16 (0,1,2,3)
+.text
+.globl _kcc_enc_movz
+.p2align 2
+_kcc_enc_movz:
+    // MOVZ: sf=0 → 0x52800000, sf=1 → 0xD2800000
+    mov w4, #0x52800000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #21       // hw
+    orr w4, w4, w1, lsl #5        // imm16
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_movk -------------------------------------------------------------
+.text
+.globl _kcc_enc_movk
+.p2align 2
+_kcc_enc_movk:
+    // MOVK: sf=0 → 0x72800000, sf=1 → 0xF2800000
+    mov w4, #0x72800000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #21       // hw
+    orr w4, w4, w1, lsl #5        // imm16
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+@}
+
+\section{Logical Encoding}
+
+@d Backend: encode logical @{
+// -- kcc_enc_and_reg ----------------------------------------------------------
+.text
+.globl _kcc_enc_and_reg
+.p2align 2
+_kcc_enc_and_reg:
+    // AND: sf=0 → 0x0A000000, sf=1 → 0x8A000000
+    mov w4, #0x0A000000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16
+    orr w4, w4, w1, lsl #5
+    orr w4, w4, w0
+    mov w0, w4
+    ret
+
+// -- kcc_enc_orr_reg ----------------------------------------------------------
+.text
+.globl _kcc_enc_orr_reg
+.p2align 2
+_kcc_enc_orr_reg:
+    // ORR: sf=0 → 0x2A000000, sf=1 → 0xAA000000
+    mov w4, #0x2A000000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16
+    orr w4, w4, w1, lsl #5
+    orr w4, w4, w0
+    mov w0, w4
+    ret
+
+// -- kcc_enc_eor_reg ----------------------------------------------------------
+.text
+.globl _kcc_enc_eor_reg
+.p2align 2
+_kcc_enc_eor_reg:
+    // EOR: sf=0 → 0x4A000000, sf=1 → 0xCA000000
+    mov w4, #0x4A000000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16
+    orr w4, w4, w1, lsl #5
+    orr w4, w4, w0
+    mov w0, w4
+    ret
+
+// -- kcc_enc_mvn --------------------------------------------------------------
+// MVN Rd, Rm → ORN Rd, XZR, Rm
+// x0=rd, x1=rm, x2=sf
+.text
+.globl _kcc_enc_mvn
+.p2align 2
+_kcc_enc_mvn:
+    // ORN: sf=0 → 0x2A200000, sf=1 → 0xAA200000
+    mov w4, #0x2A200000
+    orr w4, w4, w2, lsl #31       // sf
+    orr w4, w4, w1, lsl #16       // Rm
+    mov w5, #31
+    orr w4, w4, w5, lsl #5        // Rn = XZR (31)
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_lsl_reg ----------------------------------------------------------
+// LSLV: x0=rd, x1=rn, x2=rm, x3=sf
+.text
+.globl _kcc_enc_lsl_reg
+.p2align 2
+_kcc_enc_lsl_reg:
+    // LSLV: sf=0 → 0x1AC02000, sf=1 → 0x9AC02000
+    movz w4, #0x1AC0, lsl #16
+    movk w4, #0x2000
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16
+    orr w4, w4, w1, lsl #5
+    orr w4, w4, w0
+    mov w0, w4
+    ret
+
+// -- kcc_enc_lsr_reg ----------------------------------------------------------
+.text
+.globl _kcc_enc_lsr_reg
+.p2align 2
+_kcc_enc_lsr_reg:
+    // LSRV: sf=0 → 0x1AC02400, sf=1 → 0x9AC02400
+    movz w4, #0x1AC0, lsl #16
+    movk w4, #0x2400
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16
+    orr w4, w4, w1, lsl #5
+    orr w4, w4, w0
+    mov w0, w4
+    ret
+
+// -- kcc_enc_asr_reg ----------------------------------------------------------
+.text
+.globl _kcc_enc_asr_reg
+.p2align 2
+_kcc_enc_asr_reg:
+    // ASRV: sf=0 → 0x1AC02800, sf=1 → 0x9AC02800
+    movz w4, #0x1AC0, lsl #16
+    movk w4, #0x2800
+    orr w4, w4, w3, lsl #31
+    orr w4, w4, w2, lsl #16
+    orr w4, w4, w1, lsl #5
+    orr w4, w4, w0
+    mov w0, w4
+    ret
+@}
+
+\section{Compare and Conditional Set}
+
+@d Backend: encode compare @{
+// -- kcc_enc_cmp_reg ----------------------------------------------------------
+// CMP Rn, Rm → SUBS XZR, Rn, Rm
+// x0=rn, x1=rm, x2=sf
+.text
+.globl _kcc_enc_cmp_reg
+.p2align 2
+_kcc_enc_cmp_reg:
+    // SUBS: sf=0 → 0x6B000000, sf=1 → 0xEB000000
+    mov w3, #0x6B000000
+    orr w3, w3, w2, lsl #31
+    orr w3, w3, w1, lsl #16       // Rm
+    orr w3, w3, w0, lsl #5        // Rn
+    mov w4, #31
+    orr w3, w3, w4                // Rd = XZR (31)
+    mov w0, w3
+    ret
+
+// -- kcc_enc_cset -------------------------------------------------------------
+// CSET Rd, cond → CSINC Rd, XZR, XZR, inv(cond)
+// x0=rd, x1=cond (already inverted!), x2=sf
+.text
+.globl _kcc_enc_cset
+.p2align 2
+_kcc_enc_cset:
+    // CSINC: sf=0 → 0x1A9F07E0, sf=1 → 0x9A9F07E0
+    // Encoding: sf|0|0|11010100|Rm(=11111)|cond|01|Rn(=11111)|Rd
+    // = sf | 0x1A800000 | 31<<16 | cond<<12 | 1<<10 | 31<<5 | rd
+    mov w3, #0x1A800000
+    orr w3, w3, #0x400            // bit 10 = 1 → CSINC (not CSEL)
+    orr w3, w3, w2, lsl #31       // sf
+    mov w4, #31
+    orr w3, w3, w4, lsl #16       // Rm = XZR
+    orr w3, w3, w1, lsl #12       // cond (inverted)
+    orr w3, w3, w4, lsl #5        // Rn = XZR
+    orr w3, w3, w0                // Rd
+    mov w0, w3
+    ret
+@}
+
+\section{Memory Encoding}
+
+@d Backend: encode memory @{
+// -- kcc_enc_str_imm ----------------------------------------------------------
+// STR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled, x3=size(0=32,1=64)
+// size=1 (64-bit): 0xF9000000 | (imm12/8)<<10 | rn<<5 | rt
+// size=0 (32-bit): 0xB9000000 | (imm12/4)<<10 | rn<<5 | rt
+.text
+.globl _kcc_enc_str_imm
+.p2align 2
+_kcc_enc_str_imm:
+    // x2 is already scaled (divided by access size)
+    cbz w3, .Lstr_32
+    // 64-bit
+    mov w4, #0xF9000000
+    b .Lstr_common
+.Lstr_32:
+    mov w4, #0xB9000000
+.Lstr_common:
+    orr w4, w4, w2, lsl #10       // imm12 (pre-scaled)
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rt
+    mov w0, w4
+    ret
+
+// -- kcc_enc_ldr_imm ----------------------------------------------------------
+// LDR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled, x3=size(0=32,1=64)
+.text
+.globl _kcc_enc_ldr_imm
+.p2align 2
+_kcc_enc_ldr_imm:
+    cbz w3, .Lldr_32
+    // 64-bit
+    mov w4, #0xF9400000
+    b .Lldr_common
+.Lldr_32:
+    mov w4, #0xB9400000
+.Lldr_common:
+    orr w4, w4, w2, lsl #10       // imm12 (pre-scaled)
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rt
+    mov w0, w4
+    ret
+
+// -- kcc_enc_stp_pre ----------------------------------------------------------
+// STP (pre-index, 64-bit): x0=rt1, x1=rt2, x2=rn, x3=imm7 (signed, scaled by 8)
+// Encoding: 0xA9800000 | (imm7&0x7F)<<15 | rt2<<10 | rn<<5 | rt1
+.text
+.globl _kcc_enc_stp_pre
+.p2align 2
+_kcc_enc_stp_pre:
+    mov w4, #0xA9800000
+    and w5, w3, #0x7F
+    orr w4, w4, w5, lsl #15       // imm7
+    orr w4, w4, w1, lsl #10       // Rt2
+    orr w4, w4, w2, lsl #5        // Rn
+    orr w4, w4, w0                // Rt1
+    mov w0, w4
+    ret
+
+// -- kcc_enc_ldp_post ---------------------------------------------------------
+// LDP (post-index, 64-bit): x0=rt1, x1=rt2, x2=rn, x3=imm7 (signed, scaled by 8)
+// Encoding: 0xA8C00000 | (imm7&0x7F)<<15 | rt2<<10 | rn<<5 | rt1
+.text
+.globl _kcc_enc_ldp_post
+.p2align 2
+_kcc_enc_ldp_post:
+    mov w4, #0xA8C00000
+    and w5, w3, #0x7F
+    orr w4, w4, w5, lsl #15       // imm7
+    orr w4, w4, w1, lsl #10       // Rt2
+    orr w4, w4, w2, lsl #5        // Rn
+    orr w4, w4, w0                // Rt1
+    mov w0, w4
+    ret
+
+// -- kcc_enc_mov_reg ----------------------------------------------------------
+// MOV Rd, Rm → ORR Rd, XZR, Rm
+// x0=rd, x1=rm, x2=sf
+.text
+.globl _kcc_enc_mov_reg
+.p2align 2
+_kcc_enc_mov_reg:
+    mov w3, #0x2A000000
+    orr w3, w3, w2, lsl #31       // sf
+    orr w3, w3, w1, lsl #16       // Rm
+    mov w4, #31
+    orr w3, w3, w4, lsl #5        // Rn = XZR
+    orr w3, w3, w0                // Rd
+    mov w0, w3
+    ret
+@}
+
+\section{Branch Encoding}
+
+@d Backend: encode branch @{
+// -- kcc_enc_b ----------------------------------------------------------------
+// B imm26: x0 = offset in bytes (will be divided by 4)
+.text
+.globl _kcc_enc_b
+.p2align 2
+_kcc_enc_b:
+    asr x0, x0, #2                // offset in instructions
+    mov w1, #0x14000000
+    and w0, w0, #0x03FFFFFF
+    orr w0, w0, w1
+    ret
+
+// -- kcc_enc_bl ---------------------------------------------------------------
+// BL imm26: x0 = offset in bytes
+.text
+.globl _kcc_enc_bl
+.p2align 2
+_kcc_enc_bl:
+    asr x0, x0, #2
+    mov w1, #0x94000000
+    and w0, w0, #0x03FFFFFF
+    orr w0, w0, w1
+    ret
+
+// -- kcc_enc_b_cond -----------------------------------------------------------
+// B.cond imm19: x0 = offset in bytes, x1 = condition code
+.text
+.globl _kcc_enc_b_cond
+.p2align 2
+_kcc_enc_b_cond:
+    asr x0, x0, #2                // offset in instructions
+    mov w2, #0x54000000
+    and w3, w0, #0x7FFFF          // imm19
+    orr w2, w2, w3, lsl #5        // imm19 << 5
+    orr w2, w2, w1                // cond
+    mov w0, w2
+    ret
+
+// -- kcc_enc_cbz --------------------------------------------------------------
+// CBZ Rt, imm19: x0 = rt, x1 = offset in bytes, x2 = sf
+.text
+.globl _kcc_enc_cbz
+.p2align 2
+_kcc_enc_cbz:
+    asr x1, x1, #2                // offset in instructions
+    mov w3, #0x34000000
+    orr w3, w3, w2, lsl #31       // sf
+    and w4, w1, #0x7FFFF
+    orr w3, w3, w4, lsl #5        // imm19
+    orr w3, w3, w0                // Rt
+    mov w0, w3
+    ret
+
+// -- kcc_enc_cbnz -------------------------------------------------------------
+// CBNZ Rt, imm19: x0 = rt, x1 = offset in bytes, x2 = sf
+.text
+.globl _kcc_enc_cbnz
+.p2align 2
+_kcc_enc_cbnz:
+    asr x1, x1, #2
+    mov w3, #0x35000000
+    orr w3, w3, w2, lsl #31       // sf
+    and w4, w1, #0x7FFFF
+    orr w3, w3, w4, lsl #5        // imm19
+    orr w3, w3, w0                // Rt
+    mov w0, w3
+    ret
+
+// -- kcc_enc_ret --------------------------------------------------------------
+.text
+.globl _kcc_enc_ret
+.p2align 2
+_kcc_enc_ret:
+    movz w0, #0xD65F, lsl #16
+    movk w0, #0x03C0
+    ret
+@}
+
+\section{System Instructions}
+
+@d Backend: encode system @{
+// -- kcc_enc_nop --------------------------------------------------------------
+.text
+.globl _kcc_enc_nop
+.p2align 2
+_kcc_enc_nop:
+    movz w0, #0xD503, lsl #16
+    movk w0, #0x201F
+    ret
+
+// -- kcc_enc_brk --------------------------------------------------------------
+// BRK #imm16: x0 = imm16
+.text
+.globl _kcc_enc_brk
+.p2align 2
+_kcc_enc_brk:
+    mov w1, #0xD4200000
+    orr w0, w1, w0, lsl #5
+    ret
+@}
+
+\section{ADRP and Page-Offset Encoding}
+
+@d Backend: encode adrp @{
+// -- kcc_enc_adrp -------------------------------------------------------------
+// ADRP Rd, imm21: x0=rd, x1=imm21 (page offset in 4KB pages)
+// Encoding: 1|immlo(2)|10000|immhi(19)|Rd(5)
+// immlo = imm21[1:0], immhi = imm21[20:2]
+.text
+.globl _kcc_enc_adrp
+.p2align 2
+_kcc_enc_adrp:
+    mov w2, #0x90000000
+    and w3, w1, #0x3               // immlo = imm21[1:0]
+    orr w2, w2, w3, lsl #29        // immlo at bits [30:29]
+    lsr w4, w1, #2                 // immhi = imm21[20:2]
+    and w4, w4, #0x7FFFF           // mask to 19 bits
+    orr w2, w2, w4, lsl #5         // immhi at bits [23:5]
+    orr w2, w2, w0                 // Rd
+    mov w0, w2
+    ret
+@}
+
+\section{Code Buffer Data}
+
+@d Backend: emit data @{
+// -- Code buffer state --------------------------------------------------------
+.data
+.p2align 3
+.globl _kcc_code_buf
+_kcc_code_buf:       .quad 0     // pointer to code buffer
+.globl _kcc_code_pos
+_kcc_code_pos:       .quad 0     // current write position (bytes)
+.globl _kcc_code_cap
+_kcc_code_cap:       .quad 0     // buffer capacity (bytes)
+@}

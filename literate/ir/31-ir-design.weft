@@ -1,0 +1,450 @@
+% 31-ir-design.weft — Intermediate Representation Design
+%
+% This chapter defines the IR data structures and core allocation
+% functions.  The IR is a linear, three-address code with virtual
+% registers and basic blocks — similar in spirit to LLVM IR but far
+% simpler.  Every IR instruction is 48 bytes, arena-allocated.
+% Basic blocks form a linked list within each function.
+
+\chapter{Intermediate Representation}
+\label{ch:ir-design}
+
+\section{IR Instruction Layout}
+
+An IR instruction occupies 48 bytes:
+
+\begin{center}
+\begin{tabular}{lll}
+Offset & Field & Description \\
+\hline
+0  & IR\_OP   & opcode (see below) \\
+8  & IR\_DEST & destination vreg number \\
+16 & IR\_SRC1 & source 1 (vreg or immediate) \\
+24 & IR\_SRC2 & source 2 (vreg, immediate, or BB id) \\
+32 & IR\_TYPE & pointer to type descriptor \\
+40 & IR\_NEXT & next instruction in basic block \\
+\end{tabular}
+\end{center}
+
+@d IR: constants @{
+// -- IR instruction layout ------------------------------------------------
+.equ IR_OP,          0     // opcode
+.equ IR_DEST,        8     // destination vreg number
+.equ IR_SRC1,       16     // source 1 (vreg or immediate)
+.equ IR_SRC2,       24     // source 2 (vreg, immediate, or BB id)
+.equ IR_TYPE,       32     // pointer to type descriptor
+.equ IR_NEXT,       40     // next instruction in BB
+.equ IR_INSTR_SIZE, 48
+
+// -- Basic block layout ---------------------------------------------------
+.equ BB_ID,          0     // block label number
+.equ BB_FIRST,       8     // first instruction
+.equ BB_LAST,       16     // last instruction
+.equ BB_NEXT,       24     // next BB in function (linked list)
+.equ BB_FLAGS,      32     // bit 0 = terminated
+.equ IR_BB_SIZE,    48
+
+// -- IR function layout ---------------------------------------------------
+.equ IRF_NAME,       0     // function name string pointer
+.equ IRF_ENTRY,      8     // entry basic block
+.equ IRF_BLOCKS,    16     // vec of BB pointers
+.equ IRF_VREG_N,    24     // next vreg number counter
+.equ IRF_RETTYPE,   32     // return type descriptor
+.equ IRF_PARAMS,    40     // param count
+.equ IR_FUNC_SIZE,  48
+
+// -- BB flags -------------------------------------------------------------
+.equ BB_FLAG_TERMINATED, 1
+
+// -- IR opcodes -----------------------------------------------------------
+// Arithmetic: 1-8
+.equ IR_ADD,      1
+.equ IR_SUB,      2
+.equ IR_MUL,      3
+.equ IR_SDIV,     4
+.equ IR_UDIV,     5
+.equ IR_SMOD,     6
+.equ IR_UMOD,     7
+.equ IR_NEG,      8
+
+// Bitwise: 10-16
+.equ IR_AND,     10
+.equ IR_OR,      11
+.equ IR_XOR,     12
+.equ IR_SHL,     13
+.equ IR_LSHR,    14
+.equ IR_ASHR,    15
+.equ IR_NOT,     16
+
+// Compare: 20-25
+.equ IR_CMP_EQ,  20
+.equ IR_CMP_NE,  21
+.equ IR_CMP_SLT, 22
+.equ IR_CMP_SLE, 23
+.equ IR_CMP_SGT, 24
+.equ IR_CMP_SGE, 25
+.equ IR_CMP_ULT, 26
+.equ IR_CMP_ULE, 27
+
+// Memory: 30-33
+.equ IR_LOAD,    30
+.equ IR_STORE,   31
+.equ IR_ALLOCA,  32
+.equ IR_GEP,     33
+
+// Control flow: 40-43
+.equ IR_BR,      40
+.equ IR_BR_COND, 41
+.equ IR_RET,     42
+.equ IR_CALL,    43
+
+// Conversion: 50-53
+.equ IR_SEXT,    50
+.equ IR_ZEXT,    51
+.equ IR_TRUNC,   52
+.equ IR_BITCAST, 53
+
+// Miscellaneous: 60-63
+.equ IR_CONST,   60
+.equ IR_NOP,     61
+.equ IR_GLOBAL_REF, 63
+@}
+
+\section{IR Initialization}
+
+The IR module maintains a global state: the current function being built,
+the current basic block, and a vector of all IR functions.
+
+@d IR: init @{
+// -- kcc_ir_init ----------------------------------------------------------
+// void kcc_ir_init(void)
+// Initializes the IR module.  Must be called before any IR construction.
+.text
+.globl _kcc_ir_init
+.p2align 2
+_kcc_ir_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Zero out current function/block pointers
+    adrp x0, _kcc_ir_cur_func@@PAGE
+    add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
+    str xzr, [x0]
+
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    str xzr, [x0]
+
+    // Initialize function list vector (8 bytes per pointer, cap 16)
+    mov x0, #VEC_SIZE
+    bl _kcc_arena_alloc
+    adrp x1, _kcc_ir_funcs@@PAGE
+    add  x1, x1, _kcc_ir_funcs@@PAGEOFF
+    str x0, [x1]
+    mov x1, #8              // elem size = pointer
+    str x1, [x0, #VEC_ELEMSIZE]
+    mov x1, #16
+    str x1, [x0, #VEC_CAP]
+    str xzr, [x0, #VEC_COUNT]
+    mov x19, x0             // save vec
+
+    // Allocate initial data array
+    mov x0, #128            // 16 * 8
+    bl _kcc_arena_alloc
+    str x0, [x19, #VEC_DATA]
+
+    // Initialize local variable hash table
+    mov x0, #64
+    bl _kcc_ht_init
+    adrp x1, _kcc_ir_locals@@PAGE
+    add  x1, x1, _kcc_ir_locals@@PAGEOFF
+    str x0, [x1]
+
+    // Initialize break/continue stack (vec of pairs, 16 bytes each)
+    mov x0, #VEC_SIZE
+    bl _kcc_arena_alloc
+    adrp x1, _kcc_ir_loop_stack@@PAGE
+    add  x1, x1, _kcc_ir_loop_stack@@PAGEOFF
+    str x0, [x1]
+    mov x1, #16             // elem size = 2 pointers (continue_bb, break_bb)
+    str x1, [x0, #VEC_ELEMSIZE]
+    mov x1, #8
+    str x1, [x0, #VEC_CAP]
+    str xzr, [x0, #VEC_COUNT]
+    mov x19, x0
+
+    mov x0, #128            // 8 * 16
+    bl _kcc_arena_alloc
+    str x0, [x19, #VEC_DATA]
+
+    // Zero the BB counter
+    adrp x0, _kcc_ir_bb_counter@@PAGE
+    add  x0, x0, _kcc_ir_bb_counter@@PAGEOFF
+    str xzr, [x0]
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Allocating IR Nodes}
+
+Every IR structure is arena-allocated.
+
+@d IR: alloc instruction @{
+// -- kcc_ir_alloc_instr ---------------------------------------------------
+// ir_instr *kcc_ir_alloc_instr(uint64_t opcode)
+//   x0 = opcode
+// Returns a zeroed IR instruction with the given opcode.
+.text
+.globl _kcc_ir_alloc_instr
+.p2align 2
+_kcc_ir_alloc_instr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0              // save opcode
+
+    mov x0, #IR_INSTR_SIZE
+    bl _kcc_arena_alloc
+
+    str x19, [x0, #IR_OP]
+    str xzr, [x0, #IR_DEST]
+    str xzr, [x0, #IR_SRC1]
+    str xzr, [x0, #IR_SRC2]
+    str xzr, [x0, #IR_TYPE]
+    str xzr, [x0, #IR_NEXT]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+@d IR: alloc basic block @{
+// -- kcc_ir_alloc_bb ------------------------------------------------------
+// ir_bb *kcc_ir_alloc_bb(void)
+// Returns a new basic block with a unique ID.
+.text
+.globl _kcc_ir_alloc_bb
+.p2align 2
+_kcc_ir_alloc_bb:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x0, #IR_BB_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+
+    // Assign unique BB id
+    adrp x1, _kcc_ir_bb_counter@@PAGE
+    add  x1, x1, _kcc_ir_bb_counter@@PAGEOFF
+    ldr x2, [x1]
+    str x2, [x19, #BB_ID]
+    add x2, x2, #1
+    str x2, [x1]
+
+    str xzr, [x19, #BB_FIRST]
+    str xzr, [x19, #BB_LAST]
+    str xzr, [x19, #BB_NEXT]
+    str xzr, [x19, #BB_FLAGS]
+
+    mov x0, x19
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+@d IR: alloc function @{
+// -- kcc_ir_alloc_func ----------------------------------------------------
+// ir_func *kcc_ir_alloc_func(const char *name, type_desc *ret_type)
+//   x0 = function name pointer
+//   x1 = return type descriptor
+// Returns a new IR function.
+.text
+.globl _kcc_ir_alloc_func
+.p2align 2
+_kcc_ir_alloc_func:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0              // save name
+    mov x20, x1              // save ret_type
+
+    mov x0, #IR_FUNC_SIZE
+    bl _kcc_arena_alloc
+    mov x21, x0              // x21 = func
+
+    str x19, [x21, #IRF_NAME]
+    str x20, [x21, #IRF_RETTYPE]
+    str xzr, [x21, #IRF_ENTRY]
+    str xzr, [x21, #IRF_VREG_N]
+    str xzr, [x21, #IRF_PARAMS]
+
+    // Allocate blocks vec
+    mov x0, #VEC_SIZE
+    bl _kcc_arena_alloc
+    str x0, [x21, #IRF_BLOCKS]
+    mov x1, #8
+    str x1, [x0, #VEC_ELEMSIZE]
+    mov x1, #16
+    str x1, [x0, #VEC_CAP]
+    str xzr, [x0, #VEC_COUNT]
+    mov x19, x0
+
+    mov x0, #128             // 16 * 8
+    bl _kcc_arena_alloc
+    str x0, [x19, #VEC_DATA]
+
+    mov x0, x21              // return func
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Emitting Instructions}
+
+@d IR: emit @{
+// -- kcc_ir_emit ----------------------------------------------------------
+// void kcc_ir_emit(ir_instr *instr)
+// Appends an instruction to the current basic block.
+// If the BB is already terminated, the instruction is silently dropped.
+.text
+.globl _kcc_ir_emit
+.p2align 2
+_kcc_ir_emit:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0              // x19 = instr
+
+    // Get current BB
+    adrp x1, _kcc_ir_cur_bb@@PAGE
+    add  x1, x1, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x1, [x1]
+    cbz x1, .Lie_done        // no current BB
+
+    // Check if BB is terminated
+    ldr x2, [x1, #BB_FLAGS]
+    tst x2, #BB_FLAG_TERMINATED
+    b.ne .Lie_done            // already terminated, drop
+
+    // Append to BB's instruction list
+    ldr x2, [x1, #BB_LAST]
+    cbz x2, .Lie_first
+
+    // Not first: link after last
+    str x19, [x2, #IR_NEXT]
+    str x19, [x1, #BB_LAST]
+    b .Lie_done
+
+.Lie_first:
+    str x19, [x1, #BB_FIRST]
+    str x19, [x1, #BB_LAST]
+
+.Lie_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Virtual Register Allocation}
+
+Each function maintains a monotonically increasing vreg counter.
+
+@d IR: next vreg @{
+// -- kcc_ir_next_vreg -----------------------------------------------------
+// uint64_t kcc_ir_next_vreg(void)
+// Returns the next virtual register number for the current function.
+.text
+.globl _kcc_ir_next_vreg
+.p2align 2
+_kcc_ir_next_vreg:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_ir_cur_func@@PAGE
+    add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lnv_zero
+
+    ldr x1, [x0, #IRF_VREG_N]
+    add x2, x1, #1
+    str x2, [x0, #IRF_VREG_N]
+    mov x0, x1
+
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lnv_zero:
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Switching Basic Blocks}
+
+@d IR: set current bb @{
+// -- kcc_ir_set_bb --------------------------------------------------------
+// void kcc_ir_set_bb(ir_bb *bb)
+// Sets bb as the current insertion point and appends it to the
+// current function's block list.
+.text
+.globl _kcc_ir_set_bb
+.p2align 2
+_kcc_ir_set_bb:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0
+
+    // Set as current BB
+    adrp x1, _kcc_ir_cur_bb@@PAGE
+    add  x1, x1, _kcc_ir_cur_bb@@PAGEOFF
+    str x19, [x1]
+
+    // Add to current function's block vec
+    adrp x0, _kcc_ir_cur_func@@PAGE
+    add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lisb_done
+
+    ldr x0, [x0, #IRF_BLOCKS]   // vec
+    // vec_push takes (x0=vec, x1=pointer_to_element)
+    // Store x19 on stack so we can pass its address
+    str x19, [sp, #24]           // use stack slot for element
+    add x1, sp, #24
+    bl _kcc_vec_push
+
+.Lisb_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{IR Module Data}
+
+@d IR: data @{
+// -- IR module data -------------------------------------------------------
+.data
+.p2align 3
+.globl _kcc_ir_cur_func
+_kcc_ir_cur_func:    .quad 0     // current IR function being built
+.globl _kcc_ir_cur_bb
+_kcc_ir_cur_bb:      .quad 0     // current basic block for emission
+.globl _kcc_ir_funcs
+_kcc_ir_funcs:       .quad 0     // vec of all IR functions
+.globl _kcc_ir_locals
+_kcc_ir_locals:      .quad 0     // hash table: name → alloca vreg
+.globl _kcc_ir_loop_stack
+_kcc_ir_loop_stack:  .quad 0     // vec of (continue_bb, break_bb) pairs
+.globl _kcc_ir_bb_counter
+_kcc_ir_bb_counter:  .quad 0     // global BB id counter
+@}

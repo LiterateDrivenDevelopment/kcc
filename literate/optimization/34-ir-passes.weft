@@ -1,0 +1,91 @@
+% 34-ir-passes.weft — Optimization Pass Manager
+%
+% Runs constant folding and dead code elimination in a loop
+% until no more changes occur (fixed-point iteration).
+
+\chapter{Optimization Passes}
+\label{ch:ir-passes}
+
+@d Opt: pass manager @{
+// -- kcc_opt_run ----------------------------------------------------------
+// void kcc_opt_run(void)
+// Runs optimization passes on all IR functions until stable.
+.text
+.globl _kcc_opt_run
+.p2align 2
+_kcc_opt_run:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Load function list
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x19, [x0]
+    cbz x19, .Lpr_done
+
+    ldr x20, [x19, #VEC_COUNT]
+    mov x21, #0
+
+.Lpr_func_loop:
+    cmp x21, x20
+    b.ge .Lpr_done
+
+    mov x0, x19
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x22, [x0]               // func ptr
+
+    // Run passes on this function
+    mov x0, x22
+    bl _kcc_opt_run_func
+
+    add x21, x21, #1
+    b .Lpr_func_loop
+
+.Lpr_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_opt_run_func -----------------------------------------------------
+// void kcc_opt_run_func(ir_func *func)
+// Iterates constfold + dce until no changes.
+.text
+.globl _kcc_opt_run_func
+.p2align 2
+_kcc_opt_run_func:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                 // func
+    mov x20, #0                 // iteration counter (safety limit)
+
+.Lprf_loop:
+    cmp x20, #10                // max 10 iterations
+    b.ge .Lprf_done
+
+    // Run constant folding
+    mov x0, x19
+    bl _kcc_opt_constfold
+    mov x1, x0                  // fold count
+
+    // Run DCE
+    mov x0, x19
+    bl _kcc_opt_dce
+    add x0, x0, x1              // total changes
+
+    // If no changes, we're done
+    cbz x0, .Lprf_done
+
+    add x20, x20, #1
+    b .Lprf_loop
+
+.Lprf_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}

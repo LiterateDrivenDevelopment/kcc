@@ -1,0 +1,304 @@
+% 40-linker-info.weft — Relocation and Symbol Table Management
+%
+% This chapter manages the relocation entries and symbol table that the
+% Mach-O writer needs.  Relocations record places in the code that need
+% patching by the linker (branch targets to external functions, ADRP/ADD
+% pairs for global data).  The symbol table tracks defined and external
+% symbols.
+
+\chapter{Linker Information}
+\label{ch:linker-info}
+
+\section{Data Structures}
+
+A relocation entry is 24 bytes:
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Offset & Field & Description \\
+\hline
+0  & offset   & Byte offset in code section \\
+8  & type     & Relocation type \\
+16 & sym\_idx & Symbol table index \\
+\hline
+\end{tabular}
+\end{center}
+
+A symbol entry is 32 bytes:
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Offset & Field & Description \\
+\hline
+0  & name     & Pointer to symbol name string \\
+8  & section  & Section number (1-based, 0=undefined) \\
+16 & value    & Symbol value (offset within section) \\
+24 & flags    & N\_EXT, N\_SECT, etc. \\
+\hline
+\end{tabular}
+\end{center}
+
+@d Linker: constants @{
+// -- Linker data structure layout ---------------------------------------------
+.equ RELOC_OFFSET,     0
+.equ RELOC_TYPE,       8
+.equ RELOC_SYM,       16
+.equ RELOC_SIZE,      24
+
+.equ SYM_NAME,        0
+.equ SYM_SECTION,     8
+.equ SYM_VALUE,      16
+.equ SYM_FLAGS,      24
+.equ SYM_ENTRY_SIZE, 32
+
+// -- Mach-O relocation types --------------------------------------------------
+.equ ARM64_RELOC_BRANCH26,  2
+.equ ARM64_RELOC_PAGE21,    3
+.equ ARM64_RELOC_PAGEOFF12, 4
+
+// -- Mach-O symbol flags ------------------------------------------------------
+.equ N_UNDF,   0x00
+.equ N_EXT,    0x01
+.equ N_SECT,   0x0E
+@}
+
+\section{Initialization}
+
+@d Linker: init @{
+// -- kcc_linker_init ----------------------------------------------------------
+// void kcc_linker_init(void)
+// Allocates relocation vec, symbol vec, and string table buffer.
+.text
+.globl _kcc_linker_init
+.p2align 2
+_kcc_linker_init:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Allocate reloc vec (elem=24 bytes, initial cap=32)
+    mov x0, #VEC_SIZE
+    bl _kcc_arena_alloc
+    adrp x1, _kcc_linker_relocs@@PAGE
+    add  x1, x1, _kcc_linker_relocs@@PAGEOFF
+    str x0, [x1]
+    mov x1, #RELOC_SIZE
+    str x1, [x0, #VEC_ELEMSIZE]
+    mov x1, #32
+    str x1, [x0, #VEC_CAP]
+    str xzr, [x0, #VEC_COUNT]
+    mov x19, x0
+
+    mov x0, #768                  // 32 * 24
+    bl _kcc_arena_alloc
+    str x0, [x19, #VEC_DATA]
+
+    // Allocate symbol vec (elem=32 bytes, initial cap=32)
+    mov x0, #VEC_SIZE
+    bl _kcc_arena_alloc
+    adrp x1, _kcc_linker_syms@@PAGE
+    add  x1, x1, _kcc_linker_syms@@PAGEOFF
+    str x0, [x1]
+    mov x1, #SYM_ENTRY_SIZE
+    str x1, [x0, #VEC_ELEMSIZE]
+    mov x1, #32
+    str x1, [x0, #VEC_CAP]
+    str xzr, [x0, #VEC_COUNT]
+    mov x19, x0
+
+    mov x0, #1024                 // 32 * 32
+    bl _kcc_arena_alloc
+    str x0, [x19, #VEC_DATA]
+
+    // Allocate extern lookup hash table
+    mov x0, #64
+    bl _kcc_ht_init
+    adrp x1, _kcc_linker_extern_ht@@PAGE
+    add  x1, x1, _kcc_linker_extern_ht@@PAGEOFF
+    str x0, [x1]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Adding Symbols}
+
+@d Linker: add symbol @{
+// -- kcc_linker_add_sym -------------------------------------------------------
+// uint64_t kcc_linker_add_sym(const char *name, uint64_t section,
+//                             uint64_t value, uint64_t flags)
+//   x0=name, x1=section, x2=value, x3=flags
+// Returns the symbol index (0-based).
+.text
+.globl _kcc_linker_add_sym
+.p2align 2
+_kcc_linker_add_sym:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Build entry on stack
+    str x0, [sp, #32]             // SYM_NAME
+    str x1, [sp, #40]             // SYM_SECTION
+    str x2, [sp, #48]             // SYM_VALUE
+    str x3, [sp, #56]             // SYM_FLAGS
+
+    // Get symbol vec
+    adrp x0, _kcc_linker_syms@@PAGE
+    add  x0, x0, _kcc_linker_syms@@PAGEOFF
+    ldr x0, [x0]
+
+    // Save current count as return value
+    ldr x19, [x0, #VEC_COUNT]
+
+    // Push entry
+    add x1, sp, #32              // pointer to entry on stack
+    bl _kcc_vec_push
+
+    mov x0, x19                   // return index
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Adding Relocations}
+
+@d Linker: add reloc @{
+// -- kcc_linker_add_reloc -----------------------------------------------------
+// void kcc_linker_add_reloc(uint64_t offset, uint64_t type, uint64_t sym_index)
+//   x0=offset, x1=type, x2=sym_index
+.text
+.globl _kcc_linker_add_reloc
+.p2align 2
+_kcc_linker_add_reloc:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+
+    // Build entry on stack
+    str x0, [sp, #16]             // RELOC_OFFSET
+    str x1, [sp, #24]             // RELOC_TYPE
+    str x2, [sp, #32]             // RELOC_SYM
+
+    // Get reloc vec
+    adrp x0, _kcc_linker_relocs@@PAGE
+    add  x0, x0, _kcc_linker_relocs@@PAGEOFF
+    ldr x0, [x0]
+
+    add x1, sp, #16              // pointer to entry
+    bl _kcc_vec_push
+
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{External Symbol Lookup}
+
+When code references an external function (e.g., a call to a C
+library function), we need to add it to the symbol table as undefined
+and return its index.  We deduplicate using a hash table.
+
+@d Linker: lookup or add extern @{
+// -- kcc_linker_extern --------------------------------------------------------
+// uint64_t kcc_linker_extern(const char *name)
+//   x0 = null-terminated symbol name
+// Returns the symbol index, adding a new N_UNDF|N_EXT entry if needed.
+.text
+.globl _kcc_linker_extern
+.p2align 2
+_kcc_linker_extern:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                   // save name
+
+    // Check hash table for existing entry
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19                   // key = name
+    mov x20, x19
+    // Need key length
+    mov x0, x19
+    bl _kcc_strlen
+    mov x20, x0                   // name len
+
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19                   // key
+    mov x2, x20                   // keylen
+    bl _kcc_ht_get
+    cbz x0, .Lle_new
+
+    // Found: value is sym_index+1 (so 0 means "not found")
+    sub x0, x0, #1
+    b .Lle_done
+
+.Lle_new:
+    // Add new undefined external symbol
+    mov x0, x19                   // name
+    mov x1, #0                    // section = 0 (N_UNDF)
+    mov x2, #0                    // value = 0
+    mov x3, #(N_EXT)             // flags = N_EXT (external, undefined)
+    bl _kcc_linker_add_sym
+    mov x19, x0                   // save sym_index (now reuse x19)
+
+    // Store in hash table (value = sym_index + 1)
+    str x19, [sp, #32]            // temp save
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [sp, #32]             // restore saved name? No, x19 is now sym_index
+
+    // We need name and len again
+    // x19 = sym_index, but we saved original name...
+    // Actually let's restructure: save name in sp+32
+    // The issue is we've overwritten x19. Let me fix:
+    // Get name from symbol table entry
+    adrp x1, _kcc_linker_syms@@PAGE
+    add  x1, x1, _kcc_linker_syms@@PAGEOFF
+    ldr x1, [x1]
+    ldr x1, [x1, #VEC_DATA]
+    mov x2, #SYM_ENTRY_SIZE
+    mul x2, x19, x2
+    add x1, x1, x2
+    ldr x1, [x1, #SYM_NAME]      // get name back from entry
+
+    // hash table put: ht, key, keylen, value
+    str x1, [sp, #32]             // save name ptr
+    mov x0, x1
+    bl _kcc_strlen
+    mov x20, x0                   // keylen
+
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [sp, #32]             // name
+    mov x2, x20                   // keylen
+    add x3, x19, #1              // value = sym_index + 1
+    bl _kcc_ht_put
+
+    mov x0, x19                   // return sym_index
+
+.Lle_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Linker Data}
+
+@d Linker: data @{
+// -- Linker module data -------------------------------------------------------
+.data
+.p2align 3
+.globl _kcc_linker_relocs
+_kcc_linker_relocs:      .quad 0     // vec of relocation entries
+.globl _kcc_linker_syms
+_kcc_linker_syms:        .quad 0     // vec of symbol entries
+.globl _kcc_linker_extern_ht
+_kcc_linker_extern_ht:   .quad 0     // hash table for extern dedup
+@}

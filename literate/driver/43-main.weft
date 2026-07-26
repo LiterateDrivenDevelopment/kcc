@@ -86,6 +86,20 @@ _main:
     bl _kcc_strcmp
     cbz x0, .Lmain_check
 
+    // Check if argv[1] is "--dump-ir"
+    ldr x0, [x20, #8]            // argv[1]
+    adrp x1, _kcc_opt_dump_ir@@PAGE
+    add  x1, x1, _kcc_opt_dump_ir@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmain_dump_ir
+
+    // Check if argv[1] is "-c" (compile to object file)
+    ldr x0, [x20, #8]            // argv[1]
+    adrp x1, _kcc_opt_compile@@PAGE
+    add  x1, x1, _kcc_opt_compile@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmain_compile
+
     // Not a flag: treat as source file (legacy Phase 0 behavior)
     adrp x0, _kcc_msg_source@@PAGE
     add  x0, x0, _kcc_msg_source@@PAGEOFF
@@ -298,6 +312,86 @@ _main:
     bl _kcc_io_puts
     b .Lmain_exit
 
+.Lmain_dump_ir:
+    // --dump-ir: parse + sema + IR build + optimize + dump
+    cmp x19, #3
+    b.lt .Lmain_ir_usage
+
+    ldr x0, [x20, #16]           // argv[2]
+    bl _kcc_source_open
+    bl _kcc_source_encode
+    bl _kcc_source_splice
+
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_lex_init
+    bl _kcc_pp_init
+    bl _kcc_strtab_init
+    bl _kcc_typedef_init
+    bl _kcc_parse
+    mov x21, x0                   // save trans_unit
+
+    // Initialize type system and symbol table
+    bl _kcc_types_init
+    bl _kcc_symtab_init
+
+    // Run semantic analysis
+    mov x0, x21
+    bl _kcc_sema_check
+
+    // Check for errors before IR
+    bl _kcc_diag_had_errors
+    cbnz x0, .Lmain_error_exit
+
+    // Initialize IR module
+    bl _kcc_ir_init
+
+    // Build IR from AST
+    mov x0, x21
+    bl _kcc_ir_build
+
+    // Run optimization passes
+    bl _kcc_opt_run
+
+    // Dump IR
+    bl _kcc_ir_dump
+
+    bl _kcc_io_flush
+    bl _kcc_diag_had_errors
+    cbnz x0, .Lmain_error_exit
+    b .Lmain_exit
+
+.Lmain_compile:
+    // -c <source> -o <output>
+    // Requires at least: kcc -c source -o output (argc >= 5)
+    cmp x19, #5
+    b.lt .Lmain_compile_usage
+
+    ldr x0, [x20, #16]            // argv[2] = source file
+    ldr x1, [x20, #32]            // argv[4] = output file
+    bl _kcc_driver_compile
+    b .Lmain_exit
+
+.Lmain_compile_usage:
+    // Minimal: kcc -c source.c -o out.o (but allow kcc -c src -o out)
+    // Also allow: kcc -c source (default output: a.o? No, require -o)
+    adrp x0, _kcc_err_compile_usage@@PAGE
+    add  x0, x0, _kcc_err_compile_usage@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
+.Lmain_ir_usage:
+    adrp x0, _kcc_err_ir_usage@@PAGE
+    add  x0, x0, _kcc_err_ir_usage@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
 .Lmain_types_usage:
     adrp x0, _kcc_err_types_usage@@PAGE
     add  x0, x0, _kcc_err_types_usage@@PAGEOFF
@@ -369,7 +463,7 @@ _kcc_banner:
 _kcc_msg_source:
     .asciz "source: "
 _kcc_msg_usage:
-    .asciz "usage: kcc [--dump-tokens|-E|--dump-ast|--dump-types|--check] <source.c>\n"
+    .asciz "usage: kcc [--dump-tokens|-E|--dump-ast|--dump-types|--check|--dump-ir|-c <src> -o <out>] <source.c>\n"
 _kcc_msg_newline:
     .asciz "\n"
 _kcc_opt_dump_tokens:
@@ -394,4 +488,12 @@ _kcc_err_check_usage:
     .asciz "kcc: error: --check requires a source file\n"
 _kcc_msg_check_ok:
     .asciz "semantic check passed\n"
+_kcc_opt_dump_ir:
+    .asciz "--dump-ir"
+_kcc_err_ir_usage:
+    .asciz "kcc: error: --dump-ir requires a source file\n"
+_kcc_opt_compile:
+    .asciz "-c"
+_kcc_err_compile_usage:
+    .asciz "kcc: error: usage: kcc -c <source.c> -o <output.o>\n"
 @}

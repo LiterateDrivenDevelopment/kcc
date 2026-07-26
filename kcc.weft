@@ -182,7 +182,36 @@
 @i literate/semantics/28-conversions.weft
 
 % ═══════════════════════════════════════════════════════════════════
-% Part V: Driver
+% Part V: Intermediate Representation
+% ═══════════════════════════════════════════════════════════════════
+\part{Intermediate Representation}
+
+@i literate/ir/31-ir-design.weft
+@i literate/ir/32-ir-builder.weft
+@i literate/ir/33-ir-validation.weft
+
+% ═══════════════════════════════════════════════════════════════════
+% Part VI: Optimization
+% ═══════════════════════════════════════════════════════════════════
+\part{Optimization}
+
+@i literate/optimization/34-ir-passes.weft
+@i literate/optimization/35-peephole.weft
+@i literate/optimization/36-dce.weft
+
+% ═══════════════════════════════════════════════════════════════════
+% Part VII: The Backend
+% ═══════════════════════════════════════════════════════════════════
+\part{The Backend}
+
+@i literate/backend/37-codegen.weft
+@i literate/backend/38-emit-arm64.weft
+@i literate/backend/39-emit-macho.weft
+@i literate/backend/40-linker-info.weft
+@i literate/driver/42-driver.weft
+
+% ═══════════════════════════════════════════════════════════════════
+% Part VIII: Driver
 % ═══════════════════════════════════════════════════════════════════
 \part{The Driver}
 

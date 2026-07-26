@@ -1,0 +1,1269 @@
+% 37-codegen.weft — IR to ARM64 Code Generation
+%
+% This chapter implements the core code generator.  It walks the IR
+% produced by the frontend and emits ARM64 machine code using the
+% ``all-spill'' strategy: every virtual register is assigned a stack
+% slot.  Instructions load sources into scratch registers (x9, x10),
+% compute the result in x11, and store it back.  This produces correct
+% (if unoptimized) code and allows us to get a working compiler before
+% implementing register allocation.
+
+\chapter{Code Generation}
+\label{ch:codegen}
+
+\section{Strategy}
+
+The stack frame for a generated function:
+\begin{verbatim}
+  [x29, x30]   at offset 0 from frame base (saved by STP)
+  vreg 0       at [x29, #-8]
+  vreg 1       at [x29, #-16]
+  ...
+  vreg N-1     at [x29, #-(N*8)]
+\end{verbatim}
+
+The total frame size is $\mathit{align16}(16 + \text{vreg\_count} \times 8)$.
+We use x9 for source~1, x10 for source~2, and x11 as the destination
+scratch register.
+
+\section{Constants}
+
+@d CodeGen: constants @{
+// -- CodeGen constants --------------------------------------------------------
+.equ CG_SLOT_SIZE,   8           // each vreg occupies 8 bytes on stack
+.equ CG_REG_SRC1,   9           // x9 = first source scratch
+.equ CG_REG_SRC2,  10           // x10 = second source scratch
+.equ CG_REG_DST,   11           // x11 = destination scratch
+
+// Forward-branch patch entry: {code_offset(8), target_bb_id(8)} = 16 bytes
+.equ PATCH_OFFSET,   0
+.equ PATCH_TARGET,   8
+.equ PATCH_SIZE,    16
+@}
+
+\section{Initialization}
+
+@d CodeGen: init @{
+// -- kcc_codegen_init ---------------------------------------------------------
+.text
+.globl _kcc_codegen_init
+.p2align 2
+_kcc_codegen_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Zero state
+    adrp x0, _kcc_cg_frame_size@@PAGE
+    add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
+    str xzr, [x0]
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Compile All Functions}
+
+@d CodeGen: compile all @{
+// -- kcc_codegen_all ----------------------------------------------------------
+// void kcc_codegen_all(void)
+// Iterates all IR functions and generates code for each.
+.text
+.globl _kcc_codegen_all
+.p2align 2
+_kcc_codegen_all:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Get IR functions vec
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lcga_done
+
+    ldr x19, [x0, #VEC_COUNT]     // number of functions
+    mov x20, #0                    // index
+
+.Lcga_loop:
+    cmp x20, x19
+    b.ge .Lcga_done
+
+    // Get function pointer: vec_get(funcs_vec, index)
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    bl _kcc_vec_get
+    ldr x0, [x0]                  // dereference: vec stores pointers
+
+    bl _kcc_codegen_func
+
+    add x20, x20, #1
+    b .Lcga_loop
+
+.Lcga_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Compile Function}
+
+@d CodeGen: compile function @{
+// -- kcc_codegen_func ---------------------------------------------------------
+// void kcc_codegen_func(ir_func *func)
+//   x0 = pointer to IR function
+.text
+.globl _kcc_codegen_func
+.p2align 2
+_kcc_codegen_func:
+    stp x29, x30, [sp, #-112]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    mov x19, x0                    // x19 = ir_func
+
+    // 1. Compute frame size: align16(16 + vreg_count * 16)
+    //    Each vreg gets 8 bytes for its value slot.
+    //    Allocas get extra 8 bytes for their storage (at offset vreg_count*8+16).
+    ldr x0, [x19, #IRF_VREG_N]    // vreg count
+    lsl x0, x0, #4                // * 16 (double: value slots + alloca storage)
+    add x0, x0, #16               // + 16 for fp/lr
+    add x0, x0, #15               // round up
+    and x0, x0, #~15              // align to 16
+    mov x20, x0                    // x20 = frame_size
+
+    adrp x1, _kcc_cg_frame_size@@PAGE
+    add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
+    str x20, [x1]
+
+    // 2. Record function start offset
+    bl _kcc_code_current_pos
+    mov x21, x0                    // x21 = func_start_offset
+
+    // 3. Initialize BB label hash table (bb_id → code_offset)
+    mov x0, #64
+    bl _kcc_ht_init
+    mov x22, x0                    // x22 = bb_labels ht
+
+    // 4. Initialize forward-branch patch vec
+    mov x0, #VEC_SIZE
+    bl _kcc_arena_alloc
+    mov x23, x0                    // x23 = patch vec
+    mov x1, #PATCH_SIZE
+    str x1, [x23, #VEC_ELEMSIZE]
+    mov x1, #32
+    str x1, [x23, #VEC_CAP]
+    str xzr, [x23, #VEC_COUNT]
+
+    mov x0, #512                   // 32 * 16
+    bl _kcc_arena_alloc
+    str x0, [x23, #VEC_DATA]
+
+    // 5. Emit prologue: stp x29, x30, [sp, #-frame_size]!
+    //                    mov x29, sp
+    // STP pre-index: imm7 = -frame_size/8
+    mov x0, #29                    // rt1 = x29
+    mov x1, #30                    // rt2 = x30
+    mov x2, #31                    // rn = sp
+    neg x3, x20
+    asr x3, x3, #3                // imm7 = -frame_size / 8
+    bl _kcc_enc_stp_pre
+    bl _kcc_code_emit32
+
+    // mov x29, sp → ADD x29, sp, #0
+    mov x0, #29                    // rd = x29
+    mov x1, #31                    // rn = sp
+    mov x2, #0                     // imm12 = 0
+    mov x3, #1                     // sf = 64-bit
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    // 6. Store arguments (x0-x7) to their vreg stack slots
+    ldr x24, [x19, #IRF_PARAMS]   // param count
+    mov x25, #0                    // param index
+
+.Lcgf_store_args:
+    cmp x25, x24
+    b.ge .Lcgf_walk_bbs
+    cmp x25, #8
+    b.ge .Lcgf_walk_bbs           // max 8 register args
+
+    // STR x<param>, [x29, #slot_offset(param)]
+    // slot_offset(vreg) = -(16 + vreg*8) but for unsigned offset STR
+    // we need positive offset from sp. Actually with frame pointer:
+    // sp = x29 - frame_size + 16? No.
+    // After prologue: x29 = sp, and sp was decremented by frame_size.
+    // So x29 points to the OLD sp - frame_size.
+    // Stored fp/lr are at [x29, #0] and [x29, #8].
+    // vreg N is at [x29, #16 + N*8] ... wait no.
+    //
+    // Let's use: vreg N at [sp, #16 + N*8]
+    // Since x29 == sp after prologue, this is [x29, #16 + N*8]
+    // Frame layout:
+    //   [x29+0]: saved x29 (old fp)
+    //   [x29+8]: saved x30 (lr)
+    //   [x29+16]: vreg 0
+    //   [x29+24]: vreg 1
+    //   ...
+    //   [x29+16+N*8]: vreg N
+
+    // Encode STR: rt=param_reg, rn=29(x29), imm12_scaled=(16+param*8)/8
+    mov x0, x25                    // rt = x<param_index>
+    mov x1, #29                    // rn = x29
+    add x2, x25, #2               // imm12_scaled = (16 + param*8)/8 = param + 2
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+
+    add x25, x25, #1
+    b .Lcgf_store_args
+
+.Lcgf_walk_bbs:
+    // 7. Walk all BBs: get blocks vec from function
+    ldr x24, [x19, #IRF_BLOCKS]   // blocks vec
+    ldr x25, [x24, #VEC_COUNT]    // number of BBs
+    mov x26, #0                    // BB index
+
+.Lcgf_bb_loop:
+    cmp x26, x25
+    b.ge .Lcgf_patch
+
+    // Get BB pointer
+    mov x0, x24
+    mov x1, x26
+    bl _kcc_vec_get
+    ldr x27, [x0]                  // x27 = current BB
+
+    // Record BB label: bb_id → current code offset
+    // Allocate persistent key buffer (8 bytes) so ht stores a unique pointer
+    // (All entries must have distinct key pointers for memcmp during lookup)
+    mov x0, #8
+    bl _kcc_arena_alloc
+    mov x28, x0                    // x28 = persistent key buffer
+    ldr x1, [x27, #BB_ID]
+    str x1, [x28]                  // store bb_id in arena-allocated memory
+
+    // ht_put(bb_labels, key_ptr, 8, code_offset+1)
+    bl _kcc_code_current_pos
+    add x3, x0, #1                // value = offset + 1 (distinguish from 0)
+    mov x0, x22                    // ht
+    mov x1, x28                    // key = arena-allocated pointer to bb_id
+    mov x2, #8                     // keylen = 8 bytes
+    bl _kcc_ht_put
+
+    // Walk instructions in this BB
+    ldr x27, [x27, #BB_FIRST]     // first instruction
+
+.Lcgf_instr_loop:
+    cbz x27, .Lcgf_next_bb
+
+    // Generate code for this instruction
+    mov x0, x27                    // instruction
+    mov x1, x22                    // bb_labels ht
+    mov x2, x23                    // patch vec
+    bl _kcc_codegen_instr
+
+    // Next instruction
+    ldr x27, [x27, #IR_NEXT]
+    b .Lcgf_instr_loop
+
+.Lcgf_next_bb:
+    add x26, x26, #1
+    b .Lcgf_bb_loop
+
+.Lcgf_patch:
+    // 8. Patch forward branches
+    mov x0, x22                    // bb_labels ht
+    mov x1, x23                    // patch vec
+    bl _kcc_codegen_patch_branches
+
+    // 9. Add function symbol to linker (Mach-O needs leading underscore)
+    ldr x24, [x19, #IRF_NAME]     // name
+    mov x0, x24
+    bl _kcc_strlen
+    add x0, x0, #2                // +1 for '_' prefix, +1 for null
+    bl _kcc_arena_alloc
+    mov x25, x0                   // x25 = new name buffer
+    mov w1, #'_'
+    strb w1, [x25]                // prefix '_'
+    add x0, x25, #1              // dest = buf+1
+    mov x1, x24                   // src = original name
+    mov x2, x24
+    mov x0, x2
+    bl _kcc_strlen
+    add x2, x0, #1               // len = strlen(name) + 1 (include null)
+    add x0, x25, #1              // dest
+    mov x1, x24                   // src
+    bl _kcc_memcpy
+    mov x0, x25                   // name = "_main"
+    mov x1, #1                     // section = 1 (__text)
+    mov x2, x21                    // value = func_start_offset
+    mov x3, #(N_SECT | N_EXT)     // flags = defined + external
+    bl _kcc_linker_add_sym
+
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #112
+    ret
+@}
+
+\section{Vreg Slot Offset}
+
+@d CodeGen: vreg slot offset @{
+// -- kcc_cg_slot_offset -------------------------------------------------------
+// uint64_t kcc_cg_slot_offset(uint64_t vreg)
+// Returns the scaled imm12 value for LDR/STR unsigned offset (64-bit).
+// slot_offset = (16 + vreg * 8) / 8 = vreg + 2
+// So LDR x9, [x29, #(16 + vreg*8)] encodes imm12_scaled = vreg + 2
+.text
+.globl _kcc_cg_slot_offset
+.p2align 2
+_kcc_cg_slot_offset:
+    add x0, x0, #2                // imm12_scaled = vreg + 2
+    ret
+
+// -- kcc_cg_load_vreg ---------------------------------------------------------
+// void kcc_cg_load_vreg(uint64_t vreg, uint64_t reg)
+//   x0 = vreg number, x1 = target register number (9, 10, or 11)
+// Emits: LDR x<reg>, [x29, #slot_offset]
+.text
+.globl _kcc_cg_load_vreg
+.p2align 2
+_kcc_cg_load_vreg:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    add x2, x0, #2                // imm12_scaled = vreg + 2
+    mov x0, x1                     // rt = target reg
+    mov x1, #29                    // rn = x29
+    // x2 already set
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_cg_store_vreg --------------------------------------------------------
+// void kcc_cg_store_vreg(uint64_t vreg, uint64_t reg)
+//   x0 = vreg number, x1 = source register number
+// Emits: STR x<reg>, [x29, #slot_offset]
+.text
+.globl _kcc_cg_store_vreg
+.p2align 2
+_kcc_cg_store_vreg:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    add x2, x0, #2                // imm12_scaled = vreg + 2
+    mov x0, x1                     // rt = source reg
+    mov x1, #29                    // rn = x29
+    // x2 already set
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Instruction Dispatch}
+
+@d CodeGen: instruction dispatch @{
+// -- kcc_codegen_instr --------------------------------------------------------
+// void kcc_codegen_instr(ir_instr *instr, ht *bb_labels, vec *patches)
+//   x0 = instruction, x1 = bb label ht, x2 = patch vec
+.text
+.globl _kcc_codegen_instr
+.p2align 2
+_kcc_codegen_instr:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+
+    mov x19, x0                    // instr
+    mov x20, x1                    // bb_labels
+    mov x21, x2                    // patches
+
+    ldr x22, [x19, #IR_OP]        // opcode
+
+    // Dispatch on opcode
+    cmp x22, #IR_NOP
+    b.eq .Lcgi_done
+
+    cmp x22, #IR_CONST
+    b.eq .Lcgi_const
+
+    cmp x22, #IR_ADD
+    b.eq .Lcgi_add
+    cmp x22, #IR_SUB
+    b.eq .Lcgi_sub
+    cmp x22, #IR_MUL
+    b.eq .Lcgi_mul
+    cmp x22, #IR_SDIV
+    b.eq .Lcgi_sdiv
+    cmp x22, #IR_UDIV
+    b.eq .Lcgi_udiv
+    cmp x22, #IR_SMOD
+    b.eq .Lcgi_smod
+    cmp x22, #IR_NEG
+    b.eq .Lcgi_neg
+
+    cmp x22, #IR_AND
+    b.eq .Lcgi_and
+    cmp x22, #IR_OR
+    b.eq .Lcgi_or
+    cmp x22, #IR_XOR
+    b.eq .Lcgi_xor
+    cmp x22, #IR_SHL
+    b.eq .Lcgi_shl
+    cmp x22, #IR_LSHR
+    b.eq .Lcgi_lshr
+    cmp x22, #IR_ASHR
+    b.eq .Lcgi_ashr
+    cmp x22, #IR_NOT
+    b.eq .Lcgi_not
+
+    cmp x22, #IR_CMP_EQ
+    b.eq .Lcgi_cmp_eq
+    cmp x22, #IR_CMP_NE
+    b.eq .Lcgi_cmp_ne
+    cmp x22, #IR_CMP_SLT
+    b.eq .Lcgi_cmp_slt
+    cmp x22, #IR_CMP_SLE
+    b.eq .Lcgi_cmp_sle
+    cmp x22, #IR_CMP_SGT
+    b.eq .Lcgi_cmp_sgt
+    cmp x22, #IR_CMP_SGE
+    b.eq .Lcgi_cmp_sge
+
+    cmp x22, #IR_LOAD
+    b.eq .Lcgi_load
+    cmp x22, #IR_STORE
+    b.eq .Lcgi_store
+    cmp x22, #IR_ALLOCA
+    b.eq .Lcgi_alloca
+
+    cmp x22, #IR_BR
+    b.eq .Lcgi_br
+    cmp x22, #IR_BR_COND
+    b.eq .Lcgi_br_cond
+    cmp x22, #IR_RET
+    b.eq .Lcgi_ret
+    cmp x22, #IR_CALL
+    b.eq .Lcgi_call
+
+    // Unknown opcode: skip
+    b .Lcgi_done
+
+// ---- IR_CONST: load immediate into x11, store to dest slot ----
+.Lcgi_const:
+    ldr x23, [x19, #IR_SRC1]      // immediate value
+    ldr x24, [x19, #IR_DEST]      // dest vreg
+
+    // Emit MOVZ for bits [15:0]
+    mov x0, #CG_REG_DST           // rd = x11
+    and x1, x23, #0xFFFF          // imm16 = low 16 bits
+    mov x2, #0                     // hw = 0
+    mov x3, #1                     // sf = 64-bit
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+
+    // Check if we need MOVK for bits [31:16]
+    lsr x0, x23, #16
+    and x0, x0, #0xFFFF
+    cbz x0, .Lcgi_const_hw2
+
+    mov x0, #CG_REG_DST
+    lsr x1, x23, #16
+    and x1, x1, #0xFFFF
+    mov x2, #1                     // hw = 1
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+
+.Lcgi_const_hw2:
+    lsr x0, x23, #32
+    and x0, x0, #0xFFFF
+    cbz x0, .Lcgi_const_hw3
+
+    mov x0, #CG_REG_DST
+    lsr x1, x23, #32
+    and x1, x1, #0xFFFF
+    mov x2, #2                     // hw = 2
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+
+.Lcgi_const_hw3:
+    lsr x0, x23, #48
+    and x0, x0, #0xFFFF
+    cbz x0, .Lcgi_const_store
+
+    mov x0, #CG_REG_DST
+    lsr x1, x23, #48
+    and x1, x1, #0xFFFF
+    mov x2, #3                     // hw = 3
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+
+.Lcgi_const_store:
+    // Store x11 to dest vreg slot
+    mov x0, x24                    // vreg
+    mov x1, #CG_REG_DST           // reg = x11
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+// ---- Binary arithmetic: load src1→x9, src2→x10, op→x11, store ----
+.Lcgi_add:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_add_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_sub:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_sub_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_mul:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_mul
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_sdiv:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_sdiv
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_udiv:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_udiv
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_smod:
+    // SMOD: x11 = x9 - (x9/x10)*x10  → sdiv x11,x9,x10; msub x11,x11,x10,x9
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    // sdiv x11, x9, x10
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_sdiv
+    bl _kcc_code_emit32
+
+    // msub x11, x11, x10, x9  (x11 = x9 - x11*x10)
+    mov x0, #CG_REG_DST           // rd
+    mov x1, #CG_REG_DST           // rn (quotient)
+    mov x2, #CG_REG_SRC2          // rm (divisor)
+    mov x3, #CG_REG_SRC1          // ra (dividend)
+    mov x4, #1                     // sf
+    bl _kcc_enc_msub
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_neg:
+    // NEG x11, x9 → SUB x11, xzr, x9
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST           // rd
+    mov x1, #31                    // rn = xzr
+    mov x2, #CG_REG_SRC1          // rm
+    mov x3, #1                     // sf
+    bl _kcc_enc_sub_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+// ---- Bitwise operations ----
+.Lcgi_and:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_and_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_or:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_orr_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_xor:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_eor_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_shl:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_lsl_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_lshr:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_lsr_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_ashr:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_asr_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_not:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #1                     // sf
+    bl _kcc_enc_mvn
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+// ---- Compare operations ----
+// Pattern: load src1→x9, src2→x10, CMP x9,x10, CSET x11,<inv_cond>
+
+.Lcgi_cmp_eq:
+    mov x23, #1                    // inv_cond for EQ = NE (1)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_ne:
+    mov x23, #0                    // inv_cond for NE = EQ (0)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_slt:
+    mov x23, #10                   // inv_cond for LT = GE (10)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_sle:
+    mov x23, #12                   // inv_cond for LE = GT (12)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_sgt:
+    mov x23, #13                   // inv_cond for GT = LE (13)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_sge:
+    mov x23, #11                   // inv_cond for GE = LT (11)
+    b .Lcgi_cmp_common
+
+.Lcgi_cmp_common:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    // CMP x9, x10
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #1                     // sf
+    bl _kcc_enc_cmp_reg
+    bl _kcc_code_emit32
+
+    // CSET x11, inv_cond
+    mov x0, #CG_REG_DST
+    mov x1, x23                    // inv_cond
+    mov x2, #1                     // sf
+    bl _kcc_enc_cset
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+// ---- Memory operations ----
+.Lcgi_load:
+    // Load: x9 = pointer from src1 slot, x11 = *x9, store x11 to dest
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    // LDR x11, [x9, #0]
+    mov x0, #CG_REG_DST           // rt = x11
+    mov x1, #CG_REG_SRC1          // rn = x9
+    mov x2, #0                     // imm12_scaled = 0
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_store:
+    // Store: x9 = value from src1, x10 = pointer from src2, *x10 = x9
+    // IR_STORE: SRC1 = value vreg, SRC2 = pointer vreg
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    // STR x9, [x10, #0]
+    mov x0, #CG_REG_SRC1          // rt = x9 (value)
+    mov x1, #CG_REG_SRC2          // rn = x10 (pointer)
+    mov x2, #0                     // imm12_scaled = 0
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_alloca:
+    // Alloca: compute address of storage in the SECOND half of the frame.
+    // Storage at [x29, #16 + (vreg_count + dest)*8] — separate from value slots.
+    ldr x24, [x19, #IR_DEST]      // dest vreg
+
+    // Get vreg_count from frame_size: vreg_count = (frame_size - 16) / 16
+    adrp x0, _kcc_cg_frame_size@@PAGE
+    add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
+    ldr x0, [x0]
+    sub x0, x0, #16
+    lsr x0, x0, #4                // vreg_count = (frame-16)/16
+
+    // Storage offset = 16 + (vreg_count + dest) * 8
+    add x0, x0, x24               // vreg_count + dest
+    lsl x2, x0, #3
+    add x2, x2, #16               // imm12 = 16 + (vreg_count+dest)*8
+
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #29                    // rn = x29
+    // x2 already set (imm12)
+    mov x3, #1                     // sf
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    // Store x11 (the address) to dest's VALUE slot
+    mov x0, x24
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+// ---- Control flow ----
+.Lcgi_br:
+    // Unconditional branch to BB (SRC1 = target BB_ID)
+    ldr x23, [x19, #IR_SRC1]      // target BB_ID
+
+    // Look up target in bb_labels
+    str x23, [sp, #72]            // store bb_id for key
+    mov x0, x20                    // ht
+    add x1, sp, #72               // key = &bb_id
+    mov x2, #8                     // keylen
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_br_forward
+
+    // Backward branch: compute offset
+    sub x0, x0, #1                // undo +1 encoding
+    bl _kcc_code_current_pos
+    mov x24, x0                    // current pos
+
+    // Look up again (we lost the value)
+    mov x0, x20
+    add x1, sp, #72
+    mov x2, #8
+    bl _kcc_ht_get
+    sub x23, x0, #1               // target offset
+
+    // offset = target - current
+    sub x0, x23, x24
+    bl _kcc_enc_b
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_br_forward:
+    // Forward branch: emit placeholder, record for patching
+    bl _kcc_code_current_pos
+    mov x24, x0                    // patch offset
+
+    // Emit NOP as placeholder
+    mov x0, #0x14000000            // B with offset=0
+    bl _kcc_code_emit32
+
+    // Add to patch list: {code_offset, target_bb_id}
+    str x24, [sp, #72]            // PATCH_OFFSET
+    ldr x0, [x19, #IR_SRC1]
+    str x0, [sp, #72+8]           // PATCH_TARGET = bb_id
+
+    mov x0, x21                    // patch vec
+    add x1, sp, #72               // entry pointer
+    bl _kcc_vec_push
+    b .Lcgi_done
+
+.Lcgi_br_cond:
+    // Conditional branch: DEST=cond vreg, SRC1=true BB_ID, SRC2=false BB_ID
+    ldr x0, [x19, #IR_DEST]       // condition vreg
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    // CBNZ x9, <true_bb> (may be forward)
+    ldr x23, [x19, #IR_SRC1]      // true BB_ID
+
+    // Check if true target is known
+    str x23, [sp, #72]
+    mov x0, x20
+    add x1, sp, #72
+    mov x2, #8
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_brcond_fwd_true
+
+    // True target is backward
+    sub x23, x0, #1               // target offset
+    bl _kcc_code_current_pos
+    sub x0, x23, x0               // offset = target - current
+    mov x1, x0                     // offset in bytes
+    mov x0, #CG_REG_SRC1          // rt = x9
+    mov x2, #1                     // sf
+    bl _kcc_enc_cbnz
+    bl _kcc_code_emit32
+    b .Lcgi_brcond_false
+
+.Lcgi_brcond_fwd_true:
+    // Forward: emit CBNZ placeholder
+    bl _kcc_code_current_pos
+    mov x24, x0
+
+    // CBNZ x9, +0 (placeholder)
+    mov w0, #0xB5000000            // CBNZ 64-bit with imm19=0
+    add w0, w0, #CG_REG_SRC1      // rt = x9 (Rt field at bits [4:0])
+    bl _kcc_code_emit32
+
+    // Record patch: type CBNZ
+    str x24, [sp, #72]
+    ldr x0, [x19, #IR_SRC1]
+    str x0, [sp, #72+8]
+    mov x0, x21
+    add x1, sp, #72
+    bl _kcc_vec_push
+
+.Lcgi_brcond_false:
+    // Now emit B to false BB_ID
+    ldr x23, [x19, #IR_SRC2]      // false BB_ID
+    str x23, [sp, #72]
+    mov x0, x20
+    add x1, sp, #72
+    mov x2, #8
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_brcond_fwd_false
+
+    // Backward
+    sub x23, x0, #1
+    bl _kcc_code_current_pos
+    sub x0, x23, x0
+    bl _kcc_enc_b
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_brcond_fwd_false:
+    bl _kcc_code_current_pos
+    mov x24, x0
+    mov x0, #0x14000000
+    bl _kcc_code_emit32
+    str x24, [sp, #72]
+    ldr x0, [x19, #IR_SRC2]
+    str x0, [sp, #72+8]
+    mov x0, x21
+    add x1, sp, #72
+    bl _kcc_vec_push
+    b .Lcgi_done
+
+.Lcgi_ret:
+    // Return: load return value to x0, emit epilogue
+    ldr x23, [x19, #IR_SRC1]      // return value vreg (0 if void)
+
+    // Check if this is a void return (no src1)
+    ldr x24, [x19, #IR_TYPE]
+    cbz x24, .Lcgi_ret_epilogue
+    ldr x24, [x24]                 // type kind
+    cmp x24, #1                    // TY_VOID = 1
+    b.eq .Lcgi_ret_epilogue
+
+    // Load return value to x0
+    mov x0, x23
+    mov x1, #0                     // target reg = x0
+    bl _kcc_cg_load_vreg
+
+.Lcgi_ret_epilogue:
+    // Emit epilogue: ldp x29, x30, [sp], #frame_size ; ret
+    adrp x0, _kcc_cg_frame_size@@PAGE
+    add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
+    ldr x24, [x0]
+
+    // LDP post-index
+    mov x0, #29                    // rt1 = x29
+    mov x1, #30                    // rt2 = x30
+    mov x2, #31                    // rn = sp
+    lsr x3, x24, #3               // imm7 = frame_size / 8
+    bl _kcc_enc_ldp_post
+    bl _kcc_code_emit32
+
+    // RET
+    bl _kcc_enc_ret
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_call:
+    // Call: SRC1 = callee name (string ptr), DEST = result vreg
+    // For now: emit BL with relocation (offset patched by linker)
+    ldr x23, [x19, #IR_SRC1]      // callee name
+    ldr x24, [x19, #IR_DEST]      // result vreg
+
+    // Build Mach-O name with underscore prefix: "_" + name
+    mov x0, x23
+    bl _kcc_strlen
+    add x0, x0, #2                // +1 prefix, +1 null
+    bl _kcc_arena_alloc
+    mov x25, x0
+    mov w1, #'_'
+    strb w1, [x25]
+    mov x0, x23
+    bl _kcc_strlen
+    add x2, x0, #1               // len including null
+    add x0, x25, #1              // dest = after '_'
+    mov x1, x23                   // src = original name
+    bl _kcc_memcpy
+
+    // Add external symbol
+    mov x0, x25
+    bl _kcc_linker_extern
+    mov x25, x0                    // sym_index
+
+    // Record relocation at current position
+    bl _kcc_code_current_pos
+    mov x0, x0                     // offset
+    mov x1, #ARM64_RELOC_BRANCH26
+    mov x2, x25                    // sym_index
+    bl _kcc_linker_add_reloc
+
+    // Emit BL with offset=0 (linker will patch)
+    mov x0, #0
+    bl _kcc_enc_bl
+    bl _kcc_code_emit32
+
+    // Store return value (x0) to dest vreg slot
+    mov x0, x24                    // dest vreg
+    mov x1, #0                     // source reg = x0
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_done:
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}
+
+\section{Branch Patching}
+
+After all basic blocks have been emitted, we resolve forward branch
+references by looking up their target BB offsets and patching the
+instructions in place.
+
+@d CodeGen: patch branches @{
+// -- kcc_codegen_patch_branches -----------------------------------------------
+// void kcc_codegen_patch_branches(ht *bb_labels, vec *patches)
+//   x0 = bb_labels hash table
+//   x1 = patch vec
+.text
+.globl _kcc_codegen_patch_branches
+.p2align 2
+_kcc_codegen_patch_branches:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                    // bb_labels ht
+    mov x20, x1                    // patch vec
+    ldr x21, [x20, #VEC_COUNT]    // patch count
+    mov x22, #0                    // index
+
+.Lcpb_loop:
+    cmp x22, x21
+    b.ge .Lcpb_done
+
+    // Get patch entry
+    mov x0, x20
+    mov x1, x22
+    bl _kcc_vec_get
+    mov x23, x0                    // pointer to patch entry
+
+    ldr x0, [x23, #PATCH_OFFSET]  // code offset of branch instr
+    ldr x1, [x23, #PATCH_TARGET]  // target BB_ID
+
+    // Look up target BB offset
+    str x1, [sp, #56]             // store bb_id as key
+    mov x0, x19                    // ht
+    add x1, sp, #56               // key
+    mov x2, #8                     // keylen
+    bl _kcc_ht_get
+    cbz x0, .Lcpb_next            // target not found (shouldn't happen)
+    sub x0, x0, #1                // undo +1 encoding → target_offset
+
+    // Read original instruction to determine type
+    ldr x1, [x23, #PATCH_OFFSET]  // branch_offset
+    adrp x2, _kcc_code_buf@@PAGE
+    add  x2, x2, _kcc_code_buf@@PAGEOFF
+    ldr x2, [x2]
+    ldr w3, [x2, x1]              // original instruction
+
+    // Compute offset in bytes: target - branch_pos
+    sub x4, x0, x1                // offset_bytes = target_offset - branch_offset
+
+    // Check instruction type: B (0x14) vs CBNZ (0xB5) vs CBZ (0xB4)
+    lsr w5, w3, #24
+    cmp w5, #0x14                  // B?
+    b.eq .Lcpb_patch_b
+    cmp w5, #0xB5                  // CBNZ 64-bit?
+    b.eq .Lcpb_patch_cbnz
+    cmp w5, #0x35                  // CBNZ 32-bit?
+    b.eq .Lcpb_patch_cbnz
+    // Default: treat as B
+    b .Lcpb_patch_b
+
+.Lcpb_patch_b:
+    // Re-encode B with correct offset
+    mov x0, x4                     // offset_bytes
+    bl _kcc_enc_b
+    // Patch
+    ldr x1, [x23, #PATCH_OFFSET]
+    mov x1, x1
+    mov w1, w0                     // new instruction in w1... wait
+    // kcc_code_patch32(offset, word): x0=offset, x1=word
+    mov w2, w0                     // save encoded instruction
+    ldr x0, [x23, #PATCH_OFFSET]
+    mov w1, w2
+    bl _kcc_code_patch32
+    b .Lcpb_next
+
+.Lcpb_patch_cbnz:
+    // Re-encode CBNZ: keep rt and sf from original, update imm19
+    and w5, w3, #0x1F              // extract Rt
+    asr x6, x4, #2                // offset in instructions
+    and w6, w6, #0x7FFFF          // imm19
+    mov w7, #0xB5000000            // CBNZ 64-bit base
+    orr w7, w7, w6, lsl #5        // imm19
+    orr w7, w7, w5                // Rt
+    // Patch
+    ldr x0, [x23, #PATCH_OFFSET]
+    mov w1, w7
+    bl _kcc_code_patch32
+    b .Lcpb_next
+
+.Lcpb_next:
+    add x22, x22, #1
+    b .Lcpb_loop
+
+.Lcpb_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{CodeGen Data}
+
+@d CodeGen: data @{
+// -- CodeGen data -------------------------------------------------------------
+.data
+.p2align 3
+.globl _kcc_cg_frame_size
+_kcc_cg_frame_size:  .quad 0     // current function's frame size
+@}

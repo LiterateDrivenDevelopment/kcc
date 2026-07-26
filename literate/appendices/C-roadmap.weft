@@ -1,0 +1,462 @@
+% C-roadmap.weft — Complete phase roadmap for kcc
+%
+% This appendix documents every phase required to produce a
+% fully conforming C17 compiler from bare ARM64 assembly.
+
+\chapter{Development Roadmap}
+\label{ch:roadmap}
+
+This appendix enumerates the complete sequence of implementation
+phases that take \kcc{} from a bootable skeleton (Phase~0) to a
+self-hosting, conforming C17 compiler (Phase~8).  Each phase lists
+the \texttt{.weft} files to be created or extended, the new tangled
+output files, and the acceptance criteria that must hold before the
+phase is considered complete.
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 0 --- Project Skeleton}
+\label{sec:phase0}
+
+\textbf{Goal.}  Prove the literate infrastructure works end to end:
+\texttt{just build} produces a native ARM64 binary that boots,
+prints a banner, and exits cleanly.  No C source is compiled yet.
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{kcc.weft} --- master file, LaTeX preamble, includes.
+\item \texttt{literate/assembly.weft} --- output routing (all
+      output directives live here).
+\item \texttt{literate/foundations/01-normative-corpus.weft} ---
+      standards and citation conventions (prose only).
+\item \texttt{literate/foundations/02-conformance-model.weft} ---
+      conformance obligations (prose only).
+\item \texttt{literate/machine/07-arm64-conventions.weft} ---
+      register map, Apple ABI, \texttt{FUNC}/\texttt{ENDFUNC}/\texttt{SYSCALL} macros.
+\item \texttt{literate/machine/08-syscalls.weft} ---
+      \texttt{exit}, \texttt{write}, \texttt{read}, \texttt{open},
+      \texttt{close}, \texttt{mmap} wrappers.
+\item \texttt{literate/machine/09-memory-management.weft} ---
+      arena allocator (bump pointer over \texttt{mmap} chunks).
+\item \texttt{literate/machine/11-string-operations.weft} ---
+      \texttt{strlen}, \texttt{memcpy}, \texttt{memcmp}, \texttt{memset}.
+\item \texttt{literate/machine/12-io.weft} ---
+      buffered file I/O (4\,KiB static buffer, flush/putc/puts).
+\item \texttt{literate/driver/43-main.weft} ---
+      \texttt{\_main} entry point, argument parsing, banner.
+\end{itemize}
+
+\textbf{Tangled output.}
+\texttt{main.s}, \texttt{syscalls.s}, \texttt{arena.s},
+\texttt{strings.s}, \texttt{io.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item \texttt{just tangle} succeeds with no errors.
+\item \texttt{just build} assembles and links with no errors.
+\item \texttt{tmp/kcc} prints its banner and exits 0.
+\item \texttt{tmp/kcc hello.c} echoes the source file name.
+\end{enumerate}
+
+\textbf{Status.} Complete.
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 1 --- Data Structures and Lexer Foundation}
+\label{sec:phase1}
+
+\textbf{Goal.}  Read a C source file from disk and tokenize it into
+a stream of C17 preprocessing tokens (\stdref{6.4}).
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{literate/machine/10-data-structures.weft} ---
+      hash table (open addressing, FNV-1a) and dynamic vector,
+      both arena-allocated.
+\item \texttt{literate/machine/14-source-manager.weft} ---
+      \texttt{mmap}-based file reading, source location tracking
+      (file/line/column as a packed 64-bit value).
+\item \texttt{literate/frontend/17-lexer.weft} ---
+      character classification tables, tokenizer for all C17
+      token classes: identifiers, keywords, integer/floating
+      constants, string/char literals, punctuators.
+\end{itemize}
+
+\textbf{New tangled files.}
+\texttt{hashtab.s}, \texttt{vec.s}, \texttt{strtab.s},
+\texttt{source.s}, \texttt{lexer.s}, \texttt{lexer\_tables.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item \texttt{tmp/kcc --dump-tokens hello.c} prints every token
+      with its source location.
+\item All 44 C17 keywords are recognized.
+\item Integer, floating, character, and string literals are
+      correctly classified (value parsing deferred to Phase~5).
+\item Unterminated strings and unrecognized characters produce
+      diagnostics on stderr.
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 2 --- Complete Lexer and Diagnostics}
+\label{sec:phase2}
+
+\textbf{Goal.}  Finish the tokenizer to full C17 conformance and
+build the diagnostic engine required by \stdref{5.1.1.3}.
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{literate/machine/13-diagnostics.weft} ---
+      diagnostic engine: error/warning/note classification,
+      source-location printing (``file:line:col: error: ...''),
+      error-count tracking, fatal-error limit.
+\item \texttt{literate/frontend/15-source-encoding.weft} ---
+      Phase~1 of translation: trigraph replacement, source
+      character set mapping (\stdref{5.1.1.2} phase 1).
+\item \texttt{literate/frontend/16-line-splicing.weft} ---
+      Phase~2 of translation: backslash-newline splicing
+      (\stdref{5.1.1.2} phase 2).
+\item \texttt{literate/verification/44-test-harness.weft} ---
+      test runner: discover tests, run each, report pass/fail.
+\item \texttt{literate/verification/45-conformance-tests.weft} ---
+      initial lexer conformance tests.
+\end{itemize}
+
+\textbf{New tangled files.}
+\texttt{diag.s}, \texttt{test\_runner.s}, \texttt{test\_lexer.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item Diagnostics follow the format
+      \texttt{file:line:col: error: message}.
+\item Trigraphs and line splicing are handled before tokenization.
+\item \texttt{just test} runs the test suite and reports results.
+\item The lexer correctly tokenizes the GCC torture test suite's
+      lexer-visible subset (no preprocessing yet).
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 3 --- Preprocessor}
+\label{sec:phase3}
+
+\textbf{Goal.}  Implement the full C17 preprocessor
+(\stdref{6.10}), covering translation phases 3 and 4.
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{literate/frontend/18-preprocessor.weft} ---
+      macro definition (\texttt{\#define}), macro expansion
+      (object-like and function-like with stringification and
+      token pasting), conditional compilation
+      (\texttt{\#if}/\texttt{\#ifdef}/\texttt{\#elif}/\texttt{\#else}/\texttt{\#endif}),
+      file inclusion (\texttt{\#include}), line control
+      (\texttt{\#line}), error directive (\texttt{\#error}),
+      pragma handling (\texttt{\#pragma}, including
+      \texttt{\_Pragma} operator), null directive.
+\item \texttt{literate/frontend/19-string-literals.weft} ---
+      Phase~5: escape sequence processing, execution charset
+      mapping.
+\item \texttt{literate/frontend/20-concatenation.weft} ---
+      Phase~6: adjacent string literal concatenation.
+\end{itemize}
+
+\textbf{New tangled files.}
+\texttt{preprocessor.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item \texttt{tmp/kcc -E file.c} outputs the preprocessed token
+      stream (translation phases 1--6 complete).
+\item Recursive and self-referential macros terminate correctly
+      per \stdref{6.10.3.4}.
+\item \texttt{\#include} searches \texttt{-I} directories and
+      the system include path.
+\item String concatenation across macro boundaries works.
+\item Predefined macros (\texttt{\_\_FILE\_\_},
+      \texttt{\_\_LINE\_\_}, \texttt{\_\_DATE\_\_},
+      \texttt{\_\_TIME\_\_}, \texttt{\_\_STDC\_\_},
+      \texttt{\_\_STDC\_VERSION\_\_}) are set correctly.
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 4 --- Parser}
+\label{sec:phase4}
+
+\textbf{Goal.}  Build a recursive-descent parser that consumes
+the preprocessed token stream and produces a typed abstract syntax
+tree (AST) for every C17 construct.
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{literate/frontend/21-parser.weft} ---
+      parser core: recursive descent infrastructure, AST node
+      allocation (arena), AST node types, error recovery
+      (synchronization tokens).
+\item \texttt{literate/frontend/22-declarations.weft} ---
+      declaration parsing: declaration specifiers, declarators
+      (including abstract and function), the typedef hack
+      (lexer feedback), \texttt{struct}/\texttt{union}/\texttt{enum}
+      definitions, \texttt{\_Static\_assert}.
+\item \texttt{literate/frontend/23-expressions.weft} ---
+      expression parsing: precedence climbing for all C17
+      operators (15 precedence levels), postfix operators
+      (call, subscript, member access, increment/decrement),
+      unary operators, cast expressions, compound literals,
+      \texttt{\_Generic} selection, \texttt{sizeof}/\texttt{\_Alignof}.
+\item \texttt{literate/frontend/24-statements.weft} ---
+      statement parsing: compound, \texttt{if}/\texttt{else},
+      \texttt{switch}/\texttt{case}/\texttt{default},
+      \texttt{while}, \texttt{do}/\texttt{while}, \texttt{for},
+      \texttt{goto}, \texttt{continue}, \texttt{break},
+      \texttt{return}, labeled statements, expression statements.
+\end{itemize}
+
+\textbf{New tangled files.}
+\texttt{parser.s}, \texttt{declarations.s},
+\texttt{expressions.s}, \texttt{statements.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item \texttt{tmp/kcc --dump-ast file.c} prints the AST in a
+      readable tree format.
+\item All syntactically valid C17 programs parse without error.
+\item Syntax errors produce useful diagnostics with the
+      offending token highlighted.
+\item The typedef ambiguity is resolved correctly (e.g.,
+      \texttt{T * x;} parsed as declaration when \texttt{T} is
+      a typedef name).
+\item \texttt{sizeof(int)} and \texttt{sizeof x} both parse.
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 5 --- Type System and Semantic Analysis}
+\label{sec:phase5}
+
+\textbf{Goal.}  Implement the C17 type system and semantic
+analysis pass that decorates the AST with type information and
+checks all constraints.
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{literate/semantics/25-symbol-table.weft} ---
+      four namespaces (\stdref{6.2.3}): ordinary identifiers,
+      tags, labels, struct/union members.  Scope management:
+      file, function, block, function-prototype scopes.
+      Linkage resolution (external, internal, none).
+\item \texttt{literate/semantics/26-type-system.weft} ---
+      internal type representation: basic types, qualified types,
+      pointer, array (fixed, variable-length, incomplete),
+      function types, struct/union/enum types.
+      Type compatibility (\stdref{6.2.7}) and composite type
+      construction.
+\item \texttt{literate/semantics/27-type-conversions.weft} ---
+      integer promotions (\stdref{6.3.1.1}), usual arithmetic
+      conversions (\stdref{6.3.1.8}), implicit conversions,
+      explicit casts, pointer conversions.
+\item \texttt{literate/semantics/28-type-checking.weft} ---
+      constraint checking for every expression operator per
+      \stdref{6.5}: operand type requirements, result types,
+      lvalue-to-rvalue conversion, array-to-pointer decay,
+      function-to-pointer decay.
+\item \texttt{literate/semantics/29-initializers.weft} ---
+      initializer processing (\stdref{6.7.9}): designated
+      initializers, brace elision, string initializers for
+      arrays, recursive struct/union/array initialization.
+\item \texttt{literate/semantics/30-constant-expressions.weft} ---
+      compile-time evaluation (\stdref{6.6}): integer constant
+      expressions, arithmetic constant expressions, address
+      constants.
+\end{itemize}
+
+\textbf{New tangled files.}
+\texttt{symtab.s}, \texttt{types.s}, \texttt{conversions.s},
+\texttt{sema.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item Type errors produce clear diagnostics citing the
+      relevant Standard clause.
+\item \texttt{tmp/kcc --dump-types file.c} prints every
+      expression with its resolved type.
+\item Implicit conversions (integer promotions, UAC, pointer
+      decay) are inserted automatically.
+\item Struct member access chains resolve correctly through
+      anonymous structs/unions.
+\item \texttt{enum} constants are typed as \texttt{int} per
+      \stdref{6.7.2.2}.
+\item Initializer lists with designators and brace elision
+      produce the correct initialized object.
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 6 --- Intermediate Representation and Optimization}
+\label{sec:phase6}
+
+\textbf{Goal.}  Lower the typed AST into a linear intermediate
+representation (IR) with virtual registers, and implement
+essential optimization passes.
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{literate/ir/31-ir-design.weft} ---
+      IR design: linear IR with virtual registers, basic blocks,
+      control-flow graph, SSA-like properties (each virtual
+      register assigned once).  IR instruction set: arithmetic,
+      comparison, branch, call, load, store, alloca, phi, cast.
+\item \texttt{literate/ir/32-ir-builder.weft} ---
+      AST-to-IR lowering: expression evaluation, short-circuit
+      boolean operators, \texttt{switch} lowering (jump table or
+      if-chain), loop lowering, struct passing/returning.
+\item \texttt{literate/ir/33-ir-validation.weft} ---
+      IR well-formedness checks: every use dominated by its
+      definition, consistent types, correct basic-block
+      termination, reachability analysis.
+\item \texttt{literate/optimization/34-ir-passes.weft} ---
+      pass infrastructure: pass manager, iteration control,
+      analysis caching.
+\item \texttt{literate/optimization/35-peephole.weft} ---
+      algebraic simplifications: constant folding, strength
+      reduction, identity elimination (\texttt{x+0}, \texttt{x*1}).
+\item \texttt{literate/optimization/36-dce.weft} ---
+      dead code elimination: remove instructions whose results
+      are never used, remove unreachable basic blocks.
+\end{itemize}
+
+\textbf{New tangled files.}
+\texttt{ir.s}, \texttt{opt.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item \texttt{tmp/kcc --dump-ir file.c} prints the IR in a
+      readable textual format.
+\item IR validation passes with no errors for all valid programs.
+\item Constant expressions evaluate at compile time.
+\item Dead stores and unused computations are eliminated.
+\item The IR correctly models all C17 control flow, including
+      \texttt{goto}, \texttt{switch} fall-through, and
+      \texttt{setjmp}/\texttt{longjmp} (treated as opaque calls).
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 7 --- ARM64 Backend}
+\label{sec:phase7}
+
+\textbf{Goal.}  Generate native ARM64 machine code and emit
+Mach-O object files directly --- no external assembler needed.
+This is the self-referential core: ARM64 assembly generating
+ARM64 machine code.
+
+\textbf{weft files.}
+\begin{itemize}
+\item \texttt{literate/backend/37-abi-aapcs64.weft} ---
+      AAPCS64 calling convention implementation: parameter
+      classification (stages A, B, C), return value handling,
+      HFA/HVA detection, Apple-specific deltas (small struct
+      passing, variadic arguments).
+\item \texttt{literate/backend/38-isel.weft} ---
+      instruction selection: pattern matching from IR
+      instructions to ARM64 instruction sequences.  Covering
+      arithmetic, comparisons, branches, loads/stores (with
+      addressing mode selection), function calls, returns.
+\item \texttt{literate/backend/39-regalloc.weft} ---
+      register allocation: linear scan allocator, spill code
+      generation, callee-saved register assignment, frame
+      layout computation.
+\item \texttt{literate/backend/40-emit-arm64.weft} ---
+      ARM64 instruction encoding: binary encoding of every
+      instruction format (data processing, loads/stores,
+      branches, system), relocation handling.
+\item \texttt{literate/backend/41-emit-macho.weft} ---
+      Mach-O object file emission: header, load commands
+      (\texttt{LC\_SEGMENT\_64}, \texttt{LC\_SYMTAB},
+      \texttt{LC\_DYSYMTAB}), sections (\texttt{\_\_TEXT},
+      \texttt{\_\_DATA}, \texttt{\_\_BSS}), symbol table,
+      string table, relocation entries.
+\item \texttt{literate/driver/42-driver.weft} ---
+      full compilation pipeline orchestration: phase sequencing,
+      multi-file compilation, object file output.
+\end{itemize}
+
+\textbf{New tangled files.}
+\texttt{abi.s}, \texttt{isel.s}, \texttt{regalloc.s},
+\texttt{emit.s}, \texttt{driver.s}.
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item \texttt{tmp/kcc -c file.c -o file.o} produces a valid
+      Mach-O object file.
+\item \texttt{ld file.o -o file -lSystem ...} links the object
+      file into a working executable.
+\item Generated code passes the C17 conformance test suite
+      (integer arithmetic, control flow, function calls,
+      structs, pointers, arrays).
+\item Calling convention is correct: \kcc{}-compiled code can
+      call system libraries and vice versa.
+\item The object file is accepted by Apple's \texttt{ld} linker
+      without warnings.
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 8 --- Self-Hosting}
+\label{sec:phase8}
+
+\textbf{Goal.}  Demonstrate that \kcc{} can compile a
+non-trivial C program --- ideally a C subset of itself or an
+equivalent program --- and produce correct output.  This is the
+ultimate proof that the compiler is correct and complete.
+
+\textbf{Activities.}
+\begin{itemize}
+\item Write a C version of a significant \kcc{} subsystem
+      (e.g., the lexer or the arena allocator) and compile it
+      with \kcc{}.
+\item Differential testing: compile the same C source with both
+      \kcc{} and \texttt{clang}, then compare the behavior of
+      the two executables on a large test corpus.
+\item Bootstrap test: if feasible, write a minimal C compiler in
+      C (a ``stage-1'' compiler) and compile it with \kcc{}.
+      Then use the stage-1 compiler to compile itself.  Compare
+      the two stage-1 binaries.
+\item Performance characterization: measure compilation speed
+      and generated code quality against \texttt{clang -O0} on
+      a representative benchmark suite.
+\end{itemize}
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item At least one non-trivial C program (${}>1000$ lines)
+      compiles and runs correctly under \kcc{}.
+\item Differential testing against \texttt{clang} reveals no
+      behavioral discrepancies on conforming programs.
+\item The \stdref{J.3} implementation-defined behavior document
+      is complete (Appendix~A).
+\item The UB policy matrix is complete (Appendix~B).
+\item \texttt{just weave} produces a typeset document that
+      serves as a comprehensive textbook on both compiler
+      construction and ARM64 systems programming.
+\end{enumerate}
+
+% ────────────────────────────────────────────────────────────────
+\section{Summary}
+\label{sec:roadmap-summary}
+
+\begin{center}
+\begin{tabular}{clll}
+\hline
+Phase & Milestone & Key Output & \texttt{.weft} Files \\
+\hline
+0 & Skeleton boots        & \texttt{tmp/kcc} runs        & 01, 02, 07--09, 11, 12, 43 \\
+1 & Lexer                 & \texttt{--dump-tokens}        & 10, 14, 17 \\
+2 & Diagnostics + tests   & \texttt{just test}            & 13, 15, 16, 44, 45 \\
+3 & Preprocessor          & \texttt{-E}                   & 18, 19, 20 \\
+4 & Parser                & \texttt{--dump-ast}           & 21--24 \\
+5 & Type system           & \texttt{--dump-types}         & 25--30 \\
+6 & IR + optimization     & \texttt{--dump-ir}            & 31--36 \\
+7 & Backend               & \texttt{-c file.c -o file.o}  & 37--42 \\
+8 & Self-hosting          & Differential testing          & --- \\
+\hline
+\end{tabular}
+\end{center}
+
+Total: 45 \texttt{.weft} source files, approximately 25 tangled
+assembly files, producing a single native \texttt{tmp/kcc} binary
+that compiles C17 to ARM64 Mach-O --- with no dependency on any
+existing C compiler.

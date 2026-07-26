@@ -1,0 +1,608 @@
+% 10-data-structures.weft — Hash Table, Vector, and String Interning
+%
+% A compiler needs three fundamental data structures: a hash table
+% for O(1) lookups (keyword recognition, symbol tables), a dynamic
+% vector for growable sequences (token streams, AST children), and
+% a string intern table for canonicalizing identifiers.
+%
+% All three are arena-allocated, meaning they never individually
+% free memory --- the entire arena is released at program end.
+
+\chapter{Data Structures}
+\label{ch:data-structures}
+
+\section{FNV-1a Hash Function}
+
+FNV-1a (Fowler/Noll/Vo, variant ``a'') is a non-cryptographic hash
+function with excellent distribution for short strings --- exactly the
+workload a compiler presents (identifiers average 6--12 bytes).  The
+algorithm is simple: start from an offset basis, and for each byte
+\texttt{XOR} it into the hash then multiply by the FNV prime.
+
+The 64-bit constants are:
+\begin{itemize}
+\item Offset basis: \texttt{0xCBF29CE484222325} ($= 14695981039346656037$)
+\item Prime: \texttt{0x00000100000001B3} ($= 1099511628211$)
+\end{itemize}
+
+@d Hash: FNV-1a @{
+// -- kcc_fnv1a ------------------------------------------------------
+// uint64_t kcc_fnv1a(const void *data, size_t len)
+//   x0 = pointer to data
+//   x1 = byte count
+// Returns 64-bit FNV-1a hash in x0.
+.globl _kcc_fnv1a
+.p2align 2
+_kcc_fnv1a:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Load FNV-1a offset basis: 0xCBF29CE484222325
+    movz x2, #0xCBF2, lsl #48
+    movk x2, #0x9CE4, lsl #32
+    movk x2, #0x8422, lsl #16
+    movk x2, #0x2325
+
+    // Load FNV-1a prime: 0x00000100000001B3
+    movz x3, #0x0100, lsl #32
+    movk x3, #0x01B3
+
+    cbz x1, .Lfnv_done
+
+.Lfnv_loop:
+    ldrb w4, [x0], #1           // load byte
+    eor  x2, x2, x4             // hash ^= byte
+    mul  x2, x2, x3             // hash *= prime
+    subs x1, x1, #1
+    b.ne .Lfnv_loop
+
+.Lfnv_done:
+    mov x0, x2                  // return hash
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Hash Table}
+
+The hash table uses open addressing with linear probing.  Each entry
+stores the cached hash, a pointer to the key, the key length, and a
+64-bit value.  Empty slots are indicated by a null key pointer.
+
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Offset & Field & Description \\
+\hline
+0  & \texttt{hash}   & Cached FNV-1a hash \\
+8  & \texttt{key}    & Pointer to key bytes \\
+16 & \texttt{keylen} & Key length in bytes \\
+24 & \texttt{value}  & Associated 64-bit value \\
+\hline
+\end{tabular}
+\end{center}
+
+@d Hash: constants @{
+// -- Hash table layout ----------------------------------------------
+.equ HT_ENTRIES,       0     // pointer to entries array
+.equ HT_CAP,           8     // capacity (power of 2)
+.equ HT_COUNT,        16     // number of occupied slots
+.equ HT_SIZE,         24     // total header size
+
+.equ HTE_HASH,         0     // cached hash value
+.equ HTE_KEY,          8     // pointer to key
+.equ HTE_KEYLEN,      16     // key length
+.equ HTE_VALUE,       24     // associated value
+.equ HTE_SIZE,        32     // entry size
+@}
+
+\subsection{Initialization}
+
+\texttt{kcc\_ht\_init} creates a hash table with the given capacity
+(which must be a power of~2).  The entries array is arena-allocated
+and zero-filled, so all key pointers start as \texttt{NULL}.
+
+@d Hash: init @{
+// -- kcc_ht_init ----------------------------------------------------
+// void *kcc_ht_init(uint64_t capacity)
+//   x0 = capacity (must be power of 2)
+// Returns pointer to hash table header.
+.globl _kcc_ht_init
+.p2align 2
+_kcc_ht_init:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = capacity
+
+    // Allocate the header (HT_SIZE = 24 bytes)
+    mov x0, #HT_SIZE
+    bl _kcc_arena_alloc
+    mov x20, x0                  // x20 = header pointer
+
+    // Allocate entries array (capacity * HTE_SIZE)
+    mov x0, x19
+    mov x1, #HTE_SIZE
+    mul x0, x0, x1
+    mov x21, x0                  // x21 = total bytes
+    bl _kcc_arena_alloc
+    // x0 = entries pointer
+
+    // Zero-fill entries (arena doesn't guarantee zeroed memory)
+    mov x1, #0                   // fill byte
+    mov x2, x21                  // byte count
+    // x0 already = entries ptr, save it first
+    str x0, [x20, #HT_ENTRIES]  // store entries pointer
+    mov x3, x0                   // save entries ptr
+    bl _kcc_memset
+
+    // Fill header
+    str x19, [x20, #HT_CAP]     // capacity
+    str xzr, [x20, #HT_COUNT]   // count = 0
+
+    mov x0, x20                  // return header pointer
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Lookup}
+
+\texttt{kcc\_ht\_get} searches for a key in the table.  It returns
+the associated value if found, or 0 if not.  Since 0 is a valid
+``not found'' sentinel for our use cases (keyword token types start
+at~10), this is sufficient.
+
+@d Hash: get @{
+// -- kcc_ht_get -----------------------------------------------------
+// uint64_t kcc_ht_get(void *ht, const void *key, uint64_t keylen)
+//   x0 = hash table pointer
+//   x1 = key pointer
+//   x2 = key length
+// Returns value if found, 0 if not found.
+.globl _kcc_ht_get
+.p2align 2
+_kcc_ht_get:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+
+    mov x19, x0                  // x19 = ht
+    mov x20, x1                  // x20 = key
+    mov x21, x2                  // x21 = keylen
+
+    // Hash the key
+    mov x0, x1
+    mov x1, x2
+    bl _kcc_fnv1a
+    mov x22, x0                  // x22 = hash
+
+    // Load table fields
+    ldr x23, [x19, #HT_ENTRIES] // x23 = entries base
+    ldr x24, [x19, #HT_CAP]    // x24 = capacity
+    sub x3, x24, #1             // x3 = mask (cap - 1)
+    and x25, x22, x3            // x25 = index (callee-saved!)
+
+.Lht_get_probe:
+    // Compute entry address: entries + index * HTE_SIZE
+    mov x5, #HTE_SIZE
+    mul x6, x25, x5
+    add x6, x23, x6             // x6 = entry pointer
+
+    // Check if slot is empty (key == NULL)
+    ldr x7, [x6, #HTE_KEY]
+    cbz x7, .Lht_get_not_found
+
+    // Check hash match first (fast reject)
+    ldr x8, [x6, #HTE_HASH]
+    cmp x8, x22
+    b.ne .Lht_get_next
+
+    // Check key length
+    ldr x8, [x6, #HTE_KEYLEN]
+    cmp x8, x21
+    b.ne .Lht_get_next
+
+    // Compare key bytes
+    mov x0, x7                   // entry key
+    mov x1, x20                  // search key
+    mov x2, x21                  // length
+    bl _kcc_memcmp
+    cbnz x0, .Lht_get_next
+
+    // Found! Return value (x25 = index, callee-saved across memcmp)
+    mov x5, #HTE_SIZE
+    mul x6, x25, x5
+    add x6, x23, x6
+    ldr x0, [x6, #HTE_VALUE]
+    b .Lht_get_done
+
+.Lht_get_next:
+    add x25, x25, #1
+    sub x3, x24, #1
+    and x25, x25, x3            // wrap around
+    b .Lht_get_probe
+
+.Lht_get_not_found:
+    mov x0, #0
+
+.Lht_get_done:
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+\subsection{Insertion}
+
+\texttt{kcc\_ht\_put} inserts a key-value pair.  If the key already
+exists, the value is updated.  No resizing is performed --- the caller
+must ensure the table has sufficient capacity.  For the keyword table
+(44~entries in a 128-slot table, 34\% load factor), this is always safe.
+
+@d Hash: put @{
+// -- kcc_ht_put -----------------------------------------------------
+// void kcc_ht_put(void *ht, const void *key, uint64_t keylen, uint64_t value)
+//   x0 = hash table pointer
+//   x1 = key pointer
+//   x2 = key length
+//   x3 = value to store
+// Inserts or updates the key-value pair.
+.globl _kcc_ht_put
+.p2align 2
+_kcc_ht_put:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    mov x19, x0                  // x19 = ht
+    mov x20, x1                  // x20 = key
+    mov x21, x2                  // x21 = keylen
+    mov x25, x3                  // x25 = value
+
+    // Hash the key
+    mov x0, x1
+    mov x1, x2
+    bl _kcc_fnv1a
+    mov x22, x0                  // x22 = hash
+
+    // Load table fields
+    ldr x23, [x19, #HT_ENTRIES] // x23 = entries base
+    ldr x24, [x19, #HT_CAP]    // x24 = capacity
+    sub x3, x24, #1             // x3 = mask
+    and x27, x22, x3            // x27 = index (callee-saved!)
+
+.Lht_put_probe:
+    mov x5, #HTE_SIZE
+    mul x6, x27, x5
+    add x6, x23, x6             // x6 = entry pointer
+
+    // Empty slot? Insert here
+    ldr x7, [x6, #HTE_KEY]
+    cbz x7, .Lht_put_insert
+
+    // Check if same key (update case)
+    ldr x8, [x6, #HTE_HASH]
+    cmp x8, x22
+    b.ne .Lht_put_next
+
+    ldr x8, [x6, #HTE_KEYLEN]
+    cmp x8, x21
+    b.ne .Lht_put_next
+
+    mov x26, x6                 // save entry ptr (callee-saved)
+    mov x0, x7
+    mov x1, x20
+    mov x2, x21
+    bl _kcc_memcmp
+    cbnz x0, .Lht_put_next
+
+    // Key exists: update value
+    str x25, [x26, #HTE_VALUE]
+    b .Lht_put_done
+
+.Lht_put_next:
+    add x27, x27, #1
+    sub x3, x24, #1
+    and x27, x27, x3
+    b .Lht_put_probe
+
+.Lht_put_insert:
+    // x6 = empty entry pointer (freshly computed, no call since)
+    str x22, [x6, #HTE_HASH]
+    str x20, [x6, #HTE_KEY]
+    str x21, [x6, #HTE_KEYLEN]
+    str x25, [x6, #HTE_VALUE]
+
+    // Increment count
+    ldr x0, [x19, #HT_COUNT]
+    add x0, x0, #1
+    str x0, [x19, #HT_COUNT]
+
+.Lht_put_done:
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}
+
+\section{Dynamic Vector}
+
+A vector is a growable array of fixed-size elements.  When the vector
+is full, it doubles in capacity by allocating a new array from the
+arena and copying the old contents (the old array is wasted, as is
+typical with arena allocators).
+
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Offset & Field & Description \\
+\hline
+0  & \texttt{data}      & Pointer to element array \\
+8  & \texttt{count}     & Number of elements stored \\
+16 & \texttt{cap}       & Capacity (number of elements) \\
+24 & \texttt{elem\_size} & Size of each element in bytes \\
+\hline
+\end{tabular}
+\end{center}
+
+@d Vec: constants @{
+// -- Vector layout --------------------------------------------------
+.equ VEC_DATA,      0         // pointer to element array
+.equ VEC_COUNT,     8         // number of elements
+.equ VEC_CAP,      16         // capacity
+.equ VEC_ELEMSIZE, 24         // element size in bytes
+.equ VEC_SIZE,     32         // total header size
+@}
+
+\subsection{Initialization}
+
+@d Vec: init @{
+// -- kcc_vec_init ---------------------------------------------------
+// void *kcc_vec_init(uint64_t elem_size)
+//   x0 = element size in bytes
+// Returns pointer to vector header.  Initial capacity is 16.
+.globl _kcc_vec_init
+.p2align 2
+_kcc_vec_init:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = elem_size
+
+    // Allocate header
+    mov x0, #VEC_SIZE
+    bl _kcc_arena_alloc
+    mov x20, x0                  // x20 = header
+
+    // Allocate initial data (16 * elem_size)
+    mov x21, #16                 // initial capacity
+    mov x0, x21
+    mul x0, x0, x19
+    bl _kcc_arena_alloc
+
+    // Fill header
+    str  x0, [x20, #VEC_DATA]
+    str xzr, [x20, #VEC_COUNT]
+    str x21, [x20, #VEC_CAP]
+    str x19, [x20, #VEC_ELEMSIZE]
+
+    mov x0, x20                  // return header
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Push}
+
+Append an element.  If the vector is full, a new array of double
+capacity is allocated from the arena, and the old contents are copied.
+
+@d Vec: push @{
+// -- kcc_vec_push ---------------------------------------------------
+// void kcc_vec_push(void *vec, const void *elem)
+//   x0 = vector pointer
+//   x1 = pointer to element to copy
+// Appends a copy of elem to the vector.
+.globl _kcc_vec_push
+.p2align 2
+_kcc_vec_push:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                  // x19 = vec
+    mov x20, x1                  // x20 = elem
+
+    ldr x21, [x19, #VEC_COUNT]  // x21 = count
+    ldr x22, [x19, #VEC_CAP]   // x22 = cap
+
+    cmp x21, x22
+    b.lo .Lvec_push_store
+
+    // Grow: double capacity
+    lsl x22, x22, #1            // new_cap = cap * 2
+    ldr x0, [x19, #VEC_ELEMSIZE]
+    mul x0, x22, x0             // new_cap * elem_size
+    bl _kcc_arena_alloc
+    // x0 = new array
+
+    // Copy old data
+    mov x3, x0                  // save new array
+    ldr x1, [x19, #VEC_DATA]   // src = old array
+    mov x4, x1                  // save old for memcpy dst/src swap
+    ldr x2, [x19, #VEC_ELEMSIZE]
+    mul x2, x21, x2             // old count * elem_size
+    mov x0, x3                  // dst = new array
+    mov x1, x4                  // src = old array
+    bl _kcc_memcpy
+
+    // Update vec header
+    str x3, [x19, #VEC_DATA]
+    str x22, [x19, #VEC_CAP]
+
+.Lvec_push_store:
+    // Compute dest: data + count * elem_size
+    ldr x0, [x19, #VEC_DATA]
+    ldr x2, [x19, #VEC_ELEMSIZE]
+    mul x3, x21, x2
+    add x0, x0, x3              // dst
+
+    mov x1, x20                 // src = elem
+    // x2 = elem_size (still loaded)
+    bl _kcc_memcpy
+
+    // Increment count
+    add x21, x21, #1
+    str x21, [x19, #VEC_COUNT]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Element Access}
+
+@d Vec: get @{
+// -- kcc_vec_get ----------------------------------------------------
+// void *kcc_vec_get(void *vec, uint64_t index)
+//   x0 = vector pointer
+//   x1 = element index
+// Returns pointer to element at the given index.
+// No bounds checking (caller's responsibility).
+.globl _kcc_vec_get
+.p2align 2
+_kcc_vec_get:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    ldr x2, [x0, #VEC_ELEMSIZE]
+    ldr x3, [x0, #VEC_DATA]
+    mul x1, x1, x2
+    add x0, x3, x1              // data + index * elem_size
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{String Interning}
+
+String interning ensures that each unique string is stored exactly
+once in the arena.  Two interned strings can be compared for equality
+by pointer comparison rather than byte-by-byte --- a critical
+optimization for the symbol table.
+
+The intern table is a hash table mapping string contents to their
+canonical arena-allocated copy.
+
+@d Strtab: init @{
+// -- kcc_strtab_init ------------------------------------------------
+// void kcc_strtab_init(void)
+// Creates the global string intern table.
+.globl _kcc_strtab_init
+.p2align 2
+_kcc_strtab_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    mov x0, #256                 // initial capacity
+    bl _kcc_ht_init
+
+    adrp x1, _kcc_strtab@@PAGE
+    add  x1, x1, _kcc_strtab@@PAGEOFF
+    str  x0, [x1]               // store table pointer
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\texttt{kcc\_strtab\_intern} looks up a string in the table.  If found,
+it returns the existing interned pointer.  If not, it copies the string
+into the arena, inserts it, and returns the new pointer.
+
+@d Strtab: intern @{
+// -- kcc_strtab_intern ----------------------------------------------
+// const char *kcc_strtab_intern(const char *s, uint64_t len)
+//   x0 = pointer to string (not necessarily null-terminated)
+//   x1 = string length
+// Returns pointer to the interned (null-terminated) copy.
+.globl _kcc_strtab_intern
+.p2align 2
+_kcc_strtab_intern:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = string
+    mov x20, x1                  // x20 = length
+
+    // Look up in the table
+    adrp x0, _kcc_strtab@@PAGE
+    add  x0, x0, _kcc_strtab@@PAGEOFF
+    ldr  x0, [x0]               // x0 = table pointer
+    mov  x1, x19
+    mov  x2, x20
+    bl _kcc_ht_get
+    cbnz x0, .Lstrtab_found     // already interned
+
+    // Not found: allocate len+1 bytes and copy
+    add x0, x20, #1
+    bl _kcc_arena_alloc
+    mov x21, x0                  // x21 = new buffer
+
+    // Copy string bytes
+    mov x1, x19                  // src
+    mov x2, x20                  // count
+    bl _kcc_memcpy
+
+    // Null-terminate
+    strb wzr, [x21, x20]
+
+    // Insert into table
+    adrp x0, _kcc_strtab@@PAGE
+    add  x0, x0, _kcc_strtab@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, x21                 // key = interned copy
+    mov  x2, x20                 // keylen
+    mov  x3, x21                 // value = same pointer
+    bl _kcc_ht_put
+
+    mov x0, x21                  // return interned pointer
+
+.Lstrtab_found:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Global State}
+
+@d Strtab: data @{
+// -- String intern table global state -------------------------------
+.data
+.p2align 3
+_kcc_strtab: .quad 0             // pointer to hash table
+@}

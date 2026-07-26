@@ -1,0 +1,15 @@
+tmp/
+*.aux
+*.log
+*.toc
+*.idx
+*.ind
+*.ilg
+*.out
+*.pdf
+*.o
+*.dvi
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+.DS_Store

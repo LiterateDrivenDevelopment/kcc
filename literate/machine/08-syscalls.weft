@@ -1,0 +1,171 @@
+% 08-syscalls.weft — macOS System Call Wrappers
+%
+% kcc uses no C library.  Every interaction with the operating system
+% goes through the macOS ARM64 syscall interface: place the syscall
+% number in x16, arguments in x0–x5, and execute svc #0x80.
+%
+% This chapter provides thin wrappers that establish proper frame
+% records and present a clean calling convention to the rest of kcc.
+
+\chapter{System Calls}
+\label{ch:syscalls}
+
+\section{Syscall Number Constants}
+
+These constants come from the macOS/XNU kernel headers
+(\texttt{<sys/syscall.h>}).  On ARM64, syscall numbers are placed
+in \reg{x16} before the \texttt{svc} instruction.
+
+@d Syscall: constants @{
+// -- macOS ARM64 syscall numbers ------------------------------------
+// Source: XNU bsd/kern/syscalls.master
+.equ SYS_exit,     1
+.equ SYS_read,     3
+.equ SYS_write,    4
+.equ SYS_open,     5
+.equ SYS_close,    6
+.equ SYS_mmap,   197          // 0xC5
+.equ SYS_munmap,  73          // 0x49
+.equ SYS_lseek,  199          // 0xC7
+
+// lseek whence constants
+.equ SEEK_SET,     0
+.equ SEEK_CUR,     1
+.equ SEEK_END,     2
+
+// mmap constants for file mapping
+.equ PROT_READ,    0x1       // PROT_READ only
+.equ MAP_PRIVATE,  0x2       // MAP_PRIVATE (no MAP_ANON)
+@}
+
+\section{Process Control}
+
+The simplest syscall: terminate the process.  \texttt{SYS\_exit}
+takes a single argument in \reg{x0} (the exit status) and does
+not return.
+
+@d Syscall: exit @{
+// -- SYS_exit ---------------------------------------------------
+// void kcc_sys_exit(int status)
+//   x0 = exit status
+// Does not return.
+FUNC kcc_sys_exit
+    SYSCALL SYS_exit
+    brk #1                    // unreachable; trap if kernel returns
+ENDFUNC
+@}
+
+\section{File I/O}
+
+The core I/O syscalls.  Each wrapper preserves the AAPCS64 calling
+convention: arguments arrive in \reg{x0}--\reg{x5}, the result is
+returned in \reg{x0}, and the carry flag indicates an error (in which
+case \reg{x0} holds the \texttt{errno} value).
+
+\subsection{write}
+
+Write bytes to a file descriptor.  This is the fundamental output
+primitive; all formatted output in \kcc{} ultimately reduces to
+calls to \texttt{kcc\_sys\_write}.
+
+@d Syscall: write @{
+// -- SYS_write --------------------------------------------------
+// ssize_t kcc_sys_write(int fd, const void *buf, size_t len)
+//   x0 = file descriptor
+//   x1 = buffer pointer
+//   x2 = byte count
+// Returns bytes written in x0, or (uint64_t)-1 with carry set.
+FUNC kcc_sys_write
+    SYSCALL SYS_write
+ENDFUNC
+@}
+
+\subsection{read}
+
+Read bytes from a file descriptor.  Used by the source manager to read source files when
+\texttt{mmap} is unsuitable.
+
+@d Syscall: read @{
+// -- SYS_read ---------------------------------------------------
+// ssize_t kcc_sys_read(int fd, void *buf, size_t len)
+//   x0 = file descriptor
+//   x1 = buffer pointer
+//   x2 = maximum bytes to read
+// Returns bytes read in x0, 0 at EOF, or -1 on error.
+FUNC kcc_sys_read
+    SYSCALL SYS_read
+ENDFUNC
+@}
+
+\subsection{open}
+
+Open a file by pathname.  Returns a file descriptor or $-1$ on error.
+
+@d Syscall: open @{
+// -- SYS_open ---------------------------------------------------
+// int kcc_sys_open(const char *path, int flags, mode_t mode)
+//   x0 = path (null-terminated)
+//   x1 = flags (O_RDONLY=0, O_WRONLY=1, O_RDWR=2, ...)
+//   x2 = mode (permissions, used with O_CREAT)
+// Returns fd in x0, or -1 on error.
+FUNC kcc_sys_open
+    SYSCALL SYS_open
+ENDFUNC
+@}
+
+\subsection{close}
+
+Close a file descriptor.
+
+@d Syscall: close @{
+// -- SYS_close --------------------------------------------------
+// int kcc_sys_close(int fd)
+//   x0 = file descriptor
+// Returns 0 on success, -1 on error.
+FUNC kcc_sys_close
+    SYSCALL SYS_close
+ENDFUNC
+@}
+
+\section{Memory Management}
+
+\subsection{mmap}
+
+Map pages of memory.  This is how \kcc{} obtains all dynamic memory:
+the arena allocator (Chapter~\ref{ch:arena}) calls \texttt{mmap}
+with \texttt{MAP\_PRIVATE | MAP\_ANON} to get fresh pages from the
+kernel.
+
+@d Syscall: mmap @{
+// -- SYS_mmap ---------------------------------------------------
+// void *kcc_sys_mmap(void *addr, size_t len, int prot,
+//                    int flags, int fd, off_t offset)
+//   x0 = requested address (0 for kernel choice)
+//   x1 = length in bytes
+//   x2 = protection (PROT_READ|PROT_WRITE = 0x3)
+//   x3 = flags (MAP_PRIVATE|MAP_ANON = 0x1002)
+//   x4 = file descriptor (-1 for anonymous)
+//   x5 = offset
+// Returns mapped address in x0, or MAP_FAILED ((void *)-1).
+FUNC kcc_sys_mmap
+    SYSCALL SYS_mmap
+ENDFUNC
+@}
+
+\subsection{lseek}
+
+Reposition the file offset.  Used by the source manager to determine
+file size before \texttt{mmap}: \texttt{lseek(fd, 0, SEEK\_END)}
+returns the file length.
+
+@d Syscall: lseek @{
+// -- SYS_lseek --------------------------------------------------
+// off_t kcc_sys_lseek(int fd, off_t offset, int whence)
+//   x0 = file descriptor
+//   x1 = offset
+//   x2 = whence (SEEK_SET=0, SEEK_CUR=1, SEEK_END=2)
+// Returns new file offset in x0, or -1 on error.
+FUNC kcc_sys_lseek
+    SYSCALL SYS_lseek
+ENDFUNC
+@}

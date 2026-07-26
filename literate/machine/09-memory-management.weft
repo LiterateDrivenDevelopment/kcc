@@ -1,0 +1,241 @@
+% 09-memory-management.weft — Arena Allocator in ARM64 Assembly
+%
+% kcc manages all dynamic memory through a single arena allocator.
+% The arena obtains large chunks from the kernel via mmap and
+% sub-allocates from them with a simple bump pointer.  There is
+% no individual free operation --- the entire arena is released at
+% once when compilation completes.
+%
+% This strategy is ideal for a compiler: allocations are numerous,
+% small, and all share the same lifetime (one translation unit).
+
+\chapter{Memory Management: The Arena}
+\label{ch:arena}
+
+\section{Design Rationale}
+
+A compiler allocates thousands of small objects (tokens, AST nodes,
+type descriptors, symbol entries) that all live until the end of
+compilation.  A general-purpose allocator (malloc/free) would waste
+time tracking individual lifetimes.  An arena allocator reduces
+allocation to a pointer bump --- a single \texttt{add} instruction ---
+and deallocation to a single \texttt{munmap} of the entire arena.
+
+\section{Chunk Layout}
+
+Each arena chunk is a contiguous region obtained from \texttt{mmap}.
+The first 24 bytes form a header:
+
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Offset & Field & Description \\
+\hline
+0  & \texttt{next}  & Pointer to the next chunk (linked list) \\
+8  & \texttt{limit} & One past the last usable byte \\
+16 & \texttt{avail} & Next free byte (bump pointer) \\
+\hline
+\end{tabular}
+\end{center}
+
+@d Arena: constants @{
+// -- Arena chunk layout ---------------------------------------------
+.equ CHUNK_NEXT,    0         // pointer to next chunk
+.equ CHUNK_LIMIT,   8         // end of usable region
+.equ CHUNK_AVAIL,  16         // next free byte (bump pointer)
+.equ CHUNK_HEADER, 24         // total header size
+
+// Default chunk size: 64 KiB (16 pages of 4 KiB)
+.equ ARENA_CHUNK_SIZE, 65536
+
+// mmap constants (macOS)
+.equ PROT_RW,       0x3      // PROT_READ | PROT_WRITE
+.equ MAP_PRIV_ANON, 0x1002   // MAP_PRIVATE | MAP_ANON
+.equ MAP_FAILED,    -1
+@}
+
+\section{Initialization}
+
+\texttt{kcc\_arena\_init} obtains the first chunk from the kernel
+and initializes the global arena state.  The arena pointer is stored
+in a global variable; in later phases, the main processing loop
+will cache it in \reg{x19}.
+
+@d Arena: init @{
+// -- kcc_arena_init -------------------------------------------------
+// void kcc_arena_init(void)
+// Allocates the initial arena chunk via mmap.
+// On failure (mmap returns MAP_FAILED), exits with status 1.
+.globl _kcc_arena_init
+.p2align 2
+_kcc_arena_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+@<Arena: init mmap call@>
+@<Arena: init chunk header@>
+    ldp x29, x30, [sp], #16
+    ret
+
+.Larena_init_fail:
+    mov x0, #1                    // exit status = 1
+    bl _kcc_sys_exit
+@}
+
+The initialization proceeds in two steps.  First, we request a
+64\,KiB anonymous mapping from the kernel:
+
+@d Arena: init mmap call @{
+    // mmap(NULL, ARENA_CHUNK_SIZE, PROT_RW, MAP_PRIV_ANON, -1, 0)
+    mov x0, #0                    // addr = NULL (kernel chooses)
+    mov x1, #ARENA_CHUNK_SIZE     // len  = 64 KiB
+    mov x2, #PROT_RW              // prot = read|write
+    mov x3, #MAP_PRIV_ANON        // flags = private|anonymous
+    mov x4, #-1                   // fd   = -1 (no file)
+    mov x5, #0                    // offset = 0
+    bl _kcc_sys_mmap
+
+    // Check for MAP_FAILED
+    cmn x0, #1                    // compare with (uint64_t)-1
+    b.eq .Larena_init_fail
+@}
+
+Then we write the three header fields and record the chunk as current:
+
+@d Arena: init chunk header @{
+    // Initialize chunk header (x0 = base address)
+    str xzr, [x0, #CHUNK_NEXT]   // next = NULL
+
+    mov x1, x0
+    add x1, x1, #ARENA_CHUNK_SIZE
+    str x1, [x0, #CHUNK_LIMIT]   // limit = base + size
+
+    mov x1, x0
+    add x1, x1, #CHUNK_HEADER
+    str x1, [x0, #CHUNK_AVAIL]   // avail = base + header
+
+    // Store as the current chunk
+    adrp x1, _kcc_arena_current@@PAGE
+    add  x1, x1, _kcc_arena_current@@PAGEOFF
+    str  x0, [x1]
+@}
+
+\section{Allocation: Fast Path}
+
+\texttt{kcc\_arena\_alloc} is the primary allocation function.  It
+takes a size in bytes (in \reg{x0}), rounds it up to 8-byte alignment,
+and returns a pointer to the allocated region.
+
+The fast path is a single comparison and pointer bump --- three
+instructions after the alignment arithmetic:
+
+@d Arena: alloc fast path @{
+// -- kcc_arena_alloc ------------------------------------------------
+// void *kcc_arena_alloc(size_t size)
+//   x0 = number of bytes to allocate
+// Returns pointer to allocated memory in x0.
+// All allocations are 8-byte aligned.
+.globl _kcc_arena_alloc
+.p2align 2
+_kcc_arena_alloc:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Round size up to 8-byte alignment: (size + 7) & ~7
+    add x0, x0, #7
+    and x0, x0, #~7
+    mov x19, x0                   // x19 = aligned size
+
+    // Load current chunk pointer
+    adrp x1, _kcc_arena_current@@PAGE
+    add  x1, x1, _kcc_arena_current@@PAGEOFF
+    ldr  x2, [x1]                 // x2 = current chunk
+
+    // Load avail and limit
+    ldr x3, [x2, #CHUNK_AVAIL]   // x3 = avail
+    ldr x4, [x2, #CHUNK_LIMIT]   // x4 = limit
+
+    // Check: avail + size <= limit?
+    add x5, x3, x19
+    cmp x5, x4
+    b.hi .Larena_alloc_slow       // overflow: need new chunk
+
+    // Fast path: bump the pointer
+    str x5, [x2, #CHUNK_AVAIL]   // avail += size
+    mov x0, x3                    // return old avail
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Allocation: Slow Path}
+
+When the current chunk is exhausted, we allocate a new one via
+\texttt{mmap}, link it to the chain, and fulfill the request from
+the fresh chunk.
+
+@d Arena: alloc slow path @{
+.Larena_alloc_slow:
+    // Chunk size = max(ARENA_CHUNK_SIZE, CHUNK_HEADER + size)
+    add x0, x19, #CHUNK_HEADER
+    mov x1, #ARENA_CHUNK_SIZE
+    cmp x0, x1
+    csel x1, x0, x1, hi          // x1 = max(needed, default)
+
+    // mmap the new chunk
+    mov x0, #0
+    mov x2, #PROT_RW
+    mov x3, #MAP_PRIV_ANON
+    mov x4, #-1
+    mov x5, #0
+    bl _kcc_sys_mmap
+
+    cmn x0, #1
+    b.eq .Larena_alloc_oom
+@<Arena: alloc link new chunk@>
+
+.Larena_alloc_oom:
+    mov x0, #2                   // exit status = 2
+    bl _kcc_sys_exit
+@}
+
+Once the new chunk is mapped, we link it into the chain, initialize
+its header, and return the first allocation from it:
+
+@d Arena: alloc link new chunk @{
+    // x0 = new chunk base; link to previous chunk
+    adrp x1, _kcc_arena_current@@PAGE
+    add  x1, x1, _kcc_arena_current@@PAGEOFF
+    ldr  x2, [x1]                 // x2 = old chunk
+
+    str x2, [x0, #CHUNK_NEXT]    // new->next = old
+
+    mov x3, x0
+    add x3, x3, #ARENA_CHUNK_SIZE
+    str x3, [x0, #CHUNK_LIMIT]   // limit (conservative)
+
+    mov x3, x0
+    add x3, x3, #CHUNK_HEADER
+    add x4, x3, x19              // new avail after allocation
+    str x4, [x0, #CHUNK_AVAIL]
+
+    str x0, [x1]                  // update arena_current
+    mov x0, x3                    // return = first byte after header
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Global State}
+
+The arena's mutable state is a single pointer to the current (most
+recently allocated) chunk.  We store it in the \texttt{\_\_DATA} segment.
+
+@d Arena: data @{
+// -- Arena global state ---------------------------------------------
+.data
+.p2align 3
+_kcc_arena_current: .quad 0   // pointer to current arena chunk
+@}

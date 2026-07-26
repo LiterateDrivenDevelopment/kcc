@@ -1,0 +1,322 @@
+% 12-io.weft — Buffered File I/O
+%
+% All output from kcc (diagnostics, generated code, debug traces)
+% passes through this buffered I/O layer.  Rather than issuing a
+% syscall for every character, we accumulate output in a 4 KiB buffer
+% and flush it in bulk.  This dramatically reduces syscall overhead.
+%
+% For Phase 0, the buffer is statically allocated in .bss.  In later
+% phases, we may switch to arena-allocated buffers to support multiple
+% output streams simultaneously.
+
+\chapter{Buffered I/O}
+\label{ch:io}
+
+\section{Buffer Layout}
+
+The I/O state consists of four values: the file descriptor, the
+buffer base address, the current write position, and the capacity.
+For Phase~0, we use a single static buffer writing to \texttt{stdout}.
+
+@d IO: data @{
+// -- I/O global state -----------------------------------------------
+.data
+.p2align 3
+_kcc_io_fd:   .quad 1            // file descriptor (1 = stdout)
+_kcc_io_pos:  .quad 0            // current write position
+_kcc_io_cap:  .quad 4096         // buffer capacity
+
+.bss
+.p2align 4
+_kcc_io_buf:  .space 4096        // output buffer
+@}
+
+\section{Flush}
+
+\texttt{kcc\_io\_flush} writes the buffered contents to the file
+descriptor and resets the position to zero.  This is called
+automatically when the buffer fills, and explicitly before program
+exit.
+
+@d IO: flush @{
+// -- kcc_io_flush ---------------------------------------------------
+// void kcc_io_flush(void)
+// Writes buffered data to the file descriptor, resets position.
+.globl _kcc_io_flush
+.p2align 2
+_kcc_io_flush:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Load position — if zero, nothing to flush
+    adrp x19, _kcc_io_pos@@PAGE
+    add  x19, x19, _kcc_io_pos@@PAGEOFF
+    ldr  x2, [x19]               // x2 = bytes to write
+    cbz  x2, .Lflush_done
+
+    // Load fd
+    adrp x0, _kcc_io_fd@@PAGE
+    add  x0, x0, _kcc_io_fd@@PAGEOFF
+    ldr  x0, [x0]                // x0 = fd
+
+    // Load buffer base
+    adrp x1, _kcc_io_buf@@PAGE
+    add  x1, x1, _kcc_io_buf@@PAGEOFF  // x1 = buf
+
+    // x2 already has the byte count
+    bl _kcc_sys_write
+
+    // Reset position to 0
+    str xzr, [x19]
+
+.Lflush_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Put Character}
+
+\texttt{kcc\_io\_putc} appends a single byte to the buffer.  If
+the buffer is full, it flushes first.
+
+@d IO: putc @{
+// -- kcc_io_putc ----------------------------------------------------
+// void kcc_io_putc(int c)
+//   x0 = character to write (low 8 bits)
+FUNC kcc_io_putc
+    // Load buffer state
+    adrp x1, _kcc_io_pos@@PAGE
+    add  x1, x1, _kcc_io_pos@@PAGEOFF
+    ldr  x2, [x1]                // x2 = current position
+
+    adrp x3, _kcc_io_cap@@PAGE
+    add  x3, x3, _kcc_io_cap@@PAGEOFF
+    ldr  x3, [x3]                // x3 = capacity
+
+    // Flush if buffer is full
+    cmp x2, x3
+    b.lo .Lputc_store
+
+    // Save the character across the flush call
+    str x0, [sp, #-16]!
+    bl _kcc_io_flush
+    ldr x0, [sp], #16
+
+    // Reload position (should be 0 after flush)
+    adrp x1, _kcc_io_pos@@PAGE
+    add  x1, x1, _kcc_io_pos@@PAGEOFF
+    ldr  x2, [x1]
+
+.Lputc_store:
+    // Store the byte
+    adrp x3, _kcc_io_buf@@PAGE
+    add  x3, x3, _kcc_io_buf@@PAGEOFF
+    strb w0, [x3, x2]
+
+    // Increment position
+    add x2, x2, #1
+    str x2, [x1]
+ENDFUNC
+@}
+
+\section{Put String}
+
+\texttt{kcc\_io\_puts} writes a null-terminated string to the buffer.
+It processes the string byte by byte, flushing the buffer whenever
+it fills.  The null terminator is not written.
+
+This is the primary output function used by the compiler driver,
+the diagnostic engine, and (eventually) the code emitter.
+
+@d IO: puts @{
+// -- kcc_io_puts ----------------------------------------------------
+// void kcc_io_puts(const char *s)
+//   x0 = pointer to null-terminated string
+// Writes all bytes (excluding the null terminator) to the buffer.
+.globl _kcc_io_puts
+.p2align 2
+_kcc_io_puts:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                  // x19 = string pointer
+
+    // Cache buffer state in callee-saved registers
+    adrp x20, _kcc_io_pos@@PAGE
+    add  x20, x20, _kcc_io_pos@@PAGEOFF
+    ldr  x21, [x20]              // x21 = current position
+
+    adrp x22, _kcc_io_buf@@PAGE
+    add  x22, x22, _kcc_io_buf@@PAGEOFF  // x22 = buffer base
+
+.Lputs_loop:
+    ldrb w0, [x19], #1           // load byte, advance string ptr
+    cbz w0, .Lputs_done          // null terminator → stop
+
+    // Store byte in buffer
+    strb w0, [x22, x21]
+    add x21, x21, #1
+
+    // Check if buffer is full (4096 bytes)
+    cmp x21, #4096
+    b.lo .Lputs_loop
+
+    // Buffer full — flush
+    str x21, [x20]               // save pos before flush
+    bl _kcc_io_flush
+    ldr x21, [x20]               // reload pos (should be 0)
+    b .Lputs_loop
+
+.Lputs_done:
+    str x21, [x20]               // save final position
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Write N Bytes}
+
+\texttt{kcc\_io\_write} writes exactly \texttt{n} bytes from a pointer
+to the output buffer.  Unlike \texttt{puts}, it does not look for a null
+terminator --- the caller supplies the byte count.  This is essential for
+printing token text, which is a \texttt{(pointer, length)} pair into the
+source buffer rather than a null-terminated string.
+
+@d IO: write @{
+// -- kcc_io_write ---------------------------------------------------
+// void kcc_io_write(const void *ptr, size_t len)
+//   x0 = pointer to data
+//   x1 = byte count
+// Writes exactly len bytes to the output buffer.
+.globl _kcc_io_write
+.p2align 2
+_kcc_io_write:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                  // x19 = source pointer
+    mov x20, x1                  // x20 = remaining count
+
+    // Cache buffer state
+    adrp x21, _kcc_io_pos@@PAGE
+    add  x21, x21, _kcc_io_pos@@PAGEOFF
+
+    adrp x22, _kcc_io_buf@@PAGE
+    add  x22, x22, _kcc_io_buf@@PAGEOFF
+
+    cbz x20, .Lwrite_done
+
+.Lwrite_loop:
+    ldr  x1, [x21]              // x1 = current pos
+    ldrb w2, [x19], #1          // load byte from source
+    strb w2, [x22, x1]          // store in buffer
+    add  x1, x1, #1
+    str  x1, [x21]              // update pos
+
+    cmp x1, #4096
+    b.lo .Lwrite_no_flush
+    bl _kcc_io_flush
+.Lwrite_no_flush:
+    subs x20, x20, #1
+    b.ne .Lwrite_loop
+
+.Lwrite_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Print Unsigned Integer}
+
+\texttt{kcc\_io\_putu} converts an unsigned 64-bit integer to decimal
+ASCII and writes it to the output buffer.  This is used by
+\texttt{--dump-tokens} to print line and column numbers.
+
+The algorithm divides repeatedly by~10, storing digits in reverse order
+in a small stack buffer, then writes them out with \texttt{kcc\_io\_write}.
+
+@d IO: putu @{
+// -- kcc_io_putu ----------------------------------------------------
+// void kcc_io_putu(uint64_t n)
+//   x0 = unsigned integer to print
+// Outputs the decimal representation to the buffered output.
+.globl _kcc_io_putu
+.p2align 2
+_kcc_io_putu:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    str x19, [sp, #16]
+    // digit buffer: sp+24 through sp+47 (24 bytes, room for 20 digits)
+
+    mov x19, x0                  // x19 = number
+    add x3, sp, #48             // x3 = one past end of buffer
+    mov x4, x3                  // x4 = saved end pointer
+
+    // Handle zero specially
+    cbnz x19, .Lputu_nonzero
+    mov w1, #'0'
+    sub x3, x3, #1
+    strb w1, [x3]
+    b .Lputu_print
+
+.Lputu_nonzero:
+    mov x5, #10
+.Lputu_loop:
+    udiv x1, x19, x5            // x1 = n / 10
+    msub x2, x1, x5, x19        // x2 = n % 10
+    add  w2, w2, #'0'           // convert to ASCII
+    sub  x3, x3, #1
+    strb w2, [x3]
+    mov  x19, x1
+    cbnz x19, .Lputu_loop
+
+.Lputu_print:
+    mov x0, x3                  // pointer to first digit
+    sub x1, x4, x3             // length
+    bl _kcc_io_write
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Stderr Output}
+
+\texttt{kcc\_io\_err} writes a null-terminated string directly to
+\texttt{stderr} (file descriptor~2) via a raw syscall.  No buffering
+is used --- diagnostic messages should appear immediately, even if
+the program crashes afterwards.
+
+@d IO: err @{
+// -- kcc_io_err -----------------------------------------------------
+// void kcc_io_err(const char *s)
+//   x0 = null-terminated string
+// Writes directly to stderr (fd=2), unbuffered.
+.globl _kcc_io_err
+.p2align 2
+_kcc_io_err:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                  // save string pointer
+    bl _kcc_strlen               // x0 = length
+
+    mov x2, x0                  // x2 = byte count
+    mov x1, x19                 // x1 = buffer
+    mov x0, #2                  // x0 = fd (stderr)
+    bl _kcc_sys_write
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}

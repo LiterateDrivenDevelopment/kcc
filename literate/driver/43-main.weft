@@ -1,0 +1,140 @@
+% 43-main.weft — Entry Point and Argument Parsing
+%
+% This is where kcc begins execution.  The _main function receives
+% argc and argv from the macOS kernel, initializes the compiler's
+% subsystems, and orchestrates the compilation pipeline.
+%
+% Phase 1 adds --dump-tokens: open a source file, tokenize it,
+% and print every token with its source location.
+
+\chapter{The Driver}
+\label{ch:driver}
+
+\section{Entry Point}
+
+On macOS, the kernel passes control to \texttt{\_main} with:
+\begin{itemize}
+\item \reg{x0} = \texttt{argc} (argument count)
+\item \reg{x1} = \texttt{argv} (pointer to argument vector)
+\end{itemize}
+
+We save these immediately in callee-saved registers, then initialize
+the arena and I/O subsystems before doing any real work.
+
+@d Main: entry point @{
+// -- _main ----------------------------------------------------------
+// Entry point for kcc.
+// x0 = argc, x1 = argv
+.text
+.globl _main
+.p2align 2
+_main:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Save argc and argv
+    mov x19, x0                   // x19 = argc
+    mov x20, x1                   // x20 = argv
+
+    // Initialize subsystems
+    bl _kcc_arena_init
+    bl _kcc_lex_kw_init
+
+    // Print banner
+    adrp x0, _kcc_banner@@PAGE
+    add  x0, x0, _kcc_banner@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Check for arguments
+    cmp x19, #2
+    b.lt .Lmain_no_args
+
+    // Check if argv[1] is "--dump-tokens"
+    ldr x0, [x20, #8]            // argv[1]
+    adrp x1, _kcc_opt_dump_tokens@@PAGE
+    add  x1, x1, _kcc_opt_dump_tokens@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmain_dump_tokens
+
+    // Not a flag: treat as source file (legacy Phase 0 behavior)
+    adrp x0, _kcc_msg_source@@PAGE
+    add  x0, x0, _kcc_msg_source@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x20, #8]            // argv[1]
+    bl _kcc_io_puts
+    adrp x0, _kcc_msg_newline@@PAGE
+    add  x0, x0, _kcc_msg_newline@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lmain_exit
+
+.Lmain_dump_tokens:
+    // --dump-tokens requires a source file argument
+    cmp x19, #3
+    b.lt .Lmain_dump_usage
+
+    // Open and mmap the source file
+    ldr x0, [x20, #16]           // argv[2] = source file path
+    bl _kcc_source_open
+
+    // Initialize lexer with the mapped source
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    ldr  x1, [x1]
+
+    bl _kcc_lex_init
+
+    // Dump all tokens
+    bl _kcc_lex_dump_all
+    b .Lmain_exit
+
+.Lmain_dump_usage:
+    adrp x0, _kcc_err_dump_usage@@PAGE
+    add  x0, x0, _kcc_err_dump_usage@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
+.Lmain_no_args:
+    adrp x0, _kcc_msg_usage@@PAGE
+    add  x0, x0, _kcc_msg_usage@@PAGEOFF
+    bl _kcc_io_puts
+
+.Lmain_exit:
+    // Flush buffered output
+    bl _kcc_io_flush
+
+    // Exit cleanly
+    mov x0, #0
+    bl _kcc_sys_exit
+
+    // Unreachable
+    brk #1
+@}
+
+\section{String Constants}
+
+The driver's string literals.  These live in the read-only data section.
+Each is null-terminated for use with \texttt{kcc\_io\_puts}.
+
+@d Main: data @{
+// -- Driver string constants ----------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_kcc_banner:
+    .asciz "kcc v0.1.0 - a formal C17 compiler for ARM64\n"
+_kcc_msg_source:
+    .asciz "source: "
+_kcc_msg_usage:
+    .asciz "usage: kcc [--dump-tokens] <source.c>\n"
+_kcc_msg_newline:
+    .asciz "\n"
+_kcc_opt_dump_tokens:
+    .asciz "--dump-tokens"
+_kcc_err_dump_usage:
+    .asciz "kcc: error: --dump-tokens requires a source file\n"
+@}

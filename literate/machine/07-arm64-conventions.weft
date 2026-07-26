@@ -1,0 +1,101 @@
+% 07-arm64-conventions.weft — ARM64 Register Map, Apple ABI, Macro Definitions
+%
+% This chapter establishes the assembly-level conventions used throughout
+% kcc.  Every function in the compiler follows these rules.
+
+\chapter{ARM64 Conventions}
+\label{ch:arm64-conventions}
+
+\section{Register Assignment}
+
+The AAPCS64 (ARM IHI 0055) divides the 31 general-purpose registers
+into well-defined roles.  \kcc{} further refines the callee-saved
+registers for persistent compiler state:
+
+\begin{center}
+\begin{tabular}{lll}
+\hline
+Register(s) & AAPCS64 Role & \kcc{} Usage \\
+\hline
+\reg{x0}--\reg{x7}   & Arguments/results      & Per AAPCS64 \\
+\reg{x8}              & Indirect result         & Scratch \\
+\reg{x9}--\reg{x15}   & Temporaries             & Scratch (caller-saved) \\
+\reg{x16}--\reg{x17}  & Intra-procedure scratch & Syscall number, linker veneers \\
+\reg{x18}             & Platform register       & \textbf{Reserved} (Apple) \\
+\reg{x19}             & Callee-saved            & Arena pointer (global) \\
+\reg{x20}             & Callee-saved            & String table pointer (global) \\
+\reg{x21}             & Callee-saved            & Current source buffer \\
+\reg{x22}             & Callee-saved            & Current token pointer \\
+\reg{x23}--\reg{x28}  & Callee-saved            & Available for local use \\
+\reg{x29}             & Frame pointer           & \textbf{Mandatory} (Apple) \\
+\reg{x30}             & Link register           & Return address \\
+\reg{sp}              & Stack pointer           & 16-byte aligned always \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Apple Platform Constraints}
+
+Apple ARM64 deviates from vanilla AAPCS64 in several critical ways:
+
+\begin{enumerate}
+\item \textbf{Frame pointer is mandatory.}  Every function must
+      establish a frame record: \texttt{stp x29, x30, [sp, \#-N]!}
+      followed by \texttt{mov x29, sp} (or \texttt{add x29, sp, \#off}).
+
+\item \textbf{\reg{x18} is reserved.}  The platform register must
+      never be read or written by user code.
+
+\item \textbf{No red zone.}  Unlike x86-64, there is no guaranteed
+      scratch space below \reg{sp}.  All local storage must be
+      explicitly allocated by decrementing \reg{sp}.
+
+\item \textbf{Stack alignment.}  \reg{sp} must be 16-byte aligned
+      at every instruction that accesses memory through \reg{sp}.
+
+\item \textbf{Mach-O symbol prefix.}  All external symbols carry
+      a leading underscore: \texttt{\_main}, \texttt{\_kcc\_arena\_init}.
+
+\item \textbf{Syscall convention.}  System calls use \texttt{svc \#0x80}
+      with the syscall number in \reg{x16}, arguments in \reg{x0}--\reg{x5},
+      and the return value in \reg{x0}.  The carry flag indicates error.
+\end{enumerate}
+
+\section{Common Macros}
+
+We define three macros used throughout the codebase.  Every tangled
+\texttt{.s} file includes these at the top.
+
+\texttt{FUNC} establishes a standard function prologue with the
+mandatory frame pointer.  \texttt{ENDFUNC} tears down the frame
+and returns.  \texttt{SYSCALL} invokes a macOS system call.
+
+@d ARM64: common macros @{
+// -- kcc common macros ----------------------------------------------
+// FUNC name — standard function prologue (Apple ARM64 ABI)
+// Saves frame pointer (x29) and link register (x30).
+// The function is exported with the Mach-O underscore prefix.
+.macro FUNC name
+    .globl _\name
+    .p2align 2
+_\name:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+.endm
+
+// ENDFUNC — standard function epilogue
+// Restores x29/x30 and returns to caller.
+.macro ENDFUNC
+    ldp x29, x30, [sp], #16
+    ret
+.endm
+
+// SYSCALL num — invoke macOS syscall
+// Places the syscall number in x16 and traps to kernel.
+// Arguments must already be in x0–x5 per convention.
+// Returns result in x0; carry flag set on error.
+.macro SYSCALL num
+    mov x16, #\num
+    svc #0x80
+.endm
+@}

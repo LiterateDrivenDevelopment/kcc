@@ -1,0 +1,201 @@
+% 14-source-manager.weft — Source File Management
+%
+% The source manager handles reading C source files from disk.
+% Files are memory-mapped with mmap for zero-copy access --- the
+% kernel pages in file contents on demand, and the lexer can scan
+% directly through the mapped region.
+%
+% Source location tracking is trivial: since the lexer walks a
+% contiguous buffer, the current line and column are maintained
+% as simple counters during scanning.
+
+\chapter{Source File Management}
+\label{ch:source}
+
+\section{Design}
+
+A compiler must read source files efficiently.  The simplest approach
+is to \texttt{mmap} the entire file: the kernel provides a read-only
+view of the file's contents, paged in on demand.  The lexer then scans
+directly through the mapped memory without any copying.
+
+For each source file we track:
+\begin{itemize}
+\item The base pointer (start of mapped region)
+\item The file size (length of mapped region)
+\item The file path (for diagnostic messages)
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Offset & Field & Description \\
+\hline
+0  & \texttt{base} & Pointer to start of mapped file \\
+8  & \texttt{size} & File size in bytes \\
+16 & \texttt{path} & Pointer to file path string \\
+\hline
+\end{tabular}
+\end{center}
+
+@d Source: constants @{
+// -- Source buffer layout --------------------------------------------
+.equ SRC_BASE,      0         // pointer to mmap'd file data
+.equ SRC_SIZE,      8         // file size in bytes
+.equ SRC_PATH,     16         // pointer to file path (null-terminated)
+.equ SRC_BUFSIZE,  24         // structure size
+@}
+
+\section{Opening a Source File}
+
+\texttt{kcc\_source\_open} opens a C source file by path.  The
+sequence is:
+\begin{enumerate}
+\item \texttt{open} the file read-only.
+\item \texttt{lseek(fd, 0, SEEK\_END)} to determine the file size.
+\item \texttt{mmap} the file with \texttt{PROT\_READ | MAP\_PRIVATE}.
+\item \texttt{close} the file descriptor (the mapping persists).
+\item Store the base pointer, size, and path in the global source state.
+\end{enumerate}
+
+If any step fails, the function prints an error message to stderr
+and exits with status~1.
+
+@d Source: open file @{
+// -- kcc_source_open ------------------------------------------------
+// void kcc_source_open(const char *path)
+//   x0 = null-terminated file path
+// Opens and mmaps the file, stores result in global state.
+// On failure, prints error to stderr and exits.
+.globl _kcc_source_open
+.p2align 2
+_kcc_source_open:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = path
+
+    // Store path in global state
+    adrp x1, _kcc_src_path@@PAGE
+    add  x1, x1, _kcc_src_path@@PAGEOFF
+    str  x19, [x1]
+
+    // open(path, O_RDONLY, 0)
+    mov x0, x19                  // path
+    mov x1, #0                   // O_RDONLY = 0
+    mov x2, #0                   // mode (unused for O_RDONLY)
+    bl _kcc_sys_open
+
+    // Check for error
+    cmn x0, #1
+    b.eq .Lsource_open_fail
+    mov x20, x0                  // x20 = fd
+
+    // lseek(fd, 0, SEEK_END) to get file size
+    mov x0, x20
+    mov x1, #0
+    mov x2, #SEEK_END
+    bl _kcc_sys_lseek
+
+    cmn x0, #1
+    b.eq .Lsource_seek_fail
+    mov x21, x0                  // x21 = file size
+
+    // Reject empty files
+    cbz x21, .Lsource_empty
+
+    // mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)
+    mov x0, #0                   // addr = NULL
+    mov x1, x21                  // len = file size
+    mov x2, #PROT_READ           // prot = read only
+    mov x3, #MAP_PRIVATE         // flags = private
+    mov x4, x20                  // fd
+    mov x5, #0                   // offset = 0
+    bl _kcc_sys_mmap
+
+    cmn x0, #1
+    b.eq .Lsource_mmap_fail
+
+    // Store base and size in global state
+    adrp x1, _kcc_src_base@@PAGE
+    add  x1, x1, _kcc_src_base@@PAGEOFF
+    str  x0, [x1]
+
+    adrp x1, _kcc_src_size@@PAGE
+    add  x1, x1, _kcc_src_size@@PAGEOFF
+    str  x21, [x1]
+
+    // Close the file descriptor (mapping persists)
+    mov x0, x20
+    bl _kcc_sys_close
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lsource_open_fail:
+    adrp x0, _kcc_err_open@@PAGE
+    add  x0, x0, _kcc_err_open@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, x19
+    bl _kcc_io_err
+    adrp x0, _kcc_src_newline@@PAGE
+    add  x0, x0, _kcc_src_newline@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
+.Lsource_seek_fail:
+    mov x0, x20
+    bl _kcc_sys_close
+    adrp x0, _kcc_err_read@@PAGE
+    add  x0, x0, _kcc_err_read@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
+.Lsource_empty:
+    mov x0, x20
+    bl _kcc_sys_close
+    adrp x0, _kcc_err_empty@@PAGE
+    add  x0, x0, _kcc_err_empty@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+
+.Lsource_mmap_fail:
+    mov x0, x20
+    bl _kcc_sys_close
+    adrp x0, _kcc_err_mmap@@PAGE
+    add  x0, x0, _kcc_err_mmap@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+@}
+
+\section{Global State}
+
+The source manager's state consists of the mapped buffer, its size,
+and the file path.  These are accessed by the lexer when scanning.
+
+@d Source: data @{
+// -- Source manager global state ------------------------------------
+.data
+.p2align 3
+.globl _kcc_src_base
+_kcc_src_base:  .quad 0       // pointer to mmap'd file contents
+.globl _kcc_src_size
+_kcc_src_size:  .quad 0       // file size in bytes
+.globl _kcc_src_path
+_kcc_src_path:  .quad 0       // pointer to file path string
+
+.section __TEXT,__cstring,cstring_literals
+_kcc_err_open:   .asciz "kcc: error: cannot open file: "
+_kcc_err_read:   .asciz "kcc: error: cannot read file\n"
+_kcc_err_empty:  .asciz "kcc: error: source file is empty\n"
+_kcc_err_mmap:   .asciz "kcc: error: cannot map file\n"
+_kcc_src_newline: .asciz "\n"
+@}

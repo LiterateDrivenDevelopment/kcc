@@ -1,0 +1,1823 @@
+% 17-lexer.weft — Lexical Analysis (C17 Tokenizer)
+%
+% The lexer converts a stream of source characters into a stream of
+% tokens according to ISO 9899:2018 section 6.4.  This is Phase 3 of
+% translation (section 5.1.1.2 paragraph 3): each preprocessing token
+% is the longest sequence of characters matching a token pattern.
+%
+% The lexer operates directly on the mmap'd source buffer provided
+% by the source manager.  It maintains a cursor (current position),
+% tracks line and column numbers, and produces one token at a time.
+%
+% Token value parsing (converting "42" to the integer 42) is deferred
+% to Phase 5 (section 5.1.1.2 paragraph 5).
+
+\chapter{Lexical Analysis}
+\label{ch:lexer}
+
+\section{Token Types}
+
+Every C17 token falls into one of the categories defined in \stdref{6.4}:
+keywords, identifiers, constants, string literals, and punctuators.
+We assign a unique integer code to each.  Codes 0--9 are structural,
+10--53 are the 44 keywords, and 60+ are punctuators.
+
+@d Lexer: token constants @{
+// -- Token type codes -----------------------------------------------
+// Structural tokens
+.equ TOK_EOF,          0
+.equ TOK_IDENT,        1
+.equ TOK_NUMBER,       2      // pp-number (integer or float)
+.equ TOK_CHAR_LIT,     3      // character constant
+.equ TOK_STRING_LIT,   4      // string literal
+.equ TOK_UNKNOWN,      5      // unrecognized character
+
+// C17 keywords (section 6.4.1) — 44 keywords, codes 10–53
+.equ TOK_AUTO,        10
+.equ TOK_BREAK,       11
+.equ TOK_CASE,        12
+.equ TOK_CHAR,        13
+.equ TOK_CONST,       14
+.equ TOK_CONTINUE,    15
+.equ TOK_DEFAULT,     16
+.equ TOK_DO,          17
+.equ TOK_DOUBLE,      18
+.equ TOK_ELSE,        19
+.equ TOK_ENUM,        20
+.equ TOK_EXTERN,      21
+.equ TOK_FLOAT,       22
+.equ TOK_FOR,         23
+.equ TOK_GOTO,        24
+.equ TOK_IF,          25
+.equ TOK_INLINE,      26
+.equ TOK_INT,         27
+.equ TOK_LONG,        28
+.equ TOK_REGISTER,    29
+.equ TOK_RESTRICT,    30
+.equ TOK_RETURN,      31
+.equ TOK_SHORT,       32
+.equ TOK_SIGNED,      33
+.equ TOK_SIZEOF,      34
+.equ TOK_STATIC,      35
+.equ TOK_STRUCT,      36
+.equ TOK_SWITCH,      37
+.equ TOK_TYPEDEF,     38
+.equ TOK_UNION,       39
+.equ TOK_UNSIGNED,    40
+.equ TOK_VOID,        41
+.equ TOK_VOLATILE,    42
+.equ TOK_WHILE,       43
+.equ TOK__ALIGNAS,    44
+.equ TOK__ALIGNOF,    45
+.equ TOK__ATOMIC,     46
+.equ TOK__BOOL,       47
+.equ TOK__COMPLEX,    48
+.equ TOK__GENERIC,    49
+.equ TOK__IMAGINARY,  50
+.equ TOK__NORETURN,   51
+.equ TOK__STATIC_ASSERT, 52
+.equ TOK__THREAD_LOCAL,  53
+
+// Punctuators (section 6.4.6) — codes 60+
+.equ TOK_LPAREN,      60      // (
+.equ TOK_RPAREN,      61      // )
+.equ TOK_LBRACE,      62      // {
+.equ TOK_RBRACE,      63      // }
+.equ TOK_LBRACKET,    64      // [
+.equ TOK_RBRACKET,    65      // ]
+.equ TOK_SEMI,        66      // ;
+.equ TOK_COMMA,       67      // ,
+.equ TOK_DOT,         68      // .
+.equ TOK_ARROW,       69      // ->
+.equ TOK_INC,         70      // ++
+.equ TOK_DEC,         71      // --
+.equ TOK_AMP,         72      // &
+.equ TOK_STAR,        73      // *
+.equ TOK_PLUS,        74      // +
+.equ TOK_MINUS,       75      // -
+.equ TOK_TILDE,       76      // ~
+.equ TOK_BANG,        77      // !
+.equ TOK_SLASH,       78      // /
+.equ TOK_PERCENT,     79      // %
+.equ TOK_SHL,         80      // <<
+.equ TOK_SHR,         81      // >>
+.equ TOK_LT,          82      // <
+.equ TOK_GT,          83      // >
+.equ TOK_LE,          84      // <=
+.equ TOK_GE,          85      // >=
+.equ TOK_EQ,          86      // ==
+.equ TOK_NE,          87      // !=
+.equ TOK_CARET,       88      // ^
+.equ TOK_PIPE,        89      // |
+.equ TOK_AND,         90      // &&
+.equ TOK_OR,          91      // ||
+.equ TOK_QUESTION,    92      // ?
+.equ TOK_COLON,       93      // :
+.equ TOK_ASSIGN,      94      // =
+.equ TOK_MUL_ASSIGN,  95      // *=
+.equ TOK_DIV_ASSIGN,  96      // /=
+.equ TOK_MOD_ASSIGN,  97      // %=
+.equ TOK_ADD_ASSIGN,  98      // +=
+.equ TOK_SUB_ASSIGN,  99      // -=
+.equ TOK_SHL_ASSIGN, 100      // <<=
+.equ TOK_SHR_ASSIGN, 101      // >>=
+.equ TOK_AND_ASSIGN, 102      // &=
+.equ TOK_XOR_ASSIGN, 103      // ^=
+.equ TOK_OR_ASSIGN,  104      // |=
+.equ TOK_HASH,       105      // #
+.equ TOK_DHASH,      106      // ##
+.equ TOK_ELLIPSIS,   107      // ...
+@}
+
+\section{Lexer Initialization}
+
+\texttt{kcc\_lex\_init} prepares the lexer to scan a source buffer.
+It sets the cursor to the start of the buffer and initializes the
+line counter to~1.
+
+@d Lexer: init @{
+// -- kcc_lex_init ---------------------------------------------------
+// void kcc_lex_init(const char *base, uint64_t size)
+//   x0 = pointer to source buffer
+//   x1 = buffer size in bytes
+// Initializes lexer state to scan the given buffer.
+.globl _kcc_lex_init
+.p2align 2
+_kcc_lex_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Set cursor and end
+    adrp x2, _kcc_lex_cursor@@PAGE
+    add  x2, x2, _kcc_lex_cursor@@PAGEOFF
+    str  x0, [x2]
+
+    add  x1, x0, x1             // end = base + size
+    adrp x2, _kcc_lex_end@@PAGE
+    add  x2, x2, _kcc_lex_end@@PAGEOFF
+    str  x1, [x2]
+
+    // Line starts at 1, line_start = base
+    mov  x1, #1
+    adrp x2, _kcc_lex_line@@PAGE
+    add  x2, x2, _kcc_lex_line@@PAGEOFF
+    str  x1, [x2]
+
+    adrp x2, _kcc_lex_line_start@@PAGE
+    add  x2, x2, _kcc_lex_line_start@@PAGEOFF
+    str  x0, [x2]
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Next Token}
+
+\texttt{kcc\_lex\_next} is the main entry point.  It skips whitespace
+and comments, then dispatches to the appropriate scanner based on the
+first character.  The result is stored in the global token variables.
+
+@d Lexer: next token @{
+// -- kcc_lex_next ---------------------------------------------------
+// void kcc_lex_next(void)
+// Advances to the next token.  Stores result in _kcc_tok_* globals.
+.globl _kcc_lex_next
+.p2align 2
+_kcc_lex_next:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Load cursor and end
+    adrp x19, _kcc_lex_cursor@@PAGE
+    add  x19, x19, _kcc_lex_cursor@@PAGEOFF
+    ldr  x20, [x19]             // x20 = cursor
+
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x21, [x1]              // x21 = end
+
+.Llex_skip_ws:
+    // Check EOF
+    cmp x20, x21
+    b.hs .Llex_eof
+
+    ldrb w0, [x20]
+
+    // Check whitespace (space, tab, \r, \v, \f)
+    cmp w0, #' '
+    b.eq .Llex_ws_advance
+    cmp w0, #0x09               // \t
+    b.eq .Llex_ws_advance
+    cmp w0, #0x0D               // \r
+    b.eq .Llex_ws_advance
+    cmp w0, #0x0B               // \v
+    b.eq .Llex_ws_advance
+    cmp w0, #0x0C               // \f
+    b.eq .Llex_ws_advance
+
+    // Check newline
+    cmp w0, #0x0A               // \n
+    b.eq .Llex_newline
+
+    // Check for comments: // or /*
+    cmp w0, #'/'
+    b.eq .Llex_maybe_comment
+
+    // Not whitespace; proceed to character dispatch
+    b .Llex_dispatch
+
+.Llex_ws_advance:
+    add x20, x20, #1
+    b .Llex_skip_ws
+
+.Llex_newline:
+    add x20, x20, #1
+    // Increment line counter, update line_start
+    adrp x1, _kcc_lex_line@@PAGE
+    add  x1, x1, _kcc_lex_line@@PAGEOFF
+    ldr  x2, [x1]
+    add  x2, x2, #1
+    str  x2, [x1]
+    adrp x1, _kcc_lex_line_start@@PAGE
+    add  x1, x1, _kcc_lex_line_start@@PAGEOFF
+    str  x20, [x1]
+    b .Llex_skip_ws
+
+.Llex_maybe_comment:
+    // Check next char
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Llex_dispatch          // just a '/' at EOF
+    ldrb w2, [x1]
+    cmp w2, #'/'
+    b.eq .Llex_line_comment
+    cmp w2, #'*'
+    b.eq .Llex_block_comment
+    b .Llex_dispatch             // just a '/' punctuator
+
+.Llex_line_comment:
+    // Skip until end of line
+    add x20, x20, #2            // skip "//"
+.Llex_lc_loop:
+    cmp x20, x21
+    b.hs .Llex_skip_ws
+    ldrb w0, [x20]
+    cmp w0, #0x0A
+    b.eq .Llex_skip_ws           // newline ends comment (don't skip it)
+    add x20, x20, #1
+    b .Llex_lc_loop
+
+.Llex_block_comment:
+    // Skip until */
+    add x20, x20, #2            // skip "/*"
+.Llex_bc_loop:
+    cmp x20, x21
+    b.hs .Llex_bc_unterminated
+    ldrb w0, [x20]
+    cmp w0, #0x0A
+    b.eq .Llex_bc_newline
+    cmp w0, #'*'
+    b.ne .Llex_bc_advance
+    // Check for '/' after '*'
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Llex_bc_advance
+    ldrb w2, [x1]
+    cmp w2, #'/'
+    b.ne .Llex_bc_advance
+    add x20, x1, #1             // skip past "*/"
+    b .Llex_skip_ws
+
+.Llex_bc_newline:
+    add x20, x20, #1
+    adrp x1, _kcc_lex_line@@PAGE
+    add  x1, x1, _kcc_lex_line@@PAGEOFF
+    ldr  x2, [x1]
+    add  x2, x2, #1
+    str  x2, [x1]
+    adrp x1, _kcc_lex_line_start@@PAGE
+    add  x1, x1, _kcc_lex_line_start@@PAGEOFF
+    str  x20, [x1]
+    b .Llex_bc_loop
+
+.Llex_bc_advance:
+    add x20, x20, #1
+    b .Llex_bc_loop
+
+.Llex_bc_unterminated:
+    adrp x0, _kcc_err_unterm_comment@@PAGE
+    add  x0, x0, _kcc_err_unterm_comment@@PAGEOFF
+    bl _kcc_io_err
+    // Treat as EOF
+    b .Llex_eof
+
+.Llex_eof:
+    // Record token location before setting type
+    bl _kcc_lex_record_loc
+    mov w0, #TOK_EOF
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+    str  xzr, [x19]             // cursor stays at end
+    // tok_start = cursor, tok_len = 0
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x20, [x1]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  xzr, [x1]
+    b .Llex_done
+
+.Llex_dispatch:
+    // Save cursor state
+    str x20, [x19]
+
+    // Record location (line:col) for this token
+    bl _kcc_lex_record_loc
+
+    // Reload cursor
+    ldr x20, [x19]
+    ldrb w0, [x20]
+
+    // Dispatch based on character class
+    // Identifier start: a-z, A-Z, _
+    cmp w0, #'_'
+    b.eq .Llex_go_ident
+    cmp w0, #'a'
+    b.hs .Llex_check_lower
+    cmp w0, #'A'
+    b.hs .Llex_check_upper
+    b .Llex_check_digit
+
+.Llex_check_lower:
+    cmp w0, #'z'
+    b.ls .Llex_go_ident
+    b .Llex_check_digit
+
+.Llex_check_upper:
+    cmp w0, #'Z'
+    b.ls .Llex_go_ident
+    b .Llex_check_digit
+
+.Llex_go_ident:
+    bl _kcc_lex_scan_ident
+    b .Llex_done
+
+.Llex_check_digit:
+    cmp w0, #'0'
+    b.lo .Llex_check_string
+    cmp w0, #'9'
+    b.ls .Llex_go_number
+
+    // Check for '.' followed by digit (float like .5)
+    b .Llex_check_string
+
+.Llex_go_number:
+    bl _kcc_lex_scan_number
+    b .Llex_done
+
+.Llex_check_string:
+    cmp w0, #'"'
+    b.eq .Llex_go_string
+    cmp w0, #'\''
+    b.eq .Llex_go_char
+    cmp w0, #'.'
+    b.eq .Llex_check_dot_number
+    b .Llex_go_punct
+
+.Llex_check_dot_number:
+    // '.' might start a float (.5) or be a punctuator
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Llex_go_punct          // '.' at EOF
+    ldrb w2, [x1]
+    cmp w2, #'0'
+    b.lo .Llex_go_punct
+    cmp w2, #'9'
+    b.ls .Llex_go_number         // '.digit' -> float
+    b .Llex_go_punct
+
+.Llex_go_string:
+    bl _kcc_lex_scan_string
+    b .Llex_done
+
+.Llex_go_char:
+    bl _kcc_lex_scan_char
+    b .Llex_done
+
+.Llex_go_punct:
+    bl _kcc_lex_scan_punct
+    b .Llex_done
+
+.Llex_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Location Recording}
+
+Record the current line and column into the token globals.  Column is
+computed as \texttt{cursor $-$ line\_start $+$ 1}.
+
+@d Lexer: record location @{
+// -- kcc_lex_record_loc ---------------------------------------------
+// Internal: records current line/col into tok globals.
+.p2align 2
+_kcc_lex_record_loc:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_lex_line@@PAGE
+    add  x0, x0, _kcc_lex_line@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_tok_line@@PAGE
+    add  x1, x1, _kcc_tok_line@@PAGEOFF
+    str  x0, [x1]
+
+    // col = cursor - line_start + 1
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_lex_line_start@@PAGE
+    add  x1, x1, _kcc_lex_line_start@@PAGEOFF
+    ldr  x1, [x1]
+
+    sub x0, x0, x1
+    add x0, x0, #1
+
+    adrp x1, _kcc_tok_col@@PAGE
+    add  x1, x1, _kcc_tok_col@@PAGEOFF
+    str  x0, [x1]
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Identifier Scanner}
+
+An identifier starts with a letter or underscore and continues with
+letters, digits, or underscores (\stdref{6.4.2.1}).  After scanning,
+we look up the identifier text in the keyword hash table; if found,
+the token type is changed to the corresponding keyword code.
+
+@d Lexer: scan identifier @{
+// -- kcc_lex_scan_ident ---------------------------------------------
+// Internal: scans an identifier or keyword.
+// Cursor is at the first identifier character.
+.p2align 2
+_kcc_lex_scan_ident:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Load cursor and end
+    adrp x19, _kcc_lex_cursor@@PAGE
+    add  x19, x19, _kcc_lex_cursor@@PAGEOFF
+    ldr  x20, [x19]             // cursor
+
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x21, [x1]              // end
+
+    mov x22, x20                // x22 = token start
+
+    // Advance past identifier characters
+.Lident_loop:
+    add x20, x20, #1
+    cmp x20, x21
+    b.hs .Lident_end
+    ldrb w0, [x20]
+    // Check: a-z, A-Z, 0-9, _
+    cmp w0, #'_'
+    b.eq .Lident_loop
+    cmp w0, #'a'
+    b.lo .Lident_not_lower
+    cmp w0, #'z'
+    b.ls .Lident_loop
+.Lident_not_lower:
+    cmp w0, #'A'
+    b.lo .Lident_not_upper
+    cmp w0, #'Z'
+    b.ls .Lident_loop
+.Lident_not_upper:
+    cmp w0, #'0'
+    b.lo .Lident_end
+    cmp w0, #'9'
+    b.ls .Lident_loop
+
+.Lident_end:
+    // Store cursor
+    str x20, [x19]
+
+    // Compute length
+    sub x2, x20, x22            // x2 = length
+
+    // Store token: start and length
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x22, [x1]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  x2, [x1]
+
+    // Default to identifier
+    mov x0, #TOK_IDENT
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+    // Check keyword table
+    adrp x0, _kcc_kw_table@@PAGE
+    add  x0, x0, _kcc_kw_table@@PAGEOFF
+    ldr  x0, [x0]               // keyword hash table
+    cbz  x0, .Lident_done       // not initialized yet
+
+    mov  x1, x22                 // key = token text
+    sub  x2, x20, x22           // keylen = token length
+    bl _kcc_ht_get
+    cbz x0, .Lident_done        // not a keyword
+
+    // It's a keyword: update token type
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+.Lident_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Number Scanner}
+
+A preprocessing number (\stdref{6.4.8}) is surprisingly broad: it
+starts with a digit (or \texttt{.}~followed by a digit) and continues
+with digits, letters, underscores, dots, and \texttt{e/E/p/P} signs.
+We scan the full pp-number here; value parsing is deferred to Phase~5.
+
+@d Lexer: scan number @{
+// -- kcc_lex_scan_number --------------------------------------------
+// Internal: scans a preprocessing number.
+.p2align 2
+_kcc_lex_scan_number:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    adrp x19, _kcc_lex_cursor@@PAGE
+    add  x19, x19, _kcc_lex_cursor@@PAGEOFF
+    ldr  x20, [x19]
+
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x21, [x1]
+
+    mov x22, x20                // token start
+
+.Lnum_loop:
+    add x20, x20, #1
+    cmp x20, x21
+    b.hs .Lnum_end
+    ldrb w0, [x20]
+
+    // digits
+    cmp w0, #'0'
+    b.lo .Lnum_check_alpha
+    cmp w0, #'9'
+    b.ls .Lnum_loop
+
+.Lnum_check_alpha:
+    // letters (part of pp-number: suffixes, hex digits)
+    cmp w0, #'a'
+    b.lo .Lnum_check_upper
+    cmp w0, #'z'
+    b.ls .Lnum_check_exp
+    b .Lnum_check_dot
+
+.Lnum_check_upper:
+    cmp w0, #'A'
+    b.lo .Lnum_check_dot
+    cmp w0, #'Z'
+    b.ls .Lnum_check_exp
+    b .Lnum_check_dot
+
+.Lnum_check_exp:
+    // If e/E/p/P, next char might be +/-
+    cmp w0, #'e'
+    b.eq .Lnum_maybe_sign
+    cmp w0, #'E'
+    b.eq .Lnum_maybe_sign
+    cmp w0, #'p'
+    b.eq .Lnum_maybe_sign
+    cmp w0, #'P'
+    b.eq .Lnum_maybe_sign
+    b .Lnum_loop               // other letter, still pp-number
+
+.Lnum_maybe_sign:
+    // Peek at next char for +/-
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lnum_loop
+    ldrb w2, [x1]
+    cmp w2, #'+'
+    b.eq .Lnum_skip_sign
+    cmp w2, #'-'
+    b.eq .Lnum_skip_sign
+    b .Lnum_loop
+
+.Lnum_skip_sign:
+    add x20, x20, #1           // consume the letter
+    b .Lnum_loop                // sign consumed in next iteration
+
+.Lnum_check_dot:
+    cmp w0, #'.'
+    b.eq .Lnum_loop
+    cmp w0, #'_'
+    b.eq .Lnum_loop
+
+.Lnum_end:
+    str x20, [x19]
+
+    // Store token
+    sub x2, x20, x22
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x22, [x1]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  x2, [x1]
+
+    mov x0, #TOK_NUMBER
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{String Literal Scanner}
+
+A string literal starts and ends with \texttt{"} (\stdref{6.4.5}).
+Within the string, backslash escapes are recognized (the actual
+escape processing is deferred to Phase~5).  An unescaped newline
+or end-of-file before the closing quote is an error.
+
+@d Lexer: scan string @{
+// -- kcc_lex_scan_string --------------------------------------------
+// Internal: scans a string literal (opening '"' at cursor).
+.p2align 2
+_kcc_lex_scan_string:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    adrp x19, _kcc_lex_cursor@@PAGE
+    add  x19, x19, _kcc_lex_cursor@@PAGEOFF
+    ldr  x20, [x19]
+
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x21, [x1]
+
+    mov x22, x20                // token start (the opening ")
+    add x20, x20, #1           // skip opening "
+
+.Lstr_loop:
+    cmp x20, x21
+    b.hs .Lstr_unterminated
+    ldrb w0, [x20]
+    cmp w0, #'"'
+    b.eq .Lstr_end
+    cmp w0, #'\\'
+    b.eq .Lstr_escape
+    cmp w0, #0x0A               // newline
+    b.eq .Lstr_unterminated
+    add x20, x20, #1
+    b .Lstr_loop
+
+.Lstr_escape:
+    add x20, x20, #2           // skip backslash + escaped char
+    b .Lstr_loop
+
+.Lstr_end:
+    add x20, x20, #1           // skip closing "
+    str x20, [x19]
+
+    sub x2, x20, x22
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x22, [x1]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  x2, [x1]
+
+    mov x0, #TOK_STRING_LIT
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lstr_unterminated:
+    // Error: unterminated string
+    str x20, [x19]
+    adrp x0, _kcc_err_unterm_string@@PAGE
+    add  x0, x0, _kcc_err_unterm_string@@PAGEOFF
+    bl _kcc_io_err
+
+    sub x2, x20, x22
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x22, [x1]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  x2, [x1]
+
+    mov x0, #TOK_STRING_LIT
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Character Literal Scanner}
+
+Character literals are similar to strings but delimited by single
+quotes (\stdref{6.4.4.4}).
+
+@d Lexer: scan char @{
+// -- kcc_lex_scan_char ----------------------------------------------
+// Internal: scans a character constant (opening '\'' at cursor).
+.p2align 2
+_kcc_lex_scan_char:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    adrp x19, _kcc_lex_cursor@@PAGE
+    add  x19, x19, _kcc_lex_cursor@@PAGEOFF
+    ldr  x20, [x19]
+
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x21, [x1]
+
+    mov x22, x20                // token start
+    add x20, x20, #1           // skip opening '
+
+.Lchr_loop:
+    cmp x20, x21
+    b.hs .Lchr_unterminated
+    ldrb w0, [x20]
+    cmp w0, #'\''
+    b.eq .Lchr_end
+    cmp w0, #'\\'
+    b.eq .Lchr_escape
+    cmp w0, #0x0A
+    b.eq .Lchr_unterminated
+    add x20, x20, #1
+    b .Lchr_loop
+
+.Lchr_escape:
+    add x20, x20, #2
+    b .Lchr_loop
+
+.Lchr_end:
+    add x20, x20, #1           // skip closing '
+    str x20, [x19]
+
+    sub x2, x20, x22
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x22, [x1]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  x2, [x1]
+
+    mov x0, #TOK_CHAR_LIT
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lchr_unterminated:
+    str x20, [x19]
+    adrp x0, _kcc_err_unterm_char@@PAGE
+    add  x0, x0, _kcc_err_unterm_char@@PAGEOFF
+    bl _kcc_io_err
+
+    sub x2, x20, x22
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x22, [x1]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  x2, [x1]
+
+    mov x0, #TOK_CHAR_LIT
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Punctuator Scanner}
+
+The punctuator scanner implements longest-match for all C17 punctuators
+(\stdref{6.4.6}).  Multi-character punctuators like \texttt{>>=} or
+\texttt{...} are handled by peeking ahead.
+
+@d Lexer: scan punctuator @{
+// -- kcc_lex_scan_punct ---------------------------------------------
+// Internal: scans a punctuator.
+.p2align 2
+_kcc_lex_scan_punct:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    adrp x19, _kcc_lex_cursor@@PAGE
+    add  x19, x19, _kcc_lex_cursor@@PAGEOFF
+    ldr  x20, [x19]
+
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x21, [x1]
+
+    mov x22, x20                // token start
+    ldrb w0, [x20]
+
+    // Single-character dispatch
+    cmp w0, #'('
+    b.eq .Lpunct_1_lparen
+    cmp w0, #')'
+    b.eq .Lpunct_1_rparen
+    cmp w0, #'{'
+    b.eq .Lpunct_1_lbrace
+    cmp w0, #'}'
+    b.eq .Lpunct_1_rbrace
+    cmp w0, #'['
+    b.eq .Lpunct_1_lbracket
+    cmp w0, #']'
+    b.eq .Lpunct_1_rbracket
+    cmp w0, #';'
+    b.eq .Lpunct_1_semi
+    cmp w0, #','
+    b.eq .Lpunct_1_comma
+    cmp w0, #'~'
+    b.eq .Lpunct_1_tilde
+    cmp w0, #'?'
+    b.eq .Lpunct_1_question
+    cmp w0, #':'
+    b.eq .Lpunct_1_colon
+
+    // Two-or-more character punctuators
+    cmp w0, #'+'
+    b.eq .Lpunct_plus
+    cmp w0, #'-'
+    b.eq .Lpunct_minus
+    cmp w0, #'*'
+    b.eq .Lpunct_star
+    cmp w0, #'/'
+    b.eq .Lpunct_slash
+    cmp w0, #'%'
+    b.eq .Lpunct_percent
+    cmp w0, #'<'
+    b.eq .Lpunct_lt
+    cmp w0, #'>'
+    b.eq .Lpunct_gt
+    cmp w0, #'='
+    b.eq .Lpunct_eq
+    cmp w0, #'!'
+    b.eq .Lpunct_bang
+    cmp w0, #'&'
+    b.eq .Lpunct_amp
+    cmp w0, #'|'
+    b.eq .Lpunct_pipe
+    cmp w0, #'^'
+    b.eq .Lpunct_caret
+    cmp w0, #'#'
+    b.eq .Lpunct_hash
+    cmp w0, #'.'
+    b.eq .Lpunct_dot
+
+    // Unrecognized character
+    add x20, x20, #1
+    str x20, [x19]
+    mov x0, #TOK_UNKNOWN
+    b .Lpunct_store
+
+// -- Simple single-character punctuators ----------------------------
+.Lpunct_1_lparen:
+    mov x0, #TOK_LPAREN
+    b .Lpunct_single
+.Lpunct_1_rparen:
+    mov x0, #TOK_RPAREN
+    b .Lpunct_single
+.Lpunct_1_lbrace:
+    mov x0, #TOK_LBRACE
+    b .Lpunct_single
+.Lpunct_1_rbrace:
+    mov x0, #TOK_RBRACE
+    b .Lpunct_single
+.Lpunct_1_lbracket:
+    mov x0, #TOK_LBRACKET
+    b .Lpunct_single
+.Lpunct_1_rbracket:
+    mov x0, #TOK_RBRACKET
+    b .Lpunct_single
+.Lpunct_1_semi:
+    mov x0, #TOK_SEMI
+    b .Lpunct_single
+.Lpunct_1_comma:
+    mov x0, #TOK_COMMA
+    b .Lpunct_single
+.Lpunct_1_tilde:
+    mov x0, #TOK_TILDE
+    b .Lpunct_single
+.Lpunct_1_question:
+    mov x0, #TOK_QUESTION
+    b .Lpunct_single
+.Lpunct_1_colon:
+    mov x0, #TOK_COLON
+    b .Lpunct_single
+
+.Lpunct_single:
+    add x20, x20, #1
+    str x20, [x19]
+    b .Lpunct_store
+
+// -- Multi-character punctuators ------------------------------------
+.Lpunct_plus:                     // + ++ +=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_plus_single
+    ldrb w2, [x1]
+    cmp w2, #'+'
+    b.eq .Lpunct_inc
+    cmp w2, #'='
+    b.eq .Lpunct_add_assign
+.Lpunct_plus_single:
+    mov x0, #TOK_PLUS
+    b .Lpunct_single
+.Lpunct_inc:
+    mov x0, #TOK_INC
+    b .Lpunct_double
+.Lpunct_add_assign:
+    mov x0, #TOK_ADD_ASSIGN
+    b .Lpunct_double
+
+.Lpunct_minus:                    // - -- -= ->
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_minus_single
+    ldrb w2, [x1]
+    cmp w2, #'-'
+    b.eq .Lpunct_dec
+    cmp w2, #'='
+    b.eq .Lpunct_sub_assign
+    cmp w2, #'>'
+    b.eq .Lpunct_arrow
+.Lpunct_minus_single:
+    mov x0, #TOK_MINUS
+    b .Lpunct_single
+.Lpunct_dec:
+    mov x0, #TOK_DEC
+    b .Lpunct_double
+.Lpunct_sub_assign:
+    mov x0, #TOK_SUB_ASSIGN
+    b .Lpunct_double
+.Lpunct_arrow:
+    mov x0, #TOK_ARROW
+    b .Lpunct_double
+
+.Lpunct_star:                     // * *=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_star_single
+    ldrb w2, [x1]
+    cmp w2, #'='
+    b.eq .Lpunct_mul_assign
+.Lpunct_star_single:
+    mov x0, #TOK_STAR
+    b .Lpunct_single
+.Lpunct_mul_assign:
+    mov x0, #TOK_MUL_ASSIGN
+    b .Lpunct_double
+
+.Lpunct_slash:                    // /  /= (comments already handled)
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_slash_single
+    ldrb w2, [x1]
+    cmp w2, #'='
+    b.eq .Lpunct_div_assign
+.Lpunct_slash_single:
+    mov x0, #TOK_SLASH
+    b .Lpunct_single
+.Lpunct_div_assign:
+    mov x0, #TOK_DIV_ASSIGN
+    b .Lpunct_double
+
+.Lpunct_percent:                  // % %=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_pct_single
+    ldrb w2, [x1]
+    cmp w2, #'='
+    b.eq .Lpunct_mod_assign
+.Lpunct_pct_single:
+    mov x0, #TOK_PERCENT
+    b .Lpunct_single
+.Lpunct_mod_assign:
+    mov x0, #TOK_MOD_ASSIGN
+    b .Lpunct_double
+
+.Lpunct_lt:                       // < << <= <<=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_lt_single
+    ldrb w2, [x1]
+    cmp w2, #'<'
+    b.eq .Lpunct_shl_check
+    cmp w2, #'='
+    b.eq .Lpunct_le
+.Lpunct_lt_single:
+    mov x0, #TOK_LT
+    b .Lpunct_single
+.Lpunct_le:
+    mov x0, #TOK_LE
+    b .Lpunct_double
+.Lpunct_shl_check:               // << or <<=
+    add x2, x20, #2
+    cmp x2, x21
+    b.hs .Lpunct_shl
+    ldrb w3, [x2]
+    cmp w3, #'='
+    b.eq .Lpunct_shl_assign
+.Lpunct_shl:
+    mov x0, #TOK_SHL
+    b .Lpunct_double
+.Lpunct_shl_assign:
+    mov x0, #TOK_SHL_ASSIGN
+    b .Lpunct_triple
+
+.Lpunct_gt:                       // > >> >= >>=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_gt_single
+    ldrb w2, [x1]
+    cmp w2, #'>'
+    b.eq .Lpunct_shr_check
+    cmp w2, #'='
+    b.eq .Lpunct_ge
+.Lpunct_gt_single:
+    mov x0, #TOK_GT
+    b .Lpunct_single
+.Lpunct_ge:
+    mov x0, #TOK_GE
+    b .Lpunct_double
+.Lpunct_shr_check:
+    add x2, x20, #2
+    cmp x2, x21
+    b.hs .Lpunct_shr
+    ldrb w3, [x2]
+    cmp w3, #'='
+    b.eq .Lpunct_shr_assign
+.Lpunct_shr:
+    mov x0, #TOK_SHR
+    b .Lpunct_double
+.Lpunct_shr_assign:
+    mov x0, #TOK_SHR_ASSIGN
+    b .Lpunct_triple
+
+.Lpunct_eq:                       // = ==
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_assign
+    ldrb w2, [x1]
+    cmp w2, #'='
+    b.eq .Lpunct_eq_eq
+.Lpunct_assign:
+    mov x0, #TOK_ASSIGN
+    b .Lpunct_single
+.Lpunct_eq_eq:
+    mov x0, #TOK_EQ
+    b .Lpunct_double
+
+.Lpunct_bang:                     // ! !=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_bang_single
+    ldrb w2, [x1]
+    cmp w2, #'='
+    b.eq .Lpunct_ne
+.Lpunct_bang_single:
+    mov x0, #TOK_BANG
+    b .Lpunct_single
+.Lpunct_ne:
+    mov x0, #TOK_NE
+    b .Lpunct_double
+
+.Lpunct_amp:                      // & && &=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_amp_single
+    ldrb w2, [x1]
+    cmp w2, #'&'
+    b.eq .Lpunct_and
+    cmp w2, #'='
+    b.eq .Lpunct_and_assign
+.Lpunct_amp_single:
+    mov x0, #TOK_AMP
+    b .Lpunct_single
+.Lpunct_and:
+    mov x0, #TOK_AND
+    b .Lpunct_double
+.Lpunct_and_assign:
+    mov x0, #TOK_AND_ASSIGN
+    b .Lpunct_double
+
+.Lpunct_pipe:                     // | || |=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_pipe_single
+    ldrb w2, [x1]
+    cmp w2, #'|'
+    b.eq .Lpunct_or
+    cmp w2, #'='
+    b.eq .Lpunct_or_assign
+.Lpunct_pipe_single:
+    mov x0, #TOK_PIPE
+    b .Lpunct_single
+.Lpunct_or:
+    mov x0, #TOK_OR
+    b .Lpunct_double
+.Lpunct_or_assign:
+    mov x0, #TOK_OR_ASSIGN
+    b .Lpunct_double
+
+.Lpunct_caret:                    // ^ ^=
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_caret_single
+    ldrb w2, [x1]
+    cmp w2, #'='
+    b.eq .Lpunct_xor_assign
+.Lpunct_caret_single:
+    mov x0, #TOK_CARET
+    b .Lpunct_single
+.Lpunct_xor_assign:
+    mov x0, #TOK_XOR_ASSIGN
+    b .Lpunct_double
+
+.Lpunct_hash:                     // # ##
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_hash_single
+    ldrb w2, [x1]
+    cmp w2, #'#'
+    b.eq .Lpunct_dhash
+.Lpunct_hash_single:
+    mov x0, #TOK_HASH
+    b .Lpunct_single
+.Lpunct_dhash:
+    mov x0, #TOK_DHASH
+    b .Lpunct_double
+
+.Lpunct_dot:                      // . ...
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Lpunct_dot_single
+    ldrb w2, [x1]
+    cmp w2, #'.'
+    b.ne .Lpunct_dot_single
+    add x2, x20, #2
+    cmp x2, x21
+    b.hs .Lpunct_dot_single
+    ldrb w3, [x2]
+    cmp w3, #'.'
+    b.ne .Lpunct_dot_single
+    mov x0, #TOK_ELLIPSIS
+    b .Lpunct_triple
+.Lpunct_dot_single:
+    mov x0, #TOK_DOT
+    b .Lpunct_single
+
+// -- Length helpers --------------------------------------------------
+.Lpunct_double:
+    add x20, x20, #2
+    str x20, [x19]
+    b .Lpunct_store
+
+.Lpunct_triple:
+    add x20, x20, #3
+    str x20, [x19]
+    b .Lpunct_store
+
+.Lpunct_store:
+    // Store token type, start, length
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    str  x0, [x1]
+
+    // Compute length from start
+    ldr  x20, [x19]
+    sub  x2, x20, x22
+
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    str  x22, [x1]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    str  x2, [x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Token Dump}
+
+The \texttt{--dump-tokens} mode prints each token on a separate line
+in the format:
+\begin{verbatim}
+<line>:<col> <type> '<text>'
+\end{verbatim}
+
+\texttt{kcc\_lex\_dump\_token} prints one token;
+\texttt{kcc\_lex\_dump\_all} loops through the entire source.
+
+@d Lexer: dump token @{
+// -- kcc_lex_dump_token ---------------------------------------------
+// void kcc_lex_dump_token(void)
+// Prints the current token in dump format.
+.globl _kcc_lex_dump_token
+.p2align 2
+_kcc_lex_dump_token:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Print line number
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    bl _kcc_io_putu
+
+    // Print ':'
+    mov x0, #':'
+    bl _kcc_io_putc
+
+    // Print column
+    adrp x0, _kcc_tok_col@@PAGE
+    add  x0, x0, _kcc_tok_col@@PAGEOFF
+    ldr  x0, [x0]
+    bl _kcc_io_putu
+
+    // Print ' '
+    mov x0, #' '
+    bl _kcc_io_putc
+
+    // Print token type name
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    bl _kcc_lex_type_name        // returns pointer to name string
+    bl _kcc_io_puts
+
+    // Print " '"
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'\''
+    bl _kcc_io_putc
+
+    // Print token text
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+
+    bl _kcc_io_write
+
+    // Print "'\n"
+    mov x0, #'\''
+    bl _kcc_io_putc
+    mov x0, #0x0A
+    bl _kcc_io_putc
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+The dump-all loop repeatedly calls \texttt{kcc\_lex\_next} and
+\texttt{kcc\_lex\_dump\_token} until EOF.
+
+@d Lexer: dump all @{
+// -- kcc_lex_dump_all -----------------------------------------------
+// void kcc_lex_dump_all(void)
+// Tokenizes entire source and dumps each token.
+.globl _kcc_lex_dump_all
+.p2align 2
+_kcc_lex_dump_all:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+.Ldump_loop:
+    bl _kcc_lex_next
+
+    // Check for EOF
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Ldump_done        // TOK_EOF = 0
+
+    bl _kcc_lex_dump_token
+    b .Ldump_loop
+
+.Ldump_done:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Token Type Names}
+
+A table mapping token type codes to human-readable names for
+the \texttt{--dump-tokens} output.  \texttt{kcc\_lex\_type\_name}
+returns a pointer to the name string for a given token type.
+
+@d Lexer: token names @{
+.text
+// -- kcc_lex_type_name ----------------------------------------------
+// const char *kcc_lex_type_name(uint64_t type)
+//   x0 = token type code
+// Returns pointer to a null-terminated type name string.
+.globl _kcc_lex_type_name
+.p2align 2
+_kcc_lex_type_name:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Bounds check
+    cmp x0, #108
+    b.hs .Ltype_unknown_name
+
+    // Load from pointer table
+    adrp x1, _kcc_tok_names@@PAGE
+    add  x1, x1, _kcc_tok_names@@PAGEOFF
+    ldr  x0, [x1, x0, lsl #3]  // names[type]
+    cbnz x0, .Ltype_name_done
+
+.Ltype_unknown_name:
+    adrp x0, _kcc_tn_unknown@@PAGE
+    add  x0, x0, _kcc_tn_unknown@@PAGEOFF
+
+.Ltype_name_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- Token name strings ---------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_kcc_tn_eof:          .asciz "eof"
+_kcc_tn_identifier:   .asciz "identifier"
+_kcc_tn_number:       .asciz "number"
+_kcc_tn_char_lit:     .asciz "char_constant"
+_kcc_tn_string_lit:   .asciz "string_literal"
+_kcc_tn_unknown:      .asciz "unknown"
+// Keywords
+_kcc_tn_auto:         .asciz "auto"
+_kcc_tn_break:        .asciz "break"
+_kcc_tn_case:         .asciz "case"
+_kcc_tn_char:         .asciz "char"
+_kcc_tn_const:        .asciz "const"
+_kcc_tn_continue:     .asciz "continue"
+_kcc_tn_default:      .asciz "default"
+_kcc_tn_do:           .asciz "do"
+_kcc_tn_double:       .asciz "double"
+_kcc_tn_else:         .asciz "else"
+_kcc_tn_enum:         .asciz "enum"
+_kcc_tn_extern:       .asciz "extern"
+_kcc_tn_float:        .asciz "float"
+_kcc_tn_for:          .asciz "for"
+_kcc_tn_goto:         .asciz "goto"
+_kcc_tn_if:           .asciz "if"
+_kcc_tn_inline:       .asciz "inline"
+_kcc_tn_int:          .asciz "int"
+_kcc_tn_long:         .asciz "long"
+_kcc_tn_register:     .asciz "register"
+_kcc_tn_restrict:     .asciz "restrict"
+_kcc_tn_return:       .asciz "return"
+_kcc_tn_short:        .asciz "short"
+_kcc_tn_signed:       .asciz "signed"
+_kcc_tn_sizeof:       .asciz "sizeof"
+_kcc_tn_static:       .asciz "static"
+_kcc_tn_struct:       .asciz "struct"
+_kcc_tn_switch:       .asciz "switch"
+_kcc_tn_typedef:      .asciz "typedef"
+_kcc_tn_union:        .asciz "union"
+_kcc_tn_unsigned:     .asciz "unsigned"
+_kcc_tn_void:         .asciz "void"
+_kcc_tn_volatile:     .asciz "volatile"
+_kcc_tn_while:        .asciz "while"
+_kcc_tn_alignas:      .asciz "_Alignas"
+_kcc_tn_alignof:      .asciz "_Alignof"
+_kcc_tn_atomic:       .asciz "_Atomic"
+_kcc_tn_bool:         .asciz "_Bool"
+_kcc_tn_complex:      .asciz "_Complex"
+_kcc_tn_generic:      .asciz "_Generic"
+_kcc_tn_imaginary:    .asciz "_Imaginary"
+_kcc_tn_noreturn:     .asciz "_Noreturn"
+_kcc_tn_static_assert: .asciz "_Static_assert"
+_kcc_tn_thread_local: .asciz "_Thread_local"
+// Punctuators
+_kcc_tn_lparen:       .asciz "l_paren"
+_kcc_tn_rparen:       .asciz "r_paren"
+_kcc_tn_lbrace:       .asciz "l_brace"
+_kcc_tn_rbrace:       .asciz "r_brace"
+_kcc_tn_lbracket:     .asciz "l_bracket"
+_kcc_tn_rbracket:     .asciz "r_bracket"
+_kcc_tn_semi:         .asciz "semi"
+_kcc_tn_comma:        .asciz "comma"
+_kcc_tn_dot:          .asciz "dot"
+_kcc_tn_arrow:        .asciz "arrow"
+_kcc_tn_plusplus:     .asciz "plusplus"
+_kcc_tn_minusminus:  .asciz "minusminus"
+_kcc_tn_amp:          .asciz "amp"
+_kcc_tn_star:         .asciz "star"
+_kcc_tn_plus:         .asciz "plus"
+_kcc_tn_minus:        .asciz "minus"
+_kcc_tn_tilde:        .asciz "tilde"
+_kcc_tn_exclaim:      .asciz "exclaim"
+_kcc_tn_slash:        .asciz "slash"
+_kcc_tn_percent:      .asciz "percent"
+_kcc_tn_lessless:     .asciz "lessless"
+_kcc_tn_greatergreater: .asciz "greatergreater"
+_kcc_tn_less:         .asciz "less"
+_kcc_tn_greater:      .asciz "greater"
+_kcc_tn_lessequal:    .asciz "lessequal"
+_kcc_tn_greaterequal: .asciz "greaterequal"
+_kcc_tn_equalequal:   .asciz "equalequal"
+_kcc_tn_exclaimequal: .asciz "exclaimequal"
+_kcc_tn_caret:        .asciz "caret"
+_kcc_tn_pipe:         .asciz "pipe"
+_kcc_tn_ampamp:       .asciz "ampamp"
+_kcc_tn_pipepipe:     .asciz "pipepipe"
+_kcc_tn_question:     .asciz "question"
+_kcc_tn_colon:        .asciz "colon"
+_kcc_tn_equal:        .asciz "equal"
+_kcc_tn_starequal:    .asciz "starequal"
+_kcc_tn_slashequal:   .asciz "slashequal"
+_kcc_tn_percentequal: .asciz "percentequal"
+_kcc_tn_plusequal:    .asciz "plusequal"
+_kcc_tn_minusequal:   .asciz "minusequal"
+_kcc_tn_lesslessequal: .asciz "lesslessequal"
+_kcc_tn_greatergreaterequal: .asciz "greatergreaterequal"
+_kcc_tn_ampequal:     .asciz "ampequal"
+_kcc_tn_caretequal:   .asciz "caretequal"
+_kcc_tn_pipeequal:    .asciz "pipeequal"
+_kcc_tn_hash:         .asciz "hash"
+_kcc_tn_hashhash:     .asciz "hashhash"
+_kcc_tn_ellipsis:     .asciz "ellipsis"
+
+// -- Token name pointer table ---------------------------------------
+// Indexed by token type code.  Entries 6-9, 54-59 are NULL (unused).
+.data
+.p2align 3
+_kcc_tok_names:
+    .quad _kcc_tn_eof             // 0  TOK_EOF
+    .quad _kcc_tn_identifier      // 1  TOK_IDENT
+    .quad _kcc_tn_number          // 2  TOK_NUMBER
+    .quad _kcc_tn_char_lit        // 3  TOK_CHAR_LIT
+    .quad _kcc_tn_string_lit      // 4  TOK_STRING_LIT
+    .quad _kcc_tn_unknown         // 5  TOK_UNKNOWN
+    .quad 0, 0, 0, 0             // 6-9  reserved
+    // Keywords 10-53
+    .quad _kcc_tn_auto            // 10
+    .quad _kcc_tn_break           // 11
+    .quad _kcc_tn_case            // 12
+    .quad _kcc_tn_char            // 13
+    .quad _kcc_tn_const           // 14
+    .quad _kcc_tn_continue        // 15
+    .quad _kcc_tn_default         // 16
+    .quad _kcc_tn_do              // 17
+    .quad _kcc_tn_double          // 18
+    .quad _kcc_tn_else            // 19
+    .quad _kcc_tn_enum            // 20
+    .quad _kcc_tn_extern          // 21
+    .quad _kcc_tn_float           // 22
+    .quad _kcc_tn_for             // 23
+    .quad _kcc_tn_goto            // 24
+    .quad _kcc_tn_if              // 25
+    .quad _kcc_tn_inline          // 26
+    .quad _kcc_tn_int             // 27
+    .quad _kcc_tn_long            // 28
+    .quad _kcc_tn_register        // 29
+    .quad _kcc_tn_restrict        // 30
+    .quad _kcc_tn_return          // 31
+    .quad _kcc_tn_short           // 32
+    .quad _kcc_tn_signed          // 33
+    .quad _kcc_tn_sizeof          // 34
+    .quad _kcc_tn_static          // 35
+    .quad _kcc_tn_struct          // 36
+    .quad _kcc_tn_switch          // 37
+    .quad _kcc_tn_typedef         // 38
+    .quad _kcc_tn_union           // 39
+    .quad _kcc_tn_unsigned        // 40
+    .quad _kcc_tn_void            // 41
+    .quad _kcc_tn_volatile        // 42
+    .quad _kcc_tn_while           // 43
+    .quad _kcc_tn_alignas         // 44
+    .quad _kcc_tn_alignof         // 45
+    .quad _kcc_tn_atomic          // 46
+    .quad _kcc_tn_bool            // 47
+    .quad _kcc_tn_complex         // 48
+    .quad _kcc_tn_generic         // 49
+    .quad _kcc_tn_imaginary       // 50
+    .quad _kcc_tn_noreturn        // 51
+    .quad _kcc_tn_static_assert   // 52
+    .quad _kcc_tn_thread_local    // 53
+    .quad 0, 0, 0, 0, 0, 0       // 54-59  reserved
+    // Punctuators 60-107
+    .quad _kcc_tn_lparen          // 60
+    .quad _kcc_tn_rparen          // 61
+    .quad _kcc_tn_lbrace          // 62
+    .quad _kcc_tn_rbrace          // 63
+    .quad _kcc_tn_lbracket        // 64
+    .quad _kcc_tn_rbracket        // 65
+    .quad _kcc_tn_semi            // 66
+    .quad _kcc_tn_comma           // 67
+    .quad _kcc_tn_dot             // 68
+    .quad _kcc_tn_arrow           // 69
+    .quad _kcc_tn_plusplus        // 70
+    .quad _kcc_tn_minusminus     // 71
+    .quad _kcc_tn_amp             // 72
+    .quad _kcc_tn_star            // 73
+    .quad _kcc_tn_plus            // 74
+    .quad _kcc_tn_minus           // 75
+    .quad _kcc_tn_tilde           // 76
+    .quad _kcc_tn_exclaim         // 77
+    .quad _kcc_tn_slash           // 78
+    .quad _kcc_tn_percent         // 79
+    .quad _kcc_tn_lessless        // 80
+    .quad _kcc_tn_greatergreater  // 81
+    .quad _kcc_tn_less            // 82
+    .quad _kcc_tn_greater         // 83
+    .quad _kcc_tn_lessequal       // 84
+    .quad _kcc_tn_greaterequal    // 85
+    .quad _kcc_tn_equalequal      // 86
+    .quad _kcc_tn_exclaimequal    // 87
+    .quad _kcc_tn_caret           // 88
+    .quad _kcc_tn_pipe            // 89
+    .quad _kcc_tn_ampamp          // 90
+    .quad _kcc_tn_pipepipe        // 91
+    .quad _kcc_tn_question        // 92
+    .quad _kcc_tn_colon           // 93
+    .quad _kcc_tn_equal           // 94
+    .quad _kcc_tn_starequal       // 95
+    .quad _kcc_tn_slashequal      // 96
+    .quad _kcc_tn_percentequal    // 97
+    .quad _kcc_tn_plusequal       // 98
+    .quad _kcc_tn_minusequal      // 99
+    .quad _kcc_tn_lesslessequal   // 100
+    .quad _kcc_tn_greatergreaterequal // 101
+    .quad _kcc_tn_ampequal        // 102
+    .quad _kcc_tn_caretequal      // 103
+    .quad _kcc_tn_pipeequal       // 104
+    .quad _kcc_tn_hash            // 105
+    .quad _kcc_tn_hashhash        // 106
+    .quad _kcc_tn_ellipsis        // 107
+@}
+
+\section{Keyword Table Initialization}
+
+At startup, we populate a hash table with all 44 C17 keywords.
+Each entry maps the keyword text to its token type code.
+
+@d Lexer: keyword data @{
+// -- Keyword strings ------------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_kcc_kw_s_auto:       .asciz "auto"
+_kcc_kw_s_break:      .asciz "break"
+_kcc_kw_s_case:       .asciz "case"
+_kcc_kw_s_char:       .asciz "char"
+_kcc_kw_s_const:      .asciz "const"
+_kcc_kw_s_continue:   .asciz "continue"
+_kcc_kw_s_default:    .asciz "default"
+_kcc_kw_s_do:         .asciz "do"
+_kcc_kw_s_double:     .asciz "double"
+_kcc_kw_s_else:       .asciz "else"
+_kcc_kw_s_enum:       .asciz "enum"
+_kcc_kw_s_extern:     .asciz "extern"
+_kcc_kw_s_float:      .asciz "float"
+_kcc_kw_s_for:        .asciz "for"
+_kcc_kw_s_goto:       .asciz "goto"
+_kcc_kw_s_if:         .asciz "if"
+_kcc_kw_s_inline:     .asciz "inline"
+_kcc_kw_s_int:        .asciz "int"
+_kcc_kw_s_long:       .asciz "long"
+_kcc_kw_s_register:   .asciz "register"
+_kcc_kw_s_restrict:   .asciz "restrict"
+_kcc_kw_s_return:     .asciz "return"
+_kcc_kw_s_short:      .asciz "short"
+_kcc_kw_s_signed:     .asciz "signed"
+_kcc_kw_s_sizeof:     .asciz "sizeof"
+_kcc_kw_s_static:     .asciz "static"
+_kcc_kw_s_struct:     .asciz "struct"
+_kcc_kw_s_switch:     .asciz "switch"
+_kcc_kw_s_typedef:    .asciz "typedef"
+_kcc_kw_s_union:      .asciz "union"
+_kcc_kw_s_unsigned:   .asciz "unsigned"
+_kcc_kw_s_void:       .asciz "void"
+_kcc_kw_s_volatile:   .asciz "volatile"
+_kcc_kw_s_while:      .asciz "while"
+_kcc_kw_s_alignas:    .asciz "_Alignas"
+_kcc_kw_s_alignof:    .asciz "_Alignof"
+_kcc_kw_s_atomic:     .asciz "_Atomic"
+_kcc_kw_s_bool:       .asciz "_Bool"
+_kcc_kw_s_complex:    .asciz "_Complex"
+_kcc_kw_s_generic:    .asciz "_Generic"
+_kcc_kw_s_imaginary:  .asciz "_Imaginary"
+_kcc_kw_s_noreturn:   .asciz "_Noreturn"
+_kcc_kw_s_sassert:    .asciz "_Static_assert"
+_kcc_kw_s_tlocal:     .asciz "_Thread_local"
+
+// -- Keyword registration table -------------------------------------
+// Each entry: (string_ptr, string_len, token_type) = 24 bytes
+.data
+.p2align 3
+_kcc_kw_reg_table:
+    .quad _kcc_kw_s_auto,       4,  10
+    .quad _kcc_kw_s_break,      5,  11
+    .quad _kcc_kw_s_case,       4,  12
+    .quad _kcc_kw_s_char,       4,  13
+    .quad _kcc_kw_s_const,      5,  14
+    .quad _kcc_kw_s_continue,   8,  15
+    .quad _kcc_kw_s_default,    7,  16
+    .quad _kcc_kw_s_do,         2,  17
+    .quad _kcc_kw_s_double,     6,  18
+    .quad _kcc_kw_s_else,       4,  19
+    .quad _kcc_kw_s_enum,       4,  20
+    .quad _kcc_kw_s_extern,     6,  21
+    .quad _kcc_kw_s_float,      5,  22
+    .quad _kcc_kw_s_for,        3,  23
+    .quad _kcc_kw_s_goto,       4,  24
+    .quad _kcc_kw_s_if,         2,  25
+    .quad _kcc_kw_s_inline,     6,  26
+    .quad _kcc_kw_s_int,        3,  27
+    .quad _kcc_kw_s_long,       4,  28
+    .quad _kcc_kw_s_register,   8,  29
+    .quad _kcc_kw_s_restrict,   8,  30
+    .quad _kcc_kw_s_return,     6,  31
+    .quad _kcc_kw_s_short,      5,  32
+    .quad _kcc_kw_s_signed,     6,  33
+    .quad _kcc_kw_s_sizeof,     6,  34
+    .quad _kcc_kw_s_static,     6,  35
+    .quad _kcc_kw_s_struct,     6,  36
+    .quad _kcc_kw_s_switch,     6,  37
+    .quad _kcc_kw_s_typedef,    7,  38
+    .quad _kcc_kw_s_union,      5,  39
+    .quad _kcc_kw_s_unsigned,   8,  40
+    .quad _kcc_kw_s_void,       4,  41
+    .quad _kcc_kw_s_volatile,   8,  42
+    .quad _kcc_kw_s_while,      5,  43
+    .quad _kcc_kw_s_alignas,    8,  44
+    .quad _kcc_kw_s_alignof,    8,  45
+    .quad _kcc_kw_s_atomic,     7,  46
+    .quad _kcc_kw_s_bool,       5,  47
+    .quad _kcc_kw_s_complex,    8,  48
+    .quad _kcc_kw_s_generic,    8,  49
+    .quad _kcc_kw_s_imaginary,  10, 50
+    .quad _kcc_kw_s_noreturn,   9,  51
+    .quad _kcc_kw_s_sassert,    14, 52
+    .quad _kcc_kw_s_tlocal,     13, 53
+
+.equ KW_COUNT, 44
+.equ KW_ENTRY_BYTES, 24       // 3 quads per entry
+@}
+
+The initialization function creates a hash table and populates it
+by looping through the registration table.
+
+@d Lexer: keyword init @{
+.text
+// -- kcc_lex_kw_init ------------------------------------------------
+// void kcc_lex_kw_init(void)
+// Builds the keyword hash table from the registration table.
+.globl _kcc_lex_kw_init
+.p2align 2
+_kcc_lex_kw_init:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Create hash table with capacity 128 (power of 2, >2x keywords)
+    mov x0, #128
+    bl _kcc_ht_init
+    mov x19, x0                  // x19 = hash table
+
+    // Store in global
+    adrp x1, _kcc_kw_table@@PAGE
+    add  x1, x1, _kcc_kw_table@@PAGEOFF
+    str  x19, [x1]
+
+    // Loop through registration table
+    adrp x20, _kcc_kw_reg_table@@PAGE
+    add  x20, x20, _kcc_kw_reg_table@@PAGEOFF
+    mov  x21, #0                 // counter
+    mov  x22, #KW_COUNT
+
+.Lkw_init_loop:
+    cmp x21, x22
+    b.hs .Lkw_init_done
+
+    // Load entry: [string_ptr, string_len, token_type]
+    ldr x1, [x20, #0]           // key = string ptr
+    ldr x2, [x20, #8]           // keylen = string length
+    ldr x3, [x20, #16]          // value = token type
+
+    mov x0, x19                  // ht
+    bl _kcc_ht_put
+
+    add x20, x20, #KW_ENTRY_BYTES
+    add x21, x21, #1
+    b .Lkw_init_loop
+
+.Lkw_init_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Lexer Global State}
+
+The lexer maintains its state in global variables: the cursor position,
+end of buffer, current line/column tracking, and the current token.
+
+@d Lexer: data @{
+// -- Lexer global state ---------------------------------------------
+.data
+.p2align 3
+_kcc_lex_cursor:     .quad 0  // current position in source buffer
+_kcc_lex_end:        .quad 0  // one past end of source buffer
+_kcc_lex_line:       .quad 1  // current line number (1-based)
+_kcc_lex_line_start: .quad 0  // pointer to start of current line
+
+// Current token
+_kcc_tok_type:       .quad 0  // token type code
+_kcc_tok_start:      .quad 0  // pointer to token text in source
+_kcc_tok_len:        .quad 0  // token text length
+_kcc_tok_line:       .quad 0  // line where token starts
+_kcc_tok_col:        .quad 0  // column where token starts
+
+// Keyword hash table
+.globl _kcc_kw_table
+_kcc_kw_table:       .quad 0  // pointer to keyword hash table
+
+// Error messages
+.section __TEXT,__cstring,cstring_literals
+_kcc_err_unterm_string:  .asciz "kcc: error: unterminated string literal\n"
+_kcc_err_unterm_char:    .asciz "kcc: error: unterminated character constant\n"
+_kcc_err_unterm_comment: .asciz "kcc: error: unterminated block comment\n"
+@}

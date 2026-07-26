@@ -1,0 +1,140 @@
+% assembly.weft — Output Routing
+%
+% This file contains all output directives for kcc.  It is the single
+% point that maps logical code fragments to physical assembly files.
+%
+% When adding a new .s file to kcc, add its output directive HERE.
+% Fragment definitions go in the appropriate chapter .weft file.
+
+\chapter*{Output Routing}
+\addcontentsline{toc}{chapter}{Output Routing}
+
+The following output directives route code fragments to their
+physical assembly files under \texttt{tmp/src/}.
+
+\bigskip
+
+\noindent\textbf{main.s} --- the compiler entry point:
+
+@o tmp/src/main.s @{
+@<ARM64: common macros@>
+@<Main: entry point@>
+@<Main: data@>
+@}
+
+\noindent\textbf{syscalls.s} --- macOS system call wrappers:
+
+@o tmp/src/syscalls.s @{
+@<ARM64: common macros@>
+@<Syscall: constants@>
+@<Syscall: exit@>
+@<Syscall: write@>
+@<Syscall: read@>
+@<Syscall: open@>
+@<Syscall: close@>
+@<Syscall: mmap@>
+@<Syscall: lseek@>
+@}
+
+\noindent\textbf{arena.s} --- arena memory allocator:
+
+@o tmp/src/arena.s @{
+@<ARM64: common macros@>
+@<Syscall: constants@>
+@<Arena: constants@>
+@<Arena: init@>
+@<Arena: alloc fast path@>
+@<Arena: alloc slow path@>
+@<Arena: data@>
+@}
+
+\noindent\textbf{strings.s} --- string and memory operations:
+
+@o tmp/src/strings.s @{
+@<ARM64: common macros@>
+@<String: strlen@>
+@<String: memcpy@>
+@<String: memcmp@>
+@<String: memset@>
+@<String: strcmp@>
+@}
+
+\noindent\textbf{io.s} --- buffered file I/O:
+
+@o tmp/src/io.s @{
+@<ARM64: common macros@>
+@<IO: flush@>
+@<IO: putc@>
+@<IO: puts@>
+@<IO: write@>
+@<IO: putu@>
+@<IO: err@>
+@<IO: data@>
+@}
+
+\noindent\textbf{hashtab.s} --- hash table (FNV-1a, open addressing):
+
+@o tmp/src/hashtab.s @{
+@<ARM64: common macros@>
+@<Hash: constants@>
+@<Hash: FNV-1a@>
+@<Hash: init@>
+@<Hash: get@>
+@<Hash: put@>
+@}
+
+\noindent\textbf{vec.s} --- dynamic vector:
+
+@o tmp/src/vec.s @{
+@<ARM64: common macros@>
+@<Vec: constants@>
+@<Vec: init@>
+@<Vec: push@>
+@<Vec: get@>
+@}
+
+\noindent\textbf{strtab.s} --- string interning:
+
+@o tmp/src/strtab.s @{
+@<ARM64: common macros@>
+@<Strtab: init@>
+@<Strtab: intern@>
+@<Strtab: data@>
+@}
+
+\noindent\textbf{source.s} --- source file management:
+
+@o tmp/src/source.s @{
+@<ARM64: common macros@>
+@<Syscall: constants@>
+@<Source: constants@>
+@<Source: open file@>
+@<Source: data@>
+@}
+
+\noindent\textbf{lexer.s} --- C17 tokenizer:
+
+@o tmp/src/lexer.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Lexer: init@>
+@<Lexer: record location@>
+@<Lexer: next token@>
+@<Lexer: scan identifier@>
+@<Lexer: scan number@>
+@<Lexer: scan string@>
+@<Lexer: scan char@>
+@<Lexer: scan punctuator@>
+@<Lexer: dump token@>
+@<Lexer: dump all@>
+@<Lexer: data@>
+@}
+
+\noindent\textbf{lexer\_tables.s} --- keyword table and token names:
+
+@o tmp/src/lexer_tables.s @{
+@<ARM64: common macros@>
+@<Lexer: keyword data@>
+@<Lexer: keyword init@>
+@<Lexer: token names@>
+@}

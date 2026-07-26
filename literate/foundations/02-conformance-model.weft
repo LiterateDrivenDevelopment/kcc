@@ -1,0 +1,69 @@
+% 02-conformance-model.weft — Conformance Obligations
+%
+% Establishes the conformance model: what kcc must do, what it may
+% choose, and how it handles undefined behavior.  No code emitted.
+
+\chapter{Conformance Model}
+\label{ch:conformance}
+
+\section{Hosted vs.\ Freestanding}
+
+The Standard (\stdref{5.1.2}) distinguishes two execution environments:
+
+\begin{itemize}
+\item \textbf{Hosted} (\stdref{5.1.2.2}) --- the full C library is
+      available; program entry is \texttt{main}.
+\item \textbf{Freestanding} (\stdref{5.1.2.1}) --- a minimal library
+      subset; entry point is implementation-defined.
+\end{itemize}
+
+\kcc{} targets a \emph{hosted} environment on macOS/ARM64.
+The program entry point is \texttt{\_main} per Mach-O convention,
+which corresponds to \texttt{main} as defined in \stdref{5.1.2.2.1}.
+
+\section{Translation Limits}
+
+Section \stdref{5.2.4.1} specifies minimum translation limits that
+every conforming implementation must support.  \kcc{} meets or exceeds
+all limits listed therein.  Notable limits:
+
+\begin{itemize}
+\item 127 nesting levels of blocks
+\item 63 nesting levels of conditional inclusion
+\item 4095 characters in a logical source line (after line splicing)
+\item 4095 characters in a string literal
+\item 511 identifiers with block scope in one block
+\item 127 parameters in one function definition
+\item 63 levels of nested structure or union definitions
+\end{itemize}
+
+These limits are enforced through the diagnostic engine
+(\S\ref{ch:diagnostics}).
+
+\section{Implementation-Defined Behavior}
+
+The Standard identifies approximately 200 implementation-defined
+behaviors (\stdref{J.3}).  Each is documented in Appendix~A of this
+document with:
+
+\begin{enumerate}
+\item The \stdref{J.3} clause number.
+\item The choice made by \kcc{}.
+\item The rationale for that choice.
+\end{enumerate}
+
+\section{Undefined Behavior Policy}
+
+\kcc{} adopts a \emph{diagnostic-first} policy for undefined behavior:
+
+\begin{requirement}[UB Policy]
+Where \kcc{} can detect undefined behavior at compile time with
+reasonable cost, it shall emit a diagnostic.  Where detection is
+infeasible or unreasonably expensive, \kcc{} documents the treatment
+in Appendix~B (UB Policy Matrix) and proceeds with the most natural
+ARM64 behavior.
+\end{requirement}
+
+This policy balances strict conformance with the practical reality
+of writing a compiler in assembly language.  The UB matrix is the
+authoritative reference for each specific case.

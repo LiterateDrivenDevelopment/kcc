@@ -1,0 +1,66 @@
+% 01-normative-corpus.weft — Standards and Citation Conventions
+%
+% This chapter establishes the normative corpus that governs every
+% decision in kcc.  No code is emitted here; this is pure prose
+% that defines the language of obligation used throughout.
+
+\chapter{The Normative Corpus}
+\label{ch:normative-corpus}
+
+\section{Primary Standard}
+
+The sole governing document for the C language accepted by \kcc{} is:
+
+\begin{quote}
+\textbf{ISO/IEC 9899:2018} --- \emph{Information technology ---
+Programming languages --- C}.  Fourth edition, 2018-06-01.
+\end{quote}
+
+This document, hereafter cited as \textbf{C17} or simply ``the Standard,''
+supersedes all prior editions (C89, C99, C11).  Where the Standard is
+silent, \kcc{} treats the behavior as implementation-defined and documents
+it in Appendix~A (\stdref{J.3}).
+
+\section{Secondary References}
+
+The following documents inform the implementation but do not override
+the Standard:
+
+\begin{enumerate}
+\item \textbf{ARM Architecture Reference Manual (ARM ARM), DDI 0487}
+      --- defines the A64 instruction set, encoding rules, and system
+      registers.  All instruction mnemonics and encodings cite this
+      document by section number.
+
+\item \textbf{Procedure Call Standard for the Arm 64-bit Architecture
+      (AAPCS64)}, ARM IHI 0055 --- defines the calling convention,
+      register usage, and stack layout.
+
+\item \textbf{Apple ARM64 ABI documentation} --- describes
+      platform-specific deviations from AAPCS64: mandatory frame
+      pointer, reserved \reg{x18}, no red zone, Mach-O symbol
+      conventions.
+
+\item \textbf{Mach-O file format reference} --- governs the binary
+      format emitted by the backend.
+
+\item \textbf{macOS system call interface} --- the \texttt{svc \#0x80}
+      convention with syscall number in \reg{x16}.
+\end{enumerate}
+
+\section{Citation Conventions}
+
+Throughout this document, we use the following shorthand:
+
+\begin{itemize}
+\item \stdref{6.5.3.1} refers to ISO 9899:2018 section 6.5.3.1.
+\item \textbf{ARM ARM C6.2.5} refers to the ARM Architecture Reference
+      Manual, section C6.2.5.
+\item \textbf{AAPCS64 \S5.4} refers to the Procedure Call Standard,
+      section 5.4.
+\end{itemize}
+
+The keywords \textsc{shall}, \textsc{shall not}, \textsc{may}, and
+\textsc{undefined behavior} carry their ISO meanings.  We abbreviate
+undefined behavior as \ub{} and implementation-defined behavior
+as \idb{}.

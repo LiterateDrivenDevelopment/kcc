@@ -1,0 +1,143 @@
+% 11-string-operations.weft — String Operations in ARM64 Assembly
+%
+% Since kcc uses no C library, we provide our own implementations
+% of the fundamental string and memory operations.  These are used
+% throughout the compiler: by the lexer to compare identifiers,
+% by the arena to zero-fill memory, by the I/O layer to copy
+% output into buffers.
+%
+% Each function follows AAPCS64 conventions and includes the
+% mandatory Apple frame pointer.
+
+\chapter{String Operations}
+\label{ch:strings}
+
+\section{String Length}
+
+Compute the length of a null-terminated string by scanning for the
+zero byte.  This is the moral equivalent of \texttt{strlen(3)}.
+
+@d String: strlen @{
+// -- kcc_strlen -----------------------------------------------------
+// size_t kcc_strlen(const char *s)
+//   x0 = pointer to null-terminated string
+// Returns length (not counting the null terminator) in x0.
+FUNC kcc_strlen
+    mov x1, x0                   // x1 = scan pointer
+.Lstrlen_loop:
+    ldrb w2, [x1], #1            // load byte, advance
+    cbnz w2, .Lstrlen_loop       // loop until null
+    sub x0, x1, x0               // length = end - start
+    sub x0, x0, #1               // exclude the null byte itself
+ENDFUNC
+@}
+
+\section{Memory Copy}
+
+Copy \texttt{n} bytes from source to destination.  Overlapping
+regions produce undefined results (as with \texttt{memcpy}, not
+\texttt{memmove}).
+
+@d String: memcpy @{
+// -- kcc_memcpy -----------------------------------------------------
+// void *kcc_memcpy(void *dst, const void *src, size_t n)
+//   x0 = destination
+//   x1 = source
+//   x2 = byte count
+// Returns dst in x0.
+FUNC kcc_memcpy
+    mov x3, x0                   // save dst for return value
+    cbz x2, .Lmemcpy_done        // nothing to copy
+.Lmemcpy_loop:
+    ldrb w4, [x1], #1            // load from src
+    strb w4, [x0], #1            // store to dst
+    subs x2, x2, #1
+    b.ne .Lmemcpy_loop
+.Lmemcpy_done:
+    mov x0, x3                   // return original dst
+ENDFUNC
+@}
+
+\section{Memory Compare}
+
+Compare \texttt{n} bytes.  Returns 0 if equal, negative if the first
+differing byte in \texttt{s1} is less than in \texttt{s2}, positive
+otherwise.
+
+@d String: memcmp @{
+// -- kcc_memcmp -----------------------------------------------------
+// int kcc_memcmp(const void *s1, const void *s2, size_t n)
+//   x0 = first buffer
+//   x1 = second buffer
+//   x2 = byte count
+// Returns comparison result in x0.
+FUNC kcc_memcmp
+    cbz x2, .Lmemcmp_equal       // zero length → equal
+.Lmemcmp_loop:
+    ldrb w3, [x0], #1
+    ldrb w4, [x1], #1
+    cmp w3, w4
+    b.ne .Lmemcmp_diff
+    subs x2, x2, #1
+    b.ne .Lmemcmp_loop
+.Lmemcmp_equal:
+    mov x0, #0
+    b .Lmemcmp_ret
+.Lmemcmp_diff:
+    sub x0, x3, x4               // s1[i] - s2[i]
+.Lmemcmp_ret:
+ENDFUNC
+@}
+
+\section{Memory Set}
+
+Fill \texttt{n} bytes of memory with the value \texttt{c}.
+
+@d String: memset @{
+// -- kcc_memset -----------------------------------------------------
+// void *kcc_memset(void *s, int c, size_t n)
+//   x0 = destination
+//   x1 = fill byte (only low 8 bits used)
+//   x2 = byte count
+// Returns s in x0.
+FUNC kcc_memset
+    mov x3, x0                   // save dst for return value
+    cbz x2, .Lmemset_done
+.Lmemset_loop:
+    strb w1, [x0], #1
+    subs x2, x2, #1
+    b.ne .Lmemset_loop
+.Lmemset_done:
+    mov x0, x3                   // return original dst
+ENDFUNC
+@}
+
+\section{String Compare}
+
+Compare two null-terminated strings byte by byte.  Returns 0 if equal,
+a negative value if the first differing byte in \texttt{s1} is less than
+in \texttt{s2}, a positive value otherwise --- the same contract as
+\texttt{strcmp(3)}.
+
+@d String: strcmp @{
+// -- kcc_strcmp ------------------------------------------------------
+// int kcc_strcmp(const char *s1, const char *s2)
+//   x0 = first string (null-terminated)
+//   x1 = second string (null-terminated)
+// Returns comparison result in x0.
+FUNC kcc_strcmp
+.Lstrcmp_loop:
+    ldrb w2, [x0], #1
+    ldrb w3, [x1], #1
+    cmp w2, w3
+    b.ne .Lstrcmp_diff
+    cbz w2, .Lstrcmp_equal        // both reached null -> equal
+    b .Lstrcmp_loop
+.Lstrcmp_equal:
+    mov x0, #0
+    b .Lstrcmp_ret
+.Lstrcmp_diff:
+    sub x0, x2, x3                // s1[i] - s2[i]
+.Lstrcmp_ret:
+ENDFUNC
+@}

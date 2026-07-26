@@ -6,6 +6,7 @@ tmp/
 *.ind
 *.ilg
 *.out
+*.tex
 *.pdf
 *.o
 *.dvi

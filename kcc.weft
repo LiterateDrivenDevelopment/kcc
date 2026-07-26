@@ -172,7 +172,17 @@
 @i literate/frontend/24-statements.weft
 
 % ═══════════════════════════════════════════════════════════════════
-% Part IV: Driver
+% Part IV: Semantics
+% ═══════════════════════════════════════════════════════════════════
+\part{Semantics}
+
+@i literate/semantics/25-types.weft
+@i literate/semantics/26-symtab.weft
+@i literate/semantics/27-sema.weft
+@i literate/semantics/28-conversions.weft
+
+% ═══════════════════════════════════════════════════════════════════
+% Part V: Driver
 % ═══════════════════════════════════════════════════════════════════
 \part{The Driver}
 

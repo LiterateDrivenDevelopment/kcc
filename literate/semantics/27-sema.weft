@@ -1,0 +1,1340 @@
+% 27-sema.weft — Semantic Analysis
+%
+% This chapter implements the semantic analysis pass that walks the AST,
+% resolves types, populates the symbol table, and checks type constraints.
+% After this pass, every expression node has a resolved type in AST_F3.
+
+\chapter{Semantic Analysis}
+\label{ch:sema}
+
+\section{Entry Point}
+
+@d Sema: check @{
+// -- kcc_sema_check -------------------------------------------------------
+// void kcc_sema_check(node *trans_unit)
+//   x0 = AST_TRANS_UNIT node
+// Walks all top-level declarations.
+.text
+.globl _kcc_sema_check
+.p2align 2
+_kcc_sema_check:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Get first declaration
+    ldr x19, [x0, #AST_F0]         // first decl
+
+.Lsc_loop:
+    cbz x19, .Lsc_done
+
+    mov x0, x19
+    bl _kcc_sema_check_decl
+
+    // Next sibling
+    ldr x19, [x19, #AST_F4]
+    b .Lsc_loop
+
+.Lsc_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Type Resolution}
+
+Convert parser AST type nodes into type descriptors.
+
+@d Sema: resolve type @{
+// -- kcc_sema_resolve_type ------------------------------------------------
+// type_desc *kcc_sema_resolve_type(node *type_node)
+//   x0 = AST type node (AST_TYPE_BUILTIN, AST_TYPE_PTR, etc.)
+// Returns type descriptor pointer.
+.text
+.globl _kcc_sema_resolve_type
+.p2align 2
+_kcc_sema_resolve_type:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    cbz x0, .Lsrt_null
+    mov x19, x0
+
+    ldr x0, [x19, #AST_TAG]
+
+    cmp x0, #AST_TYPE_BUILTIN
+    b.eq .Lsrt_builtin
+    cmp x0, #AST_TYPE_PTR
+    b.eq .Lsrt_ptr
+    cmp x0, #AST_TYPE_ARRAY
+    b.eq .Lsrt_array
+    cmp x0, #AST_TYPE_FUNC
+    b.eq .Lsrt_func
+    cmp x0, #AST_TYPE_STRUCT
+    b.eq .Lsrt_struct
+    cmp x0, #AST_TYPE_UNION
+    b.eq .Lsrt_union
+    cmp x0, #AST_TYPE_ENUM
+    b.eq .Lsrt_enum
+    cmp x0, #AST_TYPE_NAME
+    b.eq .Lsrt_name
+    cmp x0, #AST_TYPE_QUALS
+    b.eq .Lsrt_quals
+
+    // Unknown type node → return int as fallback
+    b .Lsrt_fallback
+
+.Lsrt_builtin:
+    // F0 = specifier bitmask
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_type_from_specmask
+    cbz x0, .Lsrt_fallback
+    b .Lsrt_done
+
+.Lsrt_ptr:
+    // F0 = pointee type node
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    bl _kcc_type_ptr
+    b .Lsrt_done
+
+.Lsrt_array:
+    // F0 = element type node, F1 = size expr (or 0)
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    mov x20, x0                     // element type
+
+    // Array length: evaluate constant expr if present
+    ldr x1, [x19, #AST_F1]
+    cbz x1, .Lsrt_array_incomplete
+    // For now, if size_expr is INT_LIT, use its value
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_INT_LIT
+    b.ne .Lsrt_array_incomplete
+    ldr x1, [x1, #AST_F0]          // literal value
+    b .Lsrt_array_make
+
+.Lsrt_array_incomplete:
+    mov x1, #0                      // incomplete array
+
+.Lsrt_array_make:
+    mov x0, x20
+    bl _kcc_type_array
+    b .Lsrt_done
+
+.Lsrt_func:
+    // F0 = return type node, F1 = params (linked list)
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    mov x20, x0                     // return type
+
+    // For now, create function type without resolving params
+    mov x0, x20                     // return type
+    mov x1, #0                      // no param vec
+    bl _kcc_type_func
+    b .Lsrt_done
+
+.Lsrt_struct:
+    // F0 = struct_decl AST node
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_type_struct
+    b .Lsrt_done
+
+.Lsrt_union:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_type_union
+    b .Lsrt_done
+
+.Lsrt_enum:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_type_enum
+    b .Lsrt_done
+
+.Lsrt_name:
+    // Typedef name: lookup in symbol table
+    ldr x20, [x19, #AST_F0]        // interned name ptr
+    cbz x20, .Lsrt_fallback
+    mov x0, x20
+    bl _kcc_strlen
+    mov x1, x0                     // len
+    mov x0, x20                    // name
+    bl _kcc_symtab_lookup
+    cbz x0, .Lsrt_fallback
+
+    // Found symbol: return its type
+    ldr x0, [x0, #SYM_TYPE]
+    b .Lsrt_done
+
+.Lsrt_quals:
+    // F0 = base type node, F1 = qualifier flags
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    // TODO: apply qualifiers to a copy of the descriptor
+    // For now, just return the base type
+    b .Lsrt_done
+
+.Lsrt_null:
+.Lsrt_fallback:
+    // Default to int
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+
+.Lsrt_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Declaration Checking}
+
+@d Sema: check declaration @{
+// -- kcc_sema_check_decl --------------------------------------------------
+// void kcc_sema_check_decl(node *decl)
+//   x0 = declaration AST node
+// Processes declarations, registers symbols.
+.text
+.globl _kcc_sema_check_decl
+.p2align 2
+_kcc_sema_check_decl:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    cbz x0, .Lscd_done
+    mov x19, x0
+
+    ldr x20, [x19, #AST_TAG]
+
+    cmp x20, #AST_VAR_DECL
+    b.eq .Lscd_var
+    cmp x20, #AST_FUNC_DECL
+    b.eq .Lscd_func
+    cmp x20, #AST_TYPEDEF_DECL
+    b.eq .Lscd_typedef
+    cmp x20, #AST_STRUCT_DECL
+    b.eq .Lscd_struct
+    cmp x20, #AST_UNION_DECL
+    b.eq .Lscd_struct       // same handling as struct
+    cmp x20, #AST_ENUM_DECL
+    b.eq .Lscd_enum
+
+    // Other nodes (e.g., static_assert): skip
+    b .Lscd_done
+
+.Lscd_var:
+    // Resolve type
+    ldr x0, [x19, #AST_F0]         // type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0                     // resolved type
+
+    // Register in symbol table
+    ldr x0, [x19, #AST_F1]         // name_ptr
+    cbz x0, .Lscd_var_init
+    mov x22, x0
+    bl _kcc_strlen
+    mov x1, x0                     // len
+    mov x0, x22                    // name
+    mov x2, #SYM_VAR
+    mov x3, x21
+    bl _kcc_symtab_declare
+
+.Lscd_var_init:
+    // Check initializer if present
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Lscd_done
+    bl _kcc_sema_expr
+    b .Lscd_done
+
+.Lscd_func:
+    // Resolve return type
+    ldr x0, [x19, #AST_F0]         // type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0                     // function type (or return type)
+
+    // Register function in symbol table
+    ldr x0, [x19, #AST_F1]         // name_ptr
+    cbz x0, .Lscd_func_body
+    mov x22, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, #SYM_FUNC
+    mov x3, x21
+    bl _kcc_symtab_declare
+
+.Lscd_func_body:
+    // Check function body if present
+    ldr x0, [x19, #AST_F3]         // body
+    cbz x0, .Lscd_done
+
+    // Store current function return type
+    adrp x1, _kcc_sema_cur_ret@@PAGE
+    add  x1, x1, _kcc_sema_cur_ret@@PAGEOFF
+    str x21, [x1]
+
+    // Push scope for function body
+    bl _kcc_symtab_push_scope
+    bl _kcc_symtab_label_begin
+
+    // Process parameters
+    ldr x0, [x19, #AST_F2]         // first param
+.Lscd_param_loop:
+    cbz x0, .Lscd_func_stmts
+    mov x22, x0
+
+    // Resolve param type and register
+    ldr x0, [x22, #AST_F0]         // param type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0
+
+    ldr x0, [x22, #AST_F1]         // param name
+    cbz x0, .Lscd_param_next
+    mov x20, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    mov x2, #SYM_VAR
+    mov x3, x21
+    bl _kcc_symtab_declare
+
+.Lscd_param_next:
+    ldr x0, [x22, #AST_F4]         // next param
+    b .Lscd_param_loop
+
+.Lscd_func_stmts:
+    // Check function body statements
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_sema_check_stmt
+
+    bl _kcc_symtab_label_end
+    bl _kcc_symtab_pop_scope
+    b .Lscd_done
+
+.Lscd_typedef:
+    // Resolve type and register as typedef
+    ldr x0, [x19, #AST_F0]         // type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0
+
+    ldr x0, [x19, #AST_F1]         // name_ptr
+    cbz x0, .Lscd_done
+    mov x22, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, #SYM_TYPEDEF
+    mov x3, x21
+    bl _kcc_symtab_declare
+    b .Lscd_done
+
+.Lscd_struct:
+    // Register struct/union tag if named
+    ldr x0, [x19, #AST_F0]         // name_ptr
+    cbz x0, .Lscd_done
+    mov x22, x0
+
+    // Create type for struct/union
+    mov x0, x19
+    cmp x20, #AST_STRUCT_DECL
+    b.ne .Lscd_make_union
+    bl _kcc_type_struct
+    b .Lscd_tag_register
+.Lscd_make_union:
+    bl _kcc_type_union
+
+.Lscd_tag_register:
+    mov x21, x0                     // type
+    mov x0, x22                     // name
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, x21
+    bl _kcc_symtab_declare_tag
+    b .Lscd_done
+
+.Lscd_enum:
+    // Register enum tag and enumerator constants
+    ldr x0, [x19, #AST_F0]         // name_ptr
+    cbz x0, .Lscd_enum_consts
+
+    mov x22, x0
+    mov x0, x19
+    bl _kcc_type_enum
+    mov x21, x0
+    mov x0, x22
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, x21
+    bl _kcc_symtab_declare_tag
+
+.Lscd_enum_consts:
+    // Register each enumerator as SYM_ENUM_CONST with int type
+    ldr x22, [x19, #AST_F1]        // first enumerator
+    mov x20, #0                     // counter value
+
+.Lscd_enum_loop:
+    cbz x22, .Lscd_done
+
+    ldr x0, [x22, #AST_F0]         // name_ptr
+    cbz x0, .Lscd_enum_next
+    mov x21, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x21
+    mov x2, #SYM_ENUM_CONST
+    adrp x3, _kcc_type_int_s@@PAGE
+    add  x3, x3, _kcc_type_int_s@@PAGEOFF
+    ldr  x3, [x3]
+    bl _kcc_symtab_declare
+    // Store enum value
+    str x20, [x0, #SYM_VALUE]
+
+.Lscd_enum_next:
+    add x20, x20, #1
+    ldr x22, [x22, #AST_F4]        // next enumerator
+    b .Lscd_enum_loop
+
+.Lscd_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Statement Checking}
+
+@d Sema: check statement @{
+// -- kcc_sema_check_stmt --------------------------------------------------
+// void kcc_sema_check_stmt(node *stmt)
+//   x0 = statement AST node
+.text
+.globl _kcc_sema_check_stmt
+.p2align 2
+_kcc_sema_check_stmt:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    cbz x0, .Lscs_done
+    mov x19, x0
+
+    ldr x20, [x19, #AST_TAG]
+
+    cmp x20, #AST_COMPOUND
+    b.eq .Lscs_compound
+    cmp x20, #AST_EXPR_STMT
+    b.eq .Lscs_expr
+    cmp x20, #AST_IF_STMT
+    b.eq .Lscs_if
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lscs_while
+    cmp x20, #AST_DO_STMT
+    b.eq .Lscs_do
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lscs_for
+    cmp x20, #AST_RETURN_STMT
+    b.eq .Lscs_return
+    cmp x20, #AST_SWITCH_STMT
+    b.eq .Lscs_switch
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lscs_label
+    cmp x20, #AST_CASE_STMT
+    b.eq .Lscs_case
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Lscs_default
+    cmp x20, #AST_GOTO_STMT
+    b.eq .Lscs_done         // nothing to check
+    cmp x20, #AST_BREAK_STMT
+    b.eq .Lscs_done
+    cmp x20, #AST_CONTINUE_STMT
+    b.eq .Lscs_done
+    cmp x20, #AST_NULL_STMT
+    b.eq .Lscs_done
+
+    // Could be a declaration within a compound stmt
+    cmp x20, #AST_VAR_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_TYPEDEF_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_STRUCT_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_UNION_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_ENUM_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_STATIC_ASSERT
+    b.eq .Lscs_done
+
+    b .Lscs_done
+
+.Lscs_compound:
+    bl _kcc_symtab_push_scope
+
+    // Walk items
+    ldr x19, [x19, #AST_F0]        // first item
+.Lscs_compound_loop:
+    cbz x19, .Lscs_compound_end
+    mov x0, x19
+    bl _kcc_sema_check_stmt
+    ldr x19, [x19, #AST_F4]        // next
+    b .Lscs_compound_loop
+
+.Lscs_compound_end:
+    bl _kcc_symtab_pop_scope
+    b .Lscs_done
+
+.Lscs_expr:
+    ldr x0, [x19, #AST_F0]
+    cbz x0, .Lscs_done
+    bl _kcc_sema_expr
+    b .Lscs_done
+
+.Lscs_if:
+    ldr x0, [x19, #AST_F0]         // condition
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]         // then
+    bl _kcc_sema_check_stmt
+    ldr x0, [x19, #AST_F2]         // else (may be null)
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_while:
+    ldr x0, [x19, #AST_F0]         // condition
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]         // body
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_do:
+    ldr x0, [x19, #AST_F0]         // body
+    bl _kcc_sema_check_stmt
+    ldr x0, [x19, #AST_F1]         // condition
+    bl _kcc_sema_expr
+    b .Lscs_done
+
+.Lscs_for:
+    bl _kcc_symtab_push_scope
+    ldr x0, [x19, #AST_F0]         // init
+    cbz x0, .Lscs_for_cond
+    bl _kcc_sema_check_stmt
+.Lscs_for_cond:
+    ldr x0, [x19, #AST_F1]         // condition
+    cbz x0, .Lscs_for_incr
+    bl _kcc_sema_expr
+.Lscs_for_incr:
+    ldr x0, [x19, #AST_F2]         // increment
+    cbz x0, .Lscs_for_body
+    bl _kcc_sema_expr
+.Lscs_for_body:
+    ldr x0, [x19, #AST_F3]         // body
+    cbz x0, .Lscs_for_end
+    bl _kcc_sema_check_stmt
+.Lscs_for_end:
+    bl _kcc_symtab_pop_scope
+    b .Lscs_done
+
+.Lscs_return:
+    ldr x0, [x19, #AST_F0]         // return expression
+    cbz x0, .Lscs_done
+    bl _kcc_sema_expr
+    // TODO: check against function return type
+    b .Lscs_done
+
+.Lscs_switch:
+    ldr x0, [x19, #AST_F0]         // controlling expression
+    bl _kcc_sema_expr
+    // TODO: verify integer type
+    ldr x0, [x19, #AST_F1]         // body
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_label:
+    // Register label
+    ldr x0, [x19, #AST_F0]         // label name_ptr
+    cbz x0, .Lscs_label_stmt
+    mov x20, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    bl _kcc_symtab_label_add
+.Lscs_label_stmt:
+    ldr x0, [x19, #AST_F1]         // labeled statement
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_case:
+    ldr x0, [x19, #AST_F0]         // case expression
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]         // statement
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_default:
+    ldr x0, [x19, #AST_F0]         // statement
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_decl:
+    mov x0, x19
+    bl _kcc_sema_check_decl
+    b .Lscs_done
+
+.Lscs_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Expression Type-Checking}
+
+@d Sema: check expression @{
+// -- kcc_sema_expr --------------------------------------------------------
+// type_desc *kcc_sema_expr(node *expr)
+//   x0 = expression AST node
+// Type-checks the expression, stores result in AST_F3.
+// Returns the resolved type.
+.text
+.globl _kcc_sema_expr
+.p2align 2
+_kcc_sema_expr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    cbz x0, .Lse_null
+    mov x19, x0
+
+    ldr x20, [x19, #AST_TAG]
+
+    cmp x20, #AST_IDENT_EXPR
+    b.eq .Lse_ident
+    cmp x20, #AST_INT_LIT
+    b.eq .Lse_int_lit
+    cmp x20, #AST_STR_LIT
+    b.eq .Lse_str_lit
+    cmp x20, #AST_CHAR_LIT
+    b.eq .Lse_char_lit
+    cmp x20, #AST_BINARY_EXPR
+    b.eq .Lse_binary
+    cmp x20, #AST_UNARY_EXPR
+    b.eq .Lse_unary
+    cmp x20, #AST_ASSIGN_EXPR
+    b.eq .Lse_assign
+    cmp x20, #AST_COND_EXPR
+    b.eq .Lse_cond
+    cmp x20, #AST_CALL_EXPR
+    b.eq .Lse_call
+    cmp x20, #AST_SUBSCRIPT
+    b.eq .Lse_subscript
+    cmp x20, #AST_MEMBER
+    b.eq .Lse_member
+    cmp x20, #AST_CAST_EXPR
+    b.eq .Lse_cast
+    cmp x20, #AST_SIZEOF_EXPR
+    b.eq .Lse_sizeof
+    cmp x20, #AST_COMMA_EXPR
+    b.eq .Lse_comma
+    cmp x20, #AST_PAREN_EXPR
+    b.eq .Lse_paren
+
+    // Default: int
+    b .Lse_default_int
+
+.Lse_ident:
+    bl _kcc_sema_expr_ident
+    b .Lse_store
+.Lse_int_lit:
+    bl _kcc_sema_expr_literal
+    b .Lse_store
+.Lse_str_lit:
+    bl _kcc_sema_expr_literal
+    b .Lse_store
+.Lse_char_lit:
+    bl _kcc_sema_expr_literal
+    b .Lse_store
+.Lse_binary:
+    bl _kcc_sema_expr_binary
+    b .Lse_store
+.Lse_unary:
+    bl _kcc_sema_expr_unary
+    b .Lse_store
+.Lse_assign:
+    bl _kcc_sema_expr_assign
+    b .Lse_store
+.Lse_cond:
+    // Check all three parts, result type = type of then-expr
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_expr
+    mov x20, x0                     // save then type
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_sema_expr
+    mov x0, x20
+    b .Lse_store
+.Lse_call:
+    bl _kcc_sema_expr_call
+    b .Lse_store
+.Lse_subscript:
+    // array[index]: check both, result = element type
+    ldr x0, [x19, #AST_F0]         // array
+    bl _kcc_sema_expr
+    mov x20, x0
+    ldr x0, [x19, #AST_F1]         // index
+    bl _kcc_sema_expr
+    // Dereference array/pointer type
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.eq .Lse_sub_ptr
+    cmp x1, #TY_ARRAY
+    b.eq .Lse_sub_arr
+    // Not a pointer or array, default to int
+    b .Lse_default_int
+.Lse_sub_ptr:
+.Lse_sub_arr:
+    ldr x0, [x20, #TY_F0]          // pointee/element type
+    b .Lse_store
+.Lse_member:
+    bl _kcc_sema_expr_member
+    b .Lse_store
+.Lse_cast:
+    bl _kcc_sema_expr_cast
+    b .Lse_store
+.Lse_sizeof:
+    bl _kcc_sema_expr_sizeof
+    b .Lse_store
+.Lse_comma:
+    // Evaluate LHS, result is type of RHS
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_expr
+    b .Lse_store
+.Lse_paren:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_expr
+    b .Lse_store
+
+.Lse_default_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+
+.Lse_store:
+    // Store resolved type in AST_F3 of the expression node
+    str x0, [x19, #AST_F3]
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Lse_null:
+    adrp x0, _kcc_type_void@@PAGE
+    add  x0, x0, _kcc_type_void@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Identifier Expression}
+
+@d Sema: expr ident @{
+// -- kcc_sema_expr_ident --------------------------------------------------
+// type_desc *kcc_sema_expr_ident(node *expr)
+//   x19 = expression node (already loaded by caller)
+// Looks up identifier in symbol table, returns its type.
+.text
+.p2align 2
+_kcc_sema_expr_ident:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // x19 = expr node (from caller)
+    // Get name pointer
+    ldr x20, [x19, #AST_F0]        // x20 = name_ptr
+    cbz x20, .Lsei_unknown
+
+    mov x0, x20
+    bl _kcc_strlen
+    mov x1, x0                     // len
+    mov x0, x20                    // name
+
+    bl _kcc_symtab_lookup
+    cbz x0, .Lsei_undeclared
+
+    // Return symbol's type
+    ldr x0, [x0, #SYM_TYPE]
+    // Apply function/array decay
+    bl _kcc_conv_func_decay
+    bl _kcc_conv_array_decay
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Lsei_undeclared:
+    // Undeclared identifier — return int as fallback
+    // (diagnostic omitted for now to avoid crash on implicit declarations)
+
+.Lsei_unknown:
+    // Return int as fallback
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Literal Expressions}
+
+@d Sema: expr literal @{
+// -- kcc_sema_expr_literal ------------------------------------------------
+// type_desc *kcc_sema_expr_literal(node *expr)
+//   x19 = expression node, x20 = tag (set by caller)
+.text
+.p2align 2
+_kcc_sema_expr_literal:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    cmp x20, #AST_INT_LIT
+    b.eq .Lsel_int
+    cmp x20, #AST_CHAR_LIT
+    b.eq .Lsel_int
+    cmp x20, #AST_STR_LIT
+    b.eq .Lsel_str
+
+    // Default: int
+.Lsel_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lsel_str:
+    // String literal: type is "char *" (pointer to char)
+    adrp x0, _kcc_type_char_s@@PAGE
+    add  x0, x0, _kcc_type_char_s@@PAGEOFF
+    ldr  x0, [x0]
+    bl _kcc_type_ptr
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\subsection{Binary Expression}
+
+@d Sema: expr binary @{
+// -- kcc_sema_expr_binary -------------------------------------------------
+// type_desc *kcc_sema_expr_binary(node *expr)
+//   x19 = expression node
+.text
+.p2align 2
+_kcc_sema_expr_binary:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Type-check LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_expr
+    mov x21, x0                     // LHS type
+
+    // Type-check RHS
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_sema_expr
+    mov x22, x0                     // RHS type
+
+    // Get operator
+    ldr x20, [x19, #AST_F0]
+
+    // Comparison operators return int
+    cmp x20, #TOK_EQ
+    b.eq .Lseb_int
+    cmp x20, #TOK_NE
+    b.eq .Lseb_int
+    cmp x20, #TOK_LT
+    b.eq .Lseb_int
+    cmp x20, #TOK_GT
+    b.eq .Lseb_int
+    cmp x20, #TOK_LE
+    b.eq .Lseb_int
+    cmp x20, #TOK_GE
+    b.eq .Lseb_int
+
+    // Logical operators return int
+    cmp x20, #TOK_AND
+    b.eq .Lseb_int
+    cmp x20, #TOK_OR
+    b.eq .Lseb_int
+
+    // Pointer arithmetic: ptr + int or ptr - int
+    ldr x0, [x21, #TY_KIND]
+    cmp x0, #TY_PTR
+    b.eq .Lseb_ptr_arith
+
+    // Arithmetic operators: usual arithmetic conversions
+    mov x0, x21
+    mov x1, x22
+    bl _kcc_conv_usual
+    b .Lseb_done
+
+.Lseb_ptr_arith:
+    // Result is pointer type
+    mov x0, x21
+    b .Lseb_done
+
+.Lseb_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+
+.Lseb_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Unary Expression}
+
+@d Sema: expr unary @{
+// -- kcc_sema_expr_unary --------------------------------------------------
+// type_desc *kcc_sema_expr_unary(node *expr)
+//   x19 = expression node
+.text
+.p2align 2
+_kcc_sema_expr_unary:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Type-check operand
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_expr
+    mov x20, x0                     // operand type
+
+    // Get operator
+    ldr x0, [x19, #AST_F0]
+
+    cmp x0, #TOK_AMP               // address-of
+    b.eq .Lseu_addr
+    cmp x0, #TOK_STAR              // dereference
+    b.eq .Lseu_deref
+    cmp x0, #TOK_BANG              // logical not → int
+    b.eq .Lseu_int
+    cmp x0, #TOK_TILDE            // bitwise not → operand type
+    b.eq .Lseu_operand
+    cmp x0, #TOK_INC              // increment
+    b.eq .Lseu_operand
+    cmp x0, #TOK_DEC              // decrement
+    b.eq .Lseu_operand
+    cmp x0, #TOK_MINUS            // unary minus
+    b.eq .Lseu_operand
+    cmp x0, #TOK_PLUS             // unary plus
+    b.eq .Lseu_operand
+
+    // Default: operand type
+    b .Lseu_operand
+
+.Lseu_addr:
+    // &expr → pointer to operand type
+    mov x0, x20
+    bl _kcc_type_ptr
+    b .Lseu_done
+
+.Lseu_deref:
+    // *expr → dereference pointer
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Lseu_int              // error: not a pointer
+    ldr x0, [x20, #TY_F0]      // pointee type
+    b .Lseu_done
+
+.Lseu_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lseu_done
+
+.Lseu_operand:
+    mov x0, x20
+
+.Lseu_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Assignment Expression}
+
+@d Sema: expr assign @{
+// -- kcc_sema_expr_assign -------------------------------------------------
+// type_desc *kcc_sema_expr_assign(node *expr)
+//   x19 = expression node
+// Type of assignment = type of LHS.
+.text
+.p2align 2
+_kcc_sema_expr_assign:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Type-check LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_expr
+    mov x20, x0                     // LHS type (= result type)
+
+    // Type-check RHS
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_sema_expr
+
+    // Result type is LHS type
+    mov x0, x20
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Function Call}
+
+@d Sema: expr call @{
+// -- kcc_sema_expr_call ---------------------------------------------------
+// type_desc *kcc_sema_expr_call(node *expr)
+//   x19 = expression node
+.text
+.p2align 2
+_kcc_sema_expr_call:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Type-check callee
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_expr
+    mov x20, x0                     // callee type
+
+    // Type-check arguments
+    ldr x21, [x19, #AST_F1]        // first arg
+.Lsec_arg_loop:
+    cbz x21, .Lsec_arg_done
+    mov x0, x21
+    bl _kcc_sema_expr
+    ldr x21, [x21, #AST_F4]        // next arg
+    b .Lsec_arg_loop
+
+.Lsec_arg_done:
+    // Get return type from callee type
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_FUNC
+    b.eq .Lsec_func_ret
+    cmp x1, #TY_PTR
+    b.eq .Lsec_ptr_func
+
+    // Not a function type: assume int return
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lsec_done
+
+.Lsec_func_ret:
+    ldr x0, [x20, #TY_F0]          // return type
+    b .Lsec_done
+
+.Lsec_ptr_func:
+    // Pointer to function: dereference then get return type
+    ldr x0, [x20, #TY_F0]          // pointee (should be TY_FUNC)
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_FUNC
+    b.ne .Lsec_default_int
+    ldr x0, [x0, #TY_F0]           // return type
+    b .Lsec_done
+
+.Lsec_default_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+
+.Lsec_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Member Access}
+
+@d Sema: expr member @{
+// -- kcc_sema_expr_member -------------------------------------------------
+// type_desc *kcc_sema_expr_member(node *expr)
+//   x19 = expression node (AST_MEMBER)
+// F0=object, F1=name_ptr, F2=arrow(1)/dot(0)
+.text
+.p2align 2
+_kcc_sema_expr_member:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Type-check the object expression
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_expr
+    mov x20, x0                     // object type
+
+    // If arrow: dereference pointer first
+    ldr x1, [x19, #AST_F2]
+    cbz x1, .Lsem_dot
+    // Arrow: type should be pointer to struct/union
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Lsem_fallback
+    ldr x20, [x20, #TY_F0]         // dereference
+
+.Lsem_dot:
+    // Type should be struct or union
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.eq .Lsem_lookup
+    cmp x1, #TY_UNION
+    b.eq .Lsem_lookup
+
+.Lsem_fallback:
+    // Not a struct/union: return int
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Lsem_lookup:
+    // TODO: Look up member in struct/union type's member list
+    // For now, return int as placeholder for member type
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Cast Expression}
+
+@d Sema: expr cast @{
+// -- kcc_sema_expr_cast ---------------------------------------------------
+// type_desc *kcc_sema_expr_cast(node *expr)
+//   x19 = expression node
+// F0=type, F1=expr
+.text
+.p2align 2
+_kcc_sema_expr_cast:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Resolve cast target type
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    mov x20, x0                     // target type
+
+    // Type-check the expression being cast
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_expr
+
+    // Result is the target type
+    mov x0, x20
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Sizeof Expression}
+
+@d Sema: expr sizeof @{
+// -- kcc_sema_expr_sizeof -------------------------------------------------
+// type_desc *kcc_sema_expr_sizeof(node *expr)
+//   x19 = expression node
+// F0=operand (type node or expr), F1=is_type
+// Result type is always unsigned long (size_t on ARM64).
+.text
+.p2align 2
+_kcc_sema_expr_sizeof:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Check if operand is a type or expression
+    ldr x1, [x19, #AST_F1]         // is_type flag
+    cbnz x1, .Lses_type
+
+    // Expression operand: type-check it
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_expr
+    b .Lses_result
+
+.Lses_type:
+    // Type operand: resolve it (for validation)
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+
+.Lses_result:
+    // sizeof always returns unsigned long (size_t)
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Dump Types}
+
+@d Sema: dump types @{
+// -- kcc_sema_dump_types --------------------------------------------------
+// void kcc_sema_dump_types(node *trans_unit)
+//   x0 = AST_TRANS_UNIT after semantic analysis
+// Prints each declaration with resolved types.
+.text
+.globl _kcc_sema_dump_types
+.p2align 2
+_kcc_sema_dump_types:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    ldr x19, [x0, #AST_F0]         // first decl
+
+.Lsdt_loop:
+    cbz x19, .Lsdt_done
+
+    // Print declaration info
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_VAR_DECL
+    b.eq .Lsdt_var
+    cmp x0, #AST_FUNC_DECL
+    b.eq .Lsdt_func
+    cmp x0, #AST_TYPEDEF_DECL
+    b.eq .Lsdt_typedef
+    b .Lsdt_next
+
+.Lsdt_var:
+    adrp x0, _kcc_sema_str_var@@PAGE
+    add  x0, x0, _kcc_sema_str_var@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Print name
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Lsdt_var_type
+    bl _kcc_io_puts
+
+.Lsdt_var_type:
+    adrp x0, _kcc_sema_str_colon@@PAGE
+    add  x0, x0, _kcc_sema_str_colon@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Resolve and print type
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    bl _kcc_type_dump
+
+    adrp x0, _kcc_sema_str_nl@@PAGE
+    add  x0, x0, _kcc_sema_str_nl@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lsdt_next
+
+.Lsdt_func:
+    adrp x0, _kcc_sema_str_func@@PAGE
+    add  x0, x0, _kcc_sema_str_func@@PAGEOFF
+    bl _kcc_io_puts
+
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Lsdt_func_type
+    bl _kcc_io_puts
+
+.Lsdt_func_type:
+    adrp x0, _kcc_sema_str_colon@@PAGE
+    add  x0, x0, _kcc_sema_str_colon@@PAGEOFF
+    bl _kcc_io_puts
+
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    bl _kcc_type_dump
+
+    adrp x0, _kcc_sema_str_nl@@PAGE
+    add  x0, x0, _kcc_sema_str_nl@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lsdt_next
+
+.Lsdt_typedef:
+    adrp x0, _kcc_sema_str_typedef@@PAGE
+    add  x0, x0, _kcc_sema_str_typedef@@PAGEOFF
+    bl _kcc_io_puts
+
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Lsdt_td_type
+    bl _kcc_io_puts
+
+.Lsdt_td_type:
+    adrp x0, _kcc_sema_str_eq@@PAGE
+    add  x0, x0, _kcc_sema_str_eq@@PAGEOFF
+    bl _kcc_io_puts
+
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    bl _kcc_type_dump
+
+    adrp x0, _kcc_sema_str_nl@@PAGE
+    add  x0, x0, _kcc_sema_str_nl@@PAGEOFF
+    bl _kcc_io_puts
+
+.Lsdt_next:
+    ldr x19, [x19, #AST_F4]
+    b .Lsdt_loop
+
+.Lsdt_done:
+    bl _kcc_io_flush
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Semantic Analysis Data}
+
+@d Sema: data @{
+// -- Sema globals ---------------------------------------------------------
+.data
+.globl _kcc_sema_cur_ret
+_kcc_sema_cur_ret:    .quad 0       // current function return type
+
+// -- Sema error messages --------------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_kcc_sema_err_undecl:
+    .asciz "use of undeclared identifier"
+_kcc_sema_err_not_func:
+    .asciz "called object is not a function"
+_kcc_sema_err_not_struct:
+    .asciz "member access on non-struct/union type"
+_kcc_sema_err_void_val:
+    .asciz "void value not ignored as it ought to be"
+
+// -- Dump type strings ----------------------------------------------------
+_kcc_sema_str_var:      .asciz "var "
+_kcc_sema_str_func:     .asciz "func "
+_kcc_sema_str_typedef:  .asciz "typedef "
+_kcc_sema_str_colon:    .asciz ": "
+_kcc_sema_str_eq:       .asciz " = "
+_kcc_sema_str_nl:       .asciz "\n"
+@}

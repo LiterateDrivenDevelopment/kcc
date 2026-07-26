@@ -1,0 +1,1248 @@
+% 25-types.weft — Type System
+%
+% This chapter implements the type system for kcc.  Every C type is
+% represented by a 48-byte type descriptor, arena-allocated.  Basic types
+% (void, int, char, etc.) are pre-allocated as singletons at init time.
+% Derived types (pointer, array, function, struct, union, enum) are
+% constructed on demand.
+
+\chapter{Type System}
+\label{ch:types}
+
+\section{Type Descriptor Layout}
+
+A type descriptor occupies 48 bytes with the following layout:
+
+\begin{center}
+\begin{tabular}{lll}
+Offset & Field & Description \\
+\hline
+0  & TY\_KIND  & type kind constant \\
+8  & TY\_SIZE  & size in bytes \\
+16 & TY\_ALIGN & alignment in bytes \\
+24 & TY\_QUALS & const=1, volatile=2, restrict=4, \_Atomic=8 \\
+32 & TY\_F0    & kind-specific field 0 \\
+40 & TY\_F1    & kind-specific field 1 \\
+\end{tabular}
+\end{center}
+
+@d Types: constants @{
+// -- Type descriptor layout -----------------------------------------------
+.equ TY_KIND,       0
+.equ TY_SIZE,       8
+.equ TY_ALIGN,     16
+.equ TY_QUALS,     24
+.equ TY_F0,        32
+.equ TY_F1,        40
+.equ TY_DESC_SIZE, 48
+
+// -- Type kind constants --------------------------------------------------
+.equ TY_VOID,       1
+.equ TY_BOOL,       2
+.equ TY_CHAR,       3    // F0=signed(1)/unsigned(0)
+.equ TY_SHORT,      4    // F0=signed(1)/unsigned(0)
+.equ TY_INT,        5    // F0=signed(1)/unsigned(0)
+.equ TY_LONG,       6    // F0=signed(1)/unsigned(0)
+.equ TY_LLONG,      7    // F0=signed(1)/unsigned(0)
+.equ TY_FLOAT,      8
+.equ TY_DOUBLE,     9
+.equ TY_LDOUBLE,   10
+.equ TY_PTR,       11    // F0=pointee type descriptor
+.equ TY_ARRAY,     12    // F0=element type, F1=length
+.equ TY_FUNC,      13    // F0=return type, F1=param vec*
+.equ TY_STRUCT,    14    // F0=struct_decl AST, F1=member vec*
+.equ TY_UNION,     15    // F0=union_decl AST, F1=member vec*
+.equ TY_ENUM,      16    // F0=enum_decl AST
+
+// -- Specifier bitmask constants (from parser) ----------------------------
+.equ SPEC_VOID,       (1 << 0)
+.equ SPEC_CHAR,       (1 << 1)
+.equ SPEC_SHORT,      (1 << 2)
+.equ SPEC_INT,        (1 << 3)
+.equ SPEC_LONG,       (1 << 4)
+.equ SPEC_LLONG,      (1 << 5)
+.equ SPEC_FLOAT,      (1 << 6)
+.equ SPEC_DOUBLE,     (1 << 7)
+.equ SPEC_SIGNED,     (1 << 8)
+.equ SPEC_UNSIGNED,   (1 << 9)
+.equ SPEC_BOOL,       (1 << 10)
+.equ SPEC_COMPLEX,    (1 << 11)
+@}
+
+\section{Type Initialization}
+
+Pre-allocate singleton descriptors for all basic types.
+
+@d Types: init @{
+// -- kcc_types_init --------------------------------------------------------
+// void kcc_types_init(void)
+// Pre-allocates singleton type descriptors for all basic types.
+.text
+.globl _kcc_types_init
+.p2align 2
+_kcc_types_init:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // void
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_VOID
+    str x1, [x19, #TY_KIND]
+    str xzr, [x19, #TY_SIZE]       // void has no size
+    str xzr, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_void@@PAGE
+    add  x1, x1, _kcc_type_void@@PAGEOFF
+    str x19, [x1]
+
+    // _Bool
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_BOOL
+    str x1, [x19, #TY_KIND]
+    mov x1, #1
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_bool@@PAGE
+    add  x1, x1, _kcc_type_bool@@PAGEOFF
+    str x19, [x1]
+
+    // signed char
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_CHAR
+    str x1, [x19, #TY_KIND]
+    mov x1, #1
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    mov x1, #1                      // signed
+    str x1, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_char_s@@PAGE
+    add  x1, x1, _kcc_type_char_s@@PAGEOFF
+    str x19, [x1]
+
+    // unsigned char
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_CHAR
+    str x1, [x19, #TY_KIND]
+    mov x1, #1
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]         // unsigned
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_char_u@@PAGE
+    add  x1, x1, _kcc_type_char_u@@PAGEOFF
+    str x19, [x1]
+
+    // signed short
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_SHORT
+    str x1, [x19, #TY_KIND]
+    mov x1, #2
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    mov x1, #1                      // signed
+    str x1, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_short_s@@PAGE
+    add  x1, x1, _kcc_type_short_s@@PAGEOFF
+    str x19, [x1]
+
+    // unsigned short
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_SHORT
+    str x1, [x19, #TY_KIND]
+    mov x1, #2
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]         // unsigned
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_short_u@@PAGE
+    add  x1, x1, _kcc_type_short_u@@PAGEOFF
+    str x19, [x1]
+
+    // signed int
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_INT
+    str x1, [x19, #TY_KIND]
+    mov x1, #4
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    mov x1, #1                      // signed
+    str x1, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    str x19, [x1]
+
+    // unsigned int
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_INT
+    str x1, [x19, #TY_KIND]
+    mov x1, #4
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]         // unsigned
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_int_u@@PAGE
+    add  x1, x1, _kcc_type_int_u@@PAGEOFF
+    str x19, [x1]
+
+    // signed long (8 bytes on ARM64)
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_LONG
+    str x1, [x19, #TY_KIND]
+    mov x1, #8
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    mov x1, #1                      // signed
+    str x1, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_long_s@@PAGE
+    add  x1, x1, _kcc_type_long_s@@PAGEOFF
+    str x19, [x1]
+
+    // unsigned long
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_LONG
+    str x1, [x19, #TY_KIND]
+    mov x1, #8
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]         // unsigned
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_long_u@@PAGE
+    add  x1, x1, _kcc_type_long_u@@PAGEOFF
+    str x19, [x1]
+
+    // signed long long (8 bytes on ARM64)
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_LLONG
+    str x1, [x19, #TY_KIND]
+    mov x1, #8
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    mov x1, #1                      // signed
+    str x1, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_llong_s@@PAGE
+    add  x1, x1, _kcc_type_llong_s@@PAGEOFF
+    str x19, [x1]
+
+    // unsigned long long
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_LLONG
+    str x1, [x19, #TY_KIND]
+    mov x1, #8
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]         // unsigned
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_llong_u@@PAGE
+    add  x1, x1, _kcc_type_llong_u@@PAGEOFF
+    str x19, [x1]
+
+    // float
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_FLOAT
+    str x1, [x19, #TY_KIND]
+    mov x1, #4
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_float@@PAGE
+    add  x1, x1, _kcc_type_float@@PAGEOFF
+    str x19, [x1]
+
+    // double
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_DOUBLE
+    str x1, [x19, #TY_KIND]
+    mov x1, #8
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_double@@PAGE
+    add  x1, x1, _kcc_type_double@@PAGEOFF
+    str x19, [x1]
+
+    // long double (16 bytes on ARM64)
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_LDOUBLE
+    str x1, [x19, #TY_KIND]
+    mov x1, #16
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_ldouble@@PAGE
+    add  x1, x1, _kcc_type_ldouble@@PAGEOFF
+    str x19, [x1]
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Type Constructors}
+
+\subsection{Pointer Type}
+
+@d Types: make pointer @{
+// -- kcc_type_ptr ---------------------------------------------------------
+// type_desc *kcc_type_ptr(type_desc *pointee)
+//   x0 = pointee type descriptor
+// Returns pointer to TY_PTR descriptor.
+.text
+.globl _kcc_type_ptr
+.p2align 2
+_kcc_type_ptr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                     // save pointee
+
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x1, #TY_PTR
+    str x1, [x0, #TY_KIND]
+    mov x1, #8                      // pointer size on ARM64
+    str x1, [x0, #TY_SIZE]
+    str x1, [x0, #TY_ALIGN]
+    str xzr, [x0, #TY_QUALS]
+    str x19, [x0, #TY_F0]          // pointee
+    str xzr, [x0, #TY_F1]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Array Type}
+
+@d Types: make array @{
+// -- kcc_type_array -------------------------------------------------------
+// type_desc *kcc_type_array(type_desc *elem, uint64_t len)
+//   x0 = element type, x1 = length (0 = incomplete)
+// Returns TY_ARRAY descriptor.
+.text
+.globl _kcc_type_array
+.p2align 2
+_kcc_type_array:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                     // elem type
+    mov x20, x1                     // length
+
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x1, #TY_ARRAY
+    str x1, [x0, #TY_KIND]
+    // size = elem_size * length
+    ldr x2, [x19, #TY_SIZE]
+    mul x2, x2, x20
+    str x2, [x0, #TY_SIZE]
+    ldr x2, [x19, #TY_ALIGN]
+    str x2, [x0, #TY_ALIGN]
+    str xzr, [x0, #TY_QUALS]
+    str x19, [x0, #TY_F0]          // element type
+    str x20, [x0, #TY_F1]          // length
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Function Type}
+
+@d Types: make function @{
+// -- kcc_type_func --------------------------------------------------------
+// type_desc *kcc_type_func(type_desc *ret, vec *params)
+//   x0 = return type, x1 = parameter type vec (or 0)
+// Returns TY_FUNC descriptor.
+.text
+.globl _kcc_type_func
+.p2align 2
+_kcc_type_func:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                     // return type
+    mov x20, x1                     // params vec
+
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x1, #TY_FUNC
+    str x1, [x0, #TY_KIND]
+    str xzr, [x0, #TY_SIZE]        // function types have no size
+    str xzr, [x0, #TY_ALIGN]
+    str xzr, [x0, #TY_QUALS]
+    str x19, [x0, #TY_F0]          // return type
+    str x20, [x0, #TY_F1]          // param vec
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Struct/Union Type}
+
+@d Types: make struct @{
+// -- kcc_type_struct ------------------------------------------------------
+// type_desc *kcc_type_struct(node *decl_node)
+//   x0 = AST struct/union declaration node
+// Returns TY_STRUCT descriptor.
+.text
+.globl _kcc_type_struct
+.p2align 2
+_kcc_type_struct:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                     // decl node
+
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x1, #TY_STRUCT
+    str x1, [x0, #TY_KIND]
+    str xzr, [x0, #TY_SIZE]        // computed later during layout
+    str xzr, [x0, #TY_ALIGN]
+    str xzr, [x0, #TY_QUALS]
+    str x19, [x0, #TY_F0]          // AST decl node
+    str xzr, [x0, #TY_F1]          // member vec (populated by sema)
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_type_union -------------------------------------------------------
+// type_desc *kcc_type_union(node *decl_node)
+.globl _kcc_type_union
+.p2align 2
+_kcc_type_union:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0
+
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x1, #TY_UNION
+    str x1, [x0, #TY_KIND]
+    str xzr, [x0, #TY_SIZE]
+    str xzr, [x0, #TY_ALIGN]
+    str xzr, [x0, #TY_QUALS]
+    str x19, [x0, #TY_F0]
+    str xzr, [x0, #TY_F1]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Enum Type}
+
+@d Types: make enum @{
+// -- kcc_type_enum --------------------------------------------------------
+// type_desc *kcc_type_enum(node *decl_node)
+//   x0 = AST enum declaration node
+// Returns TY_ENUM descriptor (underlying type is int).
+.text
+.globl _kcc_type_enum
+.p2align 2
+_kcc_type_enum:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0
+
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x1, #TY_ENUM
+    str x1, [x0, #TY_KIND]
+    mov x1, #4                      // enum has int size
+    str x1, [x0, #TY_SIZE]
+    str x1, [x0, #TY_ALIGN]
+    str xzr, [x0, #TY_QUALS]
+    str x19, [x0, #TY_F0]          // decl node
+    str xzr, [x0, #TY_F1]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Specifier Bitmask Resolution}
+
+The parser stores a bitmask of type specifiers in \texttt{AST\_TYPE\_BUILTIN.F0}.
+This function maps each valid combination to the corresponding singleton
+type descriptor.
+
+@d Types: resolve specmask @{
+// -- kcc_type_from_specmask -----------------------------------------------
+// type_desc *kcc_type_from_specmask(uint64_t mask)
+//   x0 = specifier bitmask from parser
+// Returns type descriptor pointer, or 0 on invalid combination.
+.text
+.globl _kcc_type_from_specmask
+.p2align 2
+_kcc_type_from_specmask:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // void
+    cmp x0, #SPEC_VOID
+    b.eq .Ltfm_void
+
+    // _Bool
+    mov x1, #SPEC_BOOL
+    cmp x0, x1
+    b.eq .Ltfm_bool
+
+    // char (plain or signed char)
+    cmp x0, #SPEC_CHAR
+    b.eq .Ltfm_char_s
+    mov x1, #(SPEC_SIGNED | SPEC_CHAR)
+    cmp x0, x1
+    b.eq .Ltfm_char_s
+
+    // unsigned char
+    mov x1, #(SPEC_UNSIGNED | SPEC_CHAR)
+    cmp x0, x1
+    b.eq .Ltfm_char_u
+
+    // short / signed short / short int / signed short int
+    cmp x0, #SPEC_SHORT
+    b.eq .Ltfm_short_s
+    mov x1, #(SPEC_SIGNED | SPEC_SHORT)
+    cmp x0, x1
+    b.eq .Ltfm_short_s
+    mov x1, #(SPEC_SHORT | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_short_s
+    mov x1, #(SPEC_SIGNED | SPEC_SHORT | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_short_s
+
+    // unsigned short / unsigned short int
+    mov x1, #(SPEC_UNSIGNED | SPEC_SHORT)
+    cmp x0, x1
+    b.eq .Ltfm_short_u
+    mov x1, #(SPEC_UNSIGNED | SPEC_SHORT | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_short_u
+
+    // int / signed / signed int
+    cmp x0, #SPEC_INT
+    b.eq .Ltfm_int_s
+    mov x1, #SPEC_SIGNED
+    cmp x0, x1
+    b.eq .Ltfm_int_s
+    mov x1, #(SPEC_SIGNED | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_int_s
+
+    // unsigned / unsigned int
+    mov x1, #SPEC_UNSIGNED
+    cmp x0, x1
+    b.eq .Ltfm_int_u
+    mov x1, #(SPEC_UNSIGNED | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_int_u
+
+    // long / signed long / long int / signed long int
+    mov x1, #SPEC_LONG
+    cmp x0, x1
+    b.eq .Ltfm_long_s
+    mov x1, #(SPEC_SIGNED | SPEC_LONG)
+    cmp x0, x1
+    b.eq .Ltfm_long_s
+    mov x1, #(SPEC_LONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_long_s
+    mov x1, #(SPEC_SIGNED | SPEC_LONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_long_s
+
+    // unsigned long / unsigned long int
+    mov x1, #(SPEC_UNSIGNED | SPEC_LONG)
+    cmp x0, x1
+    b.eq .Ltfm_long_u
+    mov x1, #(SPEC_UNSIGNED | SPEC_LONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_long_u
+
+    // long long / signed long long / long long int / signed long long int
+    mov x1, #SPEC_LLONG
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+    mov x1, #(SPEC_SIGNED | SPEC_LLONG)
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+    mov x1, #(SPEC_LLONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+    mov x1, #(SPEC_SIGNED | SPEC_LLONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+    // Also accept long + long long combined
+    mov x1, #(SPEC_LONG | SPEC_LLONG)
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+    mov x1, #(SPEC_SIGNED | SPEC_LONG | SPEC_LLONG)
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+    mov x1, #(SPEC_LONG | SPEC_LLONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+    mov x1, #(SPEC_SIGNED | SPEC_LONG | SPEC_LLONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_llong_s
+
+    // unsigned long long / unsigned long long int
+    mov x1, #(SPEC_UNSIGNED | SPEC_LLONG)
+    cmp x0, x1
+    b.eq .Ltfm_llong_u
+    mov x1, #(SPEC_UNSIGNED | SPEC_LLONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_llong_u
+    mov x1, #(SPEC_UNSIGNED | SPEC_LONG | SPEC_LLONG)
+    cmp x0, x1
+    b.eq .Ltfm_llong_u
+    mov x1, #(SPEC_UNSIGNED | SPEC_LONG | SPEC_LLONG | SPEC_INT)
+    cmp x0, x1
+    b.eq .Ltfm_llong_u
+
+    // float
+    mov x1, #SPEC_FLOAT
+    cmp x0, x1
+    b.eq .Ltfm_float
+
+    // double
+    mov x1, #SPEC_DOUBLE
+    cmp x0, x1
+    b.eq .Ltfm_double
+
+    // long double
+    mov x1, #(SPEC_LONG | SPEC_DOUBLE)
+    cmp x0, x1
+    b.eq .Ltfm_ldouble
+
+    // Invalid combination
+    mov x0, #0
+    b .Ltfm_done
+
+.Ltfm_void:
+    adrp x0, _kcc_type_void@@PAGE
+    add  x0, x0, _kcc_type_void@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_bool:
+    adrp x0, _kcc_type_bool@@PAGE
+    add  x0, x0, _kcc_type_bool@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_char_s:
+    adrp x0, _kcc_type_char_s@@PAGE
+    add  x0, x0, _kcc_type_char_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_char_u:
+    adrp x0, _kcc_type_char_u@@PAGE
+    add  x0, x0, _kcc_type_char_u@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_short_s:
+    adrp x0, _kcc_type_short_s@@PAGE
+    add  x0, x0, _kcc_type_short_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_short_u:
+    adrp x0, _kcc_type_short_u@@PAGE
+    add  x0, x0, _kcc_type_short_u@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_int_s:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_int_u:
+    adrp x0, _kcc_type_int_u@@PAGE
+    add  x0, x0, _kcc_type_int_u@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_long_s:
+    adrp x0, _kcc_type_long_s@@PAGE
+    add  x0, x0, _kcc_type_long_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_long_u:
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_llong_s:
+    adrp x0, _kcc_type_llong_s@@PAGE
+    add  x0, x0, _kcc_type_llong_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_llong_u:
+    adrp x0, _kcc_type_llong_u@@PAGE
+    add  x0, x0, _kcc_type_llong_u@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_float:
+    adrp x0, _kcc_type_float@@PAGE
+    add  x0, x0, _kcc_type_float@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_double:
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_ldouble:
+    adrp x0, _kcc_type_ldouble@@PAGE
+    add  x0, x0, _kcc_type_ldouble@@PAGEOFF
+    ldr  x0, [x0]
+
+.Ltfm_done:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Type Predicates}
+
+@d Types: compatible @{
+// -- kcc_type_compatible --------------------------------------------------
+// int kcc_type_compatible(type_desc *t1, type_desc *t2)
+//   x0 = first type, x1 = second type
+// Returns 1 if types are compatible per §6.2.7, else 0.
+.text
+.globl _kcc_type_compatible
+.p2align 2
+_kcc_type_compatible:
+    // Same pointer → trivially compatible
+    cmp x0, x1
+    b.eq .Ltc_yes
+
+    // Must have same kind
+    ldr x2, [x0, #TY_KIND]
+    ldr x3, [x1, #TY_KIND]
+    cmp x2, x3
+    b.ne .Ltc_no
+
+    // For basic types: same kind + same F0 (signedness) → compatible
+    cmp x2, #TY_PTR
+    b.ge .Ltc_derived
+
+    // Basic type: compare signedness (F0)
+    ldr x2, [x0, #TY_F0]
+    ldr x3, [x1, #TY_F0]
+    cmp x2, x3
+    b.ne .Ltc_no
+
+.Ltc_yes:
+    mov x0, #1
+    ret
+
+.Ltc_derived:
+    // For pointers: compare pointee compatibility (simplified)
+    cmp x2, #TY_PTR
+    b.ne .Ltc_no
+    // TODO: recursive compatibility check for derived types
+    mov x0, #1
+    ret
+
+.Ltc_no:
+    mov x0, #0
+    ret
+@}
+
+@d Types: is integer @{
+// -- kcc_type_is_integer --------------------------------------------------
+// int kcc_type_is_integer(type_desc *t)
+// Returns 1 if t is an integer type (bool, char, short, int, long, llong, enum).
+.text
+.globl _kcc_type_is_integer
+.p2align 2
+_kcc_type_is_integer:
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_BOOL
+    b.eq .Ltii_yes
+    cmp x1, #TY_CHAR
+    b.eq .Ltii_yes
+    cmp x1, #TY_SHORT
+    b.eq .Ltii_yes
+    cmp x1, #TY_INT
+    b.eq .Ltii_yes
+    cmp x1, #TY_LONG
+    b.eq .Ltii_yes
+    cmp x1, #TY_LLONG
+    b.eq .Ltii_yes
+    cmp x1, #TY_ENUM
+    b.eq .Ltii_yes
+    mov x0, #0
+    ret
+.Ltii_yes:
+    mov x0, #1
+    ret
+@}
+
+@d Types: is arithmetic @{
+// -- kcc_type_is_arithmetic -----------------------------------------------
+// int kcc_type_is_arithmetic(type_desc *t)
+// Returns 1 if t is an arithmetic type (integer or floating).
+.text
+.globl _kcc_type_is_arithmetic
+.p2align 2
+_kcc_type_is_arithmetic:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                     // save type in callee-saved
+    bl _kcc_type_is_integer
+    cbnz x0, .Ltia_yes
+
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_FLOAT
+    b.eq .Ltia_yes
+    cmp x1, #TY_DOUBLE
+    b.eq .Ltia_yes
+    cmp x1, #TY_LDOUBLE
+    b.eq .Ltia_yes
+
+    mov x0, #0
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Ltia_yes:
+    mov x0, #1
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+@d Types: is scalar @{
+// -- kcc_type_is_scalar ---------------------------------------------------
+// int kcc_type_is_scalar(type_desc *t)
+// Returns 1 if t is a scalar type (arithmetic or pointer).
+.text
+.globl _kcc_type_is_scalar
+.p2align 2
+_kcc_type_is_scalar:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0
+    bl _kcc_type_is_arithmetic
+    cbnz x0, .Ltis_yes
+
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.eq .Ltis_yes
+
+    mov x0, #0
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Ltis_yes:
+    mov x0, #1
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Integer Conversion Rank}
+
+@d Types: rank @{
+// -- kcc_type_rank --------------------------------------------------------
+// uint64_t kcc_type_rank(type_desc *t)
+// Returns integer conversion rank per §6.3.1.1.
+// Higher rank = wider type for UAC purposes.
+.text
+.globl _kcc_type_rank
+.p2align 2
+_kcc_type_rank:
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_BOOL
+    b.eq .Ltr_bool
+    cmp x1, #TY_CHAR
+    b.eq .Ltr_char
+    cmp x1, #TY_SHORT
+    b.eq .Ltr_short
+    cmp x1, #TY_INT
+    b.eq .Ltr_int
+    cmp x1, #TY_LONG
+    b.eq .Ltr_long
+    cmp x1, #TY_LLONG
+    b.eq .Ltr_llong
+    cmp x1, #TY_ENUM
+    b.eq .Ltr_int           // enum has rank of int
+    // Default: 0
+    mov x0, #0
+    ret
+.Ltr_bool:
+    mov x0, #1
+    ret
+.Ltr_char:
+    mov x0, #2
+    ret
+.Ltr_short:
+    mov x0, #3
+    ret
+.Ltr_int:
+    mov x0, #4
+    ret
+.Ltr_long:
+    mov x0, #5
+    ret
+.Ltr_llong:
+    mov x0, #6
+    ret
+@}
+
+\section{Type Dump}
+
+Print a human-readable representation of a type descriptor.
+
+@d Types: dump @{
+// -- kcc_type_dump --------------------------------------------------------
+// void kcc_type_dump(type_desc *t)
+//   x0 = type descriptor
+// Prints the type as a readable string (e.g., "int", "const char *").
+.text
+.globl _kcc_type_dump
+.p2align 2
+_kcc_type_dump:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    cbz x0, .Ltd_null
+    mov x19, x0
+
+    // Check qualifiers
+    ldr x0, [x19, #TY_QUALS]
+    cbz x0, .Ltd_kind
+
+    tst x0, #1
+    b.eq .Ltd_no_const
+    adrp x0, _kcc_ty_str_const@@PAGE
+    add  x0, x0, _kcc_ty_str_const@@PAGEOFF
+    bl _kcc_io_puts
+.Ltd_no_const:
+    ldr x0, [x19, #TY_QUALS]
+    tst x0, #2
+    b.eq .Ltd_no_volatile
+    adrp x0, _kcc_ty_str_volatile@@PAGE
+    add  x0, x0, _kcc_ty_str_volatile@@PAGEOFF
+    bl _kcc_io_puts
+.Ltd_no_volatile:
+
+.Ltd_kind:
+    ldr x0, [x19, #TY_KIND]
+
+    cmp x0, #TY_VOID
+    b.eq .Ltd_void
+    cmp x0, #TY_BOOL
+    b.eq .Ltd_bool
+    cmp x0, #TY_CHAR
+    b.eq .Ltd_char
+    cmp x0, #TY_SHORT
+    b.eq .Ltd_short
+    cmp x0, #TY_INT
+    b.eq .Ltd_int
+    cmp x0, #TY_LONG
+    b.eq .Ltd_long
+    cmp x0, #TY_LLONG
+    b.eq .Ltd_llong
+    cmp x0, #TY_FLOAT
+    b.eq .Ltd_float
+    cmp x0, #TY_DOUBLE
+    b.eq .Ltd_double
+    cmp x0, #TY_LDOUBLE
+    b.eq .Ltd_ldouble
+    cmp x0, #TY_PTR
+    b.eq .Ltd_ptr
+    cmp x0, #TY_ARRAY
+    b.eq .Ltd_array
+    cmp x0, #TY_FUNC
+    b.eq .Ltd_func
+    cmp x0, #TY_STRUCT
+    b.eq .Ltd_struct
+    cmp x0, #TY_UNION
+    b.eq .Ltd_union
+    cmp x0, #TY_ENUM
+    b.eq .Ltd_enum
+
+    // Unknown
+    adrp x0, _kcc_ty_str_unknown@@PAGE
+    add  x0, x0, _kcc_ty_str_unknown@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+
+.Ltd_null:
+    adrp x0, _kcc_ty_str_null@@PAGE
+    add  x0, x0, _kcc_ty_str_null@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+
+.Ltd_void:
+    adrp x0, _kcc_ty_str_void@@PAGE
+    add  x0, x0, _kcc_ty_str_void@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_bool:
+    adrp x0, _kcc_ty_str_bool@@PAGE
+    add  x0, x0, _kcc_ty_str_bool@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_char:
+    ldr x0, [x19, #TY_F0]
+    cbz x0, .Ltd_char_u
+    adrp x0, _kcc_ty_str_char@@PAGE
+    add  x0, x0, _kcc_ty_str_char@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_char_u:
+    adrp x0, _kcc_ty_str_uchar@@PAGE
+    add  x0, x0, _kcc_ty_str_uchar@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_short:
+    ldr x0, [x19, #TY_F0]
+    cbz x0, .Ltd_short_u
+    adrp x0, _kcc_ty_str_short@@PAGE
+    add  x0, x0, _kcc_ty_str_short@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_short_u:
+    adrp x0, _kcc_ty_str_ushort@@PAGE
+    add  x0, x0, _kcc_ty_str_ushort@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_int:
+    ldr x0, [x19, #TY_F0]
+    cbz x0, .Ltd_int_u
+    adrp x0, _kcc_ty_str_int@@PAGE
+    add  x0, x0, _kcc_ty_str_int@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_int_u:
+    adrp x0, _kcc_ty_str_uint@@PAGE
+    add  x0, x0, _kcc_ty_str_uint@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_long:
+    ldr x0, [x19, #TY_F0]
+    cbz x0, .Ltd_long_u
+    adrp x0, _kcc_ty_str_long@@PAGE
+    add  x0, x0, _kcc_ty_str_long@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_long_u:
+    adrp x0, _kcc_ty_str_ulong@@PAGE
+    add  x0, x0, _kcc_ty_str_ulong@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_llong:
+    ldr x0, [x19, #TY_F0]
+    cbz x0, .Ltd_llong_u
+    adrp x0, _kcc_ty_str_llong@@PAGE
+    add  x0, x0, _kcc_ty_str_llong@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_llong_u:
+    adrp x0, _kcc_ty_str_ullong@@PAGE
+    add  x0, x0, _kcc_ty_str_ullong@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_float:
+    adrp x0, _kcc_ty_str_float@@PAGE
+    add  x0, x0, _kcc_ty_str_float@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_double:
+    adrp x0, _kcc_ty_str_double@@PAGE
+    add  x0, x0, _kcc_ty_str_double@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_ldouble:
+    adrp x0, _kcc_ty_str_ldouble@@PAGE
+    add  x0, x0, _kcc_ty_str_ldouble@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_ptr:
+    // Print pointee type then " *"
+    ldr x0, [x19, #TY_F0]
+    bl _kcc_type_dump
+    adrp x0, _kcc_ty_str_ptr@@PAGE
+    add  x0, x0, _kcc_ty_str_ptr@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_array:
+    ldr x0, [x19, #TY_F0]
+    bl _kcc_type_dump
+    adrp x0, _kcc_ty_str_arr_open@@PAGE
+    add  x0, x0, _kcc_ty_str_arr_open@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #TY_F1]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ty_str_arr_close@@PAGE
+    add  x0, x0, _kcc_ty_str_arr_close@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_func:
+    ldr x0, [x19, #TY_F0]
+    bl _kcc_type_dump
+    adrp x0, _kcc_ty_str_func@@PAGE
+    add  x0, x0, _kcc_ty_str_func@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_struct:
+    adrp x0, _kcc_ty_str_struct@@PAGE
+    add  x0, x0, _kcc_ty_str_struct@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_union:
+    adrp x0, _kcc_ty_str_union@@PAGE
+    add  x0, x0, _kcc_ty_str_union@@PAGEOFF
+    bl _kcc_io_puts
+    b .Ltd_done
+.Ltd_enum:
+    adrp x0, _kcc_ty_str_enum@@PAGE
+    add  x0, x0, _kcc_ty_str_enum@@PAGEOFF
+    bl _kcc_io_puts
+
+.Ltd_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Type Data}
+
+@d Types: data @{
+// -- Type singleton pointers ----------------------------------------------
+.data
+.globl _kcc_type_void
+_kcc_type_void:       .quad 0
+.globl _kcc_type_bool
+_kcc_type_bool:       .quad 0
+.globl _kcc_type_char_s
+_kcc_type_char_s:     .quad 0
+.globl _kcc_type_char_u
+_kcc_type_char_u:     .quad 0
+.globl _kcc_type_short_s
+_kcc_type_short_s:    .quad 0
+.globl _kcc_type_short_u
+_kcc_type_short_u:    .quad 0
+.globl _kcc_type_int_s
+_kcc_type_int_s:      .quad 0
+.globl _kcc_type_int_u
+_kcc_type_int_u:      .quad 0
+.globl _kcc_type_long_s
+_kcc_type_long_s:     .quad 0
+.globl _kcc_type_long_u
+_kcc_type_long_u:     .quad 0
+.globl _kcc_type_llong_s
+_kcc_type_llong_s:    .quad 0
+.globl _kcc_type_llong_u
+_kcc_type_llong_u:    .quad 0
+.globl _kcc_type_float
+_kcc_type_float:      .quad 0
+.globl _kcc_type_double
+_kcc_type_double:     .quad 0
+.globl _kcc_type_ldouble
+_kcc_type_ldouble:    .quad 0
+
+// -- Type name strings ----------------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_kcc_ty_str_void:     .asciz "void"
+_kcc_ty_str_bool:     .asciz "_Bool"
+_kcc_ty_str_char:     .asciz "char"
+_kcc_ty_str_uchar:    .asciz "unsigned char"
+_kcc_ty_str_short:    .asciz "short"
+_kcc_ty_str_ushort:   .asciz "unsigned short"
+_kcc_ty_str_int:      .asciz "int"
+_kcc_ty_str_uint:     .asciz "unsigned int"
+_kcc_ty_str_long:     .asciz "long"
+_kcc_ty_str_ulong:    .asciz "unsigned long"
+_kcc_ty_str_llong:    .asciz "long long"
+_kcc_ty_str_ullong:   .asciz "unsigned long long"
+_kcc_ty_str_float:    .asciz "float"
+_kcc_ty_str_double:   .asciz "double"
+_kcc_ty_str_ldouble:  .asciz "long double"
+_kcc_ty_str_ptr:      .asciz " *"
+_kcc_ty_str_arr_open: .asciz "["
+_kcc_ty_str_arr_close:.asciz "]"
+_kcc_ty_str_func:     .asciz " ()"
+_kcc_ty_str_struct:   .asciz "struct"
+_kcc_ty_str_union:    .asciz "union"
+_kcc_ty_str_enum:     .asciz "enum"
+_kcc_ty_str_const:    .asciz "const "
+_kcc_ty_str_volatile: .asciz "volatile "
+_kcc_ty_str_unknown:  .asciz "<unknown>"
+_kcc_ty_str_null:     .asciz "<null>"
+@}

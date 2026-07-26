@@ -1,0 +1,545 @@
+% 26-symtab.weft — Symbol Table
+%
+% The symbol table maps identifiers to their declarations.  It uses
+% three scope stacks (ordinary, tags, labels) implemented as vecs of
+% hash table pointers.  Each scope level gets its own hash table;
+% lookup walks top-down to implement C's scoping rules.
+
+\chapter{Symbol Table}
+\label{ch:symtab}
+
+\section{Symbol Record Layout}
+
+Each symbol is a 64-byte arena-allocated record:
+
+@d Symtab: constants @{
+// -- Symbol record layout -------------------------------------------------
+.equ SYM_KIND,       0    // SYM_VAR=1, SYM_FUNC=2, SYM_TYPEDEF=3, SYM_ENUM_CONST=4
+.equ SYM_TYPE,       8    // pointer to type descriptor
+.equ SYM_NAME,      16    // interned name pointer
+.equ SYM_LINKAGE,   24    // 0=none, 1=internal, 2=external
+.equ SYM_VALUE,     32    // enum constant value (for SYM_ENUM_CONST)
+.equ SYM_DEPTH,     40    // scope depth
+.equ SYM_LINE,      48    // declaration line
+.equ SYM_FLAGS,     56    // bit 0=defined, bit 1=used
+.equ SYM_SIZE,      64
+
+// -- Symbol kind constants ------------------------------------------------
+.equ SYM_VAR,         1
+.equ SYM_FUNC,        2
+.equ SYM_TYPEDEF,     3
+.equ SYM_ENUM_CONST,  4
+@}
+
+\section{Initialization}
+
+@d Symtab: init @{
+// -- kcc_symtab_init ------------------------------------------------------
+// void kcc_symtab_init(void)
+// Creates three scope stacks, pushes file scope (depth 0).
+.text
+.globl _kcc_symtab_init
+.p2align 2
+_kcc_symtab_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Create ordinary scope stack (vec of ht pointers)
+    mov x0, #8                      // element size = pointer
+    bl _kcc_vec_init
+    adrp x1, _kcc_sym_ordinary@@PAGE
+    add  x1, x1, _kcc_sym_ordinary@@PAGEOFF
+    str x0, [x1]
+
+    // Create tags scope stack
+    mov x0, #8
+    bl _kcc_vec_init
+    adrp x1, _kcc_sym_tags@@PAGE
+    add  x1, x1, _kcc_sym_tags@@PAGEOFF
+    str x0, [x1]
+
+    // Create labels stack
+    mov x0, #8
+    bl _kcc_vec_init
+    adrp x1, _kcc_sym_labels@@PAGE
+    add  x1, x1, _kcc_sym_labels@@PAGEOFF
+    str x0, [x1]
+
+    // Initialize depth to 0
+    adrp x0, _kcc_sym_depth@@PAGE
+    add  x0, x0, _kcc_sym_depth@@PAGEOFF
+    str xzr, [x0]
+
+    // Push file scope
+    bl _kcc_symtab_push_scope
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Scope Management}
+
+@d Symtab: push scope @{
+// -- kcc_symtab_push_scope ------------------------------------------------
+// void kcc_symtab_push_scope(void)
+// Pushes a new hash table onto ordinary and tags scope stacks.
+.text
+.globl _kcc_symtab_push_scope
+.p2align 2
+_kcc_symtab_push_scope:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    str x19, [sp, #16]
+    // sp+24..31 used as temp storage for vec_push element
+
+    // Create new ht for ordinary names
+    mov x0, #32                     // initial capacity
+    bl _kcc_ht_init
+    // Store ht pointer on stack for vec_push (needs pointer-to-element)
+    str x0, [sp, #24]
+
+    // Push onto ordinary stack
+    adrp x0, _kcc_sym_ordinary@@PAGE
+    add  x0, x0, _kcc_sym_ordinary@@PAGEOFF
+    ldr  x0, [x0]
+    add x1, sp, #24                 // pointer to element on stack
+    bl _kcc_vec_push
+
+    // Create new ht for tags
+    mov x0, #16
+    bl _kcc_ht_init
+    str x0, [sp, #24]
+
+    // Push onto tags stack
+    adrp x0, _kcc_sym_tags@@PAGE
+    add  x0, x0, _kcc_sym_tags@@PAGEOFF
+    ldr  x0, [x0]
+    add x1, sp, #24
+    bl _kcc_vec_push
+
+    // Increment depth
+    adrp x0, _kcc_sym_depth@@PAGE
+    add  x0, x0, _kcc_sym_depth@@PAGEOFF
+    ldr  x1, [x0]
+    add  x1, x1, #1
+    str  x1, [x0]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+@d Symtab: pop scope @{
+// -- kcc_symtab_pop_scope -------------------------------------------------
+// void kcc_symtab_pop_scope(void)
+// Pops from ordinary and tags scope stacks, decrements depth.
+.text
+.globl _kcc_symtab_pop_scope
+.p2align 2
+_kcc_symtab_pop_scope:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Pop from ordinary stack (decrement count)
+    adrp x0, _kcc_sym_ordinary@@PAGE
+    add  x0, x0, _kcc_sym_ordinary@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1
+    str  x1, [x0, #VEC_COUNT]
+
+    // Pop from tags stack
+    adrp x0, _kcc_sym_tags@@PAGE
+    add  x0, x0, _kcc_sym_tags@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1
+    str  x1, [x0, #VEC_COUNT]
+
+    // Decrement depth
+    adrp x0, _kcc_sym_depth@@PAGE
+    add  x0, x0, _kcc_sym_depth@@PAGEOFF
+    ldr  x1, [x0]
+    sub  x1, x1, #1
+    str  x1, [x0]
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Ordinary Name Space}
+
+@d Symtab: declare @{
+// -- kcc_symtab_declare ---------------------------------------------------
+// sym *kcc_symtab_declare(char *name, uint64_t len, uint64_t kind, type_desc *type)
+//   x0 = name, x1 = len, x2 = kind, x3 = type descriptor
+// Creates SYM record, inserts into current scope.
+// Returns sym pointer.
+.text
+.globl _kcc_symtab_declare
+.p2align 2
+_kcc_symtab_declare:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                     // name
+    mov x20, x1                     // len
+    mov x21, x2                     // kind
+    mov x22, x3                     // type
+
+    // Allocate symbol record
+    mov x0, #SYM_SIZE
+    bl _kcc_arena_alloc
+    mov x23, x0                     // x23 = sym
+
+    // Fill symbol fields
+    str x21, [x23, #SYM_KIND]
+    str x22, [x23, #SYM_TYPE]
+    str x19, [x23, #SYM_NAME]
+    str xzr, [x23, #SYM_LINKAGE]
+    str xzr, [x23, #SYM_VALUE]
+
+    // Store depth
+    adrp x0, _kcc_sym_depth@@PAGE
+    add  x0, x0, _kcc_sym_depth@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x23, #SYM_DEPTH]
+
+    // Store line from current token
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x23, #SYM_LINE]
+
+    // flags = defined
+    mov x0, #1
+    str x0, [x23, #SYM_FLAGS]
+
+    // Get current scope ht (top of ordinary stack)
+    adrp x0, _kcc_sym_ordinary@@PAGE
+    add  x0, x0, _kcc_sym_ordinary@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1                 // top index
+    bl _kcc_vec_get
+    ldr x24, [x0]                   // x24 = current scope ht
+
+    // Insert into ht: key=name, len=len, val=sym
+    mov x0, x24
+    mov x1, x19                     // name
+    mov x2, x20                     // len
+    mov x3, x23                     // sym pointer as value
+    bl _kcc_ht_put
+
+    mov x0, x23                     // return sym
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+@d Symtab: lookup @{
+// -- kcc_symtab_lookup ----------------------------------------------------
+// sym *kcc_symtab_lookup(char *name, uint64_t len)
+//   x0 = name, x1 = len
+// Searches ordinary scopes top-down.
+// Returns sym pointer or 0 if not found.
+.text
+.globl _kcc_symtab_lookup
+.p2align 2
+_kcc_symtab_lookup:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                     // name
+    mov x20, x1                     // len
+
+    // Get ordinary stack
+    adrp x0, _kcc_sym_ordinary@@PAGE
+    add  x0, x0, _kcc_sym_ordinary@@PAGEOFF
+    ldr  x0, [x0]
+    mov x21, x0                     // x21 = vec
+    ldr x22, [x21, #VEC_COUNT]      // x22 = count (search top-down)
+
+.Lsym_lookup_loop:
+    cbz x22, .Lsym_lookup_notfound
+    sub x22, x22, #1
+
+    // Get ht at index x22
+    mov x0, x21
+    mov x1, x22
+    bl _kcc_vec_get
+    ldr x0, [x0]                   // ht pointer
+
+    // Lookup in this ht
+    mov x1, x19                     // name
+    mov x2, x20                     // len
+    bl _kcc_ht_get
+    cbnz x0, .Lsym_lookup_found
+
+    b .Lsym_lookup_loop
+
+.Lsym_lookup_found:
+    // x0 = sym pointer (from ht_get value)
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lsym_lookup_notfound:
+    mov x0, #0
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Tag Name Space}
+
+@d Symtab: declare tag @{
+// -- kcc_symtab_declare_tag -----------------------------------------------
+// sym *kcc_symtab_declare_tag(char *name, uint64_t len, type_desc *type)
+//   x0 = tag name, x1 = len, x2 = type descriptor
+// Inserts into tags scope stack.
+.text
+.globl _kcc_symtab_declare_tag
+.p2align 2
+_kcc_symtab_declare_tag:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                     // name
+    mov x20, x1                     // len
+    mov x21, x2                     // type
+
+    // Allocate symbol record
+    mov x0, #SYM_SIZE
+    bl _kcc_arena_alloc
+    mov x22, x0                     // x22 = sym
+
+    // Fill
+    mov x1, #SYM_VAR               // tags don't need a specific kind
+    str x1, [x22, #SYM_KIND]
+    str x21, [x22, #SYM_TYPE]
+    str x19, [x22, #SYM_NAME]
+    str xzr, [x22, #SYM_LINKAGE]
+    str xzr, [x22, #SYM_VALUE]
+
+    adrp x0, _kcc_sym_depth@@PAGE
+    add  x0, x0, _kcc_sym_depth@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x22, #SYM_DEPTH]
+    str xzr, [x22, #SYM_LINE]
+    mov x0, #1
+    str x0, [x22, #SYM_FLAGS]
+
+    // Get current scope ht (top of tags stack)
+    adrp x0, _kcc_sym_tags@@PAGE
+    add  x0, x0, _kcc_sym_tags@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1
+    bl _kcc_vec_get
+    ldr x0, [x0]                   // ht
+
+    mov x1, x19
+    mov x2, x20
+    mov x3, x22
+    bl _kcc_ht_put
+
+    mov x0, x22
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+@d Symtab: lookup tag @{
+// -- kcc_symtab_lookup_tag ------------------------------------------------
+// sym *kcc_symtab_lookup_tag(char *name, uint64_t len)
+//   x0 = tag name, x1 = len
+// Searches tags scopes top-down.
+.text
+.globl _kcc_symtab_lookup_tag
+.p2align 2
+_kcc_symtab_lookup_tag:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0
+    mov x20, x1
+
+    adrp x0, _kcc_sym_tags@@PAGE
+    add  x0, x0, _kcc_sym_tags@@PAGEOFF
+    ldr  x0, [x0]
+    mov x21, x0
+    ldr x22, [x21, #VEC_COUNT]
+
+.Lsym_tag_loop:
+    cbz x22, .Lsym_tag_notfound
+    sub x22, x22, #1
+
+    mov x0, x21
+    mov x1, x22
+    bl _kcc_vec_get
+    ldr x0, [x0]
+
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_ht_get
+    cbnz x0, .Lsym_tag_found
+
+    b .Lsym_tag_loop
+
+.Lsym_tag_found:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lsym_tag_notfound:
+    mov x0, #0
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Label Scope}
+
+Labels are function-scoped: one hash table per function.
+
+@d Symtab: label scope @{
+// -- kcc_symtab_label_begin -----------------------------------------------
+// void kcc_symtab_label_begin(void)
+// Pushes a new label hash table for a function body.
+.text
+.globl _kcc_symtab_label_begin
+.p2align 2
+_kcc_symtab_label_begin:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    // sp+16..23 used as temp for vec_push element
+
+    mov x0, #16
+    bl _kcc_ht_init
+    str x0, [sp, #16]              // store ht pointer for vec_push
+
+    adrp x0, _kcc_sym_labels@@PAGE
+    add  x0, x0, _kcc_sym_labels@@PAGEOFF
+    ldr  x0, [x0]
+    add x1, sp, #16                 // pointer to element
+    bl _kcc_vec_push
+
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_symtab_label_end -------------------------------------------------
+// void kcc_symtab_label_end(void)
+// Pops the label hash table after function body.
+.globl _kcc_symtab_label_end
+.p2align 2
+_kcc_symtab_label_end:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_sym_labels@@PAGE
+    add  x0, x0, _kcc_sym_labels@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1
+    str  x1, [x0, #VEC_COUNT]
+
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_symtab_label_add -------------------------------------------------
+// void kcc_symtab_label_add(char *name, uint64_t len)
+.globl _kcc_symtab_label_add
+.p2align 2
+_kcc_symtab_label_add:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0
+    mov x20, x1
+
+    // Get top label ht
+    adrp x0, _kcc_sym_labels@@PAGE
+    add  x0, x0, _kcc_sym_labels@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1
+    bl _kcc_vec_get
+    ldr x0, [x0]                   // ht
+
+    mov x1, x19
+    mov x2, x20
+    mov x3, #1                      // value = 1 (defined)
+    bl _kcc_ht_put
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_symtab_label_lookup ----------------------------------------------
+// int kcc_symtab_label_lookup(char *name, uint64_t len)
+// Returns 1 if label is defined, 0 otherwise.
+.globl _kcc_symtab_label_lookup
+.p2align 2
+_kcc_symtab_label_lookup:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    mov x2, x1                     // len
+    mov x1, x0                     // name
+
+    // Get top label ht
+    adrp x0, _kcc_sym_labels@@PAGE
+    add  x0, x0, _kcc_sym_labels@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x3, [x0, #VEC_COUNT]
+    cbz x3, .Lsym_label_no
+    sub  x3, x3, #1
+    bl _kcc_vec_get
+    ldr x0, [x0]
+
+    // x1=name already, x2=len already
+    bl _kcc_ht_get
+    cbnz x0, .Lsym_label_yes
+
+.Lsym_label_no:
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+.Lsym_label_yes:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Symbol Table Data}
+
+@d Symtab: data @{
+// -- Symbol table globals -------------------------------------------------
+.data
+.globl _kcc_sym_ordinary
+_kcc_sym_ordinary:    .quad 0       // vec* for ordinary scope stack
+.globl _kcc_sym_tags
+_kcc_sym_tags:        .quad 0       // vec* for tag scope stack
+.globl _kcc_sym_labels
+_kcc_sym_labels:      .quad 0       // vec* for label scope stack
+.globl _kcc_sym_depth
+_kcc_sym_depth:       .quad 0       // current scope depth
+@}

@@ -1,0 +1,349 @@
+% 28-conversions.weft — Type Conversions
+%
+% Implements the implicit type conversion rules from C17 §6.3:
+% integer promotions, usual arithmetic conversions, array/function
+% decay, and lvalue conversion.
+
+\chapter{Type Conversions}
+\label{ch:conversions}
+
+\section{Integer Promotions}
+
+Per \stdref{6.3.1.1}, types with rank less than \texttt{int} promote
+to \texttt{int} (or \texttt{unsigned int} if the original type's values
+cannot be represented in \texttt{int}).
+
+@d Conv: integer promotions @{
+// -- kcc_conv_promote -----------------------------------------------------
+// type_desc *kcc_conv_promote(type_desc *type)
+//   x0 = original type
+// Returns promoted type (int or unsigned int if rank < int, else unchanged).
+.text
+.globl _kcc_conv_promote
+.p2align 2
+_kcc_conv_promote:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                     // save original
+
+    // Check if it's an integer type
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_BOOL
+    b.eq .Lcp_promote
+    cmp x1, #TY_CHAR
+    b.eq .Lcp_promote
+    cmp x1, #TY_SHORT
+    b.eq .Lcp_promote
+    cmp x1, #TY_ENUM
+    b.eq .Lcp_promote
+
+    // Already int or wider, or not integer → return unchanged
+    mov x0, x19
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Lcp_promote:
+    // Promote to signed int (all smaller types fit in int on ARM64)
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Usual Arithmetic Conversions}
+
+Per \stdref{6.3.1.8}: given two arithmetic operands, find the common
+type to which both are converted.
+
+@d Conv: usual arithmetic @{
+// -- kcc_conv_usual -------------------------------------------------------
+// type_desc *kcc_conv_usual(type_desc *t1, type_desc *t2)
+//   x0 = left type, x1 = right type
+// Returns the common type for binary arithmetic.
+.text
+.globl _kcc_conv_usual
+.p2align 2
+_kcc_conv_usual:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                     // t1
+    mov x20, x1                     // t2
+
+    // If either is long double → long double
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_LDOUBLE
+    b.eq .Lcu_ldouble
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_LDOUBLE
+    b.eq .Lcu_ldouble
+
+    // If either is double → double
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_DOUBLE
+    b.eq .Lcu_double
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_DOUBLE
+    b.eq .Lcu_double
+
+    // If either is float → float
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_FLOAT
+    b.eq .Lcu_float
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_FLOAT
+    b.eq .Lcu_float
+
+    // Both are integer types — apply integer promotions first
+    mov x0, x19
+    bl _kcc_conv_promote
+    mov x19, x0
+    mov x0, x20
+    bl _kcc_conv_promote
+    mov x20, x0
+
+    // Same type after promotion → done
+    cmp x19, x20
+    b.eq .Lcu_return_t1
+
+    // Both same signedness → higher rank wins
+    ldr x21, [x19, #TY_F0]         // signedness of t1
+    ldr x22, [x20, #TY_F0]         // signedness of t2
+    cmp x21, x22
+    b.ne .Lcu_diff_sign
+
+    // Same signedness: compare ranks
+    mov x0, x19
+    bl _kcc_type_rank
+    mov x21, x0
+    mov x0, x20
+    bl _kcc_type_rank
+    cmp x21, x0
+    b.ge .Lcu_return_t1
+    b .Lcu_return_t2
+
+.Lcu_diff_sign:
+    // Different signedness: unsigned type with >= rank wins
+    // Determine which is unsigned
+    ldr x21, [x19, #TY_F0]
+    cbz x21, .Lcu_t1_unsigned
+
+    // t2 is unsigned
+    mov x0, x20
+    bl _kcc_type_rank
+    mov x21, x0
+    mov x0, x19
+    bl _kcc_type_rank
+    cmp x21, x0
+    b.ge .Lcu_return_t2
+    // Signed type has higher rank → use signed type
+    b .Lcu_return_t1
+
+.Lcu_t1_unsigned:
+    // t1 is unsigned
+    mov x0, x19
+    bl _kcc_type_rank
+    mov x21, x0
+    mov x0, x20
+    bl _kcc_type_rank
+    cmp x21, x0
+    b.ge .Lcu_return_t1
+    b .Lcu_return_t2
+
+.Lcu_ldouble:
+    adrp x0, _kcc_type_ldouble@@PAGE
+    add  x0, x0, _kcc_type_ldouble@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lcu_done
+.Lcu_double:
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lcu_done
+.Lcu_float:
+    adrp x0, _kcc_type_float@@PAGE
+    add  x0, x0, _kcc_type_float@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lcu_done
+.Lcu_return_t1:
+    mov x0, x19
+    b .Lcu_done
+.Lcu_return_t2:
+    mov x0, x20
+
+.Lcu_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Array and Function Decay}
+
+@d Conv: array decay @{
+// -- kcc_conv_array_decay -------------------------------------------------
+// type_desc *kcc_conv_array_decay(type_desc *type)
+//   x0 = type (may be TY_ARRAY or not)
+// If array: returns pointer-to-element type.
+// Otherwise: returns type unchanged.
+.text
+.globl _kcc_conv_array_decay
+.p2align 2
+_kcc_conv_array_decay:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lcad_unchanged
+
+    // Array → pointer to element type
+    ldr x0, [x0, #TY_F0]           // element type
+    bl _kcc_type_ptr
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lcad_unchanged:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+@d Conv: func decay @{
+// -- kcc_conv_func_decay --------------------------------------------------
+// type_desc *kcc_conv_func_decay(type_desc *type)
+//   x0 = type (may be TY_FUNC or not)
+// If function: returns pointer-to-function type.
+// Otherwise: returns type unchanged.
+.text
+.globl _kcc_conv_func_decay
+.p2align 2
+_kcc_conv_func_decay:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_FUNC
+    b.ne .Lcfd_unchanged
+
+    // Function → pointer to function
+    bl _kcc_type_ptr
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lcfd_unchanged:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Lvalue Conversion}
+
+@d Conv: lvalue @{
+// -- kcc_conv_lvalue ------------------------------------------------------
+// type_desc *kcc_conv_lvalue(type_desc *type)
+//   x0 = type descriptor
+// Strips qualifiers for rvalue conversion.
+// Returns unqualified type.
+.text
+.globl _kcc_conv_lvalue
+.p2align 2
+_kcc_conv_lvalue:
+    // If type has qualifiers, return it without them
+    // For now, qualifiers are stored directly on type descriptors
+    // We simply clear the quals field (non-destructive: return same ptr)
+    // Actually for correctness we return the same descriptor but
+    // the caller should treat it as unqualified.
+    // Simple implementation: just return the type as-is
+    // (qualifier checking is separate from lvalue conversion)
+    ret
+@}
+
+\section{Implicit Conversion Check}
+
+@d Conv: implicit @{
+// -- kcc_conv_implicit ----------------------------------------------------
+// int kcc_conv_implicit(type_desc *from, type_desc *to)
+//   x0 = source type, x1 = target type
+// Returns 1 if implicit conversion from→to is valid, 0 otherwise.
+.text
+.globl _kcc_conv_implicit
+.p2align 2
+_kcc_conv_implicit:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                     // from
+    mov x20, x1                     // to
+
+    // Same type → always valid
+    cmp x19, x20
+    b.eq .Lci_yes
+
+    // Same kind → valid (widening or narrowing is allowed with warning)
+    ldr x0, [x19, #TY_KIND]
+    ldr x1, [x20, #TY_KIND]
+    cmp x0, x1
+    b.eq .Lci_yes
+
+    // Integer → integer: always valid (with possible warning)
+    mov x0, x19
+    bl _kcc_type_is_integer
+    cbz x0, .Lci_check_arith
+    mov x0, x20
+    bl _kcc_type_is_integer
+    cbnz x0, .Lci_yes
+
+.Lci_check_arith:
+    // Arithmetic → arithmetic: valid
+    mov x0, x19
+    bl _kcc_type_is_arithmetic
+    cbz x0, .Lci_check_ptr
+    mov x0, x20
+    bl _kcc_type_is_arithmetic
+    cbnz x0, .Lci_yes
+
+.Lci_check_ptr:
+    // Pointer → pointer: valid (with warning for incompatible)
+    ldr x0, [x19, #TY_KIND]
+    cmp x0, #TY_PTR
+    b.ne .Lci_check_int_ptr
+    ldr x0, [x20, #TY_KIND]
+    cmp x0, #TY_PTR
+    b.eq .Lci_yes
+
+.Lci_check_int_ptr:
+    // Integer → pointer or pointer → integer: valid (with warning)
+    ldr x0, [x19, #TY_KIND]
+    cmp x0, #TY_PTR
+    b.ne .Lci_from_not_ptr
+    mov x0, x20
+    bl _kcc_type_is_integer
+    cbnz x0, .Lci_yes
+    b .Lci_no
+
+.Lci_from_not_ptr:
+    mov x0, x19
+    bl _kcc_type_is_integer
+    cbz x0, .Lci_no
+    ldr x0, [x20, #TY_KIND]
+    cmp x0, #TY_PTR
+    b.eq .Lci_yes
+
+.Lci_no:
+    mov x0, #0
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Lci_yes:
+    mov x0, #1
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}

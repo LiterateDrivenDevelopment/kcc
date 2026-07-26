@@ -259,6 +259,92 @@ physical assembly files under \texttt{tmp/src/}.
 @<Decl: data@>
 @}
 
+\noindent\textbf{types.s} --- type system:
+
+@o tmp/src/types.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Parser: AST constants@>
+@<Types: constants@>
+@<Types: init@>
+@<Types: make pointer@>
+@<Types: make array@>
+@<Types: make function@>
+@<Types: make struct@>
+@<Types: make enum@>
+@<Types: resolve specmask@>
+@<Types: compatible@>
+@<Types: is integer@>
+@<Types: is arithmetic@>
+@<Types: is scalar@>
+@<Types: rank@>
+@<Types: dump@>
+@<Types: data@>
+@}
+
+\noindent\textbf{symtab.s} --- symbol table:
+
+@o tmp/src/symtab.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Parser: AST constants@>
+@<Diag: constants@>
+@<Vec: constants@>
+@<Symtab: constants@>
+@<Symtab: init@>
+@<Symtab: push scope@>
+@<Symtab: pop scope@>
+@<Symtab: declare@>
+@<Symtab: lookup@>
+@<Symtab: declare tag@>
+@<Symtab: lookup tag@>
+@<Symtab: label scope@>
+@<Symtab: data@>
+@}
+
+\noindent\textbf{conversions.s} --- type conversions:
+
+@o tmp/src/conversions.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Parser: AST constants@>
+@<Types: constants@>
+@<Conv: integer promotions@>
+@<Conv: usual arithmetic@>
+@<Conv: array decay@>
+@<Conv: func decay@>
+@<Conv: lvalue@>
+@<Conv: implicit@>
+@}
+
+\noindent\textbf{sema.s} --- semantic analysis:
+
+@o tmp/src/sema.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Diag: constants@>
+@<Parser: AST constants@>
+@<Types: constants@>
+@<Symtab: constants@>
+@<Vec: constants@>
+@<Sema: check@>
+@<Sema: resolve type@>
+@<Sema: check declaration@>
+@<Sema: check statement@>
+@<Sema: check expression@>
+@<Sema: expr ident@>
+@<Sema: expr literal@>
+@<Sema: expr binary@>
+@<Sema: expr unary@>
+@<Sema: expr assign@>
+@<Sema: expr call@>
+@<Sema: expr member@>
+@<Sema: expr cast@>
+@<Sema: expr sizeof@>
+@<Sema: dump types@>
+@<Sema: data@>
+@}
+
 \bigskip
 \noindent\textbf{Test binaries} --- test runner and conformance tests
 (assembled separately; linked into \texttt{tmp/test\_kcc}):

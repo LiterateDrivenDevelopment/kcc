@@ -374,8 +374,72 @@ _kcc_parse_decl_specs:
     b .Ldecl_specs_loop
 
 .Ldecl_type_builtin:
-    // Record the builtin type token
-    mov x23, x0                  // save type token
+    // Accumulate specifier bitmask in x23
+    // Each type keyword ORs its bit into x23
+    cmp x0, #TOK_VOID
+    b.eq .Ldecl_bit_void
+    cmp x0, #TOK_CHAR
+    b.eq .Ldecl_bit_char
+    cmp x0, #TOK_SHORT
+    b.eq .Ldecl_bit_short
+    cmp x0, #TOK_INT
+    b.eq .Ldecl_bit_int
+    cmp x0, #TOK_LONG
+    b.eq .Ldecl_bit_long
+    cmp x0, #TOK_FLOAT
+    b.eq .Ldecl_bit_float
+    cmp x0, #TOK_DOUBLE
+    b.eq .Ldecl_bit_double
+    cmp x0, #TOK_SIGNED
+    b.eq .Ldecl_bit_signed
+    cmp x0, #TOK_UNSIGNED
+    b.eq .Ldecl_bit_unsigned
+    cmp x0, #TOK__BOOL
+    b.eq .Ldecl_bit_bool
+    cmp x0, #TOK__COMPLEX
+    b.eq .Ldecl_bit_complex
+    b .Ldecl_bit_done
+
+.Ldecl_bit_void:
+    orr x23, x23, #(1 << 0)
+    b .Ldecl_bit_done
+.Ldecl_bit_char:
+    orr x23, x23, #(1 << 1)
+    b .Ldecl_bit_done
+.Ldecl_bit_short:
+    orr x23, x23, #(1 << 2)
+    b .Ldecl_bit_done
+.Ldecl_bit_int:
+    orr x23, x23, #(1 << 3)
+    b .Ldecl_bit_done
+.Ldecl_bit_long:
+    // Check if long already set (bit 4) -> set long long (bit 5)
+    tst x23, #(1 << 4)
+    b.ne .Ldecl_bit_llong
+    orr x23, x23, #(1 << 4)
+    b .Ldecl_bit_done
+.Ldecl_bit_llong:
+    orr x23, x23, #(1 << 5)
+    b .Ldecl_bit_done
+.Ldecl_bit_float:
+    orr x23, x23, #(1 << 6)
+    b .Ldecl_bit_done
+.Ldecl_bit_double:
+    orr x23, x23, #(1 << 7)
+    b .Ldecl_bit_done
+.Ldecl_bit_signed:
+    orr x23, x23, #(1 << 8)
+    b .Ldecl_bit_done
+.Ldecl_bit_unsigned:
+    orr x23, x23, #(1 << 9)
+    b .Ldecl_bit_done
+.Ldecl_bit_bool:
+    orr x23, x23, #(1 << 10)
+    b .Ldecl_bit_done
+.Ldecl_bit_complex:
+    orr x23, x23, #(1 << 11)
+
+.Ldecl_bit_done:
     add x22, x22, #1            // count++
     bl _kcc_pp_next
     b .Ldecl_specs_loop
@@ -439,19 +503,19 @@ _kcc_parse_decl_specs:
     b .Ldecl_apply_quals
 
 .Ldecl_build_builtin:
-    // Create builtin type node from the last type specifier token
-    // If no type specifiers at all, default to int
+    // Create builtin type node from accumulated specifier bitmask
+    // If no type specifiers at all, default to int (bit 3)
     cbz x22, .Ldecl_default_int
     mov x0, #AST_TYPE_BUILTIN
     bl _kcc_ast_alloc
-    str x23, [x0, #AST_F0]      // token code
+    str x23, [x0, #AST_F0]      // specifier bitmask
     mov x20, x0
     b .Ldecl_apply_quals
 
 .Ldecl_default_int:
     mov x0, #AST_TYPE_BUILTIN
     bl _kcc_ast_alloc
-    mov x1, #TOK_INT
+    mov x1, #(1 << 3)           // SPEC_INT bitmask
     str x1, [x0, #AST_F0]
     mov x20, x0
 

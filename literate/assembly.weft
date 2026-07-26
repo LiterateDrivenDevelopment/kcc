@@ -183,6 +183,82 @@ physical assembly files under \texttt{tmp/src/}.
 @<Concat: data@>
 @}
 
+\noindent\textbf{parser.s} --- recursive-descent parser core:
+
+@o tmp/src/parser.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Diag: constants@>
+@<Vec: constants@>
+@<Parser: AST constants@>
+@<Parser: AST alloc@>
+@<Parser: helpers@>
+@<Parser: error recovery@>
+@<Parser: typedef table@>
+@<Parser: translation unit@>
+@<Parser: dump AST@>
+@<Parser: dump helpers@>
+@<Parser: data@>
+@}
+
+\noindent\textbf{expressions.s} --- expression parsing:
+
+@o tmp/src/expressions.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Parser: AST constants@>
+@<Expr: precedence table@>
+@<Expr: parse expression@>
+@<Expr: parse assign@>
+@<Expr: parse conditional@>
+@<Expr: parse binary@>
+@<Expr: parse unary@>
+@<Expr: parse cast@>
+@<Expr: parse postfix@>
+@<Expr: parse primary@>
+@<Expr: parse arg list@>
+@<Expr: data@>
+@}
+
+\noindent\textbf{statements.s} --- statement parsing:
+
+@o tmp/src/statements.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Parser: AST constants@>
+@<Stmt: parse statement@>
+@<Stmt: parse compound@>
+@<Stmt: parse if@>
+@<Stmt: parse switch@>
+@<Stmt: parse while@>
+@<Stmt: parse do@>
+@<Stmt: parse for@>
+@<Stmt: parse goto@>
+@<Stmt: parse return@>
+@<Stmt: parse labeled@>
+@<Stmt: data@>
+@}
+
+\noindent\textbf{declarations.s} --- declaration parsing:
+
+@o tmp/src/declarations.s @{
+@<ARM64: common macros@>
+@<Lexer: token constants@>
+@<Parser: AST constants@>
+@<Decl: parse declaration@>
+@<Decl: parse specifiers@>
+@<Decl: parse declarator@>
+@<Decl: parse direct declarator@>
+@<Decl: parse abstract@>
+@<Decl: parse struct@>
+@<Decl: parse enum@>
+@<Decl: parse type name@>
+@<Decl: is type token@>
+@<Decl: parse init@>
+@<Decl: parse static assert@>
+@<Decl: data@>
+@}
+
 \bigskip
 \noindent\textbf{Test binaries} --- test runner and conformance tests
 (assembled separately; linked into \texttt{tmp/test\_kcc}):

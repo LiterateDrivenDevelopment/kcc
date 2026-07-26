@@ -166,6 +166,10 @@
 @i literate/frontend/18-preprocessor.weft
 @i literate/frontend/19-string-literals.weft
 @i literate/frontend/20-concatenation.weft
+@i literate/frontend/21-parser.weft
+@i literate/frontend/22-declarations.weft
+@i literate/frontend/23-expressions.weft
+@i literate/frontend/24-statements.weft
 
 % ═══════════════════════════════════════════════════════════════════
 % Part IV: Driver

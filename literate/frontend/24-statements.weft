@@ -1,0 +1,934 @@
+% 24-statements.weft — Statement Parsing
+%
+% This chapter implements statement parsing for the C17 recursive-descent
+% parser.  Statements are dispatched by the leading token: compound
+% statements start with '{', selection statements with 'if' or 'switch',
+% iteration statements with 'while', 'do', or 'for', jump statements
+% with 'goto', 'continue', 'break', or 'return', and labeled statements
+% with an identifier followed by ':' (or 'case'/'default').
+%
+% The grammar follows ISO 9899:2018 section 6.8.
+
+\chapter{Statement Parsing}
+\label{ch:statements}
+
+\section{Statement Dispatch}
+
+\texttt{kcc\_parse\_stmt} examines the current token and dispatches to
+the appropriate statement parser.  A bare semicolon produces a null
+statement; an opening brace starts a compound statement; keywords like
+\texttt{if}, \texttt{while}, etc.\ invoke their specific handlers.
+An identifier at the start could be either a label (if followed by
+\texttt{:}) or an expression statement.
+
+@d Stmt: parse statement @{
+// -- kcc_parse_stmt ----------------------------------------------------
+// node *kcc_parse_stmt(void)
+// Parses a single statement.
+// Returns AST node for the statement.
+.text
+.globl _kcc_parse_stmt
+.p2align 2
+_kcc_parse_stmt:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Compound statement
+    cmp x0, #TOK_LBRACE
+    b.eq .Lstmt_compound
+
+    // Null statement (bare ;)
+    cmp x0, #TOK_SEMI
+    b.eq .Lstmt_null
+
+    // Selection
+    cmp x0, #TOK_IF
+    b.eq .Lstmt_if
+    cmp x0, #TOK_SWITCH
+    b.eq .Lstmt_switch
+
+    // Iteration
+    cmp x0, #TOK_WHILE
+    b.eq .Lstmt_while
+    cmp x0, #TOK_DO
+    b.eq .Lstmt_do
+    cmp x0, #TOK_FOR
+    b.eq .Lstmt_for
+
+    // Jump
+    cmp x0, #TOK_GOTO
+    b.eq .Lstmt_goto
+    cmp x0, #TOK_CONTINUE
+    b.eq .Lstmt_continue
+    cmp x0, #TOK_BREAK
+    b.eq .Lstmt_break
+    cmp x0, #TOK_RETURN
+    b.eq .Lstmt_return
+
+    // Labeled: case
+    cmp x0, #TOK_CASE
+    b.eq .Lstmt_case
+    cmp x0, #TOK_DEFAULT
+    b.eq .Lstmt_default
+
+    // Could be label (ident ':') or expression statement
+    // Check: if it's an identifier, peek ahead for ':'
+    cmp x0, #TOK_IDENT
+    b.eq .Lstmt_check_label
+
+    // Expression statement
+    b .Lstmt_expr
+
+.Lstmt_compound:
+    bl _kcc_parse_compound
+    b .Lstmt_done
+
+.Lstmt_null:
+    bl _kcc_pp_next               // consume ';'
+    mov x0, #AST_NULL_STMT
+    bl _kcc_ast_alloc
+    b .Lstmt_done
+
+.Lstmt_if:
+    bl _kcc_parse_if
+    b .Lstmt_done
+
+.Lstmt_switch:
+    bl _kcc_parse_switch
+    b .Lstmt_done
+
+.Lstmt_while:
+    bl _kcc_parse_while
+    b .Lstmt_done
+
+.Lstmt_do:
+    bl _kcc_parse_do
+    b .Lstmt_done
+
+.Lstmt_for:
+    bl _kcc_parse_for
+    b .Lstmt_done
+
+.Lstmt_goto:
+    bl _kcc_parse_goto
+    b .Lstmt_done
+
+.Lstmt_continue:
+    bl _kcc_pp_next               // consume 'continue'
+    mov x0, #AST_CONTINUE_STMT
+    bl _kcc_ast_alloc
+    mov x19, x0
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x19
+    b .Lstmt_done
+
+.Lstmt_break:
+    bl _kcc_pp_next               // consume 'break'
+    mov x0, #AST_BREAK_STMT
+    bl _kcc_ast_alloc
+    mov x19, x0
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x19
+    b .Lstmt_done
+
+.Lstmt_return:
+    bl _kcc_parse_return
+    b .Lstmt_done
+
+.Lstmt_case:
+    bl _kcc_parse_case
+    b .Lstmt_done
+
+.Lstmt_default:
+    bl _kcc_parse_default
+    b .Lstmt_done
+
+.Lstmt_check_label:
+    // Save identifier info for possible label
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    // Intern it in case it's a label
+    bl _kcc_strtab_intern
+    mov x19, x0                  // x19 = interned name
+
+    // We need lookahead: consume ident and check for ':'
+    bl _kcc_pp_next               // consume identifier
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COLON
+    b.eq .Lstmt_label
+
+    // Not a label: it's an expression starting with this identifier.
+    // Build ident node, then parse rest as expression statement.
+    mov x0, #AST_IDENT_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // name_ptr
+    // Continue parsing postfix/binary/assignment with this as lhs
+    bl _kcc_parse_postfix_tail
+    // Now x0 might have postfix ops applied; continue with assignment
+    bl _kcc_parse_expr_rest
+    mov x19, x0
+
+    // Build expression statement
+    mov x0, #AST_EXPR_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    mov x19, x0
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x19
+    b .Lstmt_done
+
+.Lstmt_label:
+    // Label: ident ':'
+    bl _kcc_pp_next               // consume ':'
+
+    // Parse the labeled statement
+    bl _kcc_parse_stmt
+    mov x20, x0                  // x20 = inner stmt (callee-saved)
+
+    mov x0, #AST_LABEL_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // name_ptr
+    str x20, [x0, #AST_F1]      // stmt
+    b .Lstmt_done
+
+.Lstmt_expr:
+    // Expression statement: expr ';'
+    bl _kcc_parse_expr
+    mov x19, x0
+
+    mov x0, #AST_EXPR_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+
+    mov x19, x0
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x19
+
+.Lstmt_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_parse_expr_rest -----------------------------------------------
+// node *kcc_parse_expr_rest(node *lhs)
+//   x0 = already-parsed left-hand side
+// Continues parsing binary/assignment/ternary after an identifier+postfix.
+// This is needed when we consumed the ident for label lookahead.
+.globl _kcc_parse_expr_rest
+.p2align 2
+_kcc_parse_expr_rest:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = lhs so far
+
+    // Check for binary operators
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Check for assignment operators (94-104)
+    cmp  x0, #TOK_ASSIGN
+    b.lt .Lexpr_rest_check_binary
+    cmp  x0, #TOK_OR_ASSIGN
+    b.gt .Lexpr_rest_check_binary
+
+    // Assignment
+    mov x20, x0                  // x20 = op
+    bl _kcc_pp_next
+    bl _kcc_parse_assign_expr
+    mov x21, x0                  // x21 = rhs
+    mov x0, #AST_ASSIGN_EXPR
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]
+    str x19, [x0, #AST_F1]
+    str x21, [x0, #AST_F2]
+    b .Lexpr_rest_done
+
+.Lexpr_rest_check_binary:
+    // Check for binary operators via precedence
+    bl _kcc_prec_lookup
+    cbz x0, .Lexpr_rest_check_ternary
+
+    // We have a binary op. Need to handle this properly.
+    // The cleanest approach: treat x19 as the LHS and continue
+    // with precedence climbing from here.
+    // Build a wrapper that simulates: we already have LHS, now
+    // enter the binary loop.
+    mov x20, x0                  // x20 = prec of current op
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x21, [x0]               // x21 = op token
+
+    bl _kcc_pp_next               // consume operator
+
+    add x0, x20, #1
+    bl _kcc_parse_binary_expr    // parse rhs with prec+1
+    mov x22, x0                  // x22 = rhs (callee-saved)
+
+    mov x0, #AST_BINARY_EXPR
+    bl _kcc_ast_alloc
+    str x21, [x0, #AST_F0]      // op
+    str x19, [x0, #AST_F1]      // lhs
+    str x22, [x0, #AST_F2]      // rhs
+    mov x19, x0
+
+    // Continue checking for more binary/ternary
+    b .Lexpr_rest_check_comma
+
+.Lexpr_rest_check_ternary:
+    // Check for '?'
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_QUESTION
+    b.ne .Lexpr_rest_check_comma
+
+    bl _kcc_pp_next               // consume '?'
+    bl _kcc_parse_expr
+    mov x20, x0                  // then
+    mov x0, #TOK_COLON
+    bl _kcc_parse_expect
+    bl _kcc_parse_cond_expr
+    mov x21, x0                  // else
+
+    mov x0, #AST_COND_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str x20, [x0, #AST_F1]
+    str x21, [x0, #AST_F2]
+    mov x19, x0
+
+.Lexpr_rest_check_comma:
+    // Check for comma operator
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Lexpr_rest_no_comma
+
+    bl _kcc_pp_next
+    bl _kcc_parse_assign_expr
+    mov x20, x0
+
+    mov x0, #AST_COMMA_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str x20, [x0, #AST_F1]
+    mov x19, x0
+    b .Lexpr_rest_check_comma
+
+.Lexpr_rest_no_comma:
+    mov x0, x19
+
+.Lexpr_rest_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Compound Statement}
+
+A compound statement (\stdref{6.8.2}) is a brace-enclosed sequence of
+declarations and statements.  It introduces a new scope for typedef
+names.
+
+@d Stmt: parse compound @{
+// -- kcc_parse_compound ------------------------------------------------
+// node *kcc_parse_compound(void)
+// Parses a compound statement { items... }
+// Returns AST_COMPOUND node with F0 = first item.
+.globl _kcc_parse_compound
+.p2align 2
+_kcc_parse_compound:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Consume '{'
+    mov x0, #TOK_LBRACE
+    bl _kcc_parse_expect
+
+    // Push typedef scope
+    bl _kcc_typedef_push_scope
+
+    // Allocate compound node
+    mov x0, #AST_COMPOUND
+    bl _kcc_ast_alloc
+    mov x19, x0                  // x19 = compound node
+
+    mov x20, #0                  // x20 = first item
+    mov x21, #0                  // x21 = last item
+
+.Lcompound_loop:
+    // Check for '}' or EOF
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp x0, #TOK_RBRACE
+    b.eq .Lcompound_close
+    cbz x0, .Lcompound_close     // EOF
+
+    // Is it a declaration or a statement?
+    bl _kcc_parse_is_type_token
+    cbnz x0, .Lcompound_decl
+
+    // Check for storage class specifiers that start declarations
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_TYPEDEF
+    b.eq .Lcompound_decl
+    cmp x0, #TOK_EXTERN
+    b.eq .Lcompound_decl
+    cmp x0, #TOK_STATIC
+    b.eq .Lcompound_decl
+    cmp x0, #TOK_AUTO
+    b.eq .Lcompound_decl
+    cmp x0, #TOK_REGISTER
+    b.eq .Lcompound_decl
+    cmp x0, #TOK__STATIC_ASSERT
+    b.eq .Lcompound_decl
+
+    // It's a statement
+    bl _kcc_parse_stmt
+    b .Lcompound_append
+
+.Lcompound_decl:
+    bl _kcc_parse_decl
+
+.Lcompound_append:
+    mov x22, x0                  // x22 = new item
+    cbz x22, .Lcompound_loop    // skip null (error recovery)
+
+    cbz x20, .Lcompound_first
+
+    // Append: last->F4 = new
+    str x22, [x21, #AST_F4]
+    mov x21, x22
+    b .Lcompound_loop
+
+.Lcompound_first:
+    mov x20, x22
+    mov x21, x22
+    b .Lcompound_loop
+
+.Lcompound_close:
+    // Expect '}'
+    mov x0, #TOK_RBRACE
+    bl _kcc_parse_expect
+
+    // Pop typedef scope
+    bl _kcc_typedef_pop_scope
+
+    // Store first item
+    str x20, [x19, #AST_F0]
+
+    mov x0, x19                  // return compound node
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{If Statement}
+
+The if statement (\stdref{6.8.4.1}) with optional else clause.  The
+dangling-else ambiguity is resolved by greedy binding: the else
+always associates with the nearest preceding if.
+
+@d Stmt: parse if @{
+// -- kcc_parse_if ------------------------------------------------------
+// node *kcc_parse_if(void)
+// Parses: if ( expr ) stmt [else stmt]
+.globl _kcc_parse_if
+.p2align 2
+_kcc_parse_if:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Consume 'if'
+    bl _kcc_pp_next
+
+    // Expect '('
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    // Parse condition
+    bl _kcc_parse_expr
+    mov x19, x0                  // x19 = condition
+
+    // Expect ')'
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Parse 'then' statement
+    bl _kcc_parse_stmt
+    mov x20, x0                  // x20 = then
+
+    // Check for 'else'
+    mov x21, #0                  // x21 = else (default: null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ELSE
+    b.ne .Lif_build
+
+    // Consume 'else'
+    bl _kcc_pp_next
+
+    // Parse 'else' statement
+    bl _kcc_parse_stmt
+    mov x21, x0                  // x21 = else
+
+.Lif_build:
+    mov x0, #AST_IF_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // condition
+    str x20, [x0, #AST_F1]      // then
+    str x21, [x0, #AST_F2]      // else (or null)
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Switch Statement}
+
+@d Stmt: parse switch @{
+// -- kcc_parse_switch --------------------------------------------------
+// node *kcc_parse_switch(void)
+// Parses: switch ( expr ) stmt
+.globl _kcc_parse_switch
+.p2align 2
+_kcc_parse_switch:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Consume 'switch'
+    bl _kcc_pp_next
+
+    // Expect '('
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    // Parse expression
+    bl _kcc_parse_expr
+    mov x19, x0                  // x19 = expr
+
+    // Expect ')'
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Parse body
+    bl _kcc_parse_stmt
+    mov x20, x0                  // x20 = body
+
+    mov x0, #AST_SWITCH_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // expr
+    str x20, [x0, #AST_F1]      // body
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{While Statement}
+
+@d Stmt: parse while @{
+// -- kcc_parse_while ---------------------------------------------------
+// node *kcc_parse_while(void)
+// Parses: while ( expr ) stmt
+.globl _kcc_parse_while
+.p2align 2
+_kcc_parse_while:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Consume 'while'
+    bl _kcc_pp_next
+
+    // Expect '('
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    // Parse condition
+    bl _kcc_parse_expr
+    mov x19, x0                  // x19 = condition
+
+    // Expect ')'
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Parse body
+    bl _kcc_parse_stmt
+    mov x20, x0                  // x20 = body
+
+    mov x0, #AST_WHILE_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // condition
+    str x20, [x0, #AST_F1]      // body
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Do-While Statement}
+
+@d Stmt: parse do @{
+// -- kcc_parse_do ------------------------------------------------------
+// node *kcc_parse_do(void)
+// Parses: do stmt while ( expr ) ;
+.globl _kcc_parse_do
+.p2align 2
+_kcc_parse_do:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Consume 'do'
+    bl _kcc_pp_next
+
+    // Parse body
+    bl _kcc_parse_stmt
+    mov x19, x0                  // x19 = body
+
+    // Expect 'while'
+    mov x0, #TOK_WHILE
+    bl _kcc_parse_expect
+
+    // Expect '('
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    // Parse condition
+    bl _kcc_parse_expr
+    mov x20, x0                  // x20 = condition
+
+    // Expect ')'
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Expect ';'
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+
+    mov x0, #AST_DO_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // body
+    str x20, [x0, #AST_F1]      // condition
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{For Statement}
+
+The for statement (\stdref{6.8.5.3}) has three optional clauses.  The
+init clause can be a declaration (introducing a new scope) or an
+expression.
+
+@d Stmt: parse for @{
+// -- kcc_parse_for -----------------------------------------------------
+// node *kcc_parse_for(void)
+// Parses: for ( [init] ; [cond] ; [incr] ) stmt
+// init can be a declaration or expression.
+.globl _kcc_parse_for
+.p2align 2
+_kcc_parse_for:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    // Consume 'for'
+    bl _kcc_pp_next
+
+    // Expect '('
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    // Parse init clause
+    mov x19, #0                  // x19 = init (default null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_SEMI
+    b.eq .Lfor_skip_init
+
+    // Check if init is a declaration
+    bl _kcc_parse_is_type_token
+    cbnz x0, .Lfor_init_decl
+
+    // Check storage class keywords
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_TYPEDEF
+    b.eq .Lfor_init_decl
+    cmp x0, #TOK_EXTERN
+    b.eq .Lfor_init_decl
+    cmp x0, #TOK_STATIC
+    b.eq .Lfor_init_decl
+    cmp x0, #TOK_AUTO
+    b.eq .Lfor_init_decl
+    cmp x0, #TOK_REGISTER
+    b.eq .Lfor_init_decl
+
+    // Expression init
+    bl _kcc_parse_expr
+    mov x19, x0
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    b .Lfor_cond
+
+.Lfor_init_decl:
+    // Declaration (includes the trailing ';')
+    bl _kcc_parse_decl
+    mov x19, x0
+    b .Lfor_cond
+
+.Lfor_skip_init:
+    bl _kcc_pp_next               // consume ';'
+
+.Lfor_cond:
+    // Parse condition
+    mov x20, #0                  // x20 = cond (default null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_SEMI
+    b.eq .Lfor_skip_cond
+
+    bl _kcc_parse_expr
+    mov x20, x0
+
+.Lfor_skip_cond:
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+
+    // Parse increment
+    mov x21, #0                  // x21 = incr (default null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.eq .Lfor_skip_incr
+
+    bl _kcc_parse_expr
+    mov x21, x0
+
+.Lfor_skip_incr:
+    // Expect ')'
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Parse body
+    bl _kcc_parse_stmt
+    mov x22, x0                  // x22 = body
+
+    // Build for node
+    mov x0, #AST_FOR_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // init
+    str x20, [x0, #AST_F1]      // cond
+    str x21, [x0, #AST_F2]      // incr
+    str x22, [x0, #AST_F3]      // body
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Goto Statement}
+
+@d Stmt: parse goto @{
+// -- kcc_parse_goto ----------------------------------------------------
+// node *kcc_parse_goto(void)
+// Parses: goto ident ;
+.globl _kcc_parse_goto
+.p2align 2
+_kcc_parse_goto:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Consume 'goto'
+    bl _kcc_pp_next
+
+    // Get label name
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x19, x0                  // x19 = label name
+
+    // Consume identifier
+    bl _kcc_pp_next
+
+    // Expect ';'
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+
+    mov x0, #AST_GOTO_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // label_name_ptr
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Return Statement}
+
+@d Stmt: parse return @{
+// -- kcc_parse_return --------------------------------------------------
+// node *kcc_parse_return(void)
+// Parses: return [expr] ;
+.globl _kcc_parse_return
+.p2align 2
+_kcc_parse_return:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Consume 'return'
+    bl _kcc_pp_next
+
+    // Check for immediate ';' (return without value)
+    mov x19, #0                  // default: no return value
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_SEMI
+    b.eq .Lreturn_semi
+
+    // Parse return expression
+    bl _kcc_parse_expr
+    mov x19, x0
+
+.Lreturn_semi:
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+
+    mov x0, #AST_RETURN_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // expr (or 0)
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Labeled Statements}
+
+Case and default labels for switch statements.
+
+@d Stmt: parse labeled @{
+// -- kcc_parse_case ----------------------------------------------------
+// node *kcc_parse_case(void)
+// Parses: case expr : stmt
+.globl _kcc_parse_case
+.p2align 2
+_kcc_parse_case:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Consume 'case'
+    bl _kcc_pp_next
+
+    // Parse constant expression
+    bl _kcc_parse_cond_expr
+    mov x19, x0                  // x19 = expr
+
+    // Expect ':'
+    mov x0, #TOK_COLON
+    bl _kcc_parse_expect
+
+    // Parse statement
+    bl _kcc_parse_stmt
+    mov x20, x0                  // x20 = stmt
+
+    mov x0, #AST_CASE_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // expr
+    str x20, [x0, #AST_F1]      // stmt
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_parse_default -------------------------------------------------
+// node *kcc_parse_default(void)
+// Parses: default : stmt
+.globl _kcc_parse_default
+.p2align 2
+_kcc_parse_default:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Consume 'default'
+    bl _kcc_pp_next
+
+    // Expect ':'
+    mov x0, #TOK_COLON
+    bl _kcc_parse_expect
+
+    // Parse statement
+    bl _kcc_parse_stmt
+    mov x19, x0                  // x19 = stmt
+
+    mov x0, #AST_DEFAULT_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // stmt
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Statement Data}
+
+@d Stmt: data @{
+// -- Statement parser data (reserved) ----------------------------------
+// No additional data needed for statement parsing.
+@}

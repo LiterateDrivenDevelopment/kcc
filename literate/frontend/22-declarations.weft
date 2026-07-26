@@ -1,0 +1,1622 @@
+% 22-declarations.weft — Declaration Parsing
+%
+% This chapter implements declaration parsing for the C17 recursive-descent
+% parser.  Declarations are the most complex part of C syntax: a declaration
+% consists of declaration specifiers (storage class, type specifiers,
+% qualifiers) followed by a declarator that introduces a name.
+%
+% The key challenge is typedef disambiguation: the parser must know which
+% identifiers are typedef names to correctly parse declarations.  This is
+% handled by the typedef table from Chapter~\ref{ch:parser}.
+%
+% The grammar follows ISO 9899:2018 section 6.7.
+
+\chapter{Declaration Parsing}
+\label{ch:declarations}
+
+\section{Declaration}
+
+A declaration (\stdref{6.7}) has the form:
+\begin{center}
+\textit{declaration-specifiers} \textit{init-declarator-list}\texttt{?} \texttt{;}
+\end{center}
+
+The specifiers include storage class (\texttt{typedef}, \texttt{static},
+\texttt{extern}, etc.), type specifiers (\texttt{int}, \texttt{char},
+struct/union/enum, typedef names), and qualifiers (\texttt{const},
+\texttt{volatile}, \texttt{restrict}, \texttt{\_Atomic}).
+
+@d Decl: parse declaration @{
+// -- kcc_parse_decl ----------------------------------------------------
+// node *kcc_parse_decl(void)
+// Parses a declaration or function definition.
+// Returns AST node (VarDecl, FuncDecl, TypedefDecl, StructDecl, etc.)
+.text
+.globl _kcc_parse_decl
+.p2align 2
+_kcc_parse_decl:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+
+    // Check for _Static_assert
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK__STATIC_ASSERT
+    b.eq .Ldecl_static_assert
+
+    // Parse declaration specifiers
+    // Returns: x0 = type node, x1 = storage class flags
+    bl _kcc_parse_decl_specs
+    mov x19, x0                  // x19 = type node
+    mov x20, x1                  // x20 = storage class (0=none,1=typedef,2=extern,3=static,4=auto,5=register)
+
+    // Check for bare ';' (struct/union/enum declaration without declarator)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_SEMI
+    b.eq .Ldecl_bare_type
+
+    // Parse declarator
+    mov x0, x19                  // base type
+    bl _kcc_parse_declarator
+    // Returns: x0 = decl node (partially filled)
+    mov x21, x0                  // x21 = declarator result node
+    cbz x21, .Ldecl_error_recovery
+
+    // Check what kind of declaration this is
+    ldr x22, [x21, #AST_TAG]    // x22 = node tag
+
+    // If it's a function declarator and next token is '{', it's a definition
+    cmp x22, #AST_FUNC_DECL
+    b.ne .Ldecl_not_func
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACE
+    b.ne .Ldecl_func_proto
+
+    // Function definition: parse body
+    bl _kcc_parse_compound
+    str x0, [x21, #AST_F3]      // body
+    mov x0, x21
+    b .Ldecl_done
+
+.Ldecl_func_proto:
+    // Function prototype (declaration without body)
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x21
+    b .Ldecl_done
+
+.Ldecl_not_func:
+    // Variable or typedef declaration
+    // Check for typedef
+    cmp x20, #1
+    b.eq .Ldecl_typedef
+
+    // Regular variable declaration
+    // Store storage class
+    str x20, [x21, #AST_F3]     // storage_class
+
+    // Check for initializer
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ASSIGN
+    b.ne .Ldecl_var_no_init
+
+    // Consume '='
+    bl _kcc_pp_next
+
+    // Parse initializer
+    bl _kcc_parse_initializer
+    str x0, [x21, #AST_F2]      // init
+
+.Ldecl_var_no_init:
+    // Check for more declarators (comma-separated)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.eq .Ldecl_more_vars
+
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x21
+    b .Ldecl_done
+
+.Ldecl_more_vars:
+    // Multiple declarators: link via F4
+    mov x23, x21                 // x23 = first decl
+    mov x24, x21                 // x24 = last decl
+
+.Ldecl_var_loop:
+    bl _kcc_pp_next               // consume ','
+
+    // Parse next declarator with same base type
+    mov x0, x19
+    bl _kcc_parse_declarator
+    mov x25, x0                  // x25 = new decl
+    cbz x25, .Ldecl_var_loop_end
+
+    str x20, [x25, #AST_F3]     // storage_class
+
+    // Check for initializer
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ASSIGN
+    b.ne .Ldecl_var_no_init2
+
+    bl _kcc_pp_next               // consume '='
+    bl _kcc_parse_initializer
+    str x0, [x25, #AST_F2]      // init
+
+.Ldecl_var_no_init2:
+    // Link
+    str x25, [x24, #AST_F4]
+    mov x24, x25
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.eq .Ldecl_var_loop
+
+.Ldecl_var_loop_end:
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x23                  // return first decl
+    b .Ldecl_done
+
+.Ldecl_typedef:
+    // Typedef declaration: register the name
+    ldr x0, [x21, #AST_F1]      // name_ptr
+    cbz x0, .Ldecl_typedef_done
+    // Get name length via strlen
+    mov x23, x0                  // save name
+    bl _kcc_strlen
+    mov x1, x0                   // len
+    mov x0, x23                  // name
+    bl _kcc_typedef_add
+
+.Ldecl_typedef_done:
+    // Change tag to TYPEDEF_DECL
+    mov x0, #AST_TYPEDEF_DECL
+    str x0, [x21, #AST_TAG]
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x21
+    b .Ldecl_done
+
+.Ldecl_bare_type:
+    // Just a type followed by ';' (e.g., "struct S { ... };")
+    bl _kcc_pp_next               // consume ';'
+    // Return the type node itself (struct/union/enum decl)
+    mov x0, x19
+    b .Ldecl_done
+
+.Ldecl_static_assert:
+    bl _kcc_parse_static_assert
+    b .Ldecl_done
+
+.Ldecl_error_recovery:
+    bl _kcc_parse_sync
+    mov x0, #0
+
+.Ldecl_done:
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+\section{Declaration Specifiers}
+
+\texttt{kcc\_parse\_decl\_specs} parses the type specifiers, qualifiers,
+and storage class keywords that precede a declarator.  It accumulates
+type information and returns both the type node and the storage class.
+
+@d Decl: parse specifiers @{
+// -- kcc_parse_decl_specs ----------------------------------------------
+// (node*, uint64_t) kcc_parse_decl_specs(void)
+// Parses declaration specifiers.
+// Returns: x0 = type node, x1 = storage class
+//   storage class: 0=none, 1=typedef, 2=extern, 3=static, 4=auto, 5=register
+.globl _kcc_parse_decl_specs
+.p2align 2
+_kcc_parse_decl_specs:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, #0                  // x19 = storage class (0=none)
+    mov x20, #0                  // x20 = type node (built incrementally)
+    mov x21, #0                  // x21 = qualifier flags
+    mov x22, #0                  // x22 = count of type specifiers seen
+    mov x23, #0                  // x23 = base type token (for builtins)
+
+.Ldecl_specs_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Storage class specifiers
+    cmp x0, #TOK_TYPEDEF
+    b.eq .Ldecl_sc_typedef
+    cmp x0, #TOK_EXTERN
+    b.eq .Ldecl_sc_extern
+    cmp x0, #TOK_STATIC
+    b.eq .Ldecl_sc_static
+    cmp x0, #TOK_AUTO
+    b.eq .Ldecl_sc_auto
+    cmp x0, #TOK_REGISTER
+    b.eq .Ldecl_sc_register
+
+    // Type qualifiers
+    cmp x0, #TOK_CONST
+    b.eq .Ldecl_qual_const
+    cmp x0, #TOK_VOLATILE
+    b.eq .Ldecl_qual_volatile
+    cmp x0, #TOK_RESTRICT
+    b.eq .Ldecl_qual_restrict
+    cmp x0, #TOK__ATOMIC
+    b.eq .Ldecl_qual_atomic
+
+    // Function specifier
+    cmp x0, #TOK_INLINE
+    b.eq .Ldecl_skip_spec
+    cmp x0, #TOK__NORETURN
+    b.eq .Ldecl_skip_spec
+
+    // Type specifiers
+    cmp x0, #TOK_VOID
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_CHAR
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_SHORT
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_INT
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_LONG
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_FLOAT
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_DOUBLE
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_SIGNED
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_UNSIGNED
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK__BOOL
+    b.eq .Ldecl_type_builtin
+    cmp x0, #TOK__COMPLEX
+    b.eq .Ldecl_type_builtin
+
+    // struct/union/enum
+    cmp x0, #TOK_STRUCT
+    b.eq .Ldecl_type_struct
+    cmp x0, #TOK_UNION
+    b.eq .Ldecl_type_union
+    cmp x0, #TOK_ENUM
+    b.eq .Ldecl_type_enum
+
+    // Typedef name (identifier that is a typedef)
+    cmp x0, #TOK_IDENT
+    b.eq .Ldecl_check_typedef_name
+
+    // _Thread_local (storage class like)
+    cmp x0, #TOK__THREAD_LOCAL
+    b.eq .Ldecl_skip_spec
+
+    // Not a specifier, done
+    b .Ldecl_specs_done
+
+.Ldecl_sc_typedef:
+    mov x19, #1
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_sc_extern:
+    mov x19, #2
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_sc_static:
+    mov x19, #3
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_sc_auto:
+    mov x19, #4
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_sc_register:
+    mov x19, #5
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_qual_const:
+    orr x21, x21, #1
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_qual_volatile:
+    orr x21, x21, #2
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_qual_restrict:
+    orr x21, x21, #4
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_qual_atomic:
+    orr x21, x21, #8
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_skip_spec:
+    // Consume and ignore (inline, _Noreturn, _Thread_local)
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_type_builtin:
+    // Record the builtin type token
+    mov x23, x0                  // save type token
+    add x22, x22, #1            // count++
+    bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_type_struct:
+    bl _kcc_parse_struct_or_union
+    mov x20, x0
+    add x22, x22, #1
+    b .Ldecl_specs_loop
+
+.Ldecl_type_union:
+    bl _kcc_parse_struct_or_union
+    mov x20, x0
+    add x22, x22, #1
+    b .Ldecl_specs_loop
+
+.Ldecl_type_enum:
+    bl _kcc_parse_enum
+    mov x20, x0
+    add x22, x22, #1
+    b .Ldecl_specs_loop
+
+.Ldecl_check_typedef_name:
+    // Only treat as typedef name if no type specifier seen yet
+    cbnz x22, .Ldecl_specs_done
+
+    // Check if this identifier is a typedef name
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_typedef_lookup
+    cbz x0, .Ldecl_specs_done   // not a typedef name
+
+    // It's a typedef name: intern it and create TYPE_NAME node
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x24, x0                  // x24 = interned name
+
+    bl _kcc_pp_next               // consume the typedef name
+
+    mov x0, #AST_TYPE_NAME
+    bl _kcc_ast_alloc
+    str x24, [x0, #AST_F0]      // name_ptr
+    mov x20, x0
+    add x22, x22, #1
+
+    b .Ldecl_specs_loop
+
+.Ldecl_specs_done:
+    // Build the final type node
+    // If we have a builtin type and no struct/union/enum type already
+    cbz x20, .Ldecl_build_builtin
+    b .Ldecl_apply_quals
+
+.Ldecl_build_builtin:
+    // Create builtin type node from the last type specifier token
+    // If no type specifiers at all, default to int
+    cbz x22, .Ldecl_default_int
+    mov x0, #AST_TYPE_BUILTIN
+    bl _kcc_ast_alloc
+    str x23, [x0, #AST_F0]      // token code
+    mov x20, x0
+    b .Ldecl_apply_quals
+
+.Ldecl_default_int:
+    mov x0, #AST_TYPE_BUILTIN
+    bl _kcc_ast_alloc
+    mov x1, #TOK_INT
+    str x1, [x0, #AST_F0]
+    mov x20, x0
+
+.Ldecl_apply_quals:
+    // If qualifiers present, wrap in TYPE_QUALS
+    cbz x21, .Ldecl_specs_return
+
+    mov x24, x20                 // save base type
+    mov x0, #AST_TYPE_QUALS
+    bl _kcc_ast_alloc
+    str x24, [x0, #AST_F0]      // base_type
+    str x21, [x0, #AST_F1]      // qualifiers
+    mov x20, x0
+
+.Ldecl_specs_return:
+    mov x0, x20                  // type node
+    mov x1, x19                  // storage class
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Declarator}
+
+The declarator (\stdref{6.7.6}) introduces a name and modifies the
+base type with pointer, array, and function type constructors.  The
+syntax is:
+\begin{center}
+\textit{pointer}\texttt{?} \textit{direct-declarator}
+\end{center}
+where a pointer is one or more \texttt{*} optionally followed by
+type qualifiers.
+
+@d Decl: parse declarator @{
+// -- kcc_parse_declarator ----------------------------------------------
+// node *kcc_parse_declarator(node *base_type)
+//   x0 = base type node
+// Parses a declarator and returns a declaration node
+// (VAR_DECL or FUNC_DECL) with the type and name filled in.
+.globl _kcc_parse_declarator
+.p2align 2
+_kcc_parse_declarator:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = current type
+
+    // Parse pointer(s)
+.Ldeclr_ptr_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STAR
+    b.ne .Ldeclr_direct
+
+    // Consume '*'
+    bl _kcc_pp_next
+
+    // Parse optional qualifiers after *
+    mov x20, #0                  // qualifier flags
+.Ldeclr_ptr_quals:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_CONST
+    b.eq .Ldeclr_pq_const
+    cmp x0, #TOK_VOLATILE
+    b.eq .Ldeclr_pq_volatile
+    cmp x0, #TOK_RESTRICT
+    b.eq .Ldeclr_pq_restrict
+    cmp x0, #TOK__ATOMIC
+    b.eq .Ldeclr_pq_atomic
+    b .Ldeclr_ptr_build
+
+.Ldeclr_pq_const:
+    orr x20, x20, #1
+    bl _kcc_pp_next
+    b .Ldeclr_ptr_quals
+.Ldeclr_pq_volatile:
+    orr x20, x20, #2
+    bl _kcc_pp_next
+    b .Ldeclr_ptr_quals
+.Ldeclr_pq_restrict:
+    orr x20, x20, #4
+    bl _kcc_pp_next
+    b .Ldeclr_ptr_quals
+.Ldeclr_pq_atomic:
+    orr x20, x20, #8
+    bl _kcc_pp_next
+    b .Ldeclr_ptr_quals
+
+.Ldeclr_ptr_build:
+    // Build pointer type node
+    mov x0, #AST_TYPE_PTR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // pointee type
+    str x20, [x0, #AST_F1]      // qualifiers
+    mov x19, x0                  // new current type
+    b .Ldeclr_ptr_loop
+
+.Ldeclr_direct:
+    // Parse direct declarator
+    mov x0, x19
+    bl _kcc_parse_direct_declarator
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Direct Declarator}
+
+The direct declarator is where the name lives, along with array
+dimensions and function parameter lists.
+
+@d Decl: parse direct declarator @{
+// -- kcc_parse_direct_declarator ---------------------------------------
+// node *kcc_parse_direct_declarator(node *type)
+//   x0 = type built so far
+// Returns a VarDecl or FuncDecl node.
+.globl _kcc_parse_direct_declarator
+.p2align 2
+_kcc_parse_direct_declarator:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // x19 = type
+    mov x20, #0                  // x20 = name_ptr
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Check for '(' — grouped declarator like (*fp)
+    cmp x0, #TOK_LPAREN
+    b.eq .Lddecl_grouped
+
+    // Must be an identifier
+    cmp x0, #TOK_IDENT
+    b.ne .Lddecl_no_name
+
+    // Intern the name
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x20, x0                  // x20 = interned name
+
+    // Consume identifier
+    bl _kcc_pp_next
+
+.Lddecl_no_name:
+    // Check for array/function suffixes
+.Lddecl_suffix_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp x0, #TOK_LBRACKET
+    b.eq .Lddecl_array
+
+    cmp x0, #TOK_LPAREN
+    b.eq .Lddecl_function
+
+    // No more suffixes — build the declaration node
+    b .Lddecl_build_var
+
+.Lddecl_array:
+    // Array: [ size? ]
+    bl _kcc_pp_next               // consume '['
+
+    mov x21, #0                  // size expr (default null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACKET
+    b.eq .Lddecl_array_close
+
+    // Parse size expression
+    bl _kcc_parse_assign_expr
+    mov x21, x0
+
+.Lddecl_array_close:
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect
+
+    // Build array type
+    mov x0, #AST_TYPE_ARRAY
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // element type
+    str x21, [x0, #AST_F1]      // size expr
+    mov x19, x0                  // update type
+    b .Lddecl_suffix_loop
+
+.Lddecl_function:
+    // Function: ( param-list )
+    bl _kcc_pp_next               // consume '('
+
+    // Build function type
+    mov x0, #AST_TYPE_FUNC
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // return type
+    mov x21, x0                  // x21 = func type node
+
+    // Check for empty params or 'void'
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.eq .Lddecl_func_close
+
+    // Check for 'void)'
+    cmp  x0, #TOK_VOID
+    b.ne .Lddecl_parse_params
+
+    // Could be 'void)' or 'void *name'
+    // For now, if void followed by ')', treat as no params
+    // This is a simplification; full C17 requires lookahead
+    // We'll handle it by checking: if void and next is ')', consume both
+    // Otherwise fall through to param parsing
+
+    // Peek: we can't easily look ahead, so just try parsing params
+    b .Lddecl_parse_params
+
+.Lddecl_parse_params:
+    // Parse parameter list
+    mov x22, #0                  // x22 = first param
+    mov x23, #0                  // x23 = last param
+
+.Lddecl_param_loop:
+    // Check for '...'
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Lddecl_variadic
+
+    // Parse parameter declaration
+    bl _kcc_parse_param_decl
+    mov x0, x0                   // param node
+
+    cbz x22, .Lddecl_param_first
+    str x0, [x23, #AST_F4]      // last->next = new
+    mov x23, x0
+    b .Lddecl_param_comma
+
+.Lddecl_param_first:
+    mov x22, x0
+    mov x23, x0
+
+.Lddecl_param_comma:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Lddecl_func_store_params
+
+    bl _kcc_pp_next               // consume ','
+
+    // Check for '...' after comma
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Lddecl_variadic
+
+    b .Lddecl_param_loop
+
+.Lddecl_variadic:
+    bl _kcc_pp_next               // consume '...'
+    mov x0, #1
+    str x0, [x21, #AST_F2]      // variadic = 1
+
+.Lddecl_func_store_params:
+    str x22, [x21, #AST_F1]     // params
+
+.Lddecl_func_close:
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Build FuncDecl node
+    mov x0, #AST_FUNC_DECL
+    bl _kcc_ast_alloc
+    ldr x1, [x21, #AST_F0]      // return type from func type
+    str x1, [x0, #AST_F0]       // type (return type)
+    str x20, [x0, #AST_F1]      // name
+    ldr x1, [x21, #AST_F1]      // params
+    str x1, [x0, #AST_F2]       // params
+
+    b .Lddecl_done
+
+.Lddecl_grouped:
+    // Grouped declarator: ( declarator )
+    // This handles things like: int (*fp)(int)
+    bl _kcc_pp_next               // consume '('
+    mov x0, x19
+    bl _kcc_parse_declarator
+    mov x21, x0                  // save inner result
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, x21
+    b .Lddecl_done
+
+.Lddecl_build_var:
+    // Build VarDecl
+    mov x0, #AST_VAR_DECL
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // type
+    str x20, [x0, #AST_F1]      // name_ptr
+
+.Lddecl_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_parse_param_decl ----------------------------------------------
+// node *kcc_parse_param_decl(void)
+// Parses a parameter declaration.
+.globl _kcc_parse_param_decl
+.p2align 2
+_kcc_parse_param_decl:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Parse specifiers (ignore storage class for params)
+    bl _kcc_parse_decl_specs
+    mov x19, x0                  // x19 = type
+    // x1 = storage class (ignored)
+
+    // Check if there's a declarator or abstract declarator
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // If ')' or ',' follows, it's an unnamed parameter
+    cmp  x0, #TOK_RPAREN
+    b.eq .Lparam_unnamed
+    cmp  x0, #TOK_COMMA
+    b.eq .Lparam_unnamed
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Lparam_unnamed
+
+    // Try to parse a declarator
+    mov x0, x19
+    bl _kcc_parse_declarator
+    mov x20, x0                  // x20 = decl node
+
+    // Convert to PARAM_DECL
+    mov x0, #AST_PARAM_DECL
+    bl _kcc_ast_alloc
+    ldr x1, [x20, #AST_F0]      // type from declarator
+    str x1, [x0, #AST_F0]
+    ldr x1, [x20, #AST_F1]      // name from declarator
+    str x1, [x0, #AST_F1]
+
+    b .Lparam_done
+
+.Lparam_unnamed:
+    // Unnamed parameter
+    mov x0, #AST_PARAM_DECL
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // type
+    // F1 (name) stays null
+
+.Lparam_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Abstract Declarator}
+
+An abstract declarator is used in casts and \texttt{sizeof(type)}.
+It is like a regular declarator but without a name.
+
+@d Decl: parse abstract @{
+// -- kcc_parse_abstract_declarator -------------------------------------
+// node *kcc_parse_abstract_declarator(node *base_type)
+//   x0 = base type
+// Returns a type node (possibly wrapped in pointers/arrays).
+.globl _kcc_parse_abstract_declarator
+.p2align 2
+_kcc_parse_abstract_declarator:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                  // x19 = type
+
+    // Parse pointer(s)
+.Labst_ptr_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STAR
+    b.ne .Labst_done
+
+    bl _kcc_pp_next               // consume '*'
+
+    // Parse qualifiers
+    mov x20, #0
+.Labst_quals:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_CONST
+    b.ne .Labst_q2
+    orr x20, x20, #1
+    bl _kcc_pp_next
+    b .Labst_quals
+.Labst_q2:
+    cmp x0, #TOK_VOLATILE
+    b.ne .Labst_q3
+    orr x20, x20, #2
+    bl _kcc_pp_next
+    b .Labst_quals
+.Labst_q3:
+    cmp x0, #TOK_RESTRICT
+    b.ne .Labst_q4
+    orr x20, x20, #4
+    bl _kcc_pp_next
+    b .Labst_quals
+.Labst_q4:
+    cmp x0, #TOK__ATOMIC
+    b.ne .Labst_build_ptr
+    orr x20, x20, #8
+    bl _kcc_pp_next
+    b .Labst_quals
+
+.Labst_build_ptr:
+    mov x0, #AST_TYPE_PTR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str x20, [x0, #AST_F1]
+    mov x19, x0
+    b .Labst_ptr_loop
+
+.Labst_done:
+    // Check for array suffix [N]
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACKET
+    b.ne .Labst_check_func
+
+    bl _kcc_pp_next               // consume '['
+    mov x20, #0
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACKET
+    b.eq .Labst_arr_close
+    bl _kcc_parse_assign_expr
+    mov x20, x0
+.Labst_arr_close:
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect
+    mov x0, #AST_TYPE_ARRAY
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str x20, [x0, #AST_F1]
+    mov x19, x0
+    b .Labst_done
+
+.Labst_check_func:
+    // Check for function suffix (params)
+    cmp  x0, #TOK_LPAREN
+    b.ne .Labst_return
+
+    // For abstract declarators, '(' could be grouping or function
+    // Simple heuristic: if next after '(' is a type token, it's function params
+    // Otherwise treat as done (no grouping in abstract declarators for casts)
+    mov x0, x19
+    b .Labst_return
+
+.Labst_return:
+    mov x0, x19
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Struct and Union}
+
+@d Decl: parse struct @{
+// -- kcc_parse_struct_or_union -----------------------------------------
+// node *kcc_parse_struct_or_union(void)
+// Parses: struct/union [ident] [{ field-list }]
+.globl _kcc_parse_struct_or_union
+.p2align 2
+_kcc_parse_struct_or_union:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    // Determine struct vs union
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STRUCT
+    b.eq .Lstruct_tag
+    mov x19, #AST_UNION_DECL
+    b .Lstruct_consume
+.Lstruct_tag:
+    mov x19, #AST_UNION_DECL
+    cmp  x0, #TOK_STRUCT
+    mov  x19, #AST_STRUCT_DECL
+
+.Lstruct_consume:
+    // Check actual token to set correct tag
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STRUCT
+    b.eq .Lstruct_is_struct
+    mov  x19, #AST_UNION_DECL
+    b .Lstruct_after_tag
+.Lstruct_is_struct:
+    mov  x19, #AST_STRUCT_DECL
+
+.Lstruct_after_tag:
+    bl _kcc_pp_next               // consume 'struct' or 'union'
+
+    // Optional tag name
+    mov x20, #0                  // x20 = name_ptr (default null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Lstruct_check_brace
+
+    // Intern tag name
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x20, x0
+
+    bl _kcc_pp_next               // consume tag name
+
+.Lstruct_check_brace:
+    // Check for '{'
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACE
+    b.ne .Lstruct_no_body
+
+    bl _kcc_pp_next               // consume '{'
+
+    // Parse field declarations
+    mov x21, #0                  // first field
+    mov x22, #0                  // last field
+
+.Lstruct_field_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACE
+    b.eq .Lstruct_close
+    cbz  x0, .Lstruct_close      // EOF
+
+    // Parse field: specifiers + declarator
+    bl _kcc_parse_decl_specs
+    mov x23, x0                  // x23 = field type
+    // Ignore storage class for fields
+
+    // Check for anonymous struct/union field (no declarator)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_SEMI
+    b.eq .Lstruct_anon_field
+
+    // Parse field declarator
+    mov x24, #0                  // field name
+
+.Lstruct_field_decl:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Lstruct_field_colon
+
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x24, x0                  // field name
+
+    bl _kcc_pp_next               // consume name
+
+.Lstruct_field_colon:
+    // Check for bitfield ':'
+    mov x0, #0                   // bitwidth (default 0)
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x1, #TOK_COLON
+    b.ne .Lstruct_field_build
+
+    bl _kcc_pp_next               // consume ':'
+    bl _kcc_parse_cond_expr       // parse bitwidth
+    // x0 = bitwidth expr
+
+.Lstruct_field_build:
+    str x0, [sp, #-16]!         // push bitwidth (preserve across alloc)
+    mov x0, #AST_FIELD_DECL
+    bl _kcc_ast_alloc
+    ldr x1, [sp], #16           // pop bitwidth
+    str x23, [x0, #AST_F0]      // type
+    str x24, [x0, #AST_F1]      // name_ptr
+    str x1, [x0, #AST_F2]       // bitwidth
+
+    // Append
+    cbz x21, .Lstruct_field_first
+    str x0, [x22, #AST_F4]
+    mov x22, x0
+    b .Lstruct_field_more
+
+.Lstruct_field_first:
+    mov x21, x0
+    mov x22, x0
+
+.Lstruct_field_more:
+    // Check for ',' (more declarators with same type)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Lstruct_field_semi
+
+    bl _kcc_pp_next               // consume ','
+    mov x24, #0                  // reset field name
+    b .Lstruct_field_decl
+
+.Lstruct_field_semi:
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    b .Lstruct_field_loop
+
+.Lstruct_anon_field:
+    // Anonymous field (e.g., anonymous struct/union member)
+    mov x0, #AST_FIELD_DECL
+    bl _kcc_ast_alloc
+    str x23, [x0, #AST_F0]      // type
+    cbz x21, .Lstruct_anon_first
+    str x0, [x22, #AST_F4]
+    mov x22, x0
+    b .Lstruct_anon_semi
+.Lstruct_anon_first:
+    mov x21, x0
+    mov x22, x0
+.Lstruct_anon_semi:
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    b .Lstruct_field_loop
+
+.Lstruct_close:
+    mov x0, #TOK_RBRACE
+    bl _kcc_parse_expect
+
+    // Build struct/union node
+    mov x0, x19                  // tag (AST_STRUCT_DECL or AST_UNION_DECL)
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]      // name_ptr
+    str x21, [x0, #AST_F1]      // fields
+
+    // Wrap in TYPE_STRUCT or TYPE_UNION
+    mov x23, x0                  // save decl node
+    cmp x19, #AST_STRUCT_DECL
+    b.eq .Lstruct_wrap_struct
+    mov x0, #AST_TYPE_UNION
+    b .Lstruct_wrap
+.Lstruct_wrap_struct:
+    mov x0, #AST_TYPE_STRUCT
+.Lstruct_wrap:
+    bl _kcc_ast_alloc
+    str x23, [x0, #AST_F0]      // struct/union decl
+
+    b .Lstruct_done
+
+.Lstruct_no_body:
+    // Forward declaration or reference: struct tag (no body)
+    mov x0, x19
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]      // name_ptr
+
+    // Wrap in type
+    mov x23, x0
+    cmp x19, #AST_STRUCT_DECL
+    b.eq .Lstruct_fwd_struct
+    mov x0, #AST_TYPE_UNION
+    b .Lstruct_fwd_wrap
+.Lstruct_fwd_struct:
+    mov x0, #AST_TYPE_STRUCT
+.Lstruct_fwd_wrap:
+    bl _kcc_ast_alloc
+    str x23, [x0, #AST_F0]
+
+.Lstruct_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Enum}
+
+@d Decl: parse enum @{
+// -- kcc_parse_enum ----------------------------------------------------
+// node *kcc_parse_enum(void)
+// Parses: enum [ident] [{ enumerator-list }]
+.globl _kcc_parse_enum
+.p2align 2
+_kcc_parse_enum:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    // Consume 'enum'
+    bl _kcc_pp_next
+
+    // Optional tag name
+    mov x19, #0                  // x19 = name_ptr
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Lenum_check_brace
+
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x19, x0
+
+    bl _kcc_pp_next               // consume tag name
+
+.Lenum_check_brace:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACE
+    b.ne .Lenum_no_body
+
+    bl _kcc_pp_next               // consume '{'
+
+    mov x20, #0                  // first enumerator
+    mov x21, #0                  // last enumerator
+
+.Lenum_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACE
+    b.eq .Lenum_close
+
+    // Parse enumerator: ident [= expr]
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x22, x0                  // x22 = enumerator name
+
+    bl _kcc_pp_next               // consume name
+
+    mov x23, #0                  // value expr (default null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ASSIGN
+    b.ne .Lenum_build
+
+    bl _kcc_pp_next               // consume '='
+    bl _kcc_parse_cond_expr
+    mov x23, x0
+
+.Lenum_build:
+    mov x0, #AST_ENUMERATOR
+    bl _kcc_ast_alloc
+    str x22, [x0, #AST_F0]      // name
+    str x23, [x0, #AST_F1]      // value expr
+
+    cbz x20, .Lenum_first
+    str x0, [x21, #AST_F4]
+    mov x21, x0
+    b .Lenum_comma
+
+.Lenum_first:
+    mov x20, x0
+    mov x21, x0
+
+.Lenum_comma:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Lenum_close
+
+    bl _kcc_pp_next               // consume ','
+
+    // Allow trailing comma before '}'
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACE
+    b.ne .Lenum_loop
+
+.Lenum_close:
+    mov x0, #TOK_RBRACE
+    bl _kcc_parse_expect
+
+    mov x0, #AST_ENUM_DECL
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // name
+    str x20, [x0, #AST_F1]      // enumerators
+
+    // Wrap in TYPE_ENUM
+    mov x22, x0
+    mov x0, #AST_TYPE_ENUM
+    bl _kcc_ast_alloc
+    str x22, [x0, #AST_F0]
+
+    b .Lenum_done
+
+.Lenum_no_body:
+    // Forward reference
+    mov x0, #AST_ENUM_DECL
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+
+    mov x22, x0
+    mov x0, #AST_TYPE_ENUM
+    bl _kcc_ast_alloc
+    str x22, [x0, #AST_F0]
+
+.Lenum_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Type Name}
+
+A type name (\stdref{6.7.7}) appears in casts and \texttt{sizeof}.
+It consists of specifier-qualifiers followed by an optional abstract
+declarator (which can include pointers and array brackets but no name).
+
+@d Decl: parse type name @{
+// -- kcc_parse_type_name -----------------------------------------------
+// node *kcc_parse_type_name(void)
+// Parses a type-name (for casts, sizeof, _Alignof).
+// Returns a type node.
+.globl _kcc_parse_type_name
+.p2align 2
+_kcc_parse_type_name:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Parse specifiers (ignore storage class)
+    bl _kcc_parse_decl_specs
+    mov x19, x0                  // x19 = base type
+
+    // Check for abstract declarator (pointer, array)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STAR
+    b.eq .Ltname_abstract
+    cmp  x0, #TOK_LBRACKET
+    b.eq .Ltname_abstract
+    // No abstract declarator
+    mov x0, x19
+    b .Ltname_done
+
+.Ltname_abstract:
+    mov x0, x19
+    bl _kcc_parse_abstract_declarator
+
+.Ltname_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Is Type Token}
+
+This predicate checks whether the current token can start a type
+specifier.  It returns 1 for type keywords (char, int, etc.), type
+qualifiers (const, volatile, etc.), and typedef names.
+
+@d Decl: is type token @{
+// -- kcc_parse_is_type_token -------------------------------------------
+// int kcc_parse_is_type_token(void)
+// Returns 1 if the current token can start a type specifier.
+.globl _kcc_parse_is_type_token
+.p2align 2
+_kcc_parse_is_type_token:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Type specifier keywords: void(41), char(13), short(32), int(27),
+    // long(28), float(22), double(18), signed(33), unsigned(40),
+    // _Bool(47), _Complex(48)
+    cmp x0, #TOK_VOID
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_CHAR
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_SHORT
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_INT
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_LONG
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_FLOAT
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_DOUBLE
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_SIGNED
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_UNSIGNED
+    b.eq .Lis_type_yes
+    cmp x0, #TOK__BOOL
+    b.eq .Lis_type_yes
+    cmp x0, #TOK__COMPLEX
+    b.eq .Lis_type_yes
+
+    // struct, union, enum
+    cmp x0, #TOK_STRUCT
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_UNION
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_ENUM
+    b.eq .Lis_type_yes
+
+    // Type qualifiers (can start a type specifier list)
+    cmp x0, #TOK_CONST
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_VOLATILE
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_RESTRICT
+    b.eq .Lis_type_yes
+    cmp x0, #TOK__ATOMIC
+    b.eq .Lis_type_yes
+
+    // _Alignas can appear in specifier-qualifier list
+    cmp x0, #TOK__ALIGNAS
+    b.eq .Lis_type_yes
+
+    // Check for typedef name (identifier that is registered as typedef)
+    cmp x0, #TOK_IDENT
+    b.ne .Lis_type_no
+
+    // Lookup in typedef table
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_typedef_lookup
+    // x0 = 1 if typedef, 0 otherwise
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lis_type_yes:
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lis_type_no:
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Initializer}
+
+An initializer (\stdref{6.7.9}) is either an assignment expression or
+a brace-enclosed initializer list.
+
+@d Decl: parse init @{
+// -- kcc_parse_initializer ---------------------------------------------
+// node *kcc_parse_initializer(void)
+// Parses an initializer: assignment-expr or { init-list }
+.globl _kcc_parse_initializer
+.p2align 2
+_kcc_parse_initializer:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACE
+    b.ne .Linit_expr
+
+    // Brace-enclosed initializer list
+    bl _kcc_pp_next               // consume '{'
+
+    mov x0, #AST_INIT_LIST
+    bl _kcc_ast_alloc
+    mov x19, x0                  // x19 = init_list node
+
+    mov x20, #0                  // first init
+    mov x21, #0                  // last init
+
+.Linit_list_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACE
+    b.eq .Linit_list_close
+
+    // Parse one initializer (possibly with designator)
+    bl _kcc_parse_initializer
+    mov x0, x0                   // new init
+
+    cbz x20, .Linit_list_first
+    str x0, [x21, #AST_F4]
+    mov x21, x0
+    b .Linit_list_comma
+
+.Linit_list_first:
+    mov x20, x0
+    mov x21, x0
+
+.Linit_list_comma:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Linit_list_close
+
+    bl _kcc_pp_next               // consume ','
+
+    // Allow trailing comma
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACE
+    b.ne .Linit_list_loop
+
+.Linit_list_close:
+    mov x0, #TOK_RBRACE
+    bl _kcc_parse_expect
+
+    str x20, [x19, #AST_F0]     // first init
+    mov x0, x19
+    b .Linit_done
+
+.Linit_expr:
+    // Simple expression initializer
+    bl _kcc_parse_assign_expr
+
+.Linit_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Static Assert}
+
+@d Decl: parse static assert @{
+// -- kcc_parse_static_assert -------------------------------------------
+// node *kcc_parse_static_assert(void)
+// Parses: _Static_assert ( expr , string ) ;
+.globl _kcc_parse_static_assert
+.p2align 2
+_kcc_parse_static_assert:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Consume '_Static_assert'
+    bl _kcc_pp_next
+
+    // Expect '('
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    // Parse expression
+    bl _kcc_parse_cond_expr
+    mov x19, x0                  // x19 = expr
+
+    // Expect ','
+    mov x0, #TOK_COMMA
+    bl _kcc_parse_expect
+
+    // Get message string
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    bl _kcc_strtab_intern
+    mov x20, x0                  // x20 = message
+
+    bl _kcc_pp_next               // consume string
+
+    // Expect ')'
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Expect ';'
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+
+    mov x0, #AST_STATIC_ASSERT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // expr
+    str x20, [x0, #AST_F1]      // message
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Declaration Data}
+
+@d Decl: data @{
+// -- Declaration parser data (reserved) --------------------------------
+// No additional data needed for declaration parsing.
+@}

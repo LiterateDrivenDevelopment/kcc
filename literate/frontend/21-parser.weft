@@ -1,0 +1,1519 @@
+% 21-parser.weft — Recursive-Descent Parser Core
+%
+% This chapter implements the core infrastructure for kcc's recursive-descent
+% parser: AST node allocation, token consumption helpers, error recovery,
+% typedef disambiguation, and the AST dump facility.
+%
+% The parser consumes preprocessed tokens via kcc_pp_next() and produces an
+% abstract syntax tree of arena-allocated 64-byte nodes.  Every node shares
+% a uniform layout: an 8-byte tag, source location, and five 8-byte payload
+% fields (F0--F4).  F4 conventionally links sibling nodes into lists.
+%
+% The top-level entry point is kcc_parse(), which returns an AST_TRANS_UNIT
+% node containing the translation unit's external declarations.
+
+\chapter{Recursive-Descent Parser}
+\label{ch:parser}
+
+\section{AST Node Layout}
+
+Every AST node is exactly 64 bytes, arena-allocated.  This uniform size
+makes allocation trivial---a single call to \texttt{kcc\_arena\_alloc(64)}---and
+field access a constant offset from the node pointer.  The five payload
+fields (\texttt{F0}--\texttt{F4}) carry node-specific data: child pointers,
+name pointers, literal values, or operator codes.  \texttt{F4} is
+conventionally used as a \texttt{next} pointer for sibling-linked lists
+(parameter lists, statement lists, declaration lists).
+
+\medskip
+
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Offset & Field & Description \\
+\hline
+0  & \texttt{tag}  & Node type constant (\texttt{AST\_*}) \\
+8  & \texttt{line} & Source line number \\
+16 & \texttt{col}  & Source column number \\
+24 & \texttt{F0}   & Payload field 0 (node-specific) \\
+32 & \texttt{F1}   & Payload field 1 \\
+40 & \texttt{F2}   & Payload field 2 \\
+48 & \texttt{F3}   & Payload field 3 \\
+56 & \texttt{F4}   & Payload field 4 (usually: next sibling) \\
+\hline
+\end{tabular}
+\end{center}
+
+@d Parser: AST constants @{
+// -- AST node layout ---------------------------------------------------
+.equ AST_TAG,    0        // node type constant
+.equ AST_LINE,   8        // source line
+.equ AST_COL,   16        // source column
+.equ AST_F0,    24        // field 0 (node-specific)
+.equ AST_F1,    32        // field 1
+.equ AST_F2,    40        // field 2
+.equ AST_F3,    48        // field 3
+.equ AST_F4,    56        // field 4 (usually: next sibling)
+.equ AST_SIZE,  64        // total node size
+
+// -- AST node type constants -------------------------------------------
+
+// Translation unit
+.equ AST_TRANS_UNIT,      1   // F0=first decl
+
+// Declarations (10-19)
+.equ AST_VAR_DECL,       10   // F0=type, F1=name_ptr, F2=init, F3=storage_class
+.equ AST_FUNC_DECL,      11   // F0=type, F1=name_ptr, F2=params, F3=body
+.equ AST_PARAM_DECL,     12   // F0=type, F1=name_ptr
+.equ AST_TYPEDEF_DECL,   13   // F0=type, F1=name_ptr
+.equ AST_STRUCT_DECL,    14   // F0=name_ptr, F1=fields
+.equ AST_UNION_DECL,     15   // F0=name_ptr, F1=fields
+.equ AST_ENUM_DECL,      16   // F0=name_ptr, F1=enumerators
+.equ AST_ENUMERATOR,     17   // F0=name_ptr, F1=value_expr
+.equ AST_FIELD_DECL,     18   // F0=type, F1=name_ptr, F2=bitwidth
+.equ AST_STATIC_ASSERT,  19   // F0=expr, F1=msg_ptr
+
+// Type specifiers (20-29)
+.equ AST_TYPE_BUILTIN,   20   // F0=token_code
+.equ AST_TYPE_NAME,      21   // F0=name_ptr
+.equ AST_TYPE_PTR,       22   // F0=pointee_type, F1=qualifiers
+.equ AST_TYPE_ARRAY,     23   // F0=elem_type, F1=size_expr
+.equ AST_TYPE_FUNC,      24   // F0=return_type, F1=params, F2=variadic
+.equ AST_TYPE_STRUCT,    25   // F0=struct_decl
+.equ AST_TYPE_UNION,     26   // F0=union_decl
+.equ AST_TYPE_ENUM,      27   // F0=enum_decl
+.equ AST_TYPE_QUALS,     28   // F0=base_type, F1=quals
+
+// Statements (30-44)
+.equ AST_COMPOUND,       30   // F0=first_item
+.equ AST_EXPR_STMT,      31   // F0=expr
+.equ AST_IF_STMT,        32   // F0=cond, F1=then, F2=else
+.equ AST_SWITCH_STMT,    33   // F0=expr, F1=body
+.equ AST_WHILE_STMT,     34   // F0=cond, F1=body
+.equ AST_DO_STMT,        35   // F0=body, F1=cond
+.equ AST_FOR_STMT,       36   // F0=init, F1=cond, F2=incr, F3=body
+.equ AST_GOTO_STMT,      37   // F0=label_name_ptr
+.equ AST_CONTINUE_STMT,  38
+.equ AST_BREAK_STMT,     39
+.equ AST_RETURN_STMT,    40   // F0=expr (or 0)
+.equ AST_LABEL_STMT,     41   // F0=name_ptr, F1=stmt
+.equ AST_CASE_STMT,      42   // F0=expr, F1=stmt
+.equ AST_DEFAULT_STMT,   43   // F0=stmt
+.equ AST_NULL_STMT,      44   // empty statement
+
+// Expressions (50-74)
+.equ AST_IDENT_EXPR,     50   // F0=name_ptr
+.equ AST_INT_LIT,        51   // F0=value
+.equ AST_STR_LIT,        52   // F0=str_ptr, F1=str_len
+.equ AST_CHAR_LIT,       53   // F0=value
+.equ AST_BINARY_EXPR,    54   // F0=op, F1=lhs, F2=rhs
+.equ AST_UNARY_EXPR,     55   // F0=op, F1=operand, F2=prefix(1)/postfix(0)
+.equ AST_ASSIGN_EXPR,    56   // F0=op, F1=lhs, F2=rhs
+.equ AST_COND_EXPR,      57   // F0=cond, F1=then, F2=else
+.equ AST_CALL_EXPR,      58   // F0=callee, F1=first_arg
+.equ AST_SUBSCRIPT,      59   // F0=array, F1=index
+.equ AST_MEMBER,         60   // F0=object, F1=name_ptr, F2=arrow(1)/dot(0)
+.equ AST_CAST_EXPR,      61   // F0=type, F1=expr
+.equ AST_SIZEOF_EXPR,    62   // F0=operand, F1=is_type
+.equ AST_ALIGNOF_EXPR,   63   // F0=type
+.equ AST_COMMA_EXPR,     64   // F0=lhs, F1=rhs
+.equ AST_INIT_LIST,      65   // F0=first_init
+.equ AST_DESIGNATOR,     66   // F0=index_or_name, F1=is_field, F2=next_desig
+.equ AST_COMPOUND_LIT,   67   // F0=type, F1=init_list
+.equ AST_PAREN_EXPR,     68   // F0=inner
+.equ AST_GENERIC,        69   // F0=controlling_expr, F1=first_assoc
+.equ AST_GENERIC_ASSOC,  70   // F0=type (0=default), F1=expr
+@}
+
+\section{AST Node Allocation}
+
+\texttt{kcc\_ast\_alloc} allocates a fresh 64-byte node from the arena,
+zeros all fields, then stamps the tag and current source location (from
+the lexer's token globals).  Every parse function that creates a node
+calls this helper first.
+
+@d Parser: AST alloc @{
+// -- kcc_ast_alloc -----------------------------------------------------
+// node *kcc_ast_alloc(uint64_t tag)
+//   x0 = AST node type constant
+// Returns pointer to zeroed, tagged 64-byte node.
+.text
+.globl _kcc_ast_alloc
+.p2align 2
+_kcc_ast_alloc:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                  // x19 = tag
+
+    // Allocate 64 bytes
+    mov x0, #AST_SIZE
+    bl _kcc_arena_alloc
+    mov x20, x0                  // x20 = node pointer
+
+    // Zero all 8 quadwords
+    stp xzr, xzr, [x20]
+    stp xzr, xzr, [x20, #16]
+    stp xzr, xzr, [x20, #32]
+    stp xzr, xzr, [x20, #48]
+
+    // Set tag
+    str x19, [x20, #AST_TAG]
+
+    // Set source location from current token
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x20, #AST_LINE]
+
+    adrp x0, _kcc_tok_col@@PAGE
+    add  x0, x0, _kcc_tok_col@@PAGEOFF
+    ldr  x0, [x0]
+    str  x0, [x20, #AST_COL]
+
+    mov x0, x20                  // return node pointer
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Token Consumption Helpers}
+
+Three small functions provide the parser's interface to the token stream.
+\texttt{kcc\_parse\_peek} returns the current token type without consuming
+it.  \texttt{kcc\_parse\_match} consumes the current token if it matches
+the given type.  \texttt{kcc\_parse\_expect} consumes and asserts the type,
+emitting a diagnostic on mismatch.
+
+@d Parser: helpers @{
+// -- kcc_parse_peek ----------------------------------------------------
+// uint64_t kcc_parse_peek(void)
+// Returns the current token type without consuming it.
+.globl _kcc_parse_peek
+.p2align 2
+_kcc_parse_peek:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_parse_advance -------------------------------------------------
+// void kcc_parse_advance(void)
+// Consumes the current token by calling pp_next.
+.globl _kcc_parse_advance
+.p2align 2
+_kcc_parse_advance:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    bl _kcc_pp_next
+
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_parse_match ---------------------------------------------------
+// int kcc_parse_match(uint64_t tok_type)
+//   x0 = expected token type
+// If current token matches, consume it and return 1.  Otherwise return 0.
+.globl _kcc_parse_match
+.p2align 2
+_kcc_parse_match:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                  // x19 = expected type
+
+    // Check current token
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x1, x19
+    b.ne .Lmatch_fail
+
+    // Match: consume and return 1
+    bl _kcc_pp_next
+    mov x0, #1
+    b .Lmatch_done
+
+.Lmatch_fail:
+    mov x0, #0
+
+.Lmatch_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_parse_expect --------------------------------------------------
+// void kcc_parse_expect(uint64_t tok_type)
+//   x0 = expected token type
+// If current token matches, consume it.  Otherwise emit error.
+.globl _kcc_parse_expect
+.p2align 2
+_kcc_parse_expect:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                  // x19 = expected type
+
+    // Check current token
+    adrp x1, _kcc_tok_type@@PAGE
+    add  x1, x1, _kcc_tok_type@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x1, x19
+    b.ne .Lexpect_error
+
+    // Match: consume
+    bl _kcc_pp_next
+    b .Lexpect_done
+
+.Lexpect_error:
+    // Emit "expected 'X'"
+    adrp x0, _kcc_parse_msg_expected@@PAGE
+    add  x0, x0, _kcc_parse_msg_expected@@PAGEOFF
+    bl _kcc_parse_error
+
+.Lexpect_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Error Recovery}
+
+When the parser encounters an unexpected token, it needs to recover
+gracefully rather than cascading errors.  \texttt{kcc\_parse\_error}
+emits a diagnostic and sets the global error flag.
+\texttt{kcc\_parse\_sync} skips tokens until it finds a synchronization
+point: a semicolon, closing brace, or end of file.
+
+@d Parser: error recovery @{
+// -- kcc_parse_error ---------------------------------------------------
+// void kcc_parse_error(const char *msg)
+//   x0 = error message string
+// Emits an error diagnostic at the current token location.
+.globl _kcc_parse_error
+.p2align 2
+_kcc_parse_error:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0                  // x19 = message
+
+    // Set error flag
+    adrp x1, _kcc_parse_error_flag@@PAGE
+    add  x1, x1, _kcc_parse_error_flag@@PAGEOFF
+    mov  x2, #1
+    str  x2, [x1]
+
+    // Emit diagnostic: error at current token location
+    mov x0, #DIAG_ERROR
+    adrp x1, _kcc_tok_line@@PAGE
+    add  x1, x1, _kcc_tok_line@@PAGEOFF
+    ldr  x1, [x1]
+    adrp x2, _kcc_tok_col@@PAGE
+    add  x2, x2, _kcc_tok_col@@PAGEOFF
+    ldr  x2, [x2]
+    mov  x3, x19
+    bl _kcc_diag_emit
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_parse_sync ----------------------------------------------------
+// void kcc_parse_sync(void)
+// Skips tokens until ';', '}', or EOF is found.
+// Consumes ';' if that is the sync point.
+.globl _kcc_parse_sync
+.p2align 2
+_kcc_parse_sync:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+.Lsync_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // EOF — stop
+    cbz  x0, .Lsync_done
+
+    // ';' — consume and stop
+    cmp  x0, #TOK_SEMI
+    b.eq .Lsync_consume
+
+    // '}' — stop without consuming
+    cmp  x0, #TOK_RBRACE
+    b.eq .Lsync_done
+
+    // Skip this token
+    bl _kcc_pp_next
+    b .Lsync_loop
+
+.Lsync_consume:
+    bl _kcc_pp_next
+
+.Lsync_done:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Typedef Disambiguation}
+
+The classic ambiguity in C parsing: given \texttt{T * x;}, is this a
+multiplication expression or a pointer declaration?  The answer depends
+on whether \texttt{T} is a typedef name.  We maintain a scope-aware
+stack of hash tables.  Each compound statement pushes a new scope, and
+\texttt{typedef} declarations register names in the current (topmost)
+scope.  Lookup searches from top to bottom.
+
+@d Parser: typedef table @{
+// -- kcc_typedef_init --------------------------------------------------
+// void kcc_typedef_init(void)
+// Initializes the typedef scope stack with a global scope.
+.globl _kcc_typedef_init
+.p2align 2
+_kcc_typedef_init:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Create a vector of hash table pointers (elem_size = 8)
+    mov x0, #8
+    bl _kcc_vec_init
+
+    // Store the scope stack
+    adrp x1, _kcc_typedef_scopes@@PAGE
+    add  x1, x1, _kcc_typedef_scopes@@PAGEOFF
+    str  x0, [x1]
+    mov  x19, x0                 // x19 = scope stack
+
+    // Push global scope (hash table with capacity 64)
+    mov x0, #64
+    bl _kcc_ht_init
+    // x0 = global scope hash table
+
+    // Push it onto the scope stack
+    // vec_push expects pointer to element, so store on stack
+    str x0, [sp, #24]           // temporary storage for the pointer value
+    mov x0, x19                  // vec
+    add x1, sp, #24              // pointer to element (the ht pointer)
+    bl _kcc_vec_push
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_typedef_push_scope --------------------------------------------
+// void kcc_typedef_push_scope(void)
+// Pushes a new empty scope onto the typedef stack.
+.globl _kcc_typedef_push_scope
+.p2align 2
+_kcc_typedef_push_scope:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Allocate a new hash table
+    mov x0, #32
+    bl _kcc_ht_init
+    mov x19, x0                  // x19 = new scope ht
+
+    // Push onto scope stack
+    str x19, [sp, #24]
+    adrp x0, _kcc_typedef_scopes@@PAGE
+    add  x0, x0, _kcc_typedef_scopes@@PAGEOFF
+    ldr  x0, [x0]
+    add  x1, sp, #24
+    bl _kcc_vec_push
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_typedef_pop_scope ---------------------------------------------
+// void kcc_typedef_pop_scope(void)
+// Pops the topmost scope from the typedef stack.
+.globl _kcc_typedef_pop_scope
+.p2align 2
+_kcc_typedef_pop_scope:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Decrement the count in the scope vector
+    adrp x0, _kcc_typedef_scopes@@PAGE
+    add  x0, x0, _kcc_typedef_scopes@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1
+    str  x1, [x0, #VEC_COUNT]
+
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_typedef_add ---------------------------------------------------
+// void kcc_typedef_add(const char *name, uint64_t len)
+//   x0 = pointer to name
+//   x1 = name length
+// Adds a typedef name to the current (topmost) scope.
+.globl _kcc_typedef_add
+.p2align 2
+_kcc_typedef_add:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = name
+    mov x20, x1                  // x20 = len
+
+    // Get topmost scope: scopes.data[(count-1)]
+    adrp x0, _kcc_typedef_scopes@@PAGE
+    add  x0, x0, _kcc_typedef_scopes@@PAGEOFF
+    ldr  x0, [x0]                // x0 = scope vec
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1              // last index
+    bl _kcc_vec_get
+    // x0 = pointer to element (pointer to ht pointer)
+    ldr  x21, [x0]               // x21 = ht pointer
+
+    // ht_put(ht, name, len, 1)  — value 1 = "is a typedef"
+    mov x0, x21
+    mov x1, x19
+    mov x2, x20
+    mov x3, #1
+    bl _kcc_ht_put
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_typedef_lookup ------------------------------------------------
+// int kcc_typedef_lookup(const char *name, uint64_t len)
+//   x0 = pointer to name
+//   x1 = name length
+// Returns 1 if name is a typedef, 0 otherwise.
+// Searches scopes from top to bottom.
+.globl _kcc_typedef_lookup
+.p2align 2
+_kcc_typedef_lookup:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                  // x19 = name
+    mov x20, x1                  // x20 = len
+
+    // Load scope stack
+    adrp x0, _kcc_typedef_scopes@@PAGE
+    add  x0, x0, _kcc_typedef_scopes@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x21, x0                 // x21 = scope vec
+
+    ldr  x22, [x21, #VEC_COUNT] // x22 = scope count (loop index, top-down)
+
+.Ltypedef_lookup_loop:
+    cbz  x22, .Ltypedef_not_found
+
+    sub  x22, x22, #1           // decrement (search from top)
+
+    // Get scope at index x22
+    mov  x0, x21
+    mov  x1, x22
+    bl _kcc_vec_get
+    // x0 = pointer to ht pointer
+    ldr  x0, [x0]               // x0 = ht pointer
+
+    // ht_get(ht, name, len)
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_ht_get
+    cbnz x0, .Ltypedef_found
+
+    b .Ltypedef_lookup_loop
+
+.Ltypedef_not_found:
+    mov x0, #0
+    b .Ltypedef_done
+
+.Ltypedef_found:
+    mov x0, #1
+
+.Ltypedef_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Translation Unit}
+
+The top-level parsing function.  \texttt{kcc\_parse} consumes the first
+token from the preprocessor, then loops parsing external declarations
+until \texttt{TOK\_EOF}.  The result is an \texttt{AST\_TRANS\_UNIT} node
+whose \texttt{F0} points to the head of a linked list of declarations.
+
+@d Parser: translation unit @{
+// -- kcc_parse ---------------------------------------------------------
+// node *kcc_parse(void)
+// Parses a complete translation unit.
+// Returns AST_TRANS_UNIT node with F0 = first external declaration.
+.globl _kcc_parse
+.p2align 2
+_kcc_parse:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Consume first token
+    bl _kcc_pp_next
+
+    // Allocate translation unit node
+    mov x0, #AST_TRANS_UNIT
+    bl _kcc_ast_alloc
+    mov x19, x0                  // x19 = trans_unit node
+
+    mov x20, #0                  // x20 = first decl (initially null)
+    mov x21, #0                  // x21 = last decl (tail pointer)
+
+.Lparse_tu_loop:
+    // Check for EOF
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lparse_tu_done    // TOK_EOF = 0
+
+    // Parse external declaration
+    bl _kcc_parse_decl
+    mov x22, x0                  // x22 = new decl node
+
+    // Skip null results from error recovery
+    cbz x22, .Lparse_tu_loop
+
+    // Append to list
+    cbz x20, .Lparse_tu_first
+
+    // Append: last->F4 = new
+    str x22, [x21, #AST_F4]
+    mov x21, x22
+    b .Lparse_tu_loop
+
+.Lparse_tu_first:
+    // First declaration
+    mov x20, x22
+    mov x21, x22
+    b .Lparse_tu_loop
+
+.Lparse_tu_done:
+    // Store first decl in trans_unit F0
+    str x20, [x19, #AST_F0]
+
+    mov x0, x19                  // return trans_unit
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{AST Dump}
+
+The \texttt{--dump-ast} flag triggers a recursive tree walk that prints
+a textual representation of the AST.  Each node is printed with its tag
+name and field values, indented by depth.
+
+@d Parser: dump AST @{
+// -- kcc_ast_dump ------------------------------------------------------
+// void kcc_ast_dump(node *root)
+//   x0 = root node pointer
+// Recursively prints the AST tree.
+.globl _kcc_ast_dump
+.p2align 2
+_kcc_ast_dump:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    cbz x0, .Last_dump_done
+    mov x19, x0                  // x19 = node
+
+    // Print indentation
+    bl _kcc_ast_print_indent
+
+    // Print tag name
+    ldr x0, [x19, #AST_TAG]
+    bl _kcc_ast_tag_name
+    bl _kcc_io_puts
+
+    // Print location
+    adrp x0, _kcc_ast_msg_at@@PAGE
+    add  x0, x0, _kcc_ast_msg_at@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #AST_LINE]
+    bl _kcc_io_putu
+    mov x0, #':'
+    bl _kcc_io_putc
+    ldr x0, [x19, #AST_COL]
+    bl _kcc_io_putu
+
+    // Dispatch on tag for specific dump behavior
+    ldr x20, [x19, #AST_TAG]
+
+    // Translation unit and compound: dump linked list of children
+    cmp x20, #AST_TRANS_UNIT
+    b.eq .Last_dump_list_node
+    cmp x20, #AST_COMPOUND
+    b.eq .Last_dump_list_node
+
+    // Declarations
+    cmp x20, #AST_VAR_DECL
+    b.eq .Last_dump_var_decl
+    cmp x20, #AST_FUNC_DECL
+    b.eq .Last_dump_func_decl
+    cmp x20, #AST_PARAM_DECL
+    b.eq .Last_dump_param_decl
+    cmp x20, #AST_TYPEDEF_DECL
+    b.eq .Last_dump_typedef_decl
+    cmp x20, #AST_STRUCT_DECL
+    b.eq .Last_dump_struct_decl
+    cmp x20, #AST_UNION_DECL
+    b.eq .Last_dump_struct_decl
+    cmp x20, #AST_ENUM_DECL
+    b.eq .Last_dump_enum_decl
+    cmp x20, #AST_ENUMERATOR
+    b.eq .Last_dump_enumerator
+    cmp x20, #AST_FIELD_DECL
+    b.eq .Last_dump_field_decl
+
+    // Type specifiers
+    cmp x20, #AST_TYPE_BUILTIN
+    b.eq .Last_dump_type_builtin
+    cmp x20, #AST_TYPE_NAME
+    b.eq .Last_dump_name_node
+    cmp x20, #AST_TYPE_PTR
+    b.eq .Last_dump_type_ptr
+    cmp x20, #AST_TYPE_ARRAY
+    b.eq .Last_dump_type_array
+    cmp x20, #AST_TYPE_FUNC
+    b.eq .Last_dump_type_func
+
+    // Expressions
+    cmp x20, #AST_IDENT_EXPR
+    b.eq .Last_dump_name_node
+    cmp x20, #AST_INT_LIT
+    b.eq .Last_dump_int_lit
+    cmp x20, #AST_STR_LIT
+    b.eq .Last_dump_str_lit
+    cmp x20, #AST_CHAR_LIT
+    b.eq .Last_dump_int_lit
+    cmp x20, #AST_BINARY_EXPR
+    b.eq .Last_dump_binary
+    cmp x20, #AST_UNARY_EXPR
+    b.eq .Last_dump_unary
+    cmp x20, #AST_ASSIGN_EXPR
+    b.eq .Last_dump_binary
+    cmp x20, #AST_CALL_EXPR
+    b.eq .Last_dump_call
+    cmp x20, #AST_MEMBER
+    b.eq .Last_dump_member
+    cmp x20, #AST_SIZEOF_EXPR
+    b.eq .Last_dump_sizeof
+    cmp x20, #AST_CAST_EXPR
+    b.eq .Last_dump_cast
+
+    // Statements with multiple children
+    cmp x20, #AST_IF_STMT
+    b.eq .Last_dump_if
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Last_dump_two_children
+    cmp x20, #AST_DO_STMT
+    b.eq .Last_dump_two_children
+    cmp x20, #AST_SWITCH_STMT
+    b.eq .Last_dump_two_children
+    cmp x20, #AST_FOR_STMT
+    b.eq .Last_dump_for
+    cmp x20, #AST_CASE_STMT
+    b.eq .Last_dump_two_children
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Last_dump_label
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Last_dump_generic
+
+    // For all other nodes, just print newline and recurse into children
+    b .Last_dump_generic
+
+.Last_dump_var_decl:
+    // Print name if present
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    // Recurse: type (F0), init (F2)
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_func_decl:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    // Recurse: type (F0), params (F2), body (F3)
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    // Dump param list
+    ldr x22, [x19, #AST_F2]
+.Last_dump_params_loop:
+    cbz x22, .Last_dump_func_body
+    mov x0, x22
+    bl _kcc_ast_dump
+    ldr x22, [x22, #AST_F4]
+    b .Last_dump_params_loop
+.Last_dump_func_body:
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_param_decl:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_typedef_decl:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_struct_decl:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x22, [x19, #AST_F1]
+.Last_dump_fields_loop:
+    cbz x22, .Last_dump_fields_end
+    mov x0, x22
+    bl _kcc_ast_dump
+    ldr x22, [x22, #AST_F4]
+    b .Last_dump_fields_loop
+.Last_dump_fields_end:
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_enum_decl:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x22, [x19, #AST_F1]
+.Last_dump_enums_loop:
+    cbz x22, .Last_dump_enums_end
+    mov x0, x22
+    bl _kcc_ast_dump
+    ldr x22, [x22, #AST_F4]
+    b .Last_dump_enums_loop
+.Last_dump_enums_end:
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_enumerator:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_field_decl:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_type_builtin:
+    // Print the token name for the builtin type
+    adrp x0, _kcc_ast_msg_space@@PAGE
+    add  x0, x0, _kcc_ast_msg_space@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_lex_type_name
+    bl _kcc_io_puts
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    b .Last_dump_next
+
+.Last_dump_name_node:
+    // Used for AST_IDENT_EXPR, AST_TYPE_NAME: F0=name_ptr
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    b .Last_dump_next
+
+.Last_dump_type_ptr:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_type_array:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_type_func:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    // Dump params
+    ldr x22, [x19, #AST_F1]
+.Last_dump_tfunc_params:
+    cbz x22, .Last_dump_tfunc_end
+    mov x0, x22
+    bl _kcc_ast_dump
+    ldr x22, [x22, #AST_F4]
+    b .Last_dump_tfunc_params
+.Last_dump_tfunc_end:
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_int_lit:
+    // Print ' <value>'
+    adrp x0, _kcc_ast_msg_space@@PAGE
+    add  x0, x0, _kcc_ast_msg_space@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_io_putu
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    b .Last_dump_next
+
+.Last_dump_str_lit:
+    adrp x0, _kcc_ast_msg_space@@PAGE
+    add  x0, x0, _kcc_ast_msg_space@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'"'
+    bl _kcc_io_putc
+    // Print string content (F0=ptr, F1=len)
+    ldr x0, [x19, #AST_F0]
+    ldr x1, [x19, #AST_F1]
+    bl _kcc_io_write
+    mov x0, #'"'
+    bl _kcc_io_putc
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    b .Last_dump_next
+
+.Last_dump_binary:
+    // Print op token name
+    adrp x0, _kcc_ast_msg_op@@PAGE
+    add  x0, x0, _kcc_ast_msg_op@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_lex_type_name
+    bl _kcc_io_puts
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    // Recurse: lhs (F1), rhs (F2)
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_unary:
+    adrp x0, _kcc_ast_msg_op@@PAGE
+    add  x0, x0, _kcc_ast_msg_op@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_lex_type_name
+    bl _kcc_io_puts
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Last_dump_unary_postfix
+    adrp x0, _kcc_ast_msg_prefix@@PAGE
+    add  x0, x0, _kcc_ast_msg_prefix@@PAGEOFF
+    bl _kcc_io_puts
+    b .Last_dump_unary_child
+.Last_dump_unary_postfix:
+    adrp x0, _kcc_ast_msg_postfix@@PAGE
+    add  x0, x0, _kcc_ast_msg_postfix@@PAGEOFF
+    bl _kcc_io_puts
+.Last_dump_unary_child:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_call:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    // Dump arg list
+    ldr x22, [x19, #AST_F1]
+.Last_dump_args_loop:
+    cbz x22, .Last_dump_args_end
+    mov x0, x22
+    bl _kcc_ast_dump
+    ldr x22, [x22, #AST_F4]
+    b .Last_dump_args_loop
+.Last_dump_args_end:
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_member:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_print_name_field
+    ldr x0, [x19, #AST_F2]
+    cbnz x0, .Last_dump_member_arrow
+    adrp x0, _kcc_ast_msg_dot@@PAGE
+    add  x0, x0, _kcc_ast_msg_dot@@PAGEOFF
+    bl _kcc_io_puts
+    b .Last_dump_member_child
+.Last_dump_member_arrow:
+    adrp x0, _kcc_ast_msg_arrow@@PAGE
+    add  x0, x0, _kcc_ast_msg_arrow@@PAGEOFF
+    bl _kcc_io_puts
+.Last_dump_member_child:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_sizeof:
+    ldr x0, [x19, #AST_F1]
+    cbnz x0, .Last_dump_sizeof_type
+    adrp x0, _kcc_ast_msg_expr@@PAGE
+    add  x0, x0, _kcc_ast_msg_expr@@PAGEOFF
+    bl _kcc_io_puts
+    b .Last_dump_sizeof_child
+.Last_dump_sizeof_type:
+    adrp x0, _kcc_ast_msg_type@@PAGE
+    add  x0, x0, _kcc_ast_msg_type@@PAGEOFF
+    bl _kcc_io_puts
+.Last_dump_sizeof_child:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_cast:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_if:
+    // IfStmt: F0=cond, F1=then, F2=else
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_two_children:
+    // Nodes with F0 and F1 as children (WhileStmt, DoStmt, SwitchStmt, CaseStmt)
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_for:
+    // ForStmt: F0=init, F1=cond, F2=incr, F3=body
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ast_dump
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_label:
+    // LabelStmt: F0=name_ptr, F1=stmt
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ast_print_name_field
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ast_dump
+    bl _kcc_ast_indent_dec
+    b .Last_dump_next
+
+.Last_dump_list_node:
+    // TranslationUnit and CompoundStmt: dump linked list of children via F0/F4
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+    ldr x22, [x19, #AST_F0]
+.Last_dump_list_loop:
+    cbz x22, .Last_dump_list_end
+    mov x0, x22
+    bl _kcc_ast_dump
+    ldr x22, [x22, #AST_F4]
+    b .Last_dump_list_loop
+.Last_dump_list_end:
+    bl _kcc_ast_indent_dec
+    b .Last_dump_done
+
+.Last_dump_generic:
+    // Generic handler: print newline, then dump F0 children only
+    // (F1/F2 might contain non-pointer data like operator codes)
+    mov x0, #'\n'
+    bl _kcc_io_putc
+    bl _kcc_ast_indent_inc
+
+    ldr x0, [x19, #AST_F0]
+    cbz x0, .Last_dump_generic_end
+    bl _kcc_ast_dump
+.Last_dump_generic_end:
+    bl _kcc_ast_indent_dec
+
+.Last_dump_next:
+
+.Last_dump_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Dump Helpers}
+
+Small helper functions used by the AST dump: tag name lookup, indentation
+printing, and name field printing.
+
+@d Parser: dump helpers @{
+// -- kcc_ast_tag_name --------------------------------------------------
+// const char *kcc_ast_tag_name(uint64_t tag)
+//   x0 = AST tag constant
+// Returns pointer to tag name string.
+.globl _kcc_ast_tag_name
+.p2align 2
+_kcc_ast_tag_name:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Lookup in tag name table
+    adrp x1, _kcc_ast_tag_table@@PAGE
+    add  x1, x1, _kcc_ast_tag_table@@PAGEOFF
+
+    // Table has entries for known tags; use a simple scan
+    // Entry format: .quad tag, .quad name_ptr
+    mov x2, x0                  // x2 = target tag
+.Last_tag_scan:
+    ldr x3, [x1]               // tag
+    cbz x3, .Last_tag_unknown   // sentinel: tag=0 at end
+    cmp x3, x2
+    b.eq .Last_tag_found
+    add x1, x1, #16            // next entry
+    b .Last_tag_scan
+
+.Last_tag_found:
+    ldr x0, [x1, #8]           // name pointer
+    ldp x29, x30, [sp], #16
+    ret
+
+.Last_tag_unknown:
+    adrp x0, _kcc_ast_str_unknown@@PAGE
+    add  x0, x0, _kcc_ast_str_unknown@@PAGEOFF
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_ast_print_indent ----------------------------------------------
+// void kcc_ast_print_indent(void)
+// Prints spaces for the current indentation level (2 spaces per level).
+.globl _kcc_ast_print_indent
+.p2align 2
+_kcc_ast_print_indent:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    adrp x19, _kcc_ast_indent@@PAGE
+    add  x19, x19, _kcc_ast_indent@@PAGEOFF
+    ldr  x19, [x19]             // x19 = indent level
+    lsl  x19, x19, #1           // x19 = number of spaces (2 per level)
+
+.Last_indent_loop:
+    cbz x19, .Last_indent_done
+    mov x0, #' '
+    bl _kcc_io_putc
+    sub x19, x19, #1
+    b .Last_indent_loop
+
+.Last_indent_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ast_indent_inc ------------------------------------------------
+.globl _kcc_ast_indent_inc
+.p2align 2
+_kcc_ast_indent_inc:
+    adrp x0, _kcc_ast_indent@@PAGE
+    add  x0, x0, _kcc_ast_indent@@PAGEOFF
+    ldr  x1, [x0]
+    add  x1, x1, #1
+    str  x1, [x0]
+    ret
+
+// -- kcc_ast_indent_dec ------------------------------------------------
+.globl _kcc_ast_indent_dec
+.p2align 2
+_kcc_ast_indent_dec:
+    adrp x0, _kcc_ast_indent@@PAGE
+    add  x0, x0, _kcc_ast_indent@@PAGEOFF
+    ldr  x1, [x0]
+    sub  x1, x1, #1
+    str  x1, [x0]
+    ret
+
+// -- kcc_ast_print_name_field ------------------------------------------
+// void kcc_ast_print_name_field(const char *name_ptr)
+//   x0 = interned name pointer (null-terminated)
+// Prints " 'name'" if name_ptr is non-null.
+.globl _kcc_ast_print_name_field
+.p2align 2
+_kcc_ast_print_name_field:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    cbz x0, .Last_name_done
+    mov x19, x0
+
+    adrp x0, _kcc_ast_msg_space@@PAGE
+    add  x0, x0, _kcc_ast_msg_space@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'\''
+    bl _kcc_io_putc
+    mov x0, x19
+    bl _kcc_io_puts
+    mov x0, #'\''
+    bl _kcc_io_putc
+
+.Last_name_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Parser Data}
+
+Global variables and string constants for the parser.
+
+@d Parser: data @{
+// -- Parser global state -----------------------------------------------
+.data
+.p2align 3
+.globl _kcc_parse_error_flag
+_kcc_parse_error_flag:
+    .quad 0
+
+.globl _kcc_typedef_scopes
+_kcc_typedef_scopes:
+    .quad 0                      // pointer to scope stack vector
+
+.globl _kcc_ast_indent
+_kcc_ast_indent:
+    .quad 0                      // current dump indentation level
+
+// -- Parser string constants -------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+
+_kcc_parse_msg_expected:
+    .asciz "expected token"
+
+_kcc_ast_msg_at:
+    .asciz " @@ "
+
+_kcc_ast_msg_space:
+    .asciz " "
+
+_kcc_ast_msg_op:
+    .asciz " op="
+
+_kcc_ast_msg_prefix:
+    .asciz " prefix"
+
+_kcc_ast_msg_postfix:
+    .asciz " postfix"
+
+_kcc_ast_msg_dot:
+    .asciz " ."
+
+_kcc_ast_msg_arrow:
+    .asciz " ->"
+
+_kcc_ast_msg_expr:
+    .asciz " expr"
+
+_kcc_ast_msg_type:
+    .asciz " type"
+
+_kcc_ast_str_unknown:
+    .asciz "<unknown>"
+
+// -- AST tag name table ------------------------------------------------
+// Each entry: .quad tag, .quad name_string_ptr
+.p2align 3
+.data
+_kcc_ast_tag_table:
+    .quad AST_TRANS_UNIT
+    .quad _kcc_ast_n_trans_unit
+    .quad AST_VAR_DECL
+    .quad _kcc_ast_n_var_decl
+    .quad AST_FUNC_DECL
+    .quad _kcc_ast_n_func_decl
+    .quad AST_PARAM_DECL
+    .quad _kcc_ast_n_param_decl
+    .quad AST_TYPEDEF_DECL
+    .quad _kcc_ast_n_typedef_decl
+    .quad AST_STRUCT_DECL
+    .quad _kcc_ast_n_struct_decl
+    .quad AST_UNION_DECL
+    .quad _kcc_ast_n_union_decl
+    .quad AST_ENUM_DECL
+    .quad _kcc_ast_n_enum_decl
+    .quad AST_ENUMERATOR
+    .quad _kcc_ast_n_enumerator
+    .quad AST_FIELD_DECL
+    .quad _kcc_ast_n_field_decl
+    .quad AST_STATIC_ASSERT
+    .quad _kcc_ast_n_static_assert
+    .quad AST_TYPE_BUILTIN
+    .quad _kcc_ast_n_type_builtin
+    .quad AST_TYPE_NAME
+    .quad _kcc_ast_n_type_name
+    .quad AST_TYPE_PTR
+    .quad _kcc_ast_n_type_ptr
+    .quad AST_TYPE_ARRAY
+    .quad _kcc_ast_n_type_array
+    .quad AST_TYPE_FUNC
+    .quad _kcc_ast_n_type_func
+    .quad AST_TYPE_STRUCT
+    .quad _kcc_ast_n_type_struct
+    .quad AST_TYPE_UNION
+    .quad _kcc_ast_n_type_union
+    .quad AST_TYPE_ENUM
+    .quad _kcc_ast_n_type_enum
+    .quad AST_TYPE_QUALS
+    .quad _kcc_ast_n_type_quals
+    .quad AST_COMPOUND
+    .quad _kcc_ast_n_compound
+    .quad AST_EXPR_STMT
+    .quad _kcc_ast_n_expr_stmt
+    .quad AST_IF_STMT
+    .quad _kcc_ast_n_if_stmt
+    .quad AST_SWITCH_STMT
+    .quad _kcc_ast_n_switch_stmt
+    .quad AST_WHILE_STMT
+    .quad _kcc_ast_n_while_stmt
+    .quad AST_DO_STMT
+    .quad _kcc_ast_n_do_stmt
+    .quad AST_FOR_STMT
+    .quad _kcc_ast_n_for_stmt
+    .quad AST_GOTO_STMT
+    .quad _kcc_ast_n_goto_stmt
+    .quad AST_CONTINUE_STMT
+    .quad _kcc_ast_n_continue_stmt
+    .quad AST_BREAK_STMT
+    .quad _kcc_ast_n_break_stmt
+    .quad AST_RETURN_STMT
+    .quad _kcc_ast_n_return_stmt
+    .quad AST_LABEL_STMT
+    .quad _kcc_ast_n_label_stmt
+    .quad AST_CASE_STMT
+    .quad _kcc_ast_n_case_stmt
+    .quad AST_DEFAULT_STMT
+    .quad _kcc_ast_n_default_stmt
+    .quad AST_NULL_STMT
+    .quad _kcc_ast_n_null_stmt
+    .quad AST_IDENT_EXPR
+    .quad _kcc_ast_n_ident_expr
+    .quad AST_INT_LIT
+    .quad _kcc_ast_n_int_lit
+    .quad AST_STR_LIT
+    .quad _kcc_ast_n_str_lit
+    .quad AST_CHAR_LIT
+    .quad _kcc_ast_n_char_lit
+    .quad AST_BINARY_EXPR
+    .quad _kcc_ast_n_binary_expr
+    .quad AST_UNARY_EXPR
+    .quad _kcc_ast_n_unary_expr
+    .quad AST_ASSIGN_EXPR
+    .quad _kcc_ast_n_assign_expr
+    .quad AST_COND_EXPR
+    .quad _kcc_ast_n_cond_expr
+    .quad AST_CALL_EXPR
+    .quad _kcc_ast_n_call_expr
+    .quad AST_SUBSCRIPT
+    .quad _kcc_ast_n_subscript
+    .quad AST_MEMBER
+    .quad _kcc_ast_n_member
+    .quad AST_CAST_EXPR
+    .quad _kcc_ast_n_cast_expr
+    .quad AST_SIZEOF_EXPR
+    .quad _kcc_ast_n_sizeof_expr
+    .quad AST_ALIGNOF_EXPR
+    .quad _kcc_ast_n_alignof_expr
+    .quad AST_COMMA_EXPR
+    .quad _kcc_ast_n_comma_expr
+    .quad AST_INIT_LIST
+    .quad _kcc_ast_n_init_list
+    .quad AST_COMPOUND_LIT
+    .quad _kcc_ast_n_compound_lit
+    .quad AST_PAREN_EXPR
+    .quad _kcc_ast_n_paren_expr
+    .quad AST_GENERIC
+    .quad _kcc_ast_n_generic
+    .quad AST_GENERIC_ASSOC
+    .quad _kcc_ast_n_generic_assoc
+    .quad 0, 0                   // sentinel
+
+// Tag name strings
+.section __TEXT,__cstring,cstring_literals
+_kcc_ast_n_trans_unit:    .asciz "TranslationUnit"
+_kcc_ast_n_var_decl:      .asciz "VarDecl"
+_kcc_ast_n_func_decl:     .asciz "FuncDecl"
+_kcc_ast_n_param_decl:    .asciz "ParamDecl"
+_kcc_ast_n_typedef_decl:  .asciz "TypedefDecl"
+_kcc_ast_n_struct_decl:   .asciz "StructDecl"
+_kcc_ast_n_union_decl:    .asciz "UnionDecl"
+_kcc_ast_n_enum_decl:     .asciz "EnumDecl"
+_kcc_ast_n_enumerator:    .asciz "Enumerator"
+_kcc_ast_n_field_decl:    .asciz "FieldDecl"
+_kcc_ast_n_static_assert: .asciz "StaticAssert"
+_kcc_ast_n_type_builtin:  .asciz "BuiltinType"
+_kcc_ast_n_type_name:     .asciz "TypeName"
+_kcc_ast_n_type_ptr:      .asciz "PointerType"
+_kcc_ast_n_type_array:    .asciz "ArrayType"
+_kcc_ast_n_type_func:     .asciz "FuncType"
+_kcc_ast_n_type_struct:   .asciz "StructType"
+_kcc_ast_n_type_union:    .asciz "UnionType"
+_kcc_ast_n_type_enum:     .asciz "EnumType"
+_kcc_ast_n_type_quals:    .asciz "QualType"
+_kcc_ast_n_compound:      .asciz "CompoundStmt"
+_kcc_ast_n_expr_stmt:     .asciz "ExprStmt"
+_kcc_ast_n_if_stmt:       .asciz "IfStmt"
+_kcc_ast_n_switch_stmt:   .asciz "SwitchStmt"
+_kcc_ast_n_while_stmt:    .asciz "WhileStmt"
+_kcc_ast_n_do_stmt:       .asciz "DoStmt"
+_kcc_ast_n_for_stmt:      .asciz "ForStmt"
+_kcc_ast_n_goto_stmt:     .asciz "GotoStmt"
+_kcc_ast_n_continue_stmt: .asciz "ContinueStmt"
+_kcc_ast_n_break_stmt:    .asciz "BreakStmt"
+_kcc_ast_n_return_stmt:   .asciz "ReturnStmt"
+_kcc_ast_n_label_stmt:    .asciz "LabelStmt"
+_kcc_ast_n_case_stmt:     .asciz "CaseStmt"
+_kcc_ast_n_default_stmt:  .asciz "DefaultStmt"
+_kcc_ast_n_null_stmt:     .asciz "NullStmt"
+_kcc_ast_n_ident_expr:    .asciz "IdentExpr"
+_kcc_ast_n_int_lit:       .asciz "IntLit"
+_kcc_ast_n_str_lit:       .asciz "StrLit"
+_kcc_ast_n_char_lit:      .asciz "CharLit"
+_kcc_ast_n_binary_expr:   .asciz "BinaryExpr"
+_kcc_ast_n_unary_expr:    .asciz "UnaryExpr"
+_kcc_ast_n_assign_expr:   .asciz "AssignExpr"
+_kcc_ast_n_cond_expr:     .asciz "CondExpr"
+_kcc_ast_n_call_expr:     .asciz "CallExpr"
+_kcc_ast_n_subscript:     .asciz "Subscript"
+_kcc_ast_n_member:        .asciz "MemberExpr"
+_kcc_ast_n_cast_expr:     .asciz "CastExpr"
+_kcc_ast_n_sizeof_expr:   .asciz "SizeofExpr"
+_kcc_ast_n_alignof_expr:  .asciz "AlignofExpr"
+_kcc_ast_n_comma_expr:    .asciz "CommaExpr"
+_kcc_ast_n_init_list:     .asciz "InitList"
+_kcc_ast_n_compound_lit:  .asciz "CompoundLit"
+_kcc_ast_n_paren_expr:    .asciz "ParenExpr"
+_kcc_ast_n_generic:       .asciz "GenericExpr"
+_kcc_ast_n_generic_assoc: .asciz "GenericAssoc"
+@}

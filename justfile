@@ -4,10 +4,10 @@
 set quiet
 
 # All assembly source basenames (order doesn't matter for linking)
-sources := "main syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor"
+sources := "main syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations"
 
 # Library sources (everything except main — shared with test binary)
-lib_sources := "syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor"
+lib_sources := "syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations"
 
 # Test source basenames (in tmp/tests/)
 test_sources := "test_runner test_lexer"

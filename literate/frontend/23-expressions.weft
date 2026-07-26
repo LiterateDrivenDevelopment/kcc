@@ -1,0 +1,1210 @@
+% 23-expressions.weft — Expression Parsing
+%
+% This chapter implements expression parsing for the C17 recursive-descent
+% parser.  Expressions are parsed using the precedence climbing method:
+% a single function kcc_parse_binary_expr() handles all binary operators
+% by consulting a precedence table, eliminating the need for separate
+% functions per precedence level.
+%
+% The expression grammar follows ISO 9899:2018 §6.5:
+%   expression → assignment-expr (',' assignment-expr)*
+%   assignment-expr → conditional-expr | unary-expr assign-op assignment-expr
+%   conditional-expr → binary-expr ('?' expr ':' conditional-expr)?
+%   binary-expr → unary-expr (binop unary-expr)*    [precedence climbing]
+%   unary-expr → postfix-expr | prefix-op unary-expr | sizeof | _Alignof | cast
+%   postfix-expr → primary (postfix-op)*
+%   primary → ident | number | string | char | '(' expr ')' | compound-literal
+
+\chapter{Expression Parsing}
+\label{ch:expressions}
+
+\section{Precedence Table}
+
+The precedence climbing algorithm uses a lookup table mapping each
+binary operator token to its precedence level.  The table is indexed
+by \texttt{(tok\_type $-$ 60)}, covering the punctuator range.  Each
+entry is a pair of bytes: precedence level (0 = not a binary op) and
+a flag indicating right-associativity (unused for binary ops, which
+are all left-associative).
+
+C17 precedence levels (\stdref{6.5}):
+\begin{center}
+\begin{tabular}{rll}
+\hline
+Level & Operators & Associativity \\
+\hline
+4  & \texttt{||} & left \\
+5  & \texttt{\&\&} & left \\
+6  & \texttt{|} & left \\
+7  & \texttt{\^{}} & left \\
+8  & \texttt{\&} & left \\
+9  & \texttt{== !=} & left \\
+10 & \texttt{< > <= >=} & left \\
+11 & \texttt{<< >>} & left \\
+12 & \texttt{+ -} & left \\
+13 & \texttt{* / \%} & left \\
+\hline
+\end{tabular}
+\end{center}
+
+@d Expr: precedence table @{
+// -- Operator precedence lookup ----------------------------------------
+// Given a token type t in the punctuator range (60+), the precedence
+// is stored at _kcc_prec_table[t - 60].  Zero means "not a binary op".
+
+.text
+
+// -- _kcc_prec_lookup --------------------------------------------------
+// uint64_t _kcc_prec_lookup(uint64_t tok_type)
+//   x0 = token type
+// Returns precedence level (0 = not a binary op).
+.globl _kcc_prec_lookup
+.p2align 2
+_kcc_prec_lookup:
+    // Check range: must be >= 60
+    cmp x0, #60
+    b.lo .Lprec_none
+
+    sub x0, x0, #60
+    // Check upper bound
+    cmp x0, #48
+    b.hs .Lprec_none
+
+    adrp x1, _kcc_prec_table@@PAGE
+    add  x1, x1, _kcc_prec_table@@PAGEOFF
+    ldrb w0, [x1, x0]
+    ret
+
+.Lprec_none:
+    mov x0, #0
+    ret
+@}
+
+\section{Expression Entry Point}
+
+\texttt{kcc\_parse\_expr} is the top-level expression parser.  It
+parses an assignment expression, then checks for the comma operator
+(\stdref{6.5.17}).
+
+@d Expr: parse expression @{
+// -- kcc_parse_expr ----------------------------------------------------
+// node *kcc_parse_expr(void)
+// Parses a full expression (handles comma operator).
+// Returns AST node.
+.globl _kcc_parse_expr
+.p2align 2
+_kcc_parse_expr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    bl _kcc_parse_assign_expr
+    mov x19, x0                  // x19 = lhs
+
+.Lexpr_comma_loop:
+    // Check for comma operator
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Lexpr_done
+
+    // Consume comma
+    bl _kcc_pp_next
+
+    // Parse rhs
+    bl _kcc_parse_assign_expr
+    // x0 = rhs
+
+    // Build comma node: x19=lhs, x20=rhs
+    mov x20, x0                  // x20 = rhs (callee-saved)
+    mov x0, #AST_COMMA_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // lhs
+    str x20, [x0, #AST_F1]      // rhs
+    mov x19, x0                  // new lhs = comma node
+    b .Lexpr_comma_loop
+
+.Lexpr_done:
+    mov x0, x19
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Assignment Expression}
+
+Assignment is right-associative: parse a conditional expression, and if
+the next token is an assignment operator (\texttt{=}, \texttt{+=},
+\texttt{-=}, etc.), recurse on the right-hand side.
+
+@d Expr: parse assign @{
+// -- kcc_parse_assign_expr ---------------------------------------------
+// node *kcc_parse_assign_expr(void)
+// Parses an assignment expression (right-associative).
+.globl _kcc_parse_assign_expr
+.p2align 2
+_kcc_parse_assign_expr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    bl _kcc_parse_cond_expr
+    mov x19, x0                  // x19 = lhs
+
+    // Check for assignment operators (94-104)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp  x0, #TOK_ASSIGN
+    b.lt .Lassign_done
+    cmp  x0, #TOK_OR_ASSIGN
+    b.gt .Lassign_done
+
+    // It's an assignment operator
+    mov x20, x0                  // x20 = operator token
+
+    // Consume the operator
+    bl _kcc_pp_next
+
+    // Recurse for right-hand side (right-associative)
+    bl _kcc_parse_assign_expr
+    mov x21, x0                  // x21 = rhs
+
+    // Build assign node
+    mov x0, #AST_ASSIGN_EXPR
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]      // op
+    str x19, [x0, #AST_F1]      // lhs
+    str x21, [x0, #AST_F2]      // rhs
+    mov x19, x0
+
+.Lassign_done:
+    mov x0, x19
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Conditional Expression}
+
+The ternary operator \texttt{?:} (\stdref{6.5.15}): parse a binary
+expression, and if the next token is \texttt{?}, parse the ``then''
+expression, expect \texttt{:}, and parse the ``else'' conditional.
+
+@d Expr: parse conditional @{
+// -- kcc_parse_cond_expr -----------------------------------------------
+// node *kcc_parse_cond_expr(void)
+// Parses a conditional expression (ternary ? :).
+.globl _kcc_parse_cond_expr
+.p2align 2
+_kcc_parse_cond_expr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Parse binary expression with minimum precedence 4 (logical OR)
+    mov x0, #4
+    bl _kcc_parse_binary_expr
+    mov x19, x0                  // x19 = condition
+
+    // Check for '?'
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_QUESTION
+    b.ne .Lcond_done
+
+    // Consume '?'
+    bl _kcc_pp_next
+
+    // Parse 'then' expression (full expression, not just assignment)
+    bl _kcc_parse_expr
+    mov x20, x0                  // x20 = then
+
+    // Expect ':'
+    mov x0, #TOK_COLON
+    bl _kcc_parse_expect
+
+    // Parse 'else' (conditional, not assignment — right-associative)
+    bl _kcc_parse_cond_expr
+    mov x21, x0                  // x21 = else
+
+    // Build cond node
+    mov x0, #AST_COND_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // condition
+    str x20, [x0, #AST_F1]      // then
+    str x21, [x0, #AST_F2]      // else
+    mov x19, x0
+
+.Lcond_done:
+    mov x0, x19
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Binary Expression (Precedence Climbing)}
+
+The core of expression parsing.  \texttt{kcc\_parse\_binary\_expr}
+receives a minimum precedence level and loops: parse a unary expression
+as the left-hand side, then while the next token is a binary operator
+with precedence $\geq$ \texttt{min\_prec}, consume it, recursively
+parse the right-hand side with \texttt{(prec + 1)} (for left-associativity),
+and build an \texttt{AST\_BINARY\_EXPR} node.
+
+@d Expr: parse binary @{
+// -- kcc_parse_binary_expr ---------------------------------------------
+// node *kcc_parse_binary_expr(uint64_t min_prec)
+//   x0 = minimum precedence level
+// Returns AST node for the binary expression.
+.globl _kcc_parse_binary_expr
+.p2align 2
+_kcc_parse_binary_expr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                  // x19 = min_prec
+
+    // Parse left operand (unary/cast)
+    bl _kcc_parse_cast_expr
+    mov x20, x0                  // x20 = lhs
+
+.Lbinary_loop:
+    // Peek at current token
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x21, x0                 // x21 = current token type
+
+    // Look up precedence
+    bl _kcc_prec_lookup
+    mov x22, x0                  // x22 = precedence
+
+    // If prec == 0 or prec < min_prec, stop
+    cbz  x22, .Lbinary_done
+    cmp  x22, x19
+    b.lo .Lbinary_done
+
+    // Consume the operator
+    bl _kcc_pp_next
+
+    // Parse right operand with prec+1 (left-associative)
+    add x0, x22, #1
+    bl _kcc_parse_binary_expr
+    mov x22, x0                  // x22 = rhs (callee-saved)
+
+    // Build binary node: x21=op, x20=lhs, x22=rhs
+    mov x0, #AST_BINARY_EXPR
+    bl _kcc_ast_alloc
+    str x21, [x0, #AST_F0]      // op
+    str x20, [x0, #AST_F1]      // lhs
+    str x22, [x0, #AST_F2]      // rhs
+
+    mov x20, x0                  // new lhs
+    b .Lbinary_loop
+
+.Lbinary_done:
+    mov x0, x20
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Unary Expression}
+
+Unary expressions (\stdref{6.5.3}): prefix operators \texttt{++},
+\texttt{--}, \texttt{\&}, \texttt{*}, \texttt{+}, \texttt{-},
+\texttt{\~{}}, \texttt{!}, plus \texttt{sizeof} and \texttt{\_Alignof}.
+
+@d Expr: parse unary @{
+// -- kcc_parse_unary_expr ----------------------------------------------
+// node *kcc_parse_unary_expr(void)
+// Parses a unary expression.
+.globl _kcc_parse_unary_expr
+.p2align 2
+_kcc_parse_unary_expr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Check for prefix operators
+    cmp x0, #TOK_INC             // ++
+    b.eq .Lunary_prefix
+    cmp x0, #TOK_DEC             // --
+    b.eq .Lunary_prefix
+    cmp x0, #TOK_AMP             // &
+    b.eq .Lunary_prefix
+    cmp x0, #TOK_STAR            // *
+    b.eq .Lunary_prefix
+    cmp x0, #TOK_PLUS            // +
+    b.eq .Lunary_prefix
+    cmp x0, #TOK_MINUS           // -
+    b.eq .Lunary_prefix
+    cmp x0, #TOK_TILDE           // ~
+    b.eq .Lunary_prefix
+    cmp x0, #TOK_BANG            // !
+    b.eq .Lunary_prefix
+
+    // sizeof
+    cmp x0, #TOK_SIZEOF
+    b.eq .Lunary_sizeof
+
+    // _Alignof
+    cmp x0, #TOK__ALIGNOF
+    b.eq .Lunary_alignof
+
+    // Otherwise, postfix expression
+    bl _kcc_parse_postfix_expr
+    b .Lunary_done_direct
+
+.Lunary_prefix:
+    mov x19, x0                  // x19 = operator token
+    bl _kcc_pp_next               // consume operator
+
+    // Recurse for operand
+    bl _kcc_parse_cast_expr
+    mov x20, x0                  // x20 = operand
+
+    // Build unary node
+    mov x0, #AST_UNARY_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // op
+    str x20, [x0, #AST_F1]      // operand
+    mov x1, #1
+    str  x1, [x0, #AST_F2]      // prefix = 1
+    b .Lunary_done_direct
+
+.Lunary_sizeof:
+    // Consume 'sizeof'
+    bl _kcc_pp_next
+
+    // Check for '(' type-name ')'
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    b.ne .Lunary_sizeof_expr
+
+    // Could be sizeof(type) or sizeof(expr) — check next token
+    // Save state: we'll peek after '(' to see if it's a type
+    bl _kcc_pp_next               // consume '('
+
+    // Check if next token starts a type
+    bl _kcc_parse_is_type_token
+    cbz x0, .Lunary_sizeof_paren_expr
+
+    // sizeof(type-name)
+    bl _kcc_parse_type_name
+    mov x19, x0                  // x19 = type node
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    mov x0, #AST_SIZEOF_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // operand = type
+    mov x1, #1
+    str  x1, [x0, #AST_F1]      // is_type = 1
+    b .Lunary_done_direct
+
+.Lunary_sizeof_paren_expr:
+    // It's sizeof(expr) — parse expression inside parens
+    bl _kcc_parse_expr
+    mov x19, x0
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Wrap in paren node
+    mov x20, x19
+    mov x0, #AST_PAREN_EXPR
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]
+    mov x19, x0
+
+    mov x0, #AST_SIZEOF_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // operand = paren(expr)
+    str xzr, [x0, #AST_F1]      // is_type = 0
+    b .Lunary_done_direct
+
+.Lunary_sizeof_expr:
+    // sizeof unary-expression
+    bl _kcc_parse_unary_expr
+    mov x19, x0
+
+    mov x0, #AST_SIZEOF_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str xzr, [x0, #AST_F1]      // is_type = 0
+    b .Lunary_done_direct
+
+.Lunary_alignof:
+    // _Alignof ( type-name )
+    bl _kcc_pp_next               // consume '_Alignof'
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    bl _kcc_parse_type_name
+    mov x19, x0
+
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    mov x0, #AST_ALIGNOF_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+
+.Lunary_done_direct:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Cast Expression}
+
+A cast expression (\stdref{6.5.4}) looks like \texttt{(type-name) expr}.
+The difficulty is distinguishing a cast from a parenthesized expression.
+We check: if the current token is \texttt{(} and the next token starts
+a type specifier, it's a cast; otherwise fall through to unary.
+
+@d Expr: parse cast @{
+// -- kcc_parse_cast_expr -----------------------------------------------
+// node *kcc_parse_cast_expr(void)
+// Parses a cast expression or falls through to unary.
+.globl _kcc_parse_cast_expr
+.p2align 2
+_kcc_parse_cast_expr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Check for '(' that might start a cast
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    b.ne .Lcast_unary
+
+    // Save token state to determine if this is a cast or paren expr.
+    // We need to look ahead: consume '(' and check if type follows.
+    // But we can't un-consume, so we'll use is_type_token after '('.
+
+    // Consume '('
+    bl _kcc_pp_next
+
+    // Check if next token starts a type
+    bl _kcc_parse_is_type_token
+    cbz x0, .Lcast_paren_expr
+
+    // It's a cast: (type-name) cast-expr
+    bl _kcc_parse_type_name
+    mov x19, x0                  // x19 = type
+
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Check for compound literal: (type) { ... }
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACE
+    b.eq .Lcast_compound_lit
+
+    // Regular cast
+    bl _kcc_parse_cast_expr
+    mov x20, x0                  // x20 = inner expr
+
+    mov x0, #AST_CAST_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // type
+    str x20, [x0, #AST_F1]      // expr
+    b .Lcast_done
+
+.Lcast_compound_lit:
+    // Compound literal: (type) { init-list }
+    bl _kcc_parse_initializer
+    mov x20, x0                  // x20 = init list
+
+    mov x0, #AST_COMPOUND_LIT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // type
+    str x20, [x0, #AST_F1]      // init_list
+    b .Lcast_done
+
+.Lcast_paren_expr:
+    // Not a cast — it's a parenthesized expression
+    bl _kcc_parse_expr
+    mov x19, x0
+
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Wrap in paren node, then continue with postfix operations
+    mov x0, #AST_PAREN_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+
+    // Apply postfix operations (call, subscript, member access, etc.)
+    bl _kcc_parse_postfix_tail
+    b .Lcast_done
+
+.Lcast_unary:
+    bl _kcc_parse_unary_expr
+
+.Lcast_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Postfix Expression}
+
+Postfix expressions (\stdref{6.5.2}): a primary expression followed
+by zero or more postfix operations: array subscript \texttt{[i]},
+function call \texttt{(args)}, member access \texttt{.field} or
+\texttt{->field}, and postfix \texttt{++}/\texttt{--}.
+
+@d Expr: parse postfix @{
+// -- kcc_parse_postfix_expr --------------------------------------------
+// node *kcc_parse_postfix_expr(void)
+// Parses a primary expression followed by postfix operations.
+.globl _kcc_parse_postfix_expr
+.p2align 2
+_kcc_parse_postfix_expr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Parse primary
+    bl _kcc_parse_primary_expr
+    // x0 = primary node
+
+    // Apply postfix tail
+    bl _kcc_parse_postfix_tail
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_parse_postfix_tail --------------------------------------------
+// node *kcc_parse_postfix_tail(node *expr)
+//   x0 = expression to apply postfix operations to
+// Returns the final expression node.
+.globl _kcc_parse_postfix_tail
+.p2align 2
+_kcc_parse_postfix_tail:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = current expr
+
+.Lpostfix_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp x0, #TOK_LBRACKET
+    b.eq .Lpostfix_subscript
+
+    cmp x0, #TOK_LPAREN
+    b.eq .Lpostfix_call
+
+    cmp x0, #TOK_DOT
+    b.eq .Lpostfix_member_dot
+
+    cmp x0, #TOK_ARROW
+    b.eq .Lpostfix_member_arrow
+
+    cmp x0, #TOK_INC
+    b.eq .Lpostfix_inc
+
+    cmp x0, #TOK_DEC
+    b.eq .Lpostfix_dec
+
+    // No more postfix ops
+    mov x0, x19
+    b .Lpostfix_done
+
+.Lpostfix_subscript:
+    // Consume '['
+    bl _kcc_pp_next
+    // Parse index expression
+    bl _kcc_parse_expr
+    mov x20, x0                  // x20 = index
+    // Expect ']'
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect
+    // Build subscript node
+    mov x0, #AST_SUBSCRIPT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // array
+    str x20, [x0, #AST_F1]      // index
+    mov x19, x0
+    b .Lpostfix_loop
+
+.Lpostfix_call:
+    // Consume '('
+    bl _kcc_pp_next
+    // Parse argument list
+    bl _kcc_parse_arg_list
+    mov x20, x0                  // x20 = first arg (or null)
+    // Expect ')'
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    // Build call node
+    mov x0, #AST_CALL_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // callee
+    str x20, [x0, #AST_F1]      // first arg
+    mov x19, x0
+    b .Lpostfix_loop
+
+.Lpostfix_member_dot:
+    mov x21, #0                   // x21 = 0 means dot
+    bl _kcc_pp_next               // consume '.'
+    b .Lpostfix_member_common
+
+.Lpostfix_member_arrow:
+    mov x21, #1                   // x21 = 1 means arrow
+    bl _kcc_pp_next               // consume '->'
+
+.Lpostfix_member_common:
+    // Current token should be identifier (field name)
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x20, x0                  // x20 = interned name
+
+    // Consume identifier
+    bl _kcc_pp_next
+
+    // Build member node
+    mov x0, #AST_MEMBER
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // object
+    str x20, [x0, #AST_F1]      // name_ptr
+    str x21, [x0, #AST_F2]      // arrow flag (0=dot, 1=arrow)
+    mov x19, x0
+    b .Lpostfix_loop
+
+.Lpostfix_inc:
+    bl _kcc_pp_next               // consume '++'
+    mov x0, #AST_UNARY_EXPR
+    bl _kcc_ast_alloc
+    mov x1, #TOK_INC
+    str  x1, [x0, #AST_F0]      // op = ++
+    str x19, [x0, #AST_F1]      // operand
+    str xzr, [x0, #AST_F2]      // postfix = 0
+    mov x19, x0
+    b .Lpostfix_loop
+
+.Lpostfix_dec:
+    bl _kcc_pp_next               // consume '--'
+    mov x0, #AST_UNARY_EXPR
+    bl _kcc_ast_alloc
+    mov x1, #TOK_DEC
+    str  x1, [x0, #AST_F0]      // op = --
+    str x19, [x0, #AST_F1]      // operand
+    str xzr, [x0, #AST_F2]      // postfix = 0
+    mov x19, x0
+    b .Lpostfix_loop
+
+.Lpostfix_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Primary Expression}
+
+Primary expressions (\stdref{6.5.1}): identifiers, integer constants,
+string literals, character constants, and parenthesized expressions.
+
+@d Expr: parse primary @{
+// -- kcc_parse_primary_expr --------------------------------------------
+// node *kcc_parse_primary_expr(void)
+// Parses a primary expression.
+.globl _kcc_parse_primary_expr
+.p2align 2
+_kcc_parse_primary_expr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp x0, #TOK_IDENT
+    b.eq .Lprimary_ident
+
+    cmp x0, #TOK_NUMBER
+    b.eq .Lprimary_number
+
+    cmp x0, #TOK_STRING_LIT
+    b.eq .Lprimary_string
+
+    cmp x0, #TOK_CHAR_LIT
+    b.eq .Lprimary_char
+
+    cmp x0, #TOK_LPAREN
+    b.eq .Lprimary_paren
+
+    cmp x0, #TOK__GENERIC
+    b.eq .Lprimary_generic
+
+    // Error: unexpected token
+    adrp x0, _kcc_expr_msg_expected@@PAGE
+    add  x0, x0, _kcc_expr_msg_expected@@PAGEOFF
+    bl _kcc_parse_error
+    mov x0, #0                   // return null
+    b .Lprimary_done
+
+.Lprimary_ident:
+    // Intern the identifier name
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x19, x0                  // x19 = interned name
+
+    // Consume identifier
+    bl _kcc_pp_next
+
+    // Build ident node
+    mov x0, #AST_IDENT_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // name_ptr
+    b .Lprimary_done
+
+.Lprimary_number:
+    // Parse integer value from token text
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_parse_atoi
+    mov x19, x0                  // x19 = numeric value
+
+    // Consume number
+    bl _kcc_pp_next
+
+    mov x0, #AST_INT_LIT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // value
+    b .Lprimary_done
+
+.Lprimary_string:
+    // Store string pointer and length
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]               // x19 = string ptr (includes quotes)
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]               // x20 = string len
+
+    // Strip quotes: skip first char, reduce length by 2
+    add  x19, x19, #1
+    sub  x20, x20, #2
+
+    // Consume string
+    bl _kcc_pp_next
+
+    mov x0, #AST_STR_LIT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // str_ptr
+    str x20, [x0, #AST_F1]      // str_len
+    b .Lprimary_done
+
+.Lprimary_char:
+    // Parse character value
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    // Simple: character is at offset 1 (after opening quote)
+    ldrb w19, [x0, #1]
+
+    // Consume char literal
+    bl _kcc_pp_next
+
+    mov x0, #AST_CHAR_LIT
+    bl _kcc_ast_alloc
+    mov x1, x19
+    str  x1, [x0, #AST_F0]      // value
+    b .Lprimary_done
+
+.Lprimary_paren:
+    // Handled by cast_expr, but if we get here directly,
+    // consume '(' and parse expression
+    bl _kcc_pp_next               // consume '('
+    bl _kcc_parse_expr
+    mov x19, x0
+
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    mov x0, #AST_PAREN_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // inner
+    b .Lprimary_done
+
+.Lprimary_generic:
+    // _Generic ( assignment-expr , generic-assoc-list )
+    bl _kcc_pp_next               // consume '_Generic'
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+
+    // Parse controlling expression
+    bl _kcc_parse_assign_expr
+    mov x19, x0                  // x19 = controlling expr
+
+    mov x0, #TOK_COMMA
+    bl _kcc_parse_expect
+
+    // Parse generic association list
+    mov x20, #0                  // first assoc
+    mov x21, #0                  // last assoc
+
+.Lprimary_generic_loop:
+    // Check for 'default' or type-name
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_DEFAULT
+    b.eq .Lprimary_generic_default
+
+    // Parse type-name
+    bl _kcc_parse_type_name
+    mov x9, x0                   // x9 = type (temp, will save after alloc)
+    b .Lprimary_generic_assoc
+
+.Lprimary_generic_default:
+    bl _kcc_pp_next               // consume 'default'
+    mov x9, #0                   // type = null (default)
+
+.Lprimary_generic_assoc:
+    mov x0, #TOK_COLON
+    bl _kcc_parse_expect
+
+    // Save type on stack before parsing expr
+    str x9, [sp, #40]
+    bl _kcc_parse_assign_expr
+    // x0 = expr, type at [sp, #40]
+    ldr x1, [sp, #40]           // x1 = type
+
+    // Push type and expr (volatile regs won't survive alloc)
+    stp x1, x0, [sp, #-16]!
+    mov x0, #AST_GENERIC_ASSOC
+    bl _kcc_ast_alloc
+    ldp x1, x2, [sp], #16      // x1 = type, x2 = expr
+    str x1, [x0, #AST_F0]       // type (0=default)
+    str x2, [x0, #AST_F1]       // expr
+
+    // Append to list
+    cbz x20, .Lprimary_generic_first
+    str x0, [x21, #AST_F4]      // last->next = new
+    mov x21, x0
+    b .Lprimary_generic_next
+
+.Lprimary_generic_first:
+    mov x20, x0
+    mov x21, x0
+
+.Lprimary_generic_next:
+    // Check for more associations
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Lprimary_generic_end
+    bl _kcc_pp_next               // consume ','
+    b .Lprimary_generic_loop
+
+.Lprimary_generic_end:
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    mov x0, #AST_GENERIC
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // controlling_expr
+    str x20, [x0, #AST_F1]      // first_assoc
+
+.Lprimary_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_parse_atoi ----------------------------------------------------
+// uint64_t kcc_parse_atoi(const char *str, uint64_t len)
+//   x0 = pointer to digit string
+//   x1 = length
+// Returns parsed unsigned integer value.
+// Handles decimal, hex (0x), octal (0), binary (0b).
+.globl _kcc_parse_atoi
+.p2align 2
+_kcc_parse_atoi:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    cbz x1, .Latoi_zero
+
+    // Check for 0x, 0b, 0 prefix
+    ldrb w2, [x0]
+    cmp w2, #'0'
+    b.ne .Latoi_decimal
+
+    cmp x1, #1
+    b.eq .Latoi_zero              // just "0"
+
+    ldrb w2, [x0, #1]
+    cmp w2, #'x'
+    b.eq .Latoi_hex
+    cmp w2, #'X'
+    b.eq .Latoi_hex
+    cmp w2, #'b'
+    b.eq .Latoi_binary
+    cmp w2, #'B'
+    b.eq .Latoi_binary
+
+    // Octal
+    b .Latoi_octal
+
+.Latoi_decimal:
+    mov x2, #0                   // accumulator
+    mov x3, #10
+.Latoi_dec_loop:
+    cbz x1, .Latoi_done
+    ldrb w4, [x0], #1
+    // Skip type suffixes (u, U, l, L)
+    cmp w4, #'u'
+    b.eq .Latoi_done
+    cmp w4, #'U'
+    b.eq .Latoi_done
+    cmp w4, #'l'
+    b.eq .Latoi_done
+    cmp w4, #'L'
+    b.eq .Latoi_done
+    sub w4, w4, #'0'
+    mul x2, x2, x3
+    add x2, x2, x4
+    sub x1, x1, #1
+    b .Latoi_dec_loop
+
+.Latoi_hex:
+    add x0, x0, #2              // skip "0x"
+    sub x1, x1, #2
+    mov x2, #0
+.Latoi_hex_loop:
+    cbz x1, .Latoi_done
+    ldrb w4, [x0], #1
+    cmp w4, #'u'
+    b.eq .Latoi_done
+    cmp w4, #'U'
+    b.eq .Latoi_done
+    cmp w4, #'l'
+    b.eq .Latoi_done
+    cmp w4, #'L'
+    b.eq .Latoi_done
+    // Convert hex digit
+    cmp w4, #'9'
+    b.le .Latoi_hex_digit
+    cmp w4, #'a'
+    b.ge .Latoi_hex_lower
+    // A-F
+    sub w4, w4, #'A'
+    add w4, w4, #10
+    b .Latoi_hex_acc
+.Latoi_hex_lower:
+    sub w4, w4, #'a'
+    add w4, w4, #10
+    b .Latoi_hex_acc
+.Latoi_hex_digit:
+    sub w4, w4, #'0'
+.Latoi_hex_acc:
+    lsl x2, x2, #4
+    add x2, x2, x4
+    sub x1, x1, #1
+    b .Latoi_hex_loop
+
+.Latoi_octal:
+    mov x2, #0
+.Latoi_oct_loop:
+    cbz x1, .Latoi_done
+    ldrb w4, [x0], #1
+    cmp w4, #'u'
+    b.eq .Latoi_done
+    cmp w4, #'U'
+    b.eq .Latoi_done
+    cmp w4, #'l'
+    b.eq .Latoi_done
+    cmp w4, #'L'
+    b.eq .Latoi_done
+    sub w4, w4, #'0'
+    lsl x2, x2, #3
+    add x2, x2, x4
+    sub x1, x1, #1
+    b .Latoi_oct_loop
+
+.Latoi_binary:
+    add x0, x0, #2              // skip "0b"
+    sub x1, x1, #2
+    mov x2, #0
+.Latoi_bin_loop:
+    cbz x1, .Latoi_done
+    ldrb w4, [x0], #1
+    cmp w4, #'u'
+    b.eq .Latoi_done
+    cmp w4, #'U'
+    b.eq .Latoi_done
+    cmp w4, #'l'
+    b.eq .Latoi_done
+    cmp w4, #'L'
+    b.eq .Latoi_done
+    sub w4, w4, #'0'
+    lsl x2, x2, #1
+    add x2, x2, x4
+    sub x1, x1, #1
+    b .Latoi_bin_loop
+
+.Latoi_zero:
+    mov x2, #0
+
+.Latoi_done:
+    mov x0, x2
+
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Argument List}
+
+\texttt{kcc\_parse\_arg\_list} parses a comma-separated list of
+assignment expressions for function call arguments.  Returns a
+linked list of nodes via \texttt{F4}.
+
+@d Expr: parse arg list @{
+// -- kcc_parse_arg_list ------------------------------------------------
+// node *kcc_parse_arg_list(void)
+// Parses a comma-separated list of assignment expressions.
+// Returns first argument node (linked via F4), or null if empty.
+.globl _kcc_parse_arg_list
+.p2align 2
+_kcc_parse_arg_list:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Check for empty argument list (next token is ')')
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.eq .Largs_empty
+
+    mov x19, #0                  // x19 = first arg
+    mov x20, #0                  // x20 = last arg
+
+.Largs_loop:
+    // Parse one argument (assignment expression)
+    bl _kcc_parse_assign_expr
+    mov x21, x0                  // x21 = new arg
+
+    // Append to list
+    cbz x19, .Largs_first
+    str x21, [x20, #AST_F4]     // last->next = new
+    mov x20, x21
+    b .Largs_comma
+
+.Largs_first:
+    mov x19, x21
+    mov x20, x21
+
+.Largs_comma:
+    // Check for ','
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Largs_done_list
+
+    bl _kcc_pp_next               // consume ','
+    b .Largs_loop
+
+.Largs_done_list:
+    mov x0, x19
+    b .Largs_done
+
+.Largs_empty:
+    mov x0, #0
+
+.Largs_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Expression Data}
+
+@d Expr: data @{
+// -- Expression parser data --------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+
+_kcc_expr_msg_expected:
+    .asciz "expected expression"
+
+// -- Precedence table --------------------------------------------------
+// Indexed by (tok_type - 60).  48 entries covering all punctuators.
+// Value = precedence level (0 = not a binary operator).
+.data
+.p2align 2
+_kcc_prec_table:
+    //  60  (    61  )    62  {    63  }    64  [    65  ]    66  ;    67  ,
+    .byte 0,   0,   0,   0,   0,   0,   0,   0
+    //  68  .    69  ->   70  ++   71  --   72  &    73  *    74  +    75  -
+    .byte 0,   0,   0,   0,   8,  13,  12,  12
+    //  76  ~    77  !    78  /    79  %    80  <<   81  >>   82  <    83  >
+    .byte 0,   0,  13,  13,  11,  11,  10,  10
+    //  84  <=   85  >=   86  ==   87  !=   88  ^    89  |    90  &&   91  ||
+    .byte 10,  10,   9,   9,   7,   6,   5,   4
+    //  92  ?    93  :    94  =    95  *=   96  /=   97  %=   98  +=   99  -=
+    .byte 0,   0,   0,   0,   0,   0,   0,   0
+    // 100 <<=  101 >>=  102 &=   103 ^=   104 |=   105 #    106 ##   107 ...
+    .byte 0,   0,   0,   0,   0,   0,   0,   0
+@}

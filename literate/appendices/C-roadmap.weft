@@ -447,14 +447,16 @@ Mach-O with \texttt{LC\_BUILD\_VERSION}).
 \item[\checkmark] Arrays (\texttt{a[i]}): \texttt{IR\_ALLOCA} with slot
       count, \texttt{IR\_GEP} for address arithmetic, frame pre-scan for
       alloca storage layout.
+\item[\checkmark] Structs (\texttt{s.x}): field-count alloca, field-index
+      lookup via AST field chain walk, \texttt{IR\_GEP} for member access.
+      Fixed sema to register struct tags from \texttt{AST\_TYPE\_STRUCT}
+      wrappers and to look up tags for forward references.
 \end{itemize}
 
 \textbf{Next steps} (ordered by impact).
 \begin{enumerate}
 \item Multi-variable declarations (\texttt{int a=3, b=4;}): second
       variable not allocated as a local.
-\item Struct member access (\texttt{s.x}): requires \texttt{IR\_GEP}
-      with field offset arithmetic in the codegen.
 \item Missing codegen handlers for defined IR opcodes: \texttt{IR\_UMOD},
       \texttt{IR\_CMP\_ULT}, \texttt{IR\_CMP\_ULE}, \texttt{IR\_SEXT},
       \texttt{IR\_ZEXT}, \texttt{IR\_TRUNC}, \texttt{IR\_BITCAST}.

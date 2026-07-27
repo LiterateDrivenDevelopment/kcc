@@ -57,8 +57,10 @@ canonical type descriptors from Chapter~\ref{ch:types}.  The
 dispatcher handles nine type node kinds: built-in types use the
 specifier bitmask to select a pre-allocated singleton; pointer, array,
 and function types recurse into their children and call the
-corresponding type constructor.  Struct, union, and enum nodes
-delegate to their constructors.  Typedef names are resolved via
+corresponding type constructor.  Struct and union nodes with a body
+(field list) create a new type descriptor; those without a body are
+forward references and look up the tag in the symbol table to find
+the original definition.  Typedef names are resolved via
 symbol table lookup.  Qualified types are currently passed through to
 the base type.  Any unrecognised or null type node falls back to
 \texttt{int}.
@@ -155,12 +157,46 @@ _kcc_sema_resolve_type:
 
 .Lsrt_struct:
     // F0 = struct_decl AST node
-    ldr x0, [x19, #AST_F0]
+    // If the decl has fields, create a new type from it.
+    // If not (forward ref), look up the tag in the symbol table.
+    ldr x20, [x19, #AST_F0]        // AST_STRUCT_DECL
+    cbz x20, .Lsrt_fallback
+    ldr x0, [x20, #AST_F1]         // fields
+    cbnz x0, .Lsrt_struct_new
+    // No fields: look up tag
+    ldr x0, [x20, #AST_F0]         // tag name_ptr
+    cbz x0, .Lsrt_struct_new
+    mov x20, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    bl _kcc_symtab_lookup_tag
+    cbz x0, .Lsrt_fallback
+    ldr x0, [x0, #SYM_TYPE]        // sym → type descriptor
+    b .Lsrt_done
+.Lsrt_struct_new:
+    mov x0, x20
     bl _kcc_type_struct
     b .Lsrt_done
 
 .Lsrt_union:
-    ldr x0, [x19, #AST_F0]
+    // Same logic as struct: look up tag if no fields
+    ldr x20, [x19, #AST_F0]
+    cbz x20, .Lsrt_fallback
+    ldr x0, [x20, #AST_F1]
+    cbnz x0, .Lsrt_union_new
+    ldr x0, [x20, #AST_F0]
+    cbz x0, .Lsrt_union_new
+    mov x20, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    bl _kcc_symtab_lookup_tag
+    cbz x0, .Lsrt_fallback
+    ldr x0, [x0, #SYM_TYPE]        // sym → type descriptor
+    b .Lsrt_done
+.Lsrt_union_new:
+    mov x0, x20
     bl _kcc_type_union
     b .Lsrt_done
 
@@ -248,6 +284,10 @@ _kcc_sema_check_decl:
     b.eq .Lscd_struct
     cmp x20, #AST_UNION_DECL
     b.eq .Lscd_struct       // same handling as struct
+    cmp x20, #AST_TYPE_STRUCT
+    b.eq .Lscd_type_struct
+    cmp x20, #AST_TYPE_UNION
+    b.eq .Lscd_type_struct
     cmp x20, #AST_ENUM_DECL
     b.eq .Lscd_enum
 
@@ -372,6 +412,13 @@ consecutive integer values starting from zero.
     mov x3, x21
     bl _kcc_symtab_declare
     b .Lscd_done
+
+.Lscd_type_struct:
+    // AST_TYPE_STRUCT/UNION wrapper: unwrap to inner struct_decl
+    ldr x19, [x19, #AST_F0]        // inner AST_STRUCT_DECL
+    cbz x19, .Lscd_done
+    ldr x20, [x19, #AST_TAG]
+    // Fall through to .Lscd_struct
 
 .Lscd_struct:
     // Register struct/union tag if named
@@ -1215,20 +1262,27 @@ Member access handles both dot (\texttt{s.m}) and arrow
 (\texttt{p->m}) forms.  For arrow access the object type must be a
 pointer, which is dereferenced first.  The resulting type must be
 \texttt{TY\_STRUCT} or \texttt{TY\_UNION}; if not, the checker falls
-back to \texttt{int}.  Actual member lookup in the struct/union's
-member list is a placeholder that also returns \texttt{int} for now.
+back to \texttt{int}.  The lookup walks the struct declaration's
+field chain (\texttt{AST\_F1} linked via \texttt{AST\_F4}), counting
+fields until it finds a name matching the member name in
+\texttt{AST\_MEMBER.F1}.  On a match the field's declared type is
+returned and stored in \texttt{AST\_F3} by the caller (the standard
+\texttt{.Lse\_store} path); the IR builder later re-walks the field
+list to compute the field index at code-generation time.
 
 @d Sema: expr member @{
 // -- kcc_sema_expr_member -------------------------------------------------
 // type_desc *kcc_sema_expr_member(node *expr)
 //   x19 = expression node (AST_MEMBER)
 // F0=object, F1=name_ptr, F2=arrow(1)/dot(0)
+// Returns: resolved field type (or int as fallback)
 .text
 .p2align 2
 _kcc_sema_expr_member:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
 
     // Type-check the object expression
     ldr x0, [x19, #AST_F0]
@@ -1253,22 +1307,59 @@ _kcc_sema_expr_member:
     b.eq .Lsem_lookup
 
 .Lsem_fallback:
-    // Not a struct/union: return int
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 
 .Lsem_lookup:
-    // TODO: Look up member in struct/union type's member list
-    // For now, return int as placeholder for member type
+    // Walk the struct's field list to find the member
+    ldr x21, [x20, #TY_F0]         // AST_STRUCT_DECL node
+    ldr x21, [x21, #AST_F1]        // first field (AST_FIELD_DECL chain)
+    ldr x22, [x19, #AST_F1]        // member name to find
+
+.Lsem_field_loop:
+    cbz x21, .Lsem_not_found
+    ldr x0, [x21, #AST_F1]         // field name_ptr
+    cbz x0, .Lsem_field_next       // skip anonymous fields
+
+    mov x1, x22
+    bl _kcc_strcmp
+    cbz x0, .Lsem_found
+
+.Lsem_field_next:
+    ldr x21, [x21, #AST_F4]        // next field
+    b .Lsem_field_loop
+
+.Lsem_not_found:
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lsem_found:
+    // x21 = matching AST_FIELD_DECL
+    ldr x0, [x21, #AST_F0]         // field type node
+    cbz x0, .Lsem_found_int
+    bl _kcc_sema_resolve_type
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lsem_found_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 @}
 

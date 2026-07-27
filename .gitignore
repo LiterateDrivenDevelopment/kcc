@@ -7,7 +7,7 @@ tmp/
 *.ilg
 *.out
 *.tex
-*.pdf
+# *.pdf
 *.o
 *.dvi
 *.fls

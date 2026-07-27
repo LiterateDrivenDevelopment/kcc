@@ -415,7 +415,21 @@ introduce linear-scan register allocation.
 \end{enumerate}
 
 \textbf{Status.} In progress (v1 core working: constants, arithmetic,
-locals, if/else, while, goto compile and run correctly).
+locals, control flow, loops, function calls, global variables, break/continue
+all compile, link, and run correctly.  Valid Mach-O with \texttt{LC\_BUILD\_VERSION}).
+
+\textbf{Next steps.}
+\begin{itemize}
+\item String literals: store \texttt{"..."} data in the object file and
+      produce a pointer address via \texttt{ADRP}+\texttt{ADD} relocation.
+\item Multiple call arguments: ensure \texttt{call} lowers N~arguments
+      correctly into \texttt{x0}--\texttt{x7}.
+\item External function calls (\texttt{printf}, etc.): declared-but-not-defined
+      functions remain as \texttt{N\_UNDF|N\_EXT} symbols, resolved by
+      \texttt{-lSystem} at link time.
+\item Together these enable \texttt{printf("hello \%d\textbackslash{}n", 42)}
+      to compile, link, and run.
+\end{itemize}
 
 % ────────────────────────────────────────────────────────────────
 \section{Phase 8 --- Self-Hosting}

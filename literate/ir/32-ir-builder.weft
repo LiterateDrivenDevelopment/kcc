@@ -250,6 +250,8 @@ _kcc_ir_dump_instr:
     b.eq .Lidi_store
     cmp x20, #IR_ALLOCA
     b.eq .Lidi_alloca
+    cmp x20, #IR_GEP
+    b.eq .Lidi_gep
     cmp x20, #IR_BR
     b.eq .Lidi_br
     cmp x20, #IR_BR_COND
@@ -506,6 +508,22 @@ returning.
     bl _kcc_io_puts
     ldr x0, [x19, #IR_TYPE]
     bl _kcc_ir_dump_type_short
+    b .Lidi_nl
+
+// -- gep: "gep %base, %index" ---------------------------------------------
+.Lidi_gep:
+    adrp x0, _kcc_ir_op_gep@@PAGE
+    add  x0, x0, _kcc_ir_op_gep@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma@@PAGE
+    add  x0, x0, _kcc_ir_str_comma@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC2]
+    bl _kcc_io_putu
     b .Lidi_nl
 
 // -- br: "br bb<N>" -------------------------------------------------------
@@ -1309,6 +1327,8 @@ _kcc_ir_build_expr:
     b.eq .Libe_string_lit
     cmp x0, #AST_SIZEOF_EXPR
     b.eq .Libe_sizeof
+    cmp x0, #AST_SUBSCRIPT
+    b.eq .Libe_subscript
 
     // Unhandled expression — return 0
     b .Libe_zero
@@ -1381,6 +1401,11 @@ _kcc_ir_build_expr:
 .Libe_sizeof:
     mov x0, x19
     bl _kcc_ir_build_sizeof
+    b .Libe_done
+
+.Libe_subscript:
+    mov x0, x19
+    bl _kcc_ir_build_subscript
     b .Libe_done
 
 .Libe_zero:
@@ -1554,6 +1579,166 @@ run_test "sizeof-ptr" \
 
 run_test "sizeof-arith" \
     "int main(void) { return sizeof(int) + sizeof(char); }" 5
+@}
+
+\subsection{Array Subscript}
+
+The array subscript \texttt{a[i]} lowers to two IR operations: an
+\texttt{IR\_GEP} (Get Element Pointer) that computes the address of
+the $i$-th element, and an \texttt{IR\_LOAD} that reads the value
+at that address.  The \texttt{IR\_GEP} instruction takes a base
+pointer vreg in \texttt{SRC1} and an index vreg in \texttt{SRC2};
+the code generator multiplies the index by the slot size (8~bytes in
+the all-spill model) and adds it to the base address.
+
+Two helpers split the work.
+\texttt{\_kcc\_ir\_build\_subscript\_addr} resolves the array
+identifier's alloca vreg and emits the \texttt{IR\_GEP}---it is
+shared by both read (\texttt{a[i]}) and write (\texttt{a[i]=v})
+paths.  \texttt{\_kcc\_ir\_build\_subscript} calls the address
+helper and then emits an \texttt{IR\_LOAD} to produce a value vreg.
+For assignment, the assign builder calls the address helper directly
+and emits an \texttt{IR\_STORE} to write the right-hand side.
+
+@d IR: build subscript @{
+// -- kcc_ir_build_subscript_addr ------------------------------------------
+// uint64_t kcc_ir_build_subscript_addr(node *subscript)
+//   x0 = AST_SUBSCRIPT (F0=array ident, F1=index expr)
+// Returns vreg holding the element address (GEP result).
+.text
+.globl _kcc_ir_build_subscript_addr
+.p2align 2
+_kcc_ir_build_subscript_addr:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // x19 = subscript node
+
+    // Get array base address (identifier → alloca vreg)
+    ldr x0, [x19, #AST_F0]      // array expression
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libsa_expr
+
+    // Local array: look up alloca vreg
+    ldr x20, [x0, #AST_F0]      // name ptr
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    bl _kcc_ht_get
+    cbz x0, .Libsa_expr
+    sub x20, x0, #1              // alloca vreg
+    b .Libsa_index
+
+.Libsa_expr:
+    // Fallback: build the array expression as a pointer
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // base vreg
+
+.Libsa_index:
+    // Build index expression
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // index vreg
+
+    // Emit IR_GEP: base + index * element_size
+    mov x0, #IR_GEP
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]    // base pointer
+    str x21, [x22, #IR_SRC2]    // index
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // result vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    mov x0, x23                  // return GEP vreg
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_subscript_addr
+@}
+
+@d IR: build subscript @{
+// -- kcc_ir_build_subscript -----------------------------------------------
+// uint64_t kcc_ir_build_subscript(node *subscript)
+//   x0 = AST_SUBSCRIPT (F0=array, F1=index)
+// Returns vreg holding the loaded value.
+.text
+.globl _kcc_ir_build_subscript
+.p2align 2
+_kcc_ir_build_subscript:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // Get element address
+    bl _kcc_ir_build_subscript_addr
+    mov x19, x0                  // GEP vreg (element address)
+
+    // Emit IR_LOAD from element address
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x19, [x20, #IR_SRC1]    // pointer = GEP result
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0                  // result vreg
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, x19                  // return value vreg
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_build_subscript
+@}
+
+Array tests verify declaration, element write, element read, multiple
+elements, loop-based filling, and variable indexing.
+
+@d Test: codegen arrays @{
+echo ""
+echo "--- Arrays ---"
+
+run_test "array-write-read" \
+    "int main(void) { int a[3]; a[0] = 10; return a[0]; }" 10
+
+run_test "array-multi-elem" \
+    "int main(void) { int a[3]; a[0] = 1; a[1] = 2; a[2] = 3; return a[0] + a[1] + a[2]; }" 6
+
+run_test "array-overwrite" \
+    "int main(void) { int a[2]; a[0] = 5; a[0] = 9; return a[0]; }" 9
+
+run_test "array-index-var" \
+    "int main(void) { int a[4]; int i = 2; a[i] = 7; return a[2]; }" 7
+
+run_test "array-loop-fill" \
+    "int main(void) { int a[5]; int i = 0; while (i < 5) { a[i] = i; i = i + 1; } return a[3]; }" 3
+
+run_test "array-sum-loop" \
+    "int main(void) { int a[4]; a[0]=1; a[1]=2; a[2]=3; a[3]=4; int s=0; int i=0; while(i<4){s=s+a[i];i=i+1;} return s; }" 10
 @}
 
 \subsection{Identifier (Variable Load)}
@@ -2426,10 +2611,12 @@ _kcc_ir_build_assign:
     bl _kcc_ir_build_expr
     mov x21, x0                  // rhs vreg
 
-    // Get LHS — must be an identifier for now
+    // Get LHS — identifier or subscript
     ldr x0, [x19, #AST_F1]
     cbz x0, .Liba_done
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Liba_subscript
     cmp x1, #AST_IDENT_EXPR
     b.ne .Liba_done
 
@@ -2630,6 +2817,25 @@ _kcc_ir_build_assign:
     str x1, [x0, #IR_TYPE]
     str x21, [x0, #IR_SRC1]     // value (rhs or compound result)
     str x22, [x0, #IR_SRC2]     // global addr
+    bl _kcc_ir_emit
+    mov x0, x21
+    b .Liba_done
+
+.Liba_subscript:
+    // LHS is a[i]: x0 = AST_SUBSCRIPT node, x21 = rhs vreg
+    // Build GEP from subscript, then store
+    bl _kcc_ir_build_subscript_addr
+    mov x22, x0                  // x22 = element address vreg
+
+    // Emit store: rhs → element address
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]     // value
+    str x22, [x0, #IR_SRC2]     // pointer (GEP result)
     bl _kcc_ir_emit
     mov x0, x21
 
@@ -3132,10 +3338,22 @@ _kcc_ir_build_var_decl:
     ldr x21, [x0]
 
 .Libvd_alloca:
-    // Emit alloca
+    // Determine alloca slot count: arrays need N slots, scalars need 1
+    mov x24, #1                  // default: 1 slot
+    ldr x0, [x21, #TY_KIND]
+    cmp x0, #TY_ARRAY
+    b.ne .Libvd_emit_alloca
+    ldr x24, [x21, #TY_F1]      // array length
+    cbz x24, .Libvd_emit_alloca
+    // For arrays, the element type is what we store per slot
+    ldr x21, [x21, #TY_F0]      // element type
+
+.Libvd_emit_alloca:
+    // Emit alloca — SRC1 = slot count
     mov x0, #IR_ALLOCA
     bl _kcc_ir_alloc_instr
     str x21, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]     // slot count (1 for scalar, N for array)
     mov x22, x0                  // x22 = alloca instr
     bl _kcc_ir_next_vreg
     str x0, [x22, #IR_DEST]
@@ -4365,6 +4583,7 @@ _kcc_ir_op_cmp_sge:     .asciz "cmp_sge"
 _kcc_ir_op_load:        .asciz "load "
 _kcc_ir_op_store:       .asciz "store "
 _kcc_ir_op_alloca:      .asciz "alloca "
+_kcc_ir_op_gep:         .asciz "gep "
 _kcc_ir_op_br:          .asciz "br bb"
 _kcc_ir_op_br_cond:     .asciz "br_cond %"
 _kcc_ir_op_ret:         .asciz "ret "
@@ -4432,6 +4651,7 @@ _kcc_ir_ty_unknown:     .asciz "?type"
 @| _kcc_ir_op_load
 @| _kcc_ir_op_store
 @| _kcc_ir_op_alloca
+@| _kcc_ir_op_gep
 @| _kcc_ir_op_br
 @| _kcc_ir_op_br_cond
 @| _kcc_ir_op_ret

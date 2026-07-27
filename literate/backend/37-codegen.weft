@@ -15,18 +15,24 @@ This chapter is where the compiler's abstract IR meets the target machine.  The 
 
 \section{Strategy}
 
-The stack frame for a generated function:
+The stack frame for a generated function has three regions:
 \begin{verbatim}
-  [x29, x30]   at offset 0 from frame base (saved by STP)
-  vreg 0       at [x29, #-8]
-  vreg 1       at [x29, #-16]
-  ...
-  vreg N-1     at [x29, #-(N*8)]
+  [x29+0]               saved x29/x30 (16 bytes)
+  [x29+16]              vreg value slots (vreg_count * 8)
+  [x29+16+vc*8]         alloca storage  (total_alloca_slots * 8)
 \end{verbatim}
 
-The total frame size is $\mathit{align16}(16 + \text{vreg\_count} \times 8)$.
-We use x9 for source~1, x10 for source~2, and x11 as the destination
-scratch register.
+The total frame size is
+$\mathit{align16}(16 + \text{vreg\_count}\times 8
++ \text{alloca\_slots}\times 8)$.
+A pre-scan pass walks all \texttt{IR\_ALLOCA} instructions before
+code generation, sums their slot counts, and assigns each alloca a
+running offset (stored in \texttt{SRC2}).  This lets
+\texttt{IR\_ALLOCA} compute its storage address at emit time
+and ensures alloca storage does not overlap vreg slots.
+We use x9 for source~1, x10 for source~2, x11 as the destination
+scratch register, and x12 as an additional scratch for
+\texttt{IR\_GEP} address arithmetic.
 
 \section{Constants}
 
@@ -170,10 +176,10 @@ _kcc_codegen_all:
 
 Compiling one IR function proceeds in nine steps:
 \begin{enumerate}
-\item \textbf{Frame size.}  Compute
-      $\mathrm{align16}(16 + \mathit{vreg\_count} \times 16)$.
-      Each vreg gets 8~bytes for its value and 8~bytes for
-      potential alloca storage.
+\item \textbf{Frame size.}  Pre-scan all \texttt{IR\_ALLOCA}
+      instructions, sum their slot counts, then compute
+      $\mathrm{align16}(16 + \mathit{vreg\_count} \times 8
+      + \mathit{alloca\_slots} \times 8)$.
 \item \textbf{Function start.}  Record the current code-buffer
       offset so the linker symbol gets the correct value.
 \item \textbf{BB label table.}  Allocate a hash table that maps
@@ -213,19 +219,77 @@ _kcc_codegen_func:
 
     mov x19, x0                    // x19 = ir_func
 
-    // 1. Compute frame size: align16(16 + vreg_count * 16)
-    //    Each vreg gets 8 bytes for its value slot.
-    //    Allocas get extra 8 bytes for their storage (at offset vreg_count*8+16).
-    ldr x0, [x19, #IRF_VREG_N]    // vreg count
-    lsl x0, x0, #4                // * 16 (double: value slots + alloca storage)
-    add x0, x0, #16               // + 16 for fp/lr
-    add x0, x0, #15               // round up
+    // 1. Compute frame size via alloca pre-scan.
+    //    Value slots: vreg_count * 8 (one 8-byte slot per vreg).
+    //    Alloca storage: sum of all IR_ALLOCA.SRC1 values * 8.
+    //    Each alloca records its running offset in SRC2.
+    ldr x20, [x19, #IRF_VREG_N]   // vreg_count (temporary)
+
+    // Pre-scan: walk all BBs/instructions, find allocas, assign offsets
+    mov x0, #0                     // running alloca slot offset
+    ldr x1, [x19, #IRF_BLOCKS]    // blocks vec
+    ldr x2, [x1, #VEC_COUNT]      // num BBs
+    mov x3, #0                     // BB index
+.Lcgf_alloca_scan_bb:
+    cmp x3, x2
+    b.ge .Lcgf_alloca_scan_done
+    // save loop state to stack temp area [sp, #96..104]
+    str x0, [sp, #96]
+    str x2, [sp, #104]
+    stp x1, x3, [sp, #88]         // x1=blocks_vec, x3=bb_idx overlapping — use 88,96 is taken
+    // Actually use dedicated temp save
+    stp x3, x2, [sp, #88]         // save bb_idx, bb_count
+    str x0, [sp, #104]            // save running offset
+    mov x0, x1                     // blocks vec
+    mov x1, x3                     // index
+    bl _kcc_vec_get
+    ldr x4, [x0]                   // x4 = BB ptr
+    ldr x4, [x4, #BB_FIRST]       // first instr
+.Lcgf_alloca_scan_instr:
+    cbz x4, .Lcgf_alloca_scan_next_bb
+    ldr x5, [x4, #IR_OP]
+    cmp x5, #IR_ALLOCA
+    b.ne .Lcgf_alloca_scan_skip
+    // Found alloca: store running offset in SRC2, advance by SRC1
+    ldr x0, [sp, #104]            // running offset
+    str x0, [x4, #IR_SRC2]        // record offset for this alloca
+    ldr x5, [x4, #IR_SRC1]        // slot count
+    cbz x5, .Lcgf_alloca_one
+    add x0, x0, x5                // advance by slot count
+    b .Lcgf_alloca_save
+.Lcgf_alloca_one:
+    add x0, x0, #1                // default: 1 slot
+.Lcgf_alloca_save:
+    str x0, [sp, #104]
+.Lcgf_alloca_scan_skip:
+    ldr x4, [x4, #IR_NEXT]
+    b .Lcgf_alloca_scan_instr
+.Lcgf_alloca_scan_next_bb:
+    ldp x3, x2, [sp, #88]         // restore bb_idx, bb_count
+    ldr x0, [sp, #104]            // running offset
+    ldr x1, [x19, #IRF_BLOCKS]    // blocks vec (reload)
+    add x3, x3, #1
+    b .Lcgf_alloca_scan_bb
+.Lcgf_alloca_scan_done:
+    // x0 = total alloca slots, x20 = vreg_count
+    // frame_size = align16(16 + vreg_count*8 + total_alloca*8)
+    lsl x1, x20, #3               // vreg_count * 8
+    lsl x0, x0, #3                // total_alloca_slots * 8
+    add x0, x0, x1                 // + vreg value slots
+    add x0, x0, #16                // + fp/lr
+    add x0, x0, #15
     and x0, x0, #~15              // align to 16
     mov x20, x0                    // x20 = frame_size
 
     adrp x1, _kcc_cg_frame_size@@PAGE
     add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
     str x20, [x1]
+
+    // Store vreg_count for alloca address computation
+    ldr x0, [x19, #IRF_VREG_N]
+    adrp x1, _kcc_cg_vreg_count@@PAGE
+    add  x1, x1, _kcc_cg_vreg_count@@PAGEOFF
+    str x0, [x1]
 
     // 2. Record function start offset
     bl _kcc_code_current_pos
@@ -661,6 +725,8 @@ _kcc_codegen_instr:
     b.eq .Lcgi_store
     cmp x22, #IR_ALLOCA
     b.eq .Lcgi_alloca
+    cmp x22, #IR_GEP
+    b.eq .Lcgi_gep
 
     cmp x22, #IR_BR
     b.eq .Lcgi_br
@@ -1156,10 +1222,18 @@ the pointer into x10, then \texttt{STR\;x9,\;[x10]}.
 
 \texttt{IR\_ALLOCA} computes the \emph{address} of the variable's
 storage.  To avoid the slot-aliasing bug (see Debugging Lessons),
-alloca storage lives in the \emph{second half} of the frame: the
-address is \texttt{x29 + 16 + (vreg\_count + dest) * 8}, which
+alloca storage lives past the vreg value slots.  The pre-scan in
+\texttt{kcc\_codegen\_func} assigns each alloca a running offset
+(stored in \texttt{SRC2}) and sizes the frame accordingly.  The
+address is \texttt{x29 + 16 + vreg\_count * 8 + offset * 8}, which
 is distinct from the vreg's own value slot at
 \texttt{x29 + 16 + dest * 8}.
+
+\texttt{IR\_GEP} (Get Element Pointer) computes an element address
+for array subscript: \texttt{base + index * 8}.  It loads the base
+pointer and the index from their vreg slots, emits a
+\texttt{MADD\;x11,\;x10,\;x12,\;x9} (where x12 holds the constant~8)
+and stores the resulting address in the destination vreg.
 
 @d CodeGen: instruction dispatch @{
 // ---- Memory operations ----
@@ -1202,21 +1276,24 @@ is distinct from the vreg's own value slot at
     b .Lcgi_done
 
 .Lcgi_alloca:
-    // Alloca: compute address of storage in the SECOND half of the frame.
-    // Storage at [x29, #16 + (vreg_count + dest)*8] — separate from value slots.
+    // Alloca: compute address of storage past the vreg value slots.
+    // Pre-scan stored the running offset in SRC2.
+    // Address = x29 + 16 + vreg_count*8 + SRC2*8
     ldr x24, [x19, #IR_DEST]      // dest vreg
+    ldr x25, [x19, #IR_SRC2]      // alloca offset (from pre-scan)
 
-    // Get vreg_count from frame_size: vreg_count = (frame_size - 16) / 16
-    adrp x0, _kcc_cg_frame_size@@PAGE
-    add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
+    ldr x0, [x19, #IR_SRC1]       // slot count (for frame calc verification)
+
+    // Get vreg_count from ir_func
+    adrp x0, _kcc_cg_vreg_count@@PAGE
+    add  x0, x0, _kcc_cg_vreg_count@@PAGEOFF
     ldr x0, [x0]
-    sub x0, x0, #16
-    lsr x0, x0, #4                // vreg_count = (frame-16)/16
 
-    // Storage offset = 16 + (vreg_count + dest) * 8
-    add x0, x0, x24               // vreg_count + dest
-    lsl x2, x0, #3
-    add x2, x2, #16               // imm12 = 16 + (vreg_count+dest)*8
+    // Storage address = 16 + vreg_count*8 + offset*8
+    lsl x1, x0, #3                // vreg_count * 8
+    lsl x2, x25, #3               // offset * 8
+    add x2, x2, x1
+    add x2, x2, #16               // imm12 = 16 + vreg_count*8 + offset*8
 
     mov x0, #CG_REG_DST           // rd = x11
     mov x1, #29                    // rn = x29
@@ -1227,6 +1304,46 @@ is distinct from the vreg's own value slot at
 
     // Store x11 (the address) to dest's VALUE slot
     mov x0, x24
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_gep:
+    // GEP: base + index * 8
+    // SRC1 = base ptr vreg, SRC2 = index vreg
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1          // x9 = base
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2          // x10 = index
+    bl _kcc_cg_load_vreg
+
+    // MOVZ x12, #8  (slot stride)
+    mov x0, #12                    // rd = x12
+    mov x1, #8                    // imm16 = 8
+    mov x2, #0                    // hw = 0
+    mov x3, #1                    // sf = 64-bit
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+
+    // MUL x10, x10, x12  →  index * 8
+    mov x0, #CG_REG_SRC2          // rd = x10
+    mov x1, #CG_REG_SRC2          // rn = x10
+    mov x2, #12                    // rm = x12
+    mov x3, #1                    // sf = 64-bit
+    bl _kcc_enc_mul
+    bl _kcc_code_emit32
+
+    // ADD x11, x9, x10  →  base + index*8
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #CG_REG_SRC1          // rn = x9 (base)
+    mov x2, #CG_REG_SRC2          // rm = x10 (index*8)
+    mov x3, #1                    // sf = 64-bit
+    bl _kcc_enc_add_reg
+    bl _kcc_code_emit32
+
+    // Store result to dest
+    ldr x0, [x19, #IR_DEST]
     mov x1, #CG_REG_DST
     bl _kcc_cg_store_vreg
     b .Lcgi_done
@@ -2211,6 +2328,8 @@ counter, and fixup vector pointer.
 .p2align 3
 .globl _kcc_cg_frame_size
 _kcc_cg_frame_size:  .quad 0     // current function's frame size
+.globl _kcc_cg_vreg_count
+_kcc_cg_vreg_count:  .quad 0     // current function's vreg count
 .globl _kcc_cstr_buf
 _kcc_cstr_buf:       .quad 0     // cstring data buffer
 .globl _kcc_cstr_pos
@@ -2220,6 +2339,7 @@ _kcc_cstr_count:     .quad 0     // string literal counter (for naming)
 .globl _kcc_cstr_fixups
 _kcc_cstr_fixups:    .quad 0     // vec of {sym_index, cstr_offset} fixups
 @| _kcc_cg_frame_size
+@| _kcc_cg_vreg_count
 @| _kcc_cstr_buf
 @| _kcc_cstr_pos
 @| _kcc_cstr_count

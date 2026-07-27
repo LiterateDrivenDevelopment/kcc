@@ -428,6 +428,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Linker: add symbol@>
 @<Linker: add reloc@>
 @<Linker: lookup or add extern@>
+@<Linker: global sym@>
 @<Linker: data@>
 @}
 

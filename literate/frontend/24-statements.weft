@@ -707,8 +707,12 @@ _kcc_parse_for:
     cmp x0, #TOK_REGISTER
     b.eq .Lfor_init_decl
 
-    // Expression init
+    // Expression init — wrap in AST_EXPR_STMT so IR builder handles it
     bl _kcc_parse_expr
+    mov x19, x0
+    mov x0, #AST_EXPR_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
     mov x19, x0
     mov x0, #TOK_SEMI
     bl _kcc_parse_expect

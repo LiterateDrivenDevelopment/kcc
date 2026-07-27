@@ -289,6 +289,113 @@ _kcc_linker_extern:
     ret
 @}
 
+\section{Global Symbol Registration}
+
+When the code generator encounters an \texttt{IR\_GLOBAL\_REF}, the
+referenced global variable needs a \emph{defined} symbol in section~2
+(the \texttt{\_\_DATA,\_\_common} zerofill section).  We deduplicate
+via the same extern hash table---if a symbol was already registered
+(by a prior reference or call), we upgrade it from undefined to
+defined.
+
+@d Linker: global sym @{
+// -- kcc_linker_global_sym ----------------------------------------------------
+// uint64_t kcc_linker_global_sym(const char *name)
+//   x0 = null-terminated symbol name (already prefixed with '_')
+// Returns the symbol index.  If the symbol already exists as extern,
+// upgrades it to defined in section 2.  Otherwise adds new.
+// Allocates 8 bytes of data section space per global.
+.text
+.globl _kcc_linker_global_sym
+.p2align 2
+_kcc_linker_global_sym:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                   // save name
+
+    // Check if symbol already in extern hash table
+    mov x0, x19
+    bl _kcc_strlen
+    mov x20, x0                   // name len
+
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_ht_get
+    cbz x0, .Llgs_new
+
+    // Already exists — get sym_index and upgrade to defined
+    sub x21, x0, #1               // sym_index
+
+    // Get symbol entry and set section=2, value=current data offset
+    adrp x0, _kcc_linker_syms@@PAGE
+    add  x0, x0, _kcc_linker_syms@@PAGEOFF
+    ldr x0, [x0]
+    ldr x0, [x0, #VEC_DATA]
+    mov x1, #SYM_ENTRY_SIZE
+    mul x1, x21, x1
+    add x0, x0, x1               // sym entry ptr
+
+    // Set section = 2 (DATA section)
+    mov x1, #2
+    str x1, [x0, #SYM_SECTION]
+
+    // Set value = current data section offset
+    adrp x1, _kcc_globals_size@@PAGE
+    add  x1, x1, _kcc_globals_size@@PAGEOFF
+    ldr x2, [x1]
+    str x2, [x0, #SYM_VALUE]
+
+    // Advance data section size by 8 (int64 alignment)
+    add x2, x2, #8
+    str x2, [x1]
+
+    mov x0, x21
+    b .Llgs_done
+
+.Llgs_new:
+    // Add new defined symbol
+    adrp x0, _kcc_globals_size@@PAGE
+    add  x0, x0, _kcc_globals_size@@PAGEOFF
+    ldr x21, [x0]                 // current offset = value for new sym
+
+    mov x0, x19                   // name
+    mov x1, #2                    // section = 2 (DATA)
+    mov x2, x21                   // value = offset in data section
+    mov x3, #0                    // flags
+    bl _kcc_linker_add_sym
+    mov x21, x0                   // sym_index
+
+    // Advance globals size by 8
+    adrp x0, _kcc_globals_size@@PAGE
+    add  x0, x0, _kcc_globals_size@@PAGEOFF
+    ldr x1, [x0]
+    add x1, x1, #8
+    str x1, [x0]
+
+    // Store in extern hash table for dedup
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19                   // key = name
+    mov x2, x20                   // keylen
+    add x3, x21, #1              // value = sym_index + 1
+    bl _kcc_ht_put
+
+    mov x0, x21
+
+.Llgs_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
 \section{Linker Data}
 
 @d Linker: data @{
@@ -301,4 +408,6 @@ _kcc_linker_relocs:      .quad 0     // vec of relocation entries
 _kcc_linker_syms:        .quad 0     // vec of symbol entries
 .globl _kcc_linker_extern_ht
 _kcc_linker_extern_ht:   .quad 0     // hash table for extern dedup
+.globl _kcc_globals_size
+_kcc_globals_size:       .quad 0     // total size of global data section
 @}

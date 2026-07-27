@@ -292,11 +292,16 @@ _kcc_macho_finalize:
     ldr x0, [x0]
     ldr x21, [x0, #VEC_COUNT]     // x21 = nrelocs
 
+    // Get globals size
+    adrp x0, _kcc_globals_size@@PAGE
+    add  x0, x0, _kcc_globals_size@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [sp, #112]            // sp+112 = globals_size
+
     // Compute load commands size:
-    // LC_SEGMENT_64 (72 + 80*1 = 152) + LC_SYMTAB (24) + LC_DYSYMTAB (80) = 256
-    mov x22, #256                  // x22 = load_cmds_size
-    // Actually: SEGMENT_CMD_SIZE(72) + SECTION_64_SIZE(80) + SYMTAB_CMD_SIZE(24) + DYSYMTAB_CMD_SIZE(80)
-    mov x22, #(72 + 80 + 24 + 80)  // = 256
+    // LC_SEGMENT_64 (72 + 80*2 = 232) + LC_BUILD_VERSION (24) + LC_SYMTAB (24) + LC_DYSYMTAB (80) = 360
+    // Always emit 2 sections: __text + __DATA,__common (zerofill)
+    mov x22, #(232 + 24 + 24 + 80)  // = 360
 
     // Section data offset = header + load cmds
     add x23, x22, #MACH_HEADER_SIZE  // x23 = text_offset (header + LCs)
@@ -383,8 +388,8 @@ _kcc_macho_finalize:
     // filetype = MH_OBJECT
     mov w0, #MH_OBJECT
     bl _kcc_macho_write32
-    // ncmds = 3 (segment + symtab + dysymtab)
-    mov w0, #3
+    // ncmds = 4 (segment + build_version + symtab + dysymtab)
+    mov w0, #4
     bl _kcc_macho_write32
     // sizeofcmds
     mov w0, w22
@@ -400,8 +405,8 @@ _kcc_macho_finalize:
     // cmd
     mov w0, #LC_SEGMENT_64
     bl _kcc_macho_write32
-    // cmdsize = 72 + 80*1 = 152
-    mov w0, #152
+    // cmdsize = 72 + 80*2 = 232
+    mov w0, #232
     bl _kcc_macho_write32
     // segname (16 bytes, empty for object files)
     mov x0, #0
@@ -411,13 +416,14 @@ _kcc_macho_finalize:
     // vmaddr
     mov x0, #0
     bl _kcc_macho_write64
-    // vmsize = code_size
-    mov x0, x19
+    // vmsize = code_size + globals_size
+    ldr x0, [sp, #112]            // globals_size
+    add x0, x0, x19               // + code_size
     bl _kcc_macho_write64
     // fileoff = text_offset
     mov x0, x23
     bl _kcc_macho_write64
-    // filesize = code_size
+    // filesize = code_size (zerofill doesn't occupy file space)
     mov x0, x19
     bl _kcc_macho_write64
     // maxprot = 7 (rwx)
@@ -426,24 +432,30 @@ _kcc_macho_finalize:
     // initprot = 7
     mov w0, #7
     bl _kcc_macho_write32
-    // nsects = 1
-    mov w0, #1
+    // nsects = 2
+    mov w0, #2
     bl _kcc_macho_write32
     // flags = 0
     mov w0, #0
     bl _kcc_macho_write32
 
     // ---- Section: __text ----
-    // sectname (16 bytes): "__text\0..."
-    adrp x0, _kcc_macho_text_name@@PAGE
-    add  x0, x0, _kcc_macho_text_name@@PAGEOFF
-    mov x1, #16
-    bl _kcc_macho_write_bytes
-    // segname (16 bytes): "__TEXT\0..."
-    adrp x0, _kcc_macho_seg_text@@PAGE
-    add  x0, x0, _kcc_macho_seg_text@@PAGEOFF
-    mov x1, #16
-    bl _kcc_macho_write_bytes
+    // sectname (16 bytes): "__text" + 10 null bytes
+    // Little-endian: "__text\0\0" = 0x0000747865745F5F
+    mov x0, #0x5F5F
+    movk x0, #0x6574, lsl #16
+    movk x0, #0x7478, lsl #32
+    bl _kcc_macho_write64
+    mov x0, #0
+    bl _kcc_macho_write64
+    // segname (16 bytes): "__TEXT" + 10 null bytes
+    // Little-endian: "__TEXT\0\0" = 0x0000545845545F5F
+    mov x0, #0x5F5F
+    movk x0, #0x4554, lsl #16
+    movk x0, #0x5458, lsl #32
+    bl _kcc_macho_write64
+    mov x0, #0
+    bl _kcc_macho_write64
     // addr = 0
     mov x0, #0
     bl _kcc_macho_write64
@@ -471,6 +483,75 @@ _kcc_macho_finalize:
     bl _kcc_macho_write32
     mov w0, #0
     bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+
+    // ---- Section: __DATA,__common (S_ZEROFILL) ----
+    // sectname (16 bytes): "__common" + 8 null bytes
+    // Little-endian: "__common" = 0x6E6F6D6D6F635F5F
+    mov x0, #0x5F5F
+    movk x0, #0x6F63, lsl #16
+    movk x0, #0x6D6D, lsl #32
+    movk x0, #0x6E6F, lsl #48
+    bl _kcc_macho_write64
+    mov x0, #0
+    bl _kcc_macho_write64
+    // segname (16 bytes): "__DATA" + 10 null bytes
+    // Little-endian halfwords: "__"=5F5F "DA"=4144 "TA"=4154
+    mov x0, #0x5F5F
+    movk x0, #0x4144, lsl #16
+    movk x0, #0x4154, lsl #32
+    bl _kcc_macho_write64
+    mov x0, #0
+    bl _kcc_macho_write64
+    // addr = code_size (follows text in virtual memory)
+    mov x0, x19
+    bl _kcc_macho_write64
+    // size = globals_size
+    ldr x0, [sp, #112]
+    bl _kcc_macho_write64
+    // offset = 0 (S_ZEROFILL: no file data)
+    mov w0, #0
+    bl _kcc_macho_write32
+    // align = 3 (8-byte aligned, log2(8)=3)
+    mov w0, #3
+    bl _kcc_macho_write32
+    // reloff = 0
+    mov w0, #0
+    bl _kcc_macho_write32
+    // nreloc = 0
+    mov w0, #0
+    bl _kcc_macho_write32
+    // flags = S_ZEROFILL (type 1)
+    mov w0, #1
+    bl _kcc_macho_write32
+    // reserved1, reserved2, reserved3
+    mov w0, #0
+    bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+
+    // ---- LC_BUILD_VERSION ----
+    // cmd = 0x32
+    mov w0, #LC_BUILD_VERSION
+    bl _kcc_macho_write32
+    // cmdsize = 24
+    mov w0, #24
+    bl _kcc_macho_write32
+    // platform = 1 (PLATFORM_MACOS)
+    mov w0, #1
+    bl _kcc_macho_write32
+    // minos = 14.0.0 → (14<<16) = 0x000E0000
+    mov w0, #0
+    movk w0, #14, lsl #16
+    bl _kcc_macho_write32
+    // sdk = 14.0.0
+    mov w0, #0
+    movk w0, #14, lsl #16
+    bl _kcc_macho_write32
+    // ntools = 0
     mov w0, #0
     bl _kcc_macho_write32
 
@@ -639,10 +720,14 @@ _kcc_macho_finalize:
     ldr x5, [sp, #120]            // remap array
     ldr x3, [x5, x3, lsl #3]     // x3 = remap[original_index]
 
-    // For ARM64_RELOC_BRANCH26: pcrel=1, length=2, extern=1, type=2
     // Pack: (sym_idx & 0xFFFFFF) | (pcrel<<24) | (length<<25) | (extern<<27) | (type<<28)
+    // pcrel: BRANCH26=1, PAGE21=1, PAGEOFF12=0
     and w0, w3, #0xFFFFFF          // r_symbolnum (remapped)
+    // Determine pcrel based on type
+    cmp w4, #ARM64_RELOC_PAGEOFF12
+    b.eq .Lmf_reloc_no_pcrel
     orr w0, w0, #(1 << 24)        // r_pcrel = 1
+.Lmf_reloc_no_pcrel:
     orr w0, w0, #(2 << 25)        // r_length = 2 (4 bytes)
     orr w0, w0, #(1 << 27)        // r_extern = 1
     orr w0, w0, w4, lsl #28       // r_type
@@ -682,8 +767,9 @@ _kcc_macho_finalize:
     mov w0, #0x0F
     bl _kcc_macho_write8
 
-    // n_sect = 1 (__text is section 1)
-    mov w0, #1
+    // n_sect = section number from sym entry
+    ldr x2, [sp, #112]            // reload sym entry ptr
+    ldr w0, [x2, #SYM_SECTION]
     bl _kcc_macho_write8
 
     // n_desc = 0
@@ -693,6 +779,16 @@ _kcc_macho_finalize:
     // n_value = symbol value (offset in section)
     ldr x2, [sp, #112]            // reload sym entry ptr
     ldr x0, [x2, #SYM_VALUE]
+    // For section 2 globals, value is relative to section start (code_size + offset)
+    ldr x3, [x2, #SYM_SECTION]
+    cmp x3, #2
+    b.ne .Lmf_sym_val_ok
+    // Global: n_value = code_size + sym_value
+    adrp x3, _kcc_code_pos@@PAGE
+    add  x3, x3, _kcc_code_pos@@PAGEOFF
+    ldr x3, [x3]
+    add x0, x0, x3
+.Lmf_sym_val_ok:
     bl _kcc_macho_write64
 
     // Advance strtab_pos by strlen(name) + 1
@@ -865,10 +961,6 @@ _kcc_macho_pos:      .quad 0     // current write position
 _kcc_macho_err_open:
     .asciz "kcc: error: cannot open output file\n"
 
-// Section and segment names (padded to 16 bytes)
-.p2align 2
-_kcc_macho_text_name:
-    .ascii "__text\0\0\0\0\0\0\0\0\0\0"
-_kcc_macho_seg_text:
-    .ascii "__TEXT\0\0\0\0\0\0\0\0\0\0"
+// Section/segment names are now written as inline immediates in the emitter
+// (avoids linker dead-stripping trailing null bytes from local atoms)
 @}

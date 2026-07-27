@@ -307,6 +307,19 @@ _kcc_codegen_func:
     mov x2, x21                    // value = func_start_offset
     mov x3, #(N_SECT | N_EXT)     // flags = defined + external
     bl _kcc_linker_add_sym
+    mov x26, x0                    // x26 = sym_index
+
+    // Register in extern hash table so calls from other functions find it
+    mov x0, x25
+    bl _kcc_strlen
+    mov x27, x0                    // name len
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x25                    // key = prefixed name
+    mov x2, x27                    // keylen
+    add x3, x26, #1               // value = sym_index + 1
+    bl _kcc_ht_put
 
     ldp x27, x28, [sp, #80]
     ldp x25, x26, [sp, #64]
@@ -466,6 +479,8 @@ _kcc_codegen_instr:
     b.eq .Lcgi_ret
     cmp x22, #IR_CALL
     b.eq .Lcgi_call
+    cmp x22, #IR_GLOBAL_REF
+    b.eq .Lcgi_global_ref
 
     // Unknown opcode: skip
     b .Lcgi_done
@@ -1155,6 +1170,63 @@ _kcc_codegen_instr:
     // Store return value (x0) to dest vreg slot
     mov x0, x24                    // dest vreg
     mov x1, #0                     // source reg = x0
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_global_ref:
+    // GLOBAL_REF: SRC1 = symbol name (char*), DEST = vreg to store addr
+    ldr x23, [x19, #IR_SRC1]      // symbol name
+    ldr x24, [x19, #IR_DEST]      // dest vreg
+
+    // Build Mach-O name: "_" + name
+    mov x0, x23
+    bl _kcc_strlen
+    add x0, x0, #2                // +1 for '_', +1 for null
+    bl _kcc_arena_alloc
+    mov x25, x0                    // x25 = prefixed name buffer
+    mov w1, #'_'
+    strb w1, [x25]
+    mov x0, x23
+    bl _kcc_strlen
+    add x2, x0, #1               // len + null
+    add x0, x25, #1              // dest = after '_'
+    mov x1, x23                   // src = original name
+    bl _kcc_memcpy
+
+    // Register as global symbol (defined in section 2, size=8 for now)
+    mov x0, x25
+    bl _kcc_linker_global_sym
+    mov x25, x0                    // sym_index
+
+    // Emit ADRP x11, symbol@@PAGE (with PAGE21 reloc)
+    bl _kcc_code_current_pos
+    mov x0, x0                     // offset
+    mov x1, #ARM64_RELOC_PAGE21
+    mov x2, x25                    // sym_index
+    bl _kcc_linker_add_reloc
+
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #0                     // imm21 = 0 (linker patches)
+    bl _kcc_enc_adrp
+    bl _kcc_code_emit32
+
+    // Emit ADD x11, x11, symbol@@PAGEOFF (with PAGEOFF12 reloc)
+    bl _kcc_code_current_pos
+    mov x0, x0                     // offset
+    mov x1, #ARM64_RELOC_PAGEOFF12
+    mov x2, x25                    // sym_index
+    bl _kcc_linker_add_reloc
+
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #CG_REG_DST           // rn = x11
+    mov x2, #0                     // imm12 = 0 (linker patches)
+    mov x3, #1                     // sf = 64-bit
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    // Store x11 (address of global) to dest vreg slot
+    mov x0, x24
+    mov x1, #CG_REG_DST
     bl _kcc_cg_store_vreg
     b .Lcgi_done
 

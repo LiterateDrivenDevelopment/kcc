@@ -108,6 +108,7 @@ Offset & Field & Description \\
 .equ IR_CONST,   60
 .equ IR_NOP,     61
 .equ IR_GLOBAL_REF, 63
+.equ IR_STRING_LIT, 64
 @}
 
 \section{IR Initialization}

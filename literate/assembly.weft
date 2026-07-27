@@ -373,6 +373,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build unary@>
 @<IR: build assign@>
 @<IR: build call@>
+@<IR: build string literal@>
 @<IR: build conditional@>
 @<IR: build var decl@>
 @<IR: build if@>
@@ -446,6 +447,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<CodeGen: vreg slot offset@>
 @<CodeGen: instruction dispatch@>
 @<CodeGen: patch branches@>
+@<CodeGen: emit strings@>
 @<CodeGen: data@>
 @}
 

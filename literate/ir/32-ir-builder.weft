@@ -259,6 +259,8 @@ _kcc_ir_dump_instr:
     b.eq .Lidi_nop
     cmp x20, #IR_GLOBAL_REF
     b.eq .Lidi_global_ref
+    cmp x20, #IR_STRING_LIT
+    b.eq .Lidi_string_lit
 
     // Unknown opcode
     adrp x0, _kcc_ir_str_unknown@@PAGE
@@ -548,6 +550,28 @@ _kcc_ir_dump_instr:
     ldr x0, [x19, #IR_SRC1]   // name pointer
     cbz x0, .Lidi_nl
     bl _kcc_io_puts
+    b .Lidi_nl
+
+// -- string_lit: "string_lit \"<data>\"" ----------------------------------
+.Lidi_string_lit:
+    adrp x0, _kcc_ir_op_string_lit@@PAGE
+    add  x0, x0, _kcc_ir_op_string_lit@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'"'
+    bl _kcc_io_putc
+    ldr x21, [x19, #IR_SRC1]
+    ldr x22, [x19, #IR_SRC2]
+    mov x20, #0
+.Lidi_string_ch:
+    cmp x20, x22
+    b.ge .Lidi_string_end
+    ldrb w0, [x21, x20]
+    bl _kcc_io_putc
+    add x20, x20, #1
+    b .Lidi_string_ch
+.Lidi_string_end:
+    mov x0, #'"'
+    bl _kcc_io_putc
     b .Lidi_nl
 
 .Lidi_nl:
@@ -1174,6 +1198,8 @@ _kcc_ir_build_expr:
     b.eq .Libe_cond
     cmp x0, #AST_PAREN_EXPR
     b.eq .Libe_paren
+    cmp x0, #AST_STR_LIT
+    b.eq .Libe_string_lit
 
     // Unhandled expression — return 0
     b .Libe_zero
@@ -1236,6 +1262,11 @@ _kcc_ir_build_expr:
     // Unwrap parenthesized expression — just build inner
     ldr x0, [x19, #AST_F0]
     bl _kcc_ir_build_expr
+    b .Libe_done
+
+.Libe_string_lit:
+    mov x0, x19
+    bl _kcc_ir_build_string_lit
     b .Libe_done
 
 .Libe_zero:
@@ -2014,6 +2045,54 @@ _kcc_ir_build_call:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
+    ret
+@}
+
+\subsection{String Literal}
+
+@d IR: build string literal @{
+// -- kcc_ir_build_string_lit ----------------------------------------------
+// uint64_t kcc_ir_build_string_lit(node *lit)
+//   x0 = AST_STR_LIT (F0=str_ptr, F1=str_len)
+// Returns vreg holding the string's address.
+.text
+.globl _kcc_ir_build_string_lit
+.p2align 2
+_kcc_ir_build_string_lit:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // str_ptr
+    ldr x21, [x19, #AST_F1]     // str_len
+
+    mov x0, #IR_STRING_LIT
+    bl _kcc_ir_alloc_instr
+    mov x19, x0                  // save instr
+
+    str x20, [x19, #IR_SRC1]    // str data pointer
+    str x21, [x19, #IR_SRC2]    // str length
+
+    // Type: use int for now (value is a 64-bit pointer)
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x19, #IR_TYPE]
+
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // save vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20                  // return vreg
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 @}
 
@@ -2872,6 +2951,7 @@ _kcc_ir_op_trunc:       .asciz "trunc"
 _kcc_ir_op_const:       .asciz "const "
 _kcc_ir_op_nop:         .asciz "nop"
 _kcc_ir_op_global_ref:  .asciz "global_ref "
+_kcc_ir_op_string_lit:  .asciz "string_lit "
 
 // -- Loop stack (break/continue targets) --
 .data

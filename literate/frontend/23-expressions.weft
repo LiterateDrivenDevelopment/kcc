@@ -748,6 +748,17 @@ _kcc_parse_postfix_tail:
 Primary expressions (\stdref{6.5.1}): identifiers, integer constants,
 string literals, character constants, and parenthesized expressions.
 
+For string literals, the lexer delivers the raw token including the
+surrounding double quotes.  We strip the quotes, then call
+\texttt{kcc\_strlit\_process} (Chapter~\ref{ch:string-literals}) to translate
+C~escape sequences: \verb|\n|~becomes \texttt{0x0A},
+\verb|\t|~becomes \texttt{0x09}, \verb|\\|~becomes a single backslash,
+and so on.  The function returns a freshly allocated buffer with the
+processed bytes and its new (possibly shorter) length.
+Character literals receive the same treatment: we strip the single
+quotes, run the escape processor, and read the first byte of the
+result.  This means \verb|'\n'| correctly evaluates to~10.
+
 @d Expr: parse primary @{
 // -- kcc_parse_primary_expr --------------------------------------------
 // node *kcc_parse_primary_expr(void)
@@ -841,6 +852,13 @@ _kcc_parse_primary_expr:
     add  x19, x19, #1
     sub  x20, x20, #2
 
+    // Process escape sequences (\n → 0x0A, etc.)
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_strlit_process
+    mov x19, x0
+    mov x20, x1
+
     // Consume string
     bl _kcc_pp_next
 
@@ -851,12 +869,17 @@ _kcc_parse_primary_expr:
     b .Lprimary_done
 
 .Lprimary_char:
-    // Parse character value
+    // Parse character value (with escape processing)
     adrp x0, _kcc_tok_start@@PAGE
     add  x0, x0, _kcc_tok_start@@PAGEOFF
     ldr  x0, [x0]
-    // Simple: character is at offset 1 (after opening quote)
-    ldrb w19, [x0, #1]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    add  x0, x0, #1            // skip opening quote
+    sub  x1, x1, #2            // exclude quotes
+    bl _kcc_strlit_process
+    ldrb w19, [x0]              // first processed byte
 
     // Consume char literal
     bl _kcc_pp_next

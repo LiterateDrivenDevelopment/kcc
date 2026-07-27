@@ -5,9 +5,30 @@
 % Mach-O object file.
 
 \chapter{Compilation Driver}
-\label{ch:driver}
+\label{ch:compile-driver}
 
 \section{Full Compilation Pipeline}
+
+The driver orchestrates every phase of compilation in a single
+straight-line function.  Given a source path and an output path it:
+%
+\begin{enumerate}
+\item Opens and reads the source file.
+\item Runs translation phases 1--2 (trigraph replacement and line
+      splicing).
+\item Initializes the lexer, preprocessor, string table, and
+      typedef table.
+\item Parses the translation unit into an AST.
+\item Initializes the type system and symbol table, then runs
+      semantic analysis.
+\item Builds the IR and runs optimization passes.
+\item Initializes the code buffer, linker, and code generator
+      (including the cstring buffer for string literals).
+\item Lowers all IR to ARM64 machine code.
+\item Appends string literal data to the code section and patches
+      symbol values (\texttt{kcc\_codegen\_emit\_strings}).
+\item Writes the Mach-O object file.
+\end{enumerate}
 
 @d Driver: compile @{
 // -- kcc_driver_compile -------------------------------------------------------
@@ -83,6 +104,9 @@ _kcc_driver_compile:
 
     // 14. Generate code
     bl _kcc_codegen_all
+
+    // 14b. Append string literal data to code section
+    bl _kcc_codegen_emit_strings
 
     // 15. Write Mach-O object file
     mov x0, x20                    // out_path

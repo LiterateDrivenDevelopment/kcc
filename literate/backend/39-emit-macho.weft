@@ -14,6 +14,12 @@
 
 \section{Constants}
 
+The constants define Mach-O magic numbers, CPU type codes, load
+command identifiers, and structure sizes according to the
+\texttt{mach-o/loader.h} and \texttt{mach-o/nlist.h} headers.
+All values are for the 64-bit ARM64 object file format
+(\texttt{MH\_OBJECT}).
+
 @d MachO: constants @{
 // -- Mach-O constants ---------------------------------------------------------
 .equ MH_MAGIC_64,              0xFEEDFACF
@@ -52,6 +58,14 @@
 @}
 
 \section{Output Buffer Management}
+
+Rather than seeking and writing pieces of the file in random order,
+we build the entire object file in an arena-allocated 64\,KB buffer
+and flush it in one \texttt{write} system call.  The helpers
+\texttt{write8}/\texttt{16}/\texttt{32}/\texttt{64} append
+little-endian values; \texttt{write\_bytes} copies raw data;
+\texttt{pad\_to} inserts zero bytes until the write position is
+aligned to the given power of two.
 
 @d MachO: output buffer @{
 // -- kcc_macho_init -----------------------------------------------------------
@@ -256,7 +270,35 @@ _kcc_macho_pad_to:
 
 \section{Finalize and Write}
 
-The main entry point that assembles the complete Mach-O file.
+The finalize function is the heart of the Mach-O writer.  It
+computes the file layout, writes every structure in order, and
+flushes the result to disk.
+
+The file layout for our object files is:
+\begin{verbatim}
+  +0    : mach_header_64         (32 bytes)
+  +32   : LC_SEGMENT_64          (72 + 80*nsects)
+          LC_BUILD_VERSION       (24 bytes)
+          LC_SYMTAB              (24 bytes)
+          LC_DYSYMTAB            (80 bytes)
+  +hdrsz: __text section data    (code_size bytes)
+          padding to 4-byte align
+          relocation entries      (8 bytes each)
+          nlist_64 symbol table  (16 bytes each)
+          string table           (variable)
+\end{verbatim}
+
+We emit two sections: \texttt{\_\_TEXT,\_\_text} (executable code
+plus trailing string data) and \texttt{\_\_DATA,\_\_common}
+(a \texttt{S\_ZEROFILL} section for global variables, which
+occupies no file space).
+
+\subsection{Layout Computation}
+
+The first phase reads the linker tables to determine symbol counts,
+string table size, and the byte offsets of every structure in the file.
+These offsets are stored in callee-saved registers and stack slots
+for use by subsequent phases.
 
 @d MachO: finalize @{
 // -- kcc_macho_finalize -------------------------------------------------------
@@ -372,7 +414,24 @@ _kcc_macho_finalize:
     b .Lmf_count_syms
 .Lmf_count_done:
     ldr x28, [sp, #104]           // nextdef (defined external count)
+@}
 
+\subsection{Header and Load Commands}
+
+With all offsets computed, we write the Mach-O header (magic,
+CPU type, file type, load command count and size) followed by the
+four load commands: \texttt{LC\_SEGMENT\_64} (containing the
+\texttt{\_\_text} and \texttt{\_\_common} section headers),
+\texttt{LC\_BUILD\_VERSION} (suppresses Apple linker warnings),
+\texttt{LC\_SYMTAB}, and \texttt{LC\_DYSYMTAB}.
+
+Section names (\texttt{\_\_text}, \texttt{\_\_TEXT}, etc.) are
+written as inline immediate bytes rather than referencing string
+constants---this avoids the linker dead-stripping trailing null
+bytes from local atoms, which caused subtle bugs in earlier
+versions.
+
+@d MachO: finalize @{
     // ---- Write Mach-O header ----
     // magic
     mov w0, #0xFACF
@@ -625,7 +684,29 @@ _kcc_macho_finalize:
     bl _kcc_macho_write32
     mov w0, #0
     bl _kcc_macho_write32
+@}
 
+\subsection{Code, Relocations, and Symbol Remapping}
+
+After the load commands, we write the raw code bytes (the
+\texttt{\_\_text} section content), pad to 4-byte alignment, and
+then emit the relocation entries.
+
+Before writing relocations, we must build a \emph{remap array}
+that translates original symbol indices to their output positions.
+The Mach-O convention requires defined symbols to appear before
+undefined ones in the symbol table; since our linker adds symbols
+in encounter order (which interleaves defined and undefined), we
+sort them in two passes: first defined, then undefined.  Each
+relocation's \texttt{r\_symbolnum} is translated through this
+remap so the linker sees the correct index.
+
+Each relocation packs into 8~bytes: a 32-bit \texttt{r\_address}
+(section-relative), and a 32-bit info word containing the symbol
+number (24~bits), \texttt{pcrel} flag, length code, extern flag,
+and relocation type.
+
+@d MachO: finalize @{
     // ---- Write code bytes ----
     // Pad to text_offset if needed (should already be there)
     adrp x0, _kcc_code_buf@@PAGE
@@ -736,7 +817,30 @@ _kcc_macho_finalize:
     add x28, x28, #1
     b .Lmf_reloc_loop
 .Lmf_reloc_done:
+@}
 
+\subsection{Symbol Table and String Table}
+
+The symbol table consists of \texttt{nlist\_64} entries (16~bytes
+each): a 32-bit string-table index, an 8-bit type, an 8-bit
+section number, a 16-bit description, and a 64-bit value.  Defined
+symbols get \texttt{n\_type\,=\,0x0F} (\texttt{N\_SECT\textbar N\_EXT})
+and their value is the offset within the section.  Section~2
+symbols (global variables in \texttt{\_\_DATA,\_\_common}) have
+their value adjusted by adding \texttt{code\_size}---the
+\texttt{S\_ZEROFILL} section's virtual start follows the text
+section.
+
+The string table starts with a null byte at index~0 (the
+``empty string'' sentinel).  Symbol names are written in the same
+defined-then-undefined order, and a running offset tracks each
+symbol's \texttt{n\_strx} value.
+
+Finally, the entire output buffer is flushed to the file
+descriptor with a single \texttt{write} system call, and the
+file is closed.
+
+@d MachO: finalize @{
     // ---- Write symbol table (nlist_64 entries) ----
     // First: defined symbols, then undefined
     // We need to write in order: defined first, then undefined
@@ -945,6 +1049,11 @@ _kcc_macho_finalize:
 @}
 
 \section{Mach-O Data}
+
+Module state: the output file descriptor, the write buffer pointer,
+and the current buffer position.  The error string lives in the
+\texttt{\_\_cstring} section so it can be passed to
+\texttt{kcc\_io\_err}.
 
 @d MachO: data @{
 // -- Mach-O module data -------------------------------------------------------

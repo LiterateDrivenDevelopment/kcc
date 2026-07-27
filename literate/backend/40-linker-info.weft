@@ -64,6 +64,8 @@ Offset & Field & Description \\
 
 \section{Initialization}
 
+The linker module maintains three data structures: a \emph{relocation vector} (24-byte entries), a \emph{symbol vector} (32-byte entries), and a \emph{hash table} for deduplicating external symbol references. Each vector is arena-allocated with an initial capacity of 32~entries.
+
 @d Linker: init @{
 // -- kcc_linker_init ----------------------------------------------------------
 // void kcc_linker_init(void)
@@ -124,6 +126,8 @@ _kcc_linker_init:
 
 \section{Adding Symbols}
 
+Each call appends a 32-byte entry to the symbol vector and returns the new symbol's zero-based index. The caller fills in the name pointer, section number, value, and Mach-O flags. Index~0 is the first symbol added, not a reserved sentinel.
+
 @d Linker: add symbol @{
 // -- kcc_linker_add_sym -------------------------------------------------------
 // uint64_t kcc_linker_add_sym(const char *name, uint64_t section,
@@ -164,6 +168,8 @@ _kcc_linker_add_sym:
 @}
 
 \section{Adding Relocations}
+
+A relocation records three pieces of information: the byte offset within the code section where the instruction lives, the relocation type (one of \texttt{BRANCH26}, \texttt{PAGE21}, or \texttt{PAGEOFF12}), and the index of the target symbol. The Mach-O writer later packs these into the 8-byte \texttt{relocation\_info} format the linker expects.
 
 @d Linker: add reloc @{
 // -- kcc_linker_add_reloc -----------------------------------------------------
@@ -397,6 +403,8 @@ _kcc_linker_global_sym:
 @}
 
 \section{Linker Data}
+
+Module-level state: pointers to the relocation and symbol vectors, the extern deduplication hash table, and the running total of bytes allocated in the global data section (used as the \texttt{n\_value} for new \texttt{\_\_DATA,\_\_common} symbols).
 
 @d Linker: data @{
 // -- Linker module data -------------------------------------------------------

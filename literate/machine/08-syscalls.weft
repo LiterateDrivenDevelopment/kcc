@@ -10,6 +10,10 @@
 \chapter{System Calls}
 \label{ch:syscalls}
 
+Because \kcc{} links against no C library, every interaction with the operating system must go through the Darwin kernel's \texttt{svc \#0x80} interface directly.
+This chapter provides thin, AAPCS64-conforming wrappers for the seven syscalls the compiler requires: process termination, file I/O (\texttt{open}, \texttt{read}, \texttt{write}, \texttt{close}), memory mapping (\texttt{mmap}), and file seeking (\texttt{lseek}).
+Each wrapper establishes a proper frame record and translates the kernel convention---number in \reg{x16}, arguments in \reg{x0}--\reg{x5}---into ordinary function calls.
+
 \section{Syscall Number Constants}
 
 These constants come from the macOS/XNU kernel headers

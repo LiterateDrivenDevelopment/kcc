@@ -9,6 +9,8 @@
 \chapter{ARM64 Encoding}
 \label{ch:emit-arm64}
 
+The code generator from Chapter~\ref{ch:codegen} decides which ARM64 instructions to emit; this chapter provides the low-level machinery that encodes those instructions into their 32-bit binary representations.  It manages a growable code buffer, implements the encoding functions for each instruction format (arithmetic, logical, memory, compare-and-branch, conditional branch, and unconditional branch), and provides the \texttt{patch32} facility used to resolve forward branches after their targets are known.
+
 \section{Code Buffer}
 
 The code buffer is a simple growable byte array.  Since ARM64
@@ -112,7 +114,15 @@ _kcc_code_emit32:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_code_init
+@| _kcc_code_emit32
+@}
 
+\paragraph{Inspection and Patching}
+
+The remaining two operations read or modify the buffer rather than appending to it. \texttt{kcc\_code\_current\_pos} returns the byte offset where the next instruction will be written---the codegen uses this to compute branch distances and to record relocation sites for the linker. \texttt{kcc\_code\_patch32} overwrites an already-emitted 32-bit word at a given offset, which is how forward branches are resolved once the target address becomes known.
+
+@d Backend: code buffer @{
 // -- kcc_code_current_pos -----------------------------------------------------
 // uint64_t kcc_code_current_pos(void)
 // Returns the current offset in the code buffer.
@@ -139,6 +149,8 @@ _kcc_code_patch32:
     ldr x2, [x2]
     str w1, [x2, x0]
     ret
+@| _kcc_code_current_pos
+@| _kcc_code_patch32
 @}
 
 \section{Arithmetic Encoding (Register)}
@@ -238,6 +250,12 @@ _kcc_enc_msub:
     orr w5, w5, w0                // Rd
     mov w0, w5
     ret
+@| _kcc_enc_add_reg
+@| _kcc_enc_sub_reg
+@| _kcc_enc_mul
+@| _kcc_enc_sdiv
+@| _kcc_enc_udiv
+@| _kcc_enc_msub
 @}
 
 \section{Arithmetic Encoding (Immediate)}
@@ -303,6 +321,10 @@ _kcc_enc_movk:
     orr w4, w4, w0                // Rd
     mov w0, w4
     ret
+@| _kcc_enc_add_imm
+@| _kcc_enc_sub_imm
+@| _kcc_enc_movz
+@| _kcc_enc_movk
 @}
 
 \section{Logical Encoding}
@@ -369,6 +391,17 @@ _kcc_enc_mvn:
     mov w0, w4
     ret
 
+@| _kcc_enc_and_reg
+@| _kcc_enc_orr_reg
+@| _kcc_enc_eor_reg
+@| _kcc_enc_mvn
+@}
+
+\paragraph{Variable-Distance Shifts}
+
+The variable-distance shift instructions \texttt{LSLV}, \texttt{LSRV}, and \texttt{ASRV} belong to a different ARM64 instruction class---Data Processing (2-source)---rather than the Logical Shifted Register group above. They share the same opcode prefix \texttt{0x1AC0} (with \texttt{sf} at bit~31) and differ only in the sub-opcode at bits [11:10]: \texttt{0x2000} for left shift, \texttt{0x2400} for logical right shift, and \texttt{0x2800} for arithmetic right shift. The shift amount comes from register \texttt{Rm} rather than an immediate.
+
+@d Backend: encode logical @{
 // -- kcc_enc_lsl_reg ----------------------------------------------------------
 // LSLV: x0=rd, x1=rn, x2=rm, x3=sf
 .text
@@ -414,6 +447,9 @@ _kcc_enc_asr_reg:
     orr w4, w4, w0
     mov w0, w4
     ret
+@| _kcc_enc_lsl_reg
+@| _kcc_enc_lsr_reg
+@| _kcc_enc_asr_reg
 @}
 
 \section{Compare and Conditional Set}
@@ -458,6 +494,8 @@ _kcc_enc_cset:
     orr w3, w3, w0                // Rd
     mov w0, w3
     ret
+@| _kcc_enc_cmp_reg
+@| _kcc_enc_cset
 @}
 
 \section{Memory Encoding}
@@ -505,7 +543,15 @@ _kcc_enc_ldr_imm:
     orr w4, w4, w0                // Rt
     mov w0, w4
     ret
+@| _kcc_enc_str_imm
+@| _kcc_enc_ldr_imm
+@}
 
+\paragraph{Paired Load/Store}
+
+The \textsc{stp} (store pair, pre-index) and \textsc{ldp} (load pair, post-index) instructions transfer two 64-bit registers in a single operation. They are used almost exclusively in function prologues and epilogues to save and restore \texttt{x29}/\texttt{x30}. The 7-bit signed immediate in bits [21:15] is scaled by~8, giving a $\pm$512-byte range from the base register.
+
+@d Backend: encode memory @{
 // -- kcc_enc_stp_pre ----------------------------------------------------------
 // STP (pre-index, 64-bit): x0=rt1, x1=rt2, x2=rn, x3=imm7 (signed, scaled by 8)
 // Encoding: 0xA9800000 | (imm7&0x7F)<<15 | rt2<<10 | rn<<5 | rt1
@@ -537,7 +583,15 @@ _kcc_enc_ldp_post:
     orr w4, w4, w0                // Rt1
     mov w0, w4
     ret
+@| _kcc_enc_stp_pre
+@| _kcc_enc_ldp_post
+@}
 
+\paragraph{Register Move}
+
+\textsc{mov}\;$R_d, R_m$ is not a first-class ARM64 instruction but an alias for \texttt{ORR\;Rd, XZR, Rm}---a bitwise OR with the zero register that simply copies \texttt{Rm} into \texttt{Rd}. We encode it as a logical operation with \texttt{Rn\,=\,31} (the zero register), opcode prefix \texttt{0x2A000000}, and \texttt{sf} at bit~31.
+
+@d Backend: encode memory @{
 // -- kcc_enc_mov_reg ----------------------------------------------------------
 // MOV Rd, Rm → ORR Rd, XZR, Rm
 // x0=rd, x1=rm, x2=sf
@@ -553,6 +607,7 @@ _kcc_enc_mov_reg:
     orr w3, w3, w0                // Rd
     mov w0, w3
     ret
+@| _kcc_enc_mov_reg
 @}
 
 \section{Branch Encoding}
@@ -583,7 +638,15 @@ _kcc_enc_bl:
     and w0, w0, #0x03FFFFFF
     orr w0, w0, w1
     ret
+@| _kcc_enc_b
+@| _kcc_enc_bl
+@}
 
+\paragraph{Conditional Branches and Return}
+
+Conditional branches use a narrower 19-bit signed offset (still in instruction units). \textsc{b.cond} tests the NZCV flags against a 4-bit condition code in bits [3:0]; the codegen emits a \textsc{cmp} immediately before it. \textsc{cbz} and \textsc{cbnz} combine a zero/non-zero register test with the branch, avoiding a separate compare---useful for loop exits and null checks. \textsc{ret} is a fixed encoding (\texttt{0xD65F03C0}) that branches to the address in \texttt{x30}.
+
+@d Backend: encode branch @{
 // -- kcc_enc_b_cond -----------------------------------------------------------
 // B.cond imm19: x0 = offset in bytes, x1 = condition code
 .text
@@ -636,6 +699,10 @@ _kcc_enc_ret:
     movz w0, #0xD65F, lsl #16
     movk w0, #0x03C0
     ret
+@| _kcc_enc_b_cond
+@| _kcc_enc_cbz
+@| _kcc_enc_cbnz
+@| _kcc_enc_ret
 @}
 
 \section{System Instructions}
@@ -661,6 +728,8 @@ _kcc_enc_brk:
     mov w1, #0xD4200000
     orr w0, w1, w0, lsl #5
     ret
+@| _kcc_enc_nop
+@| _kcc_enc_brk
 @}
 
 \section{ADRP and Page-Offset Encoding}
@@ -685,6 +754,7 @@ _kcc_enc_adrp:
     orr w2, w2, w0                 // Rd
     mov w0, w2
     ret
+@| _kcc_enc_adrp
 @}
 
 \section{Code Buffer Data}
@@ -701,4 +771,7 @@ _kcc_code_buf:       .quad 0     // pointer to code buffer
 _kcc_code_pos:       .quad 0     // current write position (bytes)
 .globl _kcc_code_cap
 _kcc_code_cap:       .quad 0     // buffer capacity (bytes)
+@| _kcc_code_buf
+@| _kcc_code_pos
+@| _kcc_code_cap
 @}

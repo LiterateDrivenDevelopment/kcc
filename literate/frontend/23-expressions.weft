@@ -18,6 +18,8 @@
 \chapter{Expression Parsing}
 \label{ch:expressions}
 
+Expression parsing translates the operator-rich surface syntax of C into AST nodes that capture evaluation order and associativity (\stdref{6.5}).  Rather than writing a separate function for each of C's fifteen precedence levels, we use precedence climbing: a single \texttt{kcc\_parse\_binary\_expr} function consults a lookup table to decide when to recurse.  This chapter covers the precedence table, the entry point for comma expressions, assignment and conditional operators, the climbing loop for binary operators, unary and cast expressions, postfix chains, and primary expressions including parenthesized sub-expressions and compound literals.
+
 \section{Precedence Table}
 
 The precedence climbing algorithm uses a lookup table mapping each
@@ -78,6 +80,7 @@ _kcc_prec_lookup:
 .Lprec_none:
     mov x0, #0
     ret
+@| _kcc_prec_lookup
 @}
 
 \section{Expression Entry Point}
@@ -131,6 +134,7 @@ _kcc_parse_expr:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_expr
 @}
 
 \section{Assignment Expression}
@@ -189,6 +193,7 @@ _kcc_parse_assign_expr:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_assign_expr
 @}
 
 \section{Conditional Expression}
@@ -251,6 +256,7 @@ _kcc_parse_cond_expr:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_cond_expr
 @}
 
 \section{Binary Expression (Precedence Climbing)}
@@ -322,6 +328,7 @@ _kcc_parse_binary_expr:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_binary_expr
 @}
 
 \section{Unary Expression}
@@ -392,7 +399,17 @@ _kcc_parse_unary_expr:
     mov x1, #1
     str  x1, [x0, #AST_F2]      // prefix = 1
     b .Lunary_done_direct
+@| _kcc_parse_unary_expr
+@}
 
+\paragraph{Sizeof and \_Alignof.}
+The \texttt{sizeof} operator (\stdref{6.5.3.4}) comes in two forms:
+\texttt{sizeof(type-name)} queries the size of a type directly, while
+\texttt{sizeof expr} measures the type of an expression without evaluating it.
+The \texttt{\_Alignof} operator always takes a parenthesized type name.
+Both produce compile-time integer constants.
+
+@d Expr: parse unary @{
 .Lunary_sizeof:
     // Consume 'sizeof'
     bl _kcc_pp_next
@@ -576,6 +593,7 @@ _kcc_parse_cast_expr:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_cast_expr
 @}
 
 \section{Postfix Expression}
@@ -681,7 +699,18 @@ _kcc_parse_postfix_tail:
     str x20, [x0, #AST_F1]      // first arg
     mov x19, x0
     b .Lpostfix_loop
+@| _kcc_parse_postfix_expr
+@| _kcc_parse_postfix_tail
+@}
 
+\paragraph{Member access and increment/decrement.}
+The remaining postfix operators handle structure and union member access
+via the dot (\texttt{.}) and arrow (\texttt{->}) operators, and the
+postfix increment/decrement operators (\texttt{++}/\texttt{--}).
+The dot and arrow cases share a common path that interns the field name
+and builds an \texttt{AST\_MEMBER} node.
+
+@d Expr: parse postfix @{
 .Lpostfix_member_dot:
     mov x21, #0                   // x21 = 0 means dot
     bl _kcc_pp_next               // consume '.'
@@ -889,7 +918,18 @@ _kcc_parse_primary_expr:
     mov x1, x19
     str  x1, [x0, #AST_F0]      // value
     b .Lprimary_done
+@| _kcc_parse_primary_expr
+@}
 
+\paragraph{Parenthesized expressions and generic selection.}
+When the cast-expression parser has already consumed the opening parenthesis
+and determined that what follows is not a type name, control arrives at
+\texttt{.Lprimary\_paren} to handle a regular parenthesized expression.
+The \texttt{\_Generic} keyword (\stdref{6.5.1.1}) introduces a generic
+selection: \texttt{\_Generic(controlling-expr, type: expr, ...)},
+resolved at compile time based on the type of the controlling expression.
+
+@d Expr: parse primary @{
 .Lprimary_paren:
     // Handled by cast_expr, but if we get here directly,
     // consume '(' and parse expression
@@ -991,7 +1031,16 @@ _kcc_parse_primary_expr:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@}
 
+\paragraph{Integer literal conversion.}
+The helper \texttt{kcc\_parse\_atoi} converts integer literal token text
+into a machine integer.  It recognises four radix prefixes: bare digits
+for decimal, \texttt{0x}/\texttt{0X} for hexadecimal, a leading zero for
+octal, and \texttt{0b}/\texttt{0B} for binary.  Type suffixes
+(\texttt{u}, \texttt{U}, \texttt{l}, \texttt{L}) are silently skipped.
+
+@d Expr: parse primary @{
 // -- kcc_parse_atoi ----------------------------------------------------
 // uint64_t kcc_parse_atoi(const char *str, uint64_t len)
 //   x0 = pointer to digit string
@@ -1132,6 +1181,7 @@ _kcc_parse_atoi:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_parse_atoi
 @}
 
 \section{Argument List}
@@ -1201,9 +1251,17 @@ _kcc_parse_arg_list:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_arg_list
 @}
 
 \section{Expression Data}
+
+This fragment collects the static data used by the expression parser: the
+diagnostic string emitted when an unexpected token appears where an expression
+is expected, and the precedence lookup table that drives the binary operator
+precedence climbing algorithm.  The table is laid out as 48~bytes starting at
+token type~60, one byte per punctuator slot, with nonzero entries for the
+binary operators at their C17 precedence levels.
 
 @d Expr: data @{
 // -- Expression parser data --------------------------------------------

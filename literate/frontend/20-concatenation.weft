@@ -115,6 +115,7 @@ _kcc_concat_strings:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_concat_strings
 @}
 
 \section{Data}

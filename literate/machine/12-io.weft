@@ -12,6 +12,9 @@
 \chapter{Buffered I/O}
 \label{ch:io}
 
+Issuing a syscall for every output character would be ruinously expensive; instead, all compiler output---diagnostics, generated code, debug traces---passes through a buffered I/O layer that accumulates data in a 4\,KiB static buffer and flushes it in bulk.
+This chapter defines the buffer layout and global state, the flush routine, and the individual output primitives: \texttt{putc} for single bytes, \texttt{puts} for strings, \texttt{putu} for unsigned integers, and \texttt{putx} for hexadecimal.
+
 \section{Buffer Layout}
 
 The I/O state consists of four values: the file descriptor, the
@@ -29,6 +32,10 @@ _kcc_io_cap:  .quad 4096         // buffer capacity
 .bss
 .p2align 4
 _kcc_io_buf:  .space 4096        // output buffer
+@| _kcc_io_fd
+@| _kcc_io_pos
+@| _kcc_io_cap
+@| _kcc_io_buf
 @}
 
 \section{Flush}
@@ -74,6 +81,7 @@ _kcc_io_flush:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_io_flush
 @}
 
 \section{Put Character}
@@ -178,6 +186,7 @@ _kcc_io_puts:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_io_puts
 @}
 
 \section{Write N Bytes}
@@ -233,6 +242,7 @@ _kcc_io_write:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_io_write
 @}
 
 \section{Print Unsigned Integer}
@@ -287,6 +297,7 @@ _kcc_io_putu:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_io_putu
 @}
 
 \section{Stderr Output}
@@ -319,4 +330,5 @@ _kcc_io_err:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_io_err
 @}

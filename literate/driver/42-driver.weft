@@ -7,6 +7,8 @@
 \chapter{Compilation Driver}
 \label{ch:compile-driver}
 
+The preceding chapters implement each compilation phase in isolation; this chapter wires them together into a single end-to-end pipeline.  When the user invokes \texttt{kcc~-c}, the driver opens the source file, runs translation phases, parses, type-checks, lowers to IR, optimizes, generates machine code, and writes the resulting Mach-O object file.  The pipeline is deliberately sequential and straight-line---each phase completes before the next begins---so that errors are caught early and the overall flow is easy to trace.
+
 \section{Full Compilation Pipeline}
 
 The driver orchestrates every phase of compilation in a single
@@ -126,6 +128,7 @@ _kcc_driver_compile:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_driver_compile
 @}
 
 @d Driver: data @{

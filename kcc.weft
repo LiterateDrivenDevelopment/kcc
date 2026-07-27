@@ -138,6 +138,17 @@
 % ═══════════════════════════════════════════════════════════════════
 \part{Foundations}
 
+Every compiler is an implementation of a language standard, and the
+standard is a legal document: ambiguous, self-referential, and full of
+subtle constraints that only become visible when you try to encode them
+as executable rules.  This part pins down the normative corpus that
+\texttt{kcc} implements --- the final draft of ISO/IEC~9899:2018 (C17)
+--- and the conformance model that governs how a compiler may interpret
+the standard's requirements, undefined behaviour, and
+implementation-defined choices.  No code appears here; the chapters that
+follow lay the contractual ground on which every subsequent line of
+assembly rests.
+
 @i literate/foundations/01-normative-corpus.weft
 @i literate/foundations/02-conformance-model.weft
 
@@ -145,6 +156,23 @@
 % Part II: Machine
 % ═══════════════════════════════════════════════════════════════════
 \part{The Machine}
+
+A compiler that targets bare metal must build its own floor.  This part
+constructs the runtime substrate on which the rest of \texttt{kcc}
+stands: the ARM64 calling conventions and macro vocabulary
+(Chapter~\ref{ch:arm64-conventions}), thin wrappers around the Darwin
+\texttt{svc~\#0x80} system-call interface (Chapter~\ref{ch:syscalls}),
+a bump-pointer arena allocator backed by \texttt{mmap}
+(Chapter~\ref{ch:arena}), the three fundamental data structures every
+compiler needs --- hash table, dynamic vector, and string intern table
+(Chapter~\ref{ch:data-structures}) --- plus byte-level string
+operations (Chapter~\ref{ch:strings}), buffered I/O
+(Chapter~\ref{ch:io}), a diagnostic engine that formats
+\texttt{file:line:col: severity: message} errors to stderr
+(Chapter~\ref{ch:diagnostics}), and the source file manager that
+\texttt{mmap}s C source files for zero-copy lexing
+(Chapter~\ref{ch:source}).  None of these modules depend on any C
+library; every byte of output reaches the kernel through \texttt{svc}.
 
 @i literate/machine/07-arm64-conventions.weft
 @i literate/machine/08-syscalls.weft
@@ -159,6 +187,21 @@
 % Part III: The Frontend
 % ═══════════════════════════════════════════════════════════════════
 \part{The Frontend}
+
+The frontend transforms a stream of bytes into a structured
+representation of the program.  It follows the C17 translation phases
+almost to the letter: trigraph replacement and line splicing
+(Chapters~\ref{ch:source-encoding}--\ref{ch:line-splicing}), tokenisation into the
+roughly one hundred token types defined by the grammar
+(Chapter~\ref{ch:lexer}), preprocessing with macro expansion and
+conditional compilation (Chapter~\ref{ch:preprocessor}), string
+literal processing and adjacent-literal concatenation
+(Chapters~\ref{ch:string-literals}--\ref{ch:concatenation}), and finally recursive-descent
+parsing of declarations, expressions, and statements into an abstract
+syntax tree (Chapters~\ref{ch:parser}--\ref{ch:statements}).  The
+parser is hand-written --- no generator tools --- so every production
+rule is visible in the assembly, and error recovery follows a simple
+synchronisation-point strategy.
 
 @i literate/frontend/15-source-encoding.weft
 @i literate/frontend/16-line-splicing.weft
@@ -176,6 +219,21 @@
 % ═══════════════════════════════════════════════════════════════════
 \part{Semantics}
 
+Parsing proves that a program is syntactically well-formed; semantic
+analysis proves that it is \emph{meaningful}.  This part implements the
+type system (Chapter~\ref{ch:types}), with singleton descriptors for
+every built-in type and constructors for pointers, arrays, functions,
+structs, unions, and enums; the symbol table
+(Chapter~\ref{ch:symtab}), with separate scoped name spaces for
+ordinary identifiers and tags as required by \stdref{6.2.3}; the
+semantic analyser (Chapter~\ref{ch:sema}), which walks the AST
+checking declarations, statements, and expressions against the
+language's type rules; and the implicit conversion module
+(Chapter~\ref{ch:conversions}), which implements the standard's array,
+function, and lvalue decay rules.  After this pass, every AST
+expression node carries its resolved type, and any constraint
+violation has been reported as a diagnostic.
+
 @i literate/semantics/25-types.weft
 @i literate/semantics/26-symtab.weft
 @i literate/semantics/27-sema.weft
@@ -186,6 +244,19 @@
 % ═══════════════════════════════════════════════════════════════════
 \part{Intermediate Representation}
 
+Between the tree-shaped AST and the flat machine code lies the
+intermediate representation: a control-flow graph of basic blocks,
+each containing a linear sequence of three-address instructions in
+static single-assignment (SSA) form.  Chapter~\ref{ch:ir-design}
+defines the IR vocabulary --- constants, arithmetic, comparisons,
+memory operations, branches, calls, and allocas --- together with the
+data structures for functions, basic blocks, and instructions.
+Chapter~\ref{ch:ir-builder} walks the typed AST and emits the
+corresponding IR, lowering C control flow into explicit branches and
+phi-less SSA.  Chapter~\ref{ch:ir-validation} provides a structural
+integrity check that verifies every basic block is properly terminated
+before the IR is handed to later phases.
+
 @i literate/ir/31-ir-design.weft
 @i literate/ir/32-ir-builder.weft
 @i literate/ir/33-ir-validation.weft
@@ -195,6 +266,21 @@
 % ═══════════════════════════════════════════════════════════════════
 \part{Optimization}
 
+The IR produced by the builder is correct but na\"ive: it loads and
+stores every temporary through a stack slot, and it faithfully
+translates constant sub-expressions that could be folded at compile
+time.  This part applies two classical optimisation passes over the IR
+before code generation.  The pass manager (Chapter~\ref{ch:ir-passes})
+iterates over all functions and drives the individual passes.
+Constant folding and peephole simplification
+(Chapter~\ref{ch:peephole}) evaluate arithmetic on constants at
+compile time and replace redundant instruction patterns.  Dead code
+elimination (Chapter~\ref{ch:dce}) uses a mark-and-sweep algorithm
+over the use--def chains to remove instructions whose results are
+never consumed.  Together these passes eliminate the most obvious
+waste without introducing the complexity of a full register allocator
+or loop optimiser.
+
 @i literate/optimization/34-ir-passes.weft
 @i literate/optimization/35-peephole.weft
 @i literate/optimization/36-dce.weft
@@ -203,6 +289,23 @@
 % Part VII: The Backend
 % ═══════════════════════════════════════════════════════════════════
 \part{The Backend}
+
+The backend closes the loop: it lowers the optimised IR into ARM64
+machine code and packages the result as a Mach-O object file that
+Apple's linker can consume.  The code generator
+(Chapter~\ref{ch:codegen}) uses a simple all-spill strategy --- every
+virtual register lives in a stack slot, and three scratch registers
+(\texttt{x9}, \texttt{x10}, \texttt{x11}) shuttle values between
+slots and ALU --- trading runtime performance for implementation
+simplicity.  The ARM64 encoder (Chapter~\ref{ch:emit-arm64}) provides
+functions that pack each instruction class into its 32-bit binary
+encoding.  The Mach-O writer (Chapter~\ref{ch:emit-macho}) assembles the
+object file: header, load commands, code section, relocations, symbol
+table, and string table.  The linker-info module
+(Chapter~\ref{ch:linker-info}) manages relocations and symbols during code
+generation, and the compilation driver
+(Chapter~\ref{ch:compile-driver}) orchestrates the full pipeline from
+source file to \texttt{.o}.
 
 @i literate/backend/37-codegen.weft
 @i literate/backend/38-emit-arm64.weft
@@ -215,12 +318,35 @@
 % ═══════════════════════════════════════════════════════════════════
 \part{The Driver}
 
+The driver is the user-facing entry point of the compiler.  It parses
+the command-line arguments, selects the requested mode of operation ---
+\texttt{--dump-tokens} for lexer output, \texttt{-E} for preprocessor
+output, \texttt{--dump-ast} for the parse tree, \texttt{--dump-types}
+for type-annotated output, \texttt{--check} for semantic-only
+validation, \texttt{--dump-ir} for the intermediate representation, or
+\texttt{-c} for full compilation to an object file --- and dispatches to
+the appropriate pipeline stage.  Because the compiler has no C runtime,
+\texttt{\_main} is the true process entry point: it receives
+\texttt{argc} and \texttt{argv} directly from the kernel's stack frame.
+
 @i literate/driver/43-main.weft
 
 % ═══════════════════════════════════════════════════════════════════
 % Part V: Verification
 % ═══════════════════════════════════════════════════════════════════
 \part{Verification}
+
+Trust but verify.  This part contains the test infrastructure that
+guards against regressions as the compiler evolves.  The test harness
+(Chapter~\ref{ch:test-harness}) provides a minimal xUnit-style
+framework --- written in the same bare-metal ARM64 assembly as the
+compiler itself --- with setup helpers, assertion macros, and a runner
+that reports pass/fail counts to stdout.  The conformance tests
+(Chapter~\ref{ch:conformance}) exercise the lexer against the token
+categories defined by the C17 grammar: keywords, numeric constants,
+string and character literals, punctuators, comments, trigraphs, and
+line splicing.  Each test feeds a known input string to the lexer and
+asserts the expected token type and spelling.
 
 @i literate/verification/44-test-harness.weft
 @i literate/verification/45-conformance-tests.weft

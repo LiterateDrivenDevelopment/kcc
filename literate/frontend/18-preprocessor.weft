@@ -133,6 +133,7 @@ _kcc_pp_init:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_pp_init
 @}
 
 \section{The Preprocessor Loop}
@@ -294,6 +295,7 @@ _kcc_pp_next:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_pp_next
 @}
 
 \section{Directive Dispatch}
@@ -452,7 +454,16 @@ _kcc_pp_dispatch:
     bl _kcc_memcmp
     cbz x0, .Ldir_include
     b .Ldir_unknown
+@}
 
+\paragraph{Directive handlers.}
+Once the name has been identified by length and content, control falls
+through to a dispatch target that calls the appropriate handler function.
+Each handler is a standalone routine that consumes the rest of the
+directive line and returns to the dispatcher, which then restores
+callee-saved registers and returns to the preprocessor loop.
+
+@d PP: directive dispatch @{
 // Dispatch targets
 .Ldir_define:
     bl _kcc_pp_do_define
@@ -646,7 +657,17 @@ _kcc_pp_do_define:
     mov x24, x0                // x24 = body ptr
     mov x25, x1                // x25 = body len
     b .Ldef_store
+@}
 
+\paragraph{Storage and error reporting.}
+Both the object-like and function-like paths converge at
+\texttt{.Ldef\_store}, which allocates the macro definition structure
+in the arena, fills in every field, and inserts the definition into
+the macro hash table.  If the directive was malformed---a missing name
+or an invalid parameter list---the corresponding error label emits a
+diagnostic and skips to the end of the line.
+
+@d PP: define @{
 .Ldef_store:
     // Allocate macro definition in arena
     mov x0, #PP_MACRO_SIZE
@@ -835,7 +856,19 @@ _kcc_pp_do_ifdef:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@}
 
+The \texttt{\#if} and \texttt{\#elif} directives evaluate a constant
+integer expression to decide whether to process the enclosed source.
+\texttt{\_kcc\_pp\_do\_if} extracts the rest of the directive line,
+temporarily redirects the lexer to scan the expression text, calls the
+recursive-descent evaluator, and pushes an \texttt{ACTIVE} or
+\texttt{SKIP} state accordingly.  \texttt{\_kcc\_pp\_do\_elif} follows
+the same pattern but must also account for whether a previous branch
+in the same group was already taken---if so, the state becomes
+\texttt{DONE} regardless of the expression's value.
+
+@d PP: conditional @{
 // -- _kcc_pp_do_if --------------------------------------------------
 // Handles #if with basic expression evaluation.
 .p2align 2
@@ -892,7 +925,19 @@ _kcc_pp_do_if:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@}
 
+\paragraph{The \texttt{\#elif} directive.}
+The \texttt{\#elif} handler must determine whether a previous branch in
+the same conditional group was already taken.  If the current state is
+\texttt{ACTIVE}, the branch just processed was chosen, so the state
+transitions to \texttt{DONE} and the rest of the group is skipped.  If
+the state is already \texttt{DONE}, the directive line is consumed
+without evaluation.  Only when the state is \texttt{SKIP}---meaning no
+branch has yet matched---does the handler evaluate the expression and
+potentially activate the branch.
+
+@d PP: conditional @{
 // -- _kcc_pp_do_elif ------------------------------------------------
 .p2align 2
 _kcc_pp_do_elif:
@@ -1005,7 +1050,17 @@ _kcc_pp_do_elif:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@}
 
+\paragraph{\texttt{\#else}, \texttt{\#endif}, and the conditional push helper.}
+The \texttt{\#else} directive toggles the conditional stack: if the
+current branch was \texttt{ACTIVE} it becomes \texttt{DONE}, and if
+it was \texttt{SKIP} it becomes \texttt{ACTIVE}.  \texttt{\#endif}
+simply pops the stack by decrementing the depth counter.
+\texttt{\_kcc\_pp\_cond\_push} is the shared helper that stores a new
+state byte onto the stack and increments the depth.
+
+@d PP: conditional @{
 // -- _kcc_pp_do_else ------------------------------------------------
 .p2align 2
 _kcc_pp_do_else:
@@ -1104,7 +1159,18 @@ _kcc_pp_cond_push:
     ret
 .Lcpush_overflow:
     ret                        // silently cap depth
+@}
 
+When the preprocessor is skipping tokens inside a false conditional
+branch, it must still track nested \texttt{\#if}/\texttt{\#endif}
+pairs so that a matching \texttt{\#endif} pops the correct level.
+\texttt{\_kcc\_pp\_skip\_directive} examines directives encountered
+during skipping: \texttt{\#if}, \texttt{\#ifdef}, and
+\texttt{\#ifndef} push a new \texttt{SKIP} state, \texttt{\#endif}
+pops a level, and \texttt{\#elif}/\texttt{\#else} toggle the top of
+the conditional stack when the depth matches.
+
+@d PP: conditional @{
 // -- _kcc_pp_skip_directive -----------------------------------------
 // Handle directives encountered while skipping (conditional false).
 // Only #if/#ifdef/#ifndef (push), #elif/#else (toggle), #endif (pop)
@@ -1506,7 +1572,19 @@ _kcc_pp_try_expand:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_pp_try_expand
+@}
 
+\paragraph{Function-like expansion.}
+When a function-like macro is invoked, the preprocessor must first
+locate the opening parenthesis (skipping whitespace), then collect the
+argument list by tracking parenthesis depth across nested calls and
+splitting on commas at the top level.  Once all arguments are gathered,
+the substitution engine replaces each parameter name in the replacement
+body with the corresponding argument text before pushing the result
+onto the context stack.
+
+@d PP: expand @{
 .Lexp_funclike:
     // Function-like: peek for '(' after identifier
     adrp x0, _kcc_lex_cursor@@PAGE
@@ -1623,7 +1701,18 @@ _kcc_pp_try_expand:
     sub  x2, x0, x2            // length
     str  x2, [x1, #8]
     add  x24, x24, #1         // total arg count
+@}
 
+\paragraph{Substitution and expansion context.}
+With all arguments collected in the argument array, the expansion
+proceeds to the substitution phase.  The macro's replacement body,
+parameter list, and the freshly gathered argument texts are passed to
+\texttt{\_kcc\_pp\_substitute}, which performs textual replacement of
+parameter names with argument text.  If the result is non-empty, the
+macro is marked with \texttt{PP\_FLAG\_EXPANDING} to prevent recursive
+re-expansion, and the substituted text is pushed onto the context stack.
+
+@d PP: expand @{
     // Now substitute: build expanded text
     // For each identifier in body matching a param name, replace with arg text
     ldr  x0, [x21, #PP_MACRO_BODY]
@@ -1689,7 +1778,20 @@ _kcc_pp_try_expand:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@}
 
+\subsection{Parameter Substitution}
+
+For function-like macros, parameter names appearing in the replacement
+body must be replaced with the corresponding argument text collected
+from the call site.  \texttt{\_kcc\_pp\_substitute} walks the body
+character by character; when it encounters an identifier, it compares
+it against each parameter name using \texttt{\_kcc\_memcmp}.  On a
+match, the argument text is copied to the output buffer instead of
+the parameter name.  Non-identifier characters and unmatched
+identifiers are copied verbatim.
+
+@d PP: expand @{
 // -- _kcc_pp_substitute ---------------------------------------------
 // Substitutes parameters in macro body with argument text.
 // x0=body_ptr, x1=body_len, x2=params, x3=nparam, x4=args, x5=nargs
@@ -1747,7 +1849,18 @@ _kcc_pp_substitute:
     add x26, x26, #1
     add x27, x27, #1
     b .Lsub_loop
+@}
 
+\paragraph{Identifier extraction and parameter matching.}
+When the body walker encounters the start of an identifier (a letter or
+underscore), it enters the extraction path.  The scanner advances through
+subsequent identifier characters to delimit the full name, then compares
+it against every parameter in the macro's parameter list using
+\texttt{\_kcc\_memcmp}.  A match causes the corresponding argument text
+to be copied into the output buffer; an unmatched identifier is copied
+verbatim.
+
+@d PP: expand @{
 .Lsub_ident:
     // Found identifier start. Extract the full identifier
     mov x28, x27               // x28 = ident start position
@@ -2008,7 +2121,17 @@ _kcc_pp_ctx_push_expand:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@}
 
+When an included file or macro expansion reaches \texttt{TOK\_EOF},
+the preprocessor loop calls \texttt{\_kcc\_pp\_ctx\_pop} to restore
+the previous lexer state.  For expansion contexts, the macro's
+anti-recursion flag (\texttt{PP\_FLAG\_EXPANDING}) is cleared so that
+later occurrences of the same macro name can be expanded again.  For
+include contexts, the saved source buffer and path are restored in
+addition to the lexer cursor.
+
+@d PP: context @{
 // -- _kcc_pp_ctx_pop ------------------------------------------------
 // Pop context stack. Restores lexer state. Unmarks macro if expand.
 .p2align 2
@@ -2174,7 +2297,18 @@ _kcc_pp_eval_land:
     ldr  x19, [sp, #16]
     ldp  x29, x30, [sp], #32
     ret
+@| _kcc_pp_eval_expr
+@}
 
+The equality and relational operators form the next two precedence
+levels.  \texttt{\_kcc\_pp\_eval\_eq} handles \texttt{==} and
+\texttt{!=} by comparing the integer values returned from
+\texttt{\_kcc\_pp\_eval\_rel}, which in turn handles \texttt{<},
+\texttt{>}, \texttt{<=}, and \texttt{>=}.  All comparisons yield
+either~0 or~1 using the ARM64 \texttt{cset} instruction with the
+appropriate condition code.
+
+@d PP: eval @{
 // -- Equality: expr == expr, expr != expr
 .p2align 2
 _kcc_pp_eval_eq:
@@ -2270,7 +2404,18 @@ _kcc_pp_eval_rel:
     ldp  x19, x20, [sp, #16]
     ldp  x29, x30, [sp], #32
     ret
+@}
 
+At the lowest precedence tier sit the unary and primary expressions.
+\texttt{\_kcc\_pp\_eval\_unary} handles the logical-not operator
+\texttt{!} by recursing and then applying \texttt{cset eq}.
+\texttt{\_kcc\_pp\_eval\_primary} recognizes four forms: integer
+literals (parsed via \texttt{\_kcc\_pp\_atoi}), parenthesized
+sub-expressions, the \texttt{defined} operator (with or without
+parentheses), and bare identifiers---which evaluate to their macro
+body as an integer, or to~0 if undefined per \stdref{6.10.1}/4.
+
+@d PP: eval @{
 // -- Unary: !expr, primary
 .p2align 2
 _kcc_pp_eval_unary:
@@ -2294,7 +2439,18 @@ _kcc_pp_eval_unary:
     bl _kcc_pp_eval_primary
     ldp  x29, x30, [sp], #16
     ret
+@}
 
+\paragraph{Primary expressions and integer parsing.}
+A primary expression in a preprocessor \texttt{\#if} context is one
+of four forms: an integer literal, a parenthesized sub-expression,
+the \texttt{defined} operator (with or without parentheses around the
+macro name), or a bare identifier that is looked up as a macro and
+converted to an integer---defaulting to~0 for undefined names per
+\stdref{6.10.1} paragraph~4.  The helper \texttt{\_kcc\_pp\_atoi}
+performs simple decimal ASCII-to-integer conversion.
+
+@d PP: eval @{
 // -- Primary: number, defined(X), defined X, (expr), ident→0
 .p2align 2
 _kcc_pp_eval_primary:
@@ -2356,7 +2512,17 @@ _kcc_pp_eval_primary:
     ldr  x19, [sp, #16]
     ldp  x29, x30, [sp], #32
     ret
+@}
 
+\paragraph{Identifier and \texttt{defined} operator handling.}
+Identifiers in a preprocessor constant expression require special
+treatment.  The \texttt{defined} operator tests whether a macro name
+exists in the macro table, returning~1 or~0 without expanding it; both
+\texttt{defined(NAME)} and \texttt{defined NAME} forms are accepted per
+\stdref{6.10.1}.  Any other identifier is looked up as a macro and its
+body parsed as an integer; undefined names evaluate to~0.
+
+@d PP: eval @{
 .Leval_ident:
     // Check for "defined"
     adrp x0, _kcc_tok_start@@PAGE
@@ -2464,7 +2630,17 @@ _kcc_pp_eval_primary:
     ldr  x19, [sp, #16]
     ldp  x29, x30, [sp], #32
     ret
+@}
 
+\paragraph{Decimal integer parsing.}
+The helper \texttt{\_kcc\_pp\_atoi} converts a decimal digit string to a
+64-bit integer.  It walks the byte buffer from left to right, accumulating
+the result with a multiply-by-ten-and-add loop, and stops at the first
+non-digit character or end of input.  No sign handling is needed because
+preprocessor integer constants in \texttt{\#if} expressions are
+non-negative literals at this stage.
+
+@d PP: eval @{
 // -- _kcc_pp_atoi ---------------------------------------------------
 // Simple ASCII-to-integer: x0=ptr, x1=len → x0=value
 .p2align 2
@@ -2586,6 +2762,15 @@ _kcc_pp_def_simple:
 @}
 
 \section{Helper Functions}
+
+Two utility routines support the directive handlers.
+\texttt{\_kcc\_pp\_skip\_line} advances the lexer cursor past the end of
+the current line, updating the line counter when it crosses a newline.
+Directives call it to discard trailing tokens after the significant
+part has been processed.  \texttt{\_kcc\_pp\_rest\_of\_line} returns a
+pointer and length for the remaining text on the directive line, with
+leading and trailing whitespace trimmed, so that \texttt{\#define}
+bodies and \texttt{\#if} expressions can be extracted cleanly.
 
 @d PP: helpers @{
 .text
@@ -2731,9 +2916,18 @@ _kcc_pp_dump_all:
 .Lppdump_done:
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_pp_dump_all
 @}
 
 \section{Global State}
+
+The preprocessor keeps its state in a set of global variables.  The
+macro hash table (\texttt{\_kcc\_pp\_macros}) maps macro names to
+definition structures.  The context stack records saved lexer states
+for nested \texttt{\#include} files and macro expansions, while the
+conditional stack tracks \texttt{\#if}/\texttt{\#endif} nesting depth
+and branch state.  The \texttt{prev\_line} variable enables
+beginning-of-line detection for directive recognition.
 
 @d PP: data @{
 // -- Preprocessor global state --------------------------------------
@@ -2792,4 +2986,41 @@ _kcc_pp_err_include:      .asciz "#include expects \"file\" or <file>"
 _kcc_pp_err_unterm_cond:  .asciz "unterminated conditional directive"
 _kcc_pp_err_unterm_args:  .asciz "unterminated macro argument list"
 _kcc_pp_err_depth:        .asciz "maximum include/expansion depth exceeded"
+@| _kcc_pp_macros
+@| _kcc_pp_ctx_depth
+@| _kcc_pp_cond_depth
+@| _kcc_pp_prev_line
+@| _kcc_pp_has_pending
+@| _kcc_pp_dir_line
+@| _kcc_pp_ctx_stack
+@| _kcc_pp_cond_stack
+@| _kcc_pp_s_define
+@| _kcc_pp_s_undef
+@| _kcc_pp_s_ifdef
+@| _kcc_pp_s_ifndef
+@| _kcc_pp_s_if
+@| _kcc_pp_s_elif
+@| _kcc_pp_s_else
+@| _kcc_pp_s_endif
+@| _kcc_pp_s_include
+@| _kcc_pp_s_error
+@| _kcc_pp_s_line
+@| _kcc_pp_s_pragma
+@| _kcc_pp_s_defined
+@| _kcc_pp_pre_stdc
+@| _kcc_pp_pre_stdc_ver
+@| _kcc_pp_pre_hosted
+@| _kcc_pp_pre_one
+@| _kcc_pp_pre_c17val
+@| _kcc_pp_err_unknown_dir
+@| _kcc_pp_err_def_name
+@| _kcc_pp_err_def_param
+@| _kcc_pp_err_ifdef_name
+@| _kcc_pp_err_stray_elif
+@| _kcc_pp_err_stray_else
+@| _kcc_pp_err_stray_endif
+@| _kcc_pp_err_include
+@| _kcc_pp_err_unterm_cond
+@| _kcc_pp_err_unterm_args
+@| _kcc_pp_err_depth
 @}

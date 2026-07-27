@@ -7,7 +7,15 @@
 \chapter{Semantic Analysis}
 \label{ch:sema}
 
+Parsing produces a syntactically valid AST, but many constraints in the C language are semantic rather than syntactic: an operand must have arithmetic type for \texttt{+}, a function call must match its prototype, and every identifier must resolve to a visible declaration.  This chapter implements the semantic analysis pass that enforces these rules.  It walks the AST top-down, resolves declaration types using the type system from Chapter~\ref{ch:types}, populates the symbol table from Chapter~\ref{ch:symtab}, and annotates every expression node with its resolved type.  The chapter is organized around three domains: declaration checking, statement checking, and expression checking.
+
 \section{Entry Point}
+
+The top-level entry point receives the \texttt{AST\_TRANS\_UNIT} node
+and walks its linked list of declarations (chained via
+\texttt{AST\_F4}).  For each declaration it delegates to
+\texttt{\_kcc\_sema\_check\_decl}, which resolves types and
+populates the symbol table.
 
 @d Sema: check @{
 // -- kcc_sema_check -------------------------------------------------------
@@ -39,11 +47,21 @@ _kcc_sema_check:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_sema_check
 @}
 
 \section{Type Resolution}
 
-Convert parser AST type nodes into type descriptors.
+Type resolution converts parser-produced AST type nodes into the
+canonical type descriptors from Chapter~\ref{ch:types}.  The
+dispatcher handles nine type node kinds: built-in types use the
+specifier bitmask to select a pre-allocated singleton; pointer, array,
+and function types recurse into their children and call the
+corresponding type constructor.  Struct, union, and enum nodes
+delegate to their constructors.  Typedef names are resolved via
+symbol table lookup.  Qualified types are currently passed through to
+the base type.  Any unrecognised or null type node falls back to
+\texttt{int}.
 
 @d Sema: resolve type @{
 // -- kcc_sema_resolve_type ------------------------------------------------
@@ -185,9 +203,21 @@ _kcc_sema_resolve_type:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_sema_resolve_type
 @}
 
 \section{Declaration Checking}
+
+The declaration checker dispatches on the AST tag to handle each
+declaration kind.  Variable declarations resolve their type and
+register a \texttt{SYM\_VAR} in the symbol table, optionally
+type-checking the initialiser.  Function declarations register a
+\texttt{SYM\_FUNC}, push a new scope for parameters and body, then
+check the body statements.  Typedef declarations register
+\texttt{SYM\_TYPEDEF}.  Struct and union declarations register the
+tag in the tag namespace via \texttt{\_kcc\_symtab\_declare\_tag}.
+Enum declarations register the tag and walk the enumerator list,
+assigning each constant an incrementing integer value.
 
 @d Sema: check declaration @{
 // -- kcc_sema_check_decl --------------------------------------------------
@@ -312,7 +342,20 @@ _kcc_sema_check_decl:
     bl _kcc_symtab_label_end
     bl _kcc_symtab_pop_scope
     b .Lscd_done
+@| _kcc_sema_check_decl
+@}
 
+\paragraph{Typedefs, Aggregate Tags, and Enumerations}
+
+Typedef declarations resolve the underlying type and register the name
+with kind \texttt{SYM\_TYPEDEF}.  Struct and union declarations create
+the corresponding type descriptor via \texttt{kcc\_type\_struct} or
+\texttt{kcc\_type\_union} and register the tag in the tag name space.
+Enum declarations register both the tag itself and each enumerator
+constant as an ordinary symbol of type \texttt{int}, assigning
+consecutive integer values starting from zero.
+
+@d Sema: check declaration @{
 .Lscd_typedef:
     // Resolve type and register as typedef
     ldr x0, [x19, #AST_F0]         // type node
@@ -407,6 +450,17 @@ _kcc_sema_check_decl:
 
 \section{Statement Checking}
 
+The statement checker walks the AST recursively, dispatching on the
+statement tag.  Compound statements push a new scope before walking
+their children and pop it afterward, implementing C's block scoping
+rules.  Expression statements type-check their expression via
+\texttt{\_kcc\_sema\_expr}.  Control-flow statements
+(\texttt{if}/\texttt{while}/\texttt{do}/\texttt{for}) check their
+conditions and recurse into their bodies.  \texttt{for} pushes its
+own scope to contain the loop variable declaration.  Labels register
+themselves in the label namespace.  Declarations encountered inside
+compound statements are forwarded to the declaration checker.
+
 @d Sema: check statement @{
 // -- kcc_sema_check_stmt --------------------------------------------------
 // void kcc_sema_check_stmt(node *stmt)
@@ -470,7 +524,20 @@ _kcc_sema_check_stmt:
     b.eq .Lscs_done
 
     b .Lscs_done
+@| _kcc_sema_check_stmt
+@}
 
+\paragraph{Compound Statements and Control Flow}
+
+Compound statements push a new scope onto both the ordinary and tag
+stacks, walk their child list recursively, and pop the scope on exit.
+Expression statements simply type-check their contained expression.
+The \texttt{if}/\texttt{while}/\texttt{do}/\texttt{for} handlers each
+check their condition expression and recurse into their bodies;
+\texttt{for} additionally pushes its own scope to contain the loop
+variable declaration.
+
+@d Sema: check statement @{
 .Lscs_compound:
     bl _kcc_symtab_push_scope
 
@@ -537,7 +604,18 @@ _kcc_sema_check_stmt:
 .Lscs_for_end:
     bl _kcc_symtab_pop_scope
     b .Lscs_done
+@}
 
+\paragraph{Return, Switch, Labels, and Declarations}
+
+\texttt{return} type-checks its expression (if present) against the
+function's declared return type.  \texttt{switch} checks the controlling
+expression and recurses into the body.  Label, case, and default
+statements register or validate their labels and recurse into their
+associated statement.  Any declaration node encountered inside a compound
+statement is forwarded to \texttt{kcc\_sema\_check\_decl}.
+
+@d Sema: check statement @{
 .Lscs_return:
     ldr x0, [x19, #AST_F0]         // return expression
     cbz x0, .Lscs_done
@@ -594,6 +672,18 @@ _kcc_sema_check_stmt:
 @}
 
 \section{Expression Type-Checking}
+
+The expression type-checker is the core of semantic analysis.  It
+dispatches on the AST tag, delegates to specialised handlers for each
+expression kind, and stores the resolved type in the node's
+\texttt{AST\_F3} field.  Simple expressions are handled inline:
+parenthesised expressions unwrap to their child, comma expressions
+return the type of the right operand, conditional expressions return
+the type of the \emph{then} branch, and subscript expressions
+dereference one level of pointer or array type.  More complex
+expressions (identifiers, binary, unary, assignment, calls, member
+access, casts, sizeof) are delegated to dedicated subroutines
+described in the following subsections.
 
 @d Sema: check expression @{
 // -- kcc_sema_expr --------------------------------------------------------
@@ -743,9 +833,18 @@ _kcc_sema_expr:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_sema_expr
 @}
 
 \subsection{Identifier Expression}
+
+An identifier expression looks up the name in the symbol table.  If
+found, the symbol's type is returned after applying function and
+array decay (per \stdref{6.3.2.1}): a function designator decays to
+a pointer-to-function, and an array decays to a pointer to its first
+element.  Undeclared identifiers fall back to \texttt{int}; a
+diagnostic is deferred to avoid crashing on implicit function
+declarations common in legacy C code.
 
 @d Sema: expr ident @{
 // -- kcc_sema_expr_ident --------------------------------------------------
@@ -798,6 +897,11 @@ _kcc_sema_expr_ident:
 
 \subsection{Literal Expressions}
 
+Integer and character literals have type \texttt{int}.  String
+literals have type \texttt{char~*} (pointer to signed char), matching
+the C17 rule that a string literal is an array that decays to a
+pointer.
+
 @d Sema: expr literal @{
 // -- kcc_sema_expr_literal ------------------------------------------------
 // type_desc *kcc_sema_expr_literal(node *expr)
@@ -834,6 +938,14 @@ _kcc_sema_expr_literal:
 @}
 
 \subsection{Binary Expression}
+
+Binary expression type-checking first resolves the types of both
+operands.  Comparison and logical operators always produce
+\texttt{int} (per \stdref{6.5.8--9} and \stdref{6.5.13--14}).  If
+the left operand is a pointer and the operator is additive, the
+result is a pointer type (pointer arithmetic).  Otherwise, the usual
+arithmetic conversions (\texttt{\_kcc\_conv\_usual}) determine the
+common type.
 
 @d Sema: expr binary @{
 // -- kcc_sema_expr_binary -------------------------------------------------
@@ -910,6 +1022,14 @@ _kcc_sema_expr_binary:
 
 \subsection{Unary Expression}
 
+Unary expression types depend on the operator.  Address-of
+(\texttt{\&}) wraps the operand type in a pointer.  Dereference
+(\texttt{*}) unwraps one pointer level; if the operand is not a
+pointer, the checker falls back to \texttt{int}.  Logical not
+(\texttt{!}) always produces \texttt{int}.  All remaining operators
+(bitwise not, increment, decrement, unary minus and plus) preserve
+the operand type.
+
 @d Sema: expr unary @{
 // -- kcc_sema_expr_unary --------------------------------------------------
 // type_desc *kcc_sema_expr_unary(node *expr)
@@ -980,6 +1100,11 @@ _kcc_sema_expr_unary:
 
 \subsection{Assignment Expression}
 
+Per \stdref{6.5.16}, the type of an assignment expression is the type
+of the left operand.  Both sides are type-checked, but the result
+type is always the LHS type.  Compound assignments (\texttt{+=},
+\texttt{-=}, etc.) are treated identically for type purposes.
+
 @d Sema: expr assign @{
 // -- kcc_sema_expr_assign -------------------------------------------------
 // type_desc *kcc_sema_expr_assign(node *expr)
@@ -1010,6 +1135,14 @@ _kcc_sema_expr_assign:
 @}
 
 \subsection{Function Call}
+
+A function call first type-checks the callee expression, then
+walks the argument list and type-checks each argument.  The result
+type is the callee's return type, extracted from the
+\texttt{TY\_FUNC} descriptor's \texttt{TY\_F0} field.  If the callee
+is a pointer-to-function, the pointer is dereferenced first.
+Implicit function declarations (callee not found) fall back to
+\texttt{int} return.
 
 @d Sema: expr call @{
 // -- kcc_sema_expr_call ---------------------------------------------------
@@ -1078,6 +1211,13 @@ _kcc_sema_expr_call:
 
 \subsection{Member Access}
 
+Member access handles both dot (\texttt{s.m}) and arrow
+(\texttt{p->m}) forms.  For arrow access the object type must be a
+pointer, which is dereferenced first.  The resulting type must be
+\texttt{TY\_STRUCT} or \texttt{TY\_UNION}; if not, the checker falls
+back to \texttt{int}.  Actual member lookup in the struct/union's
+member list is a placeholder that also returns \texttt{int} for now.
+
 @d Sema: expr member @{
 // -- kcc_sema_expr_member -------------------------------------------------
 // type_desc *kcc_sema_expr_member(node *expr)
@@ -1134,6 +1274,11 @@ _kcc_sema_expr_member:
 
 \subsection{Cast Expression}
 
+A cast expression resolves its target type from the AST type node,
+type-checks the inner expression, and returns the target type as the
+result.  No conversion code is emitted at this stage; the IR builder
+handles actual truncation and extension.
+
 @d Sema: expr cast @{
 // -- kcc_sema_expr_cast ---------------------------------------------------
 // type_desc *kcc_sema_expr_cast(node *expr)
@@ -1164,6 +1309,12 @@ _kcc_sema_expr_cast:
 @}
 
 \subsection{Sizeof Expression}
+
+The \texttt{sizeof} operator can take either a type or an expression
+as its operand (distinguished by the \texttt{AST\_F1} flag).  If the
+operand is an expression, it is type-checked (though its value is not
+evaluated at run time).  In both cases the result type is
+\texttt{unsigned long}, which is \texttt{size\_t} on ARM64.
 
 @d Sema: expr sizeof @{
 // -- kcc_sema_expr_sizeof -------------------------------------------------
@@ -1201,6 +1352,16 @@ _kcc_sema_expr_sizeof:
 @}
 
 \section{Dump Types}
+
+The type dumper implements the \texttt{--dump-types} flag.  It walks
+the top-level declaration list and prints each variable, function, or
+typedef declaration together with its resolved type descriptor.  The
+output format is:
+\begin{verbatim}
+var x: int
+func main: int
+typedef size_t = unsigned long
+\end{verbatim}
 
 @d Sema: dump types @{
 // -- kcc_sema_dump_types --------------------------------------------------
@@ -1309,9 +1470,15 @@ _kcc_sema_dump_types:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_sema_dump_types
 @}
 
 \section{Semantic Analysis Data}
+
+Module-level state for semantic analysis: a pointer to the current
+function's return type (used to validate \texttt{return} statements),
+error message strings for diagnostics, and formatting strings used by
+the type dumper.
 
 @d Sema: data @{
 // -- Sema globals ---------------------------------------------------------
@@ -1337,4 +1504,11 @@ _kcc_sema_str_typedef:  .asciz "typedef "
 _kcc_sema_str_colon:    .asciz ": "
 _kcc_sema_str_eq:       .asciz " = "
 _kcc_sema_str_nl:       .asciz "\n"
+@| _kcc_sema_cur_ret
+@| _kcc_sema_str_var
+@| _kcc_sema_str_func
+@| _kcc_sema_str_typedef
+@| _kcc_sema_str_colon
+@| _kcc_sema_str_eq
+@| _kcc_sema_str_nl
 @}

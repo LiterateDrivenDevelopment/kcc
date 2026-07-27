@@ -149,7 +149,18 @@ _kcc_strlit_process:
     strb w0, [x23]
     add x23, x23, #1
     b .Lstrlit_loop
+@| _kcc_strlit_process
+@}
 
+\paragraph{Simple escape handlers.}
+Each single-character escape sequence maps to a fixed byte value defined by
+the standard.  The handler stores the replacement byte into the output buffer
+at~\texttt{x23}, advances the cursor, and branches back to the main loop.
+These thirteen cases cover every simple escape in~\stdref{6.4.4.4}
+paragraph~7, plus the null character \texttt{\textbackslash 0} from
+paragraph~6.
+
+@d StringLit: process @{
 .Lstrlit_esc_n:
     mov w0, #0x0A
     strb w0, [x23]
@@ -235,7 +246,19 @@ _kcc_strlit_process:
     strb w0, [x23]
     add x23, x23, #1
     b .Lstrlit_loop
+@}
 
+\paragraph{Numeric escape sequences.}
+Octal escapes (\texttt{\textbackslash}\emph{NNN}, \stdref{6.4.4.4}/6)
+and hexadecimal escapes (\texttt{\textbackslash x}\emph{NN},
+\stdref{6.4.4.4}/8) require multi-digit accumulation.  Octal sequences
+consume up to three digits and shift left by three per digit; hexadecimal
+sequences consume an unlimited number of digits (the standard allows it)
+and shift left by four.  Both truncate the final value to a single byte
+before storing it in the output buffer.  The function epilogue restores
+callee-saved registers and returns the processed buffer pointer and length.
+
+@d StringLit: process @{
 .Lstrlit_esc_octal:
     // w0 already has the first octal digit ('1'-'7')
     sub w0, w0, #'0'             // convert to value

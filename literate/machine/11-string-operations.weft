@@ -12,6 +12,10 @@
 \chapter{String Operations}
 \label{ch:strings}
 
+Without a C library, the compiler must supply its own implementations of the fundamental memory and string primitives.
+This chapter provides \texttt{strlen}, \texttt{memcpy}, \texttt{memcmp}, \texttt{memset}, and \texttt{strcmp}---five routines used pervasively by the lexer, the arena, the I/O layer, and the string intern table.
+Each function follows AAPCS64 conventions and establishes the mandatory Apple frame pointer.
+
 \section{String Length}
 
 Compute the length of a null-terminated string by scanning for the

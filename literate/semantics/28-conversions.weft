@@ -7,6 +7,8 @@
 \chapter{Type Conversions}
 \label{ch:conversions}
 
+C specifies a set of implicit type conversions that the compiler must apply automatically whenever operands do not match the type expected by an operator or context (\stdref{6.3}).  This chapter implements the four key conversion rules: integer promotions widen types narrower than \texttt{int}; the usual arithmetic conversions harmonize two operands to a common type; array-to-pointer and function-to-pointer decay convert lvalues to their implicit pointer forms; and lvalue conversion strips qualifiers to produce an rvalue.
+
 \section{Integer Promotions}
 
 Per \stdref{6.3.1.1}, types with rank less than \texttt{int} promote
@@ -53,6 +55,7 @@ _kcc_conv_promote:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_conv_promote
 @}
 
 \section{Usual Arithmetic Conversions}
@@ -183,9 +186,17 @@ _kcc_conv_usual:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_conv_usual
 @}
 
 \section{Array and Function Decay}
+
+Per \stdref{6.3.2.1}, an expression of array type decays to a pointer to
+its first element in most contexts (except \texttt{sizeof}, \texttt{\_Alignof},
+and the \texttt{\&} operator).  Similarly, a function designator decays to
+a pointer-to-function (\stdref{6.3.2.1p4}).  Both functions check the
+\texttt{TY\_KIND} field and, if the type matches, call
+\texttt{kcc\_type\_ptr} to wrap it; otherwise they return the type unchanged.
 
 @d Conv: array decay @{
 // -- kcc_conv_array_decay -------------------------------------------------
@@ -213,7 +224,13 @@ _kcc_conv_array_decay:
 .Lcad_unchanged:
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_conv_array_decay
 @}
+
+Function designators undergo an analogous decay: a value of function
+type is implicitly converted to a pointer-to-function (\stdref{6.3.2.1p4}).
+This allows a function name to be used directly in a call expression
+without the explicit \texttt{\&} operator.
 
 @d Conv: func decay @{
 // -- kcc_conv_func_decay --------------------------------------------------
@@ -240,9 +257,15 @@ _kcc_conv_func_decay:
 .Lcfd_unchanged:
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_conv_func_decay
 @}
 
 \section{Lvalue Conversion}
+
+When an lvalue appears in a context that requires an rvalue, its qualifiers
+are stripped (\stdref{6.3.2.1p2}).  The current implementation is a
+no-op stub that returns the descriptor unchanged, since qualifier
+enforcement is handled separately during semantic analysis.
 
 @d Conv: lvalue @{
 // -- kcc_conv_lvalue ------------------------------------------------------
@@ -262,9 +285,17 @@ _kcc_conv_lvalue:
     // Simple implementation: just return the type as-is
     // (qualifier checking is separate from lvalue conversion)
     ret
+@| _kcc_conv_lvalue
 @}
 
 \section{Implicit Conversion Check}
+
+This predicate determines whether an implicit conversion from one type to
+another is valid.  It returns~1 for same-type, integer-to-integer,
+arithmetic-to-arithmetic, pointer-to-pointer, and integer/pointer
+cross-conversions (the last with a diagnostic warning in later passes).
+The check is intentionally permissive so that sema can issue warnings
+rather than hard errors for narrowing or sign-changing conversions.
 
 @d Conv: implicit @{
 // -- kcc_conv_implicit ----------------------------------------------------
@@ -346,4 +377,5 @@ _kcc_conv_implicit:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_conv_implicit
 @}

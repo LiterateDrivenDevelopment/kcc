@@ -9,6 +9,8 @@
 \chapter{Type System}
 \label{ch:types}
 
+Every C expression has a type, and the compiler must track these types to enforce the language's constraints and to determine the size, alignment, and representation of every object.  This chapter defines the type descriptor---a 48-byte arena-allocated record that encodes kind, size, alignment, and qualifiers---and builds the infrastructure around it.  We begin with the descriptor layout and the pre-allocated singletons for built-in types, then provide constructors for derived types (pointers, arrays, functions, structures, unions, and enumerations), predicate functions for querying type properties, a specifier resolver that converts the parser's bitmask into a canonical type, and a diagnostic dump for debugging.
+
 \section{Type Descriptor Layout}
 
 A type descriptor occupies 48 bytes with the following layout:
@@ -115,7 +117,21 @@ _kcc_types_init:
     adrp x1, _kcc_type_bool@@PAGE
     add  x1, x1, _kcc_type_bool@@PAGEOFF
     str x19, [x1]
+@| _kcc_types_init
+@}
 
+\paragraph{Character and Integer Type Singletons}
+
+The next block allocates singletons for every standard integer type, from
+\texttt{char} through \texttt{long long}, each in both signed and unsigned
+variants.  The C17 standard treats plain \texttt{char}, \texttt{signed char},
+and \texttt{unsigned char} as three distinct types (\stdref{6.2.5p15}); our
+implementation maps plain \texttt{char} to \texttt{signed char}, following the
+default sign convention on Apple ARM64 targets.  Each descriptor stores its
+signedness in \texttt{TY\_F0} (1 for signed, 0 for unsigned) so that later
+stages can select the correct conversion and promotion rules.
+
+@d Types: init @{
     // signed char
     mov x0, #TY_DESC_SIZE
     bl _kcc_arena_alloc
@@ -280,7 +296,18 @@ _kcc_types_init:
     adrp x1, _kcc_type_llong_u@@PAGE
     add  x1, x1, _kcc_type_llong_u@@PAGEOFF
     str x19, [x1]
+@}
 
+\paragraph{Floating-Point Type Singletons}
+
+The three floating-point singletons cover \texttt{float} (4~bytes),
+\texttt{double} (8~bytes), and \texttt{long double} (16~bytes on ARM64).
+Unlike integer types, floating-point descriptors do not use \texttt{TY\_F0}
+for signedness --- all three are inherently signed per \stdref{6.2.5p10}.
+After allocating the last singleton the function restores callee-saved
+registers \texttt{x19}/\texttt{x20} and returns.
+
+@d Types: init @{
     // float
     mov x0, #TY_DESC_SIZE
     bl _kcc_arena_alloc
@@ -338,6 +365,12 @@ _kcc_types_init:
 
 \subsection{Pointer Type}
 
+Construct a pointer type descriptor from a given pointee type.  The function
+arena-allocates a \texttt{TY\_DESC\_SIZE} record, sets its kind to
+\texttt{TY\_PTR}, and records size and alignment as 8 bytes (the pointer
+width on ARM64).  The pointee type descriptor is stored in \texttt{TY\_F0}
+so that later phases can dereference through the pointer chain.
+
 @d Types: make pointer @{
 // -- kcc_type_ptr ---------------------------------------------------------
 // type_desc *kcc_type_ptr(type_desc *pointee)
@@ -367,9 +400,16 @@ _kcc_type_ptr:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_type_ptr
 @}
 
 \subsection{Array Type}
+
+Construct an array type descriptor.  The element type is saved in
+\texttt{TY\_F0} and the array length in \texttt{TY\_F1}; a length of zero
+indicates an incomplete array type (\stdref{6.2.5}).  The total size is
+computed as element size multiplied by length, and alignment is inherited
+directly from the element type.
 
 @d Types: make array @{
 // -- kcc_type_array -------------------------------------------------------
@@ -404,9 +444,16 @@ _kcc_type_array:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_type_array
 @}
 
 \subsection{Function Type}
+
+Construct a function type descriptor.  The return type is stored in
+\texttt{TY\_F0} and the parameter type vector in \texttt{TY\_F1}.  Function
+types are not object types, so both size and alignment are set to zero
+(\stdref{6.2.5}).  The parameter vector may be null for unprototyped
+(K\&R-style) declarations.
 
 @d Types: make function @{
 // -- kcc_type_func --------------------------------------------------------
@@ -437,9 +484,18 @@ _kcc_type_func:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_type_func
 @}
 
 \subsection{Struct/Union Type}
+
+Construct struct and union type descriptors.  At creation time, size and
+alignment are left at zero because member layout has not been computed yet;
+the semantic analysis pass fills them in once all members are known.  The
+AST declaration node is stored in \texttt{TY\_F0}, and \texttt{TY\_F1}
+will later hold the member vector populated by sema.  The only difference
+between the two constructors is the kind constant (\texttt{TY\_STRUCT}
+versus \texttt{TY\_UNION}).
 
 @d Types: make struct @{
 // -- kcc_type_struct ------------------------------------------------------
@@ -494,9 +550,16 @@ _kcc_type_union:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_type_struct
+@| _kcc_type_union
 @}
 
 \subsection{Enum Type}
+
+Construct an enum type descriptor.  Per \stdref{6.7.2.2}, the underlying
+type of an enumeration is \texttt{int}, so size and alignment are both set
+to~4.  The AST enum declaration node is stored in \texttt{TY\_F0} for later
+reference during enumerator constant evaluation.
 
 @d Types: make enum @{
 // -- kcc_type_enum --------------------------------------------------------
@@ -527,6 +590,7 @@ _kcc_type_enum:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_type_enum
 @}
 
 \section{Specifier Bitmask Resolution}
@@ -606,7 +670,21 @@ _kcc_type_from_specmask:
     mov x1, #(SPEC_UNSIGNED | SPEC_INT)
     cmp x0, x1
     b.eq .Ltfm_int_u
+@| _kcc_type_from_specmask
+@}
 
+\paragraph{Long, Long Long, and Floating-Point Dispatch}
+
+The remaining dispatch covers \texttt{long} and \texttt{long long} types,
+which accept the most specifier combinations in C17.  The parser may set
+\texttt{SPEC\_LONG} alone or combined with \texttt{SPEC\_LLONG} (from two
+successive \texttt{long} keywords), and any of these may appear with or
+without \texttt{SPEC\_SIGNED}, \texttt{SPEC\_UNSIGNED}, or \texttt{SPEC\_INT}.
+After the integer specifiers, the floating-point keywords \texttt{float},
+\texttt{double}, and \texttt{long double} are matched.  Any bitmask that
+falls through every comparison returns zero to signal an invalid combination.
+
+@d Types: resolve specmask @{
     // long / signed long / long int / signed long int
     mov x1, #SPEC_LONG
     cmp x0, x1
@@ -688,7 +766,18 @@ _kcc_type_from_specmask:
     // Invalid combination
     mov x0, #0
     b .Ltfm_done
+@}
 
+\paragraph{Singleton Pointer Loads}
+
+Each label target below loads the address of the corresponding global
+singleton pointer (e.g.\ \texttt{\_kcc\_type\_int\_s}) using an
+\texttt{ADRP+ADD} pair, dereferences it to obtain the type descriptor
+allocated by \texttt{kcc\_types\_init}, and branches to the common
+epilogue at \texttt{.Ltfm\_done}.  The pattern is uniform across all
+fifteen basic types --- only the symbol name changes.
+
+@d Types: resolve specmask @{
 .Ltfm_void:
     adrp x0, _kcc_type_void@@PAGE
     add  x0, x0, _kcc_type_void@@PAGEOFF
@@ -771,6 +860,14 @@ _kcc_type_from_specmask:
 
 \section{Type Predicates}
 
+The type predicates implement the classification rules from \stdref{6.2.5}
+and the compatibility check from \stdref{6.2.7}.  \texttt{kcc\_type\_compatible}
+first tests pointer identity (same descriptor means trivially compatible),
+then compares kind constants and, for basic types, the signedness field in
+\texttt{TY\_F0}.  The helper predicates \texttt{kcc\_type\_is\_integer},
+\texttt{kcc\_type\_is\_arithmetic}, and \texttt{kcc\_type\_is\_scalar}
+classify a type by checking its kind against the relevant set of constants.
+
 @d Types: compatible @{
 // -- kcc_type_compatible --------------------------------------------------
 // int kcc_type_compatible(type_desc *t1, type_desc *t2)
@@ -815,7 +912,14 @@ _kcc_type_compatible:
 .Ltc_no:
     mov x0, #0
     ret
+@| _kcc_type_compatible
 @}
+
+\texttt{kcc\_type\_is\_integer} checks whether a type belongs to the
+integer category (\stdref{6.2.5p17}): \texttt{\_Bool}, \texttt{char},
+\texttt{short}, \texttt{int}, \texttt{long}, \texttt{long long}, and
+enumerated types.  The check is a linear scan of kind constants ---
+seven comparisons at most.
 
 @d Types: is integer @{
 // -- kcc_type_is_integer --------------------------------------------------
@@ -845,7 +949,13 @@ _kcc_type_is_integer:
 .Ltii_yes:
     mov x0, #1
     ret
+@| _kcc_type_is_integer
 @}
+
+Arithmetic types are the union of integer types and floating-point
+types (\stdref{6.2.5p18}).  \texttt{kcc\_type\_is\_arithmetic} first
+delegates to \texttt{kcc\_type\_is\_integer}; if that returns false, it
+checks for \texttt{float}, \texttt{double}, and \texttt{long double}.
 
 @d Types: is arithmetic @{
 // -- kcc_type_is_arithmetic -----------------------------------------------
@@ -880,7 +990,14 @@ _kcc_type_is_arithmetic:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_type_is_arithmetic
 @}
+
+Scalar types comprise all arithmetic types plus pointer types
+(\stdref{6.2.5p21}).  This predicate is used throughout semantic
+analysis wherever the standard requires a ``scalar expression'' ---
+for example, the controlling expression of \texttt{if}, \texttt{while},
+and \texttt{for} statements.
 
 @d Types: is scalar @{
 // -- kcc_type_is_scalar ---------------------------------------------------
@@ -911,9 +1028,17 @@ _kcc_type_is_scalar:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_type_is_scalar
 @}
 
 \section{Integer Conversion Rank}
+
+Every integer type has a \emph{conversion rank} that governs the usual
+arithmetic conversions (\stdref{6.3.1.1}).  The ranking assigns
+\texttt{\_Bool} the lowest rank (1) and \texttt{long long} the highest (6),
+with \texttt{enum} sharing the rank of \texttt{int}.  The function returns
+the rank as an unsigned integer so that callers can compare two types with
+a simple greater-than test.
 
 @d Types: rank @{
 // -- kcc_type_rank --------------------------------------------------------
@@ -960,6 +1085,7 @@ _kcc_type_rank:
 .Ltr_llong:
     mov x0, #6
     ret
+@| _kcc_type_rank
 @}
 
 \section{Type Dump}
@@ -1041,7 +1167,21 @@ _kcc_type_dump:
     add  x0, x0, _kcc_ty_str_unknown@@PAGEOFF
     bl _kcc_io_puts
     b .Ltd_done
+@| _kcc_type_dump
+@}
 
+\paragraph{Basic Type Label Targets}
+
+Each label below prints the human-readable name for one basic type kind.
+For integer types (\texttt{char} through \texttt{long long}), the code
+checks the \texttt{TY\_F0} signedness flag stored in the descriptor and
+selects the appropriate string --- for example, \texttt{"int"} versus
+\texttt{"unsigned int"}.  Non-integer basic types (\texttt{void},
+\texttt{\_Bool}, \texttt{float}, \texttt{double}, \texttt{long double})
+print a fixed string unconditionally since they have no signed/unsigned
+variants.
+
+@d Types: dump @{
 .Ltd_null:
     adrp x0, _kcc_ty_str_null@@PAGE
     add  x0, x0, _kcc_ty_str_null@@PAGEOFF
@@ -1133,6 +1273,20 @@ _kcc_type_dump:
     add  x0, x0, _kcc_ty_str_ldouble@@PAGEOFF
     bl _kcc_io_puts
     b .Ltd_done
+@}
+
+\paragraph{Derived Type Label Targets}
+
+Derived types require more than a single string print.  Pointer types
+recursively call \texttt{kcc\_type\_dump} on the pointee stored in
+\texttt{TY\_F0}, then append \texttt{" *"}.  Array types print the element
+type followed by the length in brackets via \texttt{kcc\_io\_putu}.  Function
+types print the return type followed by \texttt{" ()"}.  Aggregate types
+(\texttt{struct}, \texttt{union}, \texttt{enum}) currently print only their
+tag keyword; full member layout details are deferred to the semantic analysis
+dump routines.
+
+@d Types: dump @{
 .Ltd_ptr:
     // Print pointee type then " *"
     ldr x0, [x19, #TY_F0]
@@ -1182,6 +1336,12 @@ _kcc_type_dump:
 @}
 
 \section{Type Data}
+
+This section collects the global storage for the type subsystem.  The
+singleton pointers (one \texttt{.quad} per basic type) are initialised to
+zero and filled by \texttt{kcc\_types\_init} at startup.  The string
+literals in \texttt{\_\_TEXT,\_\_cstring} provide human-readable names used
+by \texttt{kcc\_type\_dump} for diagnostic output.
 
 @d Types: data @{
 // -- Type singleton pointers ----------------------------------------------
@@ -1245,4 +1405,44 @@ _kcc_ty_str_const:    .asciz "const "
 _kcc_ty_str_volatile: .asciz "volatile "
 _kcc_ty_str_unknown:  .asciz "<unknown>"
 _kcc_ty_str_null:     .asciz "<null>"
+@| _kcc_type_void
+@| _kcc_type_bool
+@| _kcc_type_char_s
+@| _kcc_type_char_u
+@| _kcc_type_short_s
+@| _kcc_type_short_u
+@| _kcc_type_int_s
+@| _kcc_type_int_u
+@| _kcc_type_long_s
+@| _kcc_type_long_u
+@| _kcc_type_llong_s
+@| _kcc_type_llong_u
+@| _kcc_type_float
+@| _kcc_type_double
+@| _kcc_type_ldouble
+@| _kcc_ty_str_void
+@| _kcc_ty_str_bool
+@| _kcc_ty_str_char
+@| _kcc_ty_str_uchar
+@| _kcc_ty_str_short
+@| _kcc_ty_str_ushort
+@| _kcc_ty_str_int
+@| _kcc_ty_str_uint
+@| _kcc_ty_str_long
+@| _kcc_ty_str_ulong
+@| _kcc_ty_str_llong
+@| _kcc_ty_str_ullong
+@| _kcc_ty_str_float
+@| _kcc_ty_str_double
+@| _kcc_ty_str_ldouble
+@| _kcc_ty_str_ptr
+@| _kcc_ty_str_arr_open
+@| _kcc_ty_str_func
+@| _kcc_ty_str_struct
+@| _kcc_ty_str_union
+@| _kcc_ty_str_enum
+@| _kcc_ty_str_const
+@| _kcc_ty_str_volatile
+@| _kcc_ty_str_unknown
+@| _kcc_ty_str_null
 @}

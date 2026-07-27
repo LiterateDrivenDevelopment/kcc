@@ -15,6 +15,8 @@
 \chapter{Lexical Analysis}
 \label{ch:lexer}
 
+Lexical analysis is Phase~3 of the C17 translation pipeline (\stdref{5.1.1.2}, paragraph~3): the source buffer is decomposed into preprocessing tokens according to the longest-match rule of \stdref{6.4}.  The lexer scans identifiers, numeric constants, string and character literals, and punctuators, while a hash table maps identifier text to keyword token codes.  This chapter begins with the token type constants, then covers initialization, the main \texttt{kcc\_lex\_next} dispatch loop, individual scanners for each token category, keyword recognition, and the global state that connects the lexer to the rest of the compiler.
+
 \section{Token Types}
 
 Every C17 token falls into one of the categories defined in \stdref{6.4}:
@@ -169,6 +171,7 @@ _kcc_lex_init:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_lex_init
 @}
 
 \section{Next Token}
@@ -256,7 +259,17 @@ _kcc_lex_next:
     cmp w2, #'*'
     b.eq .Llex_block_comment
     b .Llex_dispatch             // just a '/' punctuator
+@| _kcc_lex_next
+@}
 
+\paragraph{Comment handling.}
+When the whitespace skipper detects a \texttt{/} character, it peeks
+one byte ahead.  A second \texttt{/} starts a line comment that runs
+to the next newline; a \texttt{*} starts a block comment that runs
+to the closing \texttt{*/} sequence.  Block comments may span
+multiple lines, so the newline counter is updated inside the loop.
+
+@d Lexer: next token @{
 .Llex_line_comment:
     // Skip until end of line
     add x20, x20, #2            // skip "//"
@@ -317,7 +330,16 @@ _kcc_lex_next:
     bl _kcc_diag_error
     // Treat as EOF
     b .Llex_eof
+@}
 
+\paragraph{EOF and character dispatch.}
+Once whitespace and comments have been consumed, we either hit EOF
+or a meaningful character.  The dispatcher classifies the first byte
+into one of four categories---identifier start (letter or underscore),
+digit, string or character delimiter, or punctuator---and branches to
+the corresponding scanner subroutine.
+
+@d Lexer: next token @{
 .Llex_eof:
     // Record token location before setting type
     bl _kcc_lex_record_loc
@@ -999,7 +1021,17 @@ _kcc_lex_scan_punct:
     add x20, x20, #1
     str x20, [x19]
     b .Lpunct_store
+@}
 
+\paragraph{Arithmetic operators.}
+The five arithmetic operators (\texttt{+}, \texttt{-}, \texttt{*}, \texttt{/}, \texttt{\%})
+each have compound-assignment forms (\texttt{+=}, \texttt{-=}, etc.).
+Additionally, \texttt{+} and \texttt{-} form increment/decrement
+(\texttt{++}, \texttt{--}), and \texttt{-} forms the arrow operator
+(\texttt{->}).  Each group peeks at the next character to decide
+between the single and compound forms.
+
+@d Lexer: scan punctuator @{
 // -- Multi-character punctuators ------------------------------------
 .Lpunct_plus:                     // + ++ +=
     add x1, x20, #1
@@ -1085,7 +1117,18 @@ _kcc_lex_scan_punct:
 .Lpunct_mod_assign:
     mov x0, #TOK_MOD_ASSIGN
     b .Lpunct_double
+@}
 
+\paragraph{Comparison, logical, and bitwise operators.}
+The relational operators \texttt{<} and \texttt{>} introduce the
+richest lookahead: each can form a simple comparison, a shift
+(\texttt{<<}, \texttt{>>}), a compound relation (\texttt{<=}, \texttt{>=}),
+or a shift-assign (\texttt{<<=}, \texttt{>>=})---requiring up to
+two bytes of lookahead.  The remaining operators in this group
+(\texttt{=}, \texttt{!}, \texttt{\&}, \texttt{|}, \texttt{\^})
+each have at most one compound form.
+
+@d Lexer: scan punctuator @{
 .Lpunct_lt:                       // < << <= <<=
     add x1, x20, #1
     cmp x1, x21
@@ -1223,7 +1266,18 @@ _kcc_lex_scan_punct:
 .Lpunct_xor_assign:
     mov x0, #TOK_XOR_ASSIGN
     b .Lpunct_double
+@}
 
+\paragraph{Remaining punctuators and shared helpers.}
+The hash (\texttt{\#}) and dot (\texttt{.}) punctuators round out
+the set.  Hash can double to form the token-pasting operator
+\texttt{\#\#}, while three consecutive dots form the ellipsis
+\texttt{...}.  The shared helpers \texttt{.Lpunct\_double} and
+\texttt{.Lpunct\_triple} advance the cursor by two or three bytes,
+and \texttt{.Lpunct\_store} writes the final token type, start
+pointer, and length into the global variables.
+
+@d Lexer: scan punctuator @{
 .Lpunct_hash:                     // # ##
     add x1, x20, #1
     cmp x1, x21
@@ -1365,6 +1419,7 @@ _kcc_lex_dump_token:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_lex_dump_token
 @}
 
 The dump-all loop repeatedly calls \texttt{kcc\_lex\_next} and
@@ -1395,6 +1450,7 @@ _kcc_lex_dump_all:
 .Ldump_done:
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_lex_dump_all
 @}
 
 \section{Token Type Names}
@@ -1486,6 +1542,66 @@ _kcc_tn_imaginary:    .asciz "_Imaginary"
 _kcc_tn_noreturn:     .asciz "_Noreturn"
 _kcc_tn_static_assert: .asciz "_Static_assert"
 _kcc_tn_thread_local: .asciz "_Thread_local"
+@| _kcc_lex_type_name
+@| _kcc_tn_eof
+@| _kcc_tn_identifier
+@| _kcc_tn_number
+@| _kcc_tn_char_lit
+@| _kcc_tn_string_lit
+@| _kcc_tn_unknown
+@| _kcc_tn_auto
+@| _kcc_tn_break
+@| _kcc_tn_case
+@| _kcc_tn_char
+@| _kcc_tn_const
+@| _kcc_tn_continue
+@| _kcc_tn_default
+@| _kcc_tn_do
+@| _kcc_tn_double
+@| _kcc_tn_else
+@| _kcc_tn_enum
+@| _kcc_tn_extern
+@| _kcc_tn_float
+@| _kcc_tn_for
+@| _kcc_tn_goto
+@| _kcc_tn_if
+@| _kcc_tn_inline
+@| _kcc_tn_int
+@| _kcc_tn_long
+@| _kcc_tn_register
+@| _kcc_tn_restrict
+@| _kcc_tn_return
+@| _kcc_tn_short
+@| _kcc_tn_signed
+@| _kcc_tn_sizeof
+@| _kcc_tn_static
+@| _kcc_tn_struct
+@| _kcc_tn_switch
+@| _kcc_tn_typedef
+@| _kcc_tn_union
+@| _kcc_tn_unsigned
+@| _kcc_tn_void
+@| _kcc_tn_volatile
+@| _kcc_tn_while
+@| _kcc_tn_alignas
+@| _kcc_tn_alignof
+@| _kcc_tn_atomic
+@| _kcc_tn_bool
+@| _kcc_tn_complex
+@| _kcc_tn_generic
+@| _kcc_tn_imaginary
+@| _kcc_tn_noreturn
+@| _kcc_tn_static_assert
+@| _kcc_tn_thread_local
+@}
+
+\paragraph{Punctuator name strings.}
+Each punctuator token type has a corresponding human-readable name
+used in the \texttt{--dump-tokens} output.  The names follow the
+convention used by Clang's token dump format: \texttt{l\_paren},
+\texttt{semi}, \texttt{plusplus}, \texttt{lessequal}, and so on.
+
+@d Lexer: token names @{
 // Punctuators
 _kcc_tn_lparen:       .asciz "l_paren"
 _kcc_tn_rparen:       .asciz "r_paren"
@@ -1535,7 +1651,63 @@ _kcc_tn_pipeequal:    .asciz "pipeequal"
 _kcc_tn_hash:         .asciz "hash"
 _kcc_tn_hashhash:     .asciz "hashhash"
 _kcc_tn_ellipsis:     .asciz "ellipsis"
+@| _kcc_tn_lparen
+@| _kcc_tn_rparen
+@| _kcc_tn_lbrace
+@| _kcc_tn_rbrace
+@| _kcc_tn_lbracket
+@| _kcc_tn_rbracket
+@| _kcc_tn_semi
+@| _kcc_tn_comma
+@| _kcc_tn_dot
+@| _kcc_tn_arrow
+@| _kcc_tn_plusplus
+@| _kcc_tn_minusminus
+@| _kcc_tn_amp
+@| _kcc_tn_star
+@| _kcc_tn_plus
+@| _kcc_tn_minus
+@| _kcc_tn_tilde
+@| _kcc_tn_exclaim
+@| _kcc_tn_slash
+@| _kcc_tn_percent
+@| _kcc_tn_lessless
+@| _kcc_tn_greatergreater
+@| _kcc_tn_less
+@| _kcc_tn_greater
+@| _kcc_tn_lessequal
+@| _kcc_tn_greaterequal
+@| _kcc_tn_equalequal
+@| _kcc_tn_exclaimequal
+@| _kcc_tn_caret
+@| _kcc_tn_pipe
+@| _kcc_tn_ampamp
+@| _kcc_tn_pipepipe
+@| _kcc_tn_question
+@| _kcc_tn_colon
+@| _kcc_tn_equal
+@| _kcc_tn_starequal
+@| _kcc_tn_slashequal
+@| _kcc_tn_percentequal
+@| _kcc_tn_plusequal
+@| _kcc_tn_minusequal
+@| _kcc_tn_lesslessequal
+@| _kcc_tn_greatergreaterequal
+@| _kcc_tn_ampequal
+@| _kcc_tn_caretequal
+@| _kcc_tn_pipeequal
+@| _kcc_tn_hash
+@| _kcc_tn_hashhash
+@| _kcc_tn_ellipsis
+@}
 
+\paragraph{Token name pointer table.}
+A flat array of 108 pointers, indexed by token type code, enables
+constant-time lookup in \texttt{kcc\_lex\_type\_name}.  Gaps in the
+code space (6--9 for future structural tokens, 54--59 reserved
+between keywords and punctuators) are filled with null entries.
+
+@d Lexer: token names @{
 // -- Token name pointer table ---------------------------------------
 // Indexed by token type code.  Entries 6-9, 54-59 are NULL (unused).
 .data
@@ -1750,6 +1922,50 @@ _kcc_kw_reg_table:
 
 .equ KW_COUNT, 44
 .equ KW_ENTRY_BYTES, 24       // 3 quads per entry
+@| _kcc_kw_s_auto
+@| _kcc_kw_s_break
+@| _kcc_kw_s_case
+@| _kcc_kw_s_char
+@| _kcc_kw_s_const
+@| _kcc_kw_s_continue
+@| _kcc_kw_s_default
+@| _kcc_kw_s_do
+@| _kcc_kw_s_double
+@| _kcc_kw_s_else
+@| _kcc_kw_s_enum
+@| _kcc_kw_s_extern
+@| _kcc_kw_s_float
+@| _kcc_kw_s_for
+@| _kcc_kw_s_goto
+@| _kcc_kw_s_if
+@| _kcc_kw_s_inline
+@| _kcc_kw_s_int
+@| _kcc_kw_s_long
+@| _kcc_kw_s_register
+@| _kcc_kw_s_restrict
+@| _kcc_kw_s_return
+@| _kcc_kw_s_short
+@| _kcc_kw_s_signed
+@| _kcc_kw_s_sizeof
+@| _kcc_kw_s_static
+@| _kcc_kw_s_struct
+@| _kcc_kw_s_switch
+@| _kcc_kw_s_typedef
+@| _kcc_kw_s_union
+@| _kcc_kw_s_unsigned
+@| _kcc_kw_s_void
+@| _kcc_kw_s_volatile
+@| _kcc_kw_s_while
+@| _kcc_kw_s_alignas
+@| _kcc_kw_s_alignof
+@| _kcc_kw_s_atomic
+@| _kcc_kw_s_bool
+@| _kcc_kw_s_complex
+@| _kcc_kw_s_generic
+@| _kcc_kw_s_imaginary
+@| _kcc_kw_s_noreturn
+@| _kcc_kw_s_sassert
+@| _kcc_kw_s_tlocal
 @}
 
 The initialization function creates a hash table and populates it
@@ -1805,6 +2021,7 @@ _kcc_lex_kw_init:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_lex_kw_init
 @}
 
 \section{Lexer Global State}
@@ -1846,4 +2063,17 @@ _kcc_kw_table:       .quad 0  // pointer to keyword hash table
 _kcc_err_unterm_string:  .asciz "unterminated string literal"
 _kcc_err_unterm_char:    .asciz "unterminated character constant"
 _kcc_err_unterm_comment: .asciz "unterminated block comment"
+@| _kcc_lex_cursor
+@| _kcc_lex_end
+@| _kcc_lex_line
+@| _kcc_lex_line_start
+@| _kcc_tok_type
+@| _kcc_tok_start
+@| _kcc_tok_len
+@| _kcc_tok_line
+@| _kcc_tok_col
+@| _kcc_kw_table
+@| _kcc_err_unterm_string
+@| _kcc_err_unterm_char
+@| _kcc_err_unterm_comment
 @}

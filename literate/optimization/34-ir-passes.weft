@@ -6,6 +6,16 @@
 \chapter{Optimization Passes}
 \label{ch:ir-passes}
 
+Generating correct IR is necessary, but the initial translation from AST to IR often leaves redundancy---constant expressions that could be evaluated at compile time, arithmetic identities that cancel out, and instructions whose results are never consumed.  This chapter provides the pass manager that drives optimization.  It iterates over every IR function and runs the available passes (constant folding and dead code elimination) in a loop until no further changes occur, achieving a fixed-point result.
+
+\section{Pass Manager}
+
+The pass manager runs optimization passes over each IR function until a
+fixed point is reached---that is, until no pass reports any changes.  Each
+pass is a function that takes an IR function pointer and returns non-zero
+if it modified something.  The outer loop iterates all functions in the
+module; the inner loop repeats the pass sequence until stable.
+
 @d Opt: pass manager @{
 // -- kcc_opt_run ----------------------------------------------------------
 // void kcc_opt_run(void)
@@ -49,7 +59,16 @@ _kcc_opt_run:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_opt_run
+@}
 
+\section{Per-Function Iteration}
+
+The per-function driver calls each registered pass and tracks whether any
+modification occurred.  When a pass fires, the \texttt{changed} flag resets
+the fixed-point loop so all passes run again on the modified IR.
+
+@d Opt: pass manager @{
 // -- kcc_opt_run_func -----------------------------------------------------
 // void kcc_opt_run_func(ir_func *func)
 // Iterates constfold + dce until no changes.
@@ -88,4 +107,5 @@ _kcc_opt_run_func:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_opt_run_func
 @}

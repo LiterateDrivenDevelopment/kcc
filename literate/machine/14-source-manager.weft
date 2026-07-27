@@ -12,6 +12,10 @@
 \chapter{Source File Management}
 \label{ch:source}
 
+Before the lexer can scan a single token, the source file must be loaded into memory.
+The source manager handles this by memory-mapping each file with \texttt{mmap}, giving the lexer a contiguous, zero-copy view of the entire translation unit.
+This chapter describes the source buffer layout, the file-opening sequence, and the global state that tracks the currently active source.
+
 \section{Design}
 
 A compiler must read source files efficiently.  The simplest approach
@@ -174,6 +178,7 @@ _kcc_source_open:
     bl _kcc_io_err
     mov x0, #1
     bl _kcc_sys_exit
+@| _kcc_source_open
 @}
 
 \section{Global State}
@@ -198,4 +203,12 @@ _kcc_err_read:   .asciz "kcc: error: cannot read file\n"
 _kcc_err_empty:  .asciz "kcc: error: source file is empty\n"
 _kcc_err_mmap:   .asciz "kcc: error: cannot map file\n"
 _kcc_src_newline: .asciz "\n"
+@| _kcc_src_base
+@| _kcc_src_size
+@| _kcc_src_path
+@| _kcc_err_open
+@| _kcc_err_read
+@| _kcc_err_empty
+@| _kcc_err_mmap
+@| _kcc_src_newline
 @}

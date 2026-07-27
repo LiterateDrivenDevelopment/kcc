@@ -12,6 +12,8 @@
 \chapter{Mach-O Emission}
 \label{ch:emit-macho}
 
+Once all machine code has been emitted and relocations recorded, the compiler must package the result into a file format that the system linker can consume.  This chapter writes a minimal Mach-O 64-bit object file (\texttt{MH\_OBJECT}) following Apple's conventions.  The output contains a \texttt{\_\_TEXT,\_\_text} section holding the generated code, a symbol table of defined and external symbols, relocation entries for branch and data-reference instructions, a string table for symbol names, and an \texttt{LC\_BUILD\_VERSION} load command to suppress linker warnings.
+
 \section{Constants}
 
 The constants define Mach-O magic numbers, CPU type codes, load
@@ -122,7 +124,23 @@ _kcc_macho_init:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_macho_init
+@}
 
+\paragraph{Primitive Integer Writers}
+
+The next four functions---\texttt{\_kcc\_macho\_write8},
+\texttt{\_kcc\_macho\_write16}, \texttt{\_kcc\_macho\_write32}, and
+\texttt{\_kcc\_macho\_write64}---each store a single little-endian
+value at the current buffer position and advance the position counter
+by the appropriate number of bytes.  They share an identical pattern:
+load the buffer base from \texttt{\_kcc\_macho\_buf}, load the
+current offset from \texttt{\_kcc\_macho\_pos}, perform a sized store
+(\texttt{strb}/\texttt{strh}/\texttt{str~w}/\texttt{str~x}), and
+bump the offset.  Because they never call another function, they are
+leaf routines with no stack frame.
+
+@d MachO: output buffer @{
 // -- kcc_macho_write8 ---------------------------------------------------------
 .text
 .globl _kcc_macho_write8
@@ -186,7 +204,24 @@ _kcc_macho_write64:
     add x3, x3, #8
     str x3, [x2]
     ret
+@| _kcc_macho_write8
+@| _kcc_macho_write16
+@| _kcc_macho_write32
+@| _kcc_macho_write64
+@}
 
+\paragraph{Bulk Data Copy and Alignment Padding}
+
+Two more routines complete the buffer API.
+\texttt{\_kcc\_macho\_write\_bytes} copies an arbitrary byte range
+into the output buffer using \texttt{\_kcc\_memcpy} and advances the
+position by the source length; it is used to emit raw code bytes and
+symbol-name strings.  \texttt{\_kcc\_macho\_pad\_to} inserts zero
+bytes until the write position reaches the next multiple of a given
+alignment---needed because Mach-O relocations must be 4-byte aligned
+and the code section size is not guaranteed to be a multiple of~4.
+
+@d MachO: output buffer @{
 // -- kcc_macho_write_bytes ----------------------------------------------------
 // void kcc_macho_write_bytes(const void *src, uint64_t len)
 .text
@@ -266,6 +301,8 @@ _kcc_macho_pad_to:
 .Lmpt_done:
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_macho_write_bytes
+@| _kcc_macho_pad_to
 @}
 
 \section{Finalize and Write}
@@ -385,7 +422,20 @@ _kcc_macho_finalize:
     b .Lmf_strtab_size
 .Lmf_strtab_done:
     // x27 = strtab_size
+@| _kcc_macho_finalize
+@}
 
+\paragraph{Symbol Classification for \texttt{LC\_DYSYMTAB}}
+
+The dynamic symbol table command requires the counts of defined
+external and undefined external symbols.  Mach-O mandates that
+defined symbols precede undefined ones in the symbol table, so we
+walk the linker's symbol vector and count how many have a non-zero
+\texttt{SYM\_SECTION} (defined) versus zero (undefined).  The
+defined count is stored in \texttt{x28}; the undefined count is
+derived later by subtraction from the total \texttt{x20}.
+
+@d MachO: finalize @{
     // Count defined vs undefined symbols for dysymtab
     mov x28, #0                    // index
     str xzr, [sp, #96]            // nlocal = 0
@@ -497,7 +547,23 @@ versions.
     // flags = 0
     mov w0, #0
     bl _kcc_macho_write32
+@}
 
+\paragraph{Section Headers}
+
+Each section within the segment gets an 80-byte
+\texttt{section\_64} descriptor.  The \texttt{\_\_TEXT,\_\_text}
+section carries the executable machine code: its \texttt{offset}
+points to the raw bytes in the file, its \texttt{reloff}/\texttt{nreloc}
+reference the relocation entries, and its flags mark it as containing
+pure instructions.  The \texttt{\_\_DATA,\_\_common} section is a
+\texttt{S\_ZEROFILL} region for uninitialized global variables; it
+occupies virtual address space immediately after the text section but
+requires no file storage---the \texttt{offset} and \texttt{reloff}
+fields are both zero.  Section and segment names are written as
+inline immediate constants to avoid linker dead-stripping issues.
+
+@d MachO: finalize @{
     // ---- Section: __text ----
     // sectname (16 bytes): "__text" + 10 null bytes
     // Little-endian: "__text\0\0" = 0x0000747865745F5F
@@ -591,7 +657,22 @@ versions.
     bl _kcc_macho_write32
     mov w0, #0
     bl _kcc_macho_write32
+@}
 
+\paragraph{Auxiliary Load Commands}
+
+Three more load commands follow the segment.
+\texttt{LC\_BUILD\_VERSION} records the target platform (macOS) and
+minimum OS version; without it Apple's linker emits a warning on every
+link.  \texttt{LC\_SYMTAB} gives the file offsets and counts of the
+symbol table (\texttt{nlist\_64} array at \texttt{x25}) and string
+table (at \texttt{x26}, size \texttt{x27}).  \texttt{LC\_DYSYMTAB}
+partitions symbols into local, defined-external, and
+undefined-external ranges so the dynamic linker can resolve imports
+efficiently---most of its 80~bytes are zero because our object file
+has no indirect or module tables.
+
+@d MachO: finalize @{
     // ---- LC_BUILD_VERSION ----
     // cmd = 0x32
     mov w0, #LC_BUILD_VERSION
@@ -772,7 +853,22 @@ and relocation type.
     add x28, x28, #1
     b .Lmf_remap_undef
 .Lmf_remap_done:
+@}
 
+\paragraph{Emitting Relocation Entries}
+
+With the remap array in place, we iterate the linker's relocation
+vector and write one 8-byte \texttt{relocation\_info} record per
+entry.  The first word is the section-relative \texttt{r\_address};
+the second packs the (remapped) symbol index into bits~0--23,
+followed by the \texttt{r\_pcrel} flag (bit~24), \texttt{r\_length}
+(bits~25--26, always~2 for 4-byte instructions),
+\texttt{r\_extern} (bit~27, always~1), and the relocation type
+(bits~28--31).  \texttt{ARM64\_RELOC\_BRANCH26} and
+\texttt{ARM64\_RELOC\_PAGE21} are PC-relative; \texttt{PAGEOFF12}
+is not, so the \texttt{pcrel} bit is cleared for that case.
+
+@d MachO: finalize @{
     // ---- Write relocations ----
     // For each reloc: pack into relocation_info format
     // r_address (32 bits) | r_symbolnum(24)|r_pcrel(1)|r_length(2)|r_extern(1)|r_type(4)
@@ -908,7 +1004,22 @@ file is closed.
     add x28, x28, #1
     b .Lmf_sym_def_loop
 .Lmf_sym_def_done:
+@}
 
+\paragraph{Undefined Symbol Entries}
+
+The second pass emits \texttt{nlist\_64} entries for symbols whose
+\texttt{SYM\_SECTION} is zero---these are external references
+(typically libc functions like \texttt{\_printf} or
+\texttt{\_exit}).  Their \texttt{n\_type} is set to
+\texttt{N\_UNDF\,|\,N\_EXT} (\texttt{0x01}), \texttt{n\_sect} is
+\texttt{NO\_SECT} (0), and \texttt{n\_value} is zero since the
+actual address will be resolved by the linker.  The string-table
+offset counter \texttt{sp+96} continues from where the defined-symbol
+pass left off, maintaining a consistent mapping between the symbol
+table and the string table.
+
+@d MachO: finalize @{
     // Pass 2: undefined symbols
     mov x28, #0
 .Lmf_sym_undef_loop:
@@ -958,7 +1069,22 @@ file is closed.
     add x28, x28, #1
     b .Lmf_sym_undef_loop
 .Lmf_sym_undef_done:
+@}
 
+\paragraph{String Table and File Flush}
+
+The string table is a flat byte array referenced by the
+\texttt{n\_strx} offsets in each \texttt{nlist\_64} entry.  It begins
+with a single NUL byte at index~0 (the Mach-O ``empty string''
+sentinel), followed by each symbol's name including its null
+terminator, written in the same defined-then-undefined order as the
+symbol table.  After the string table is complete, the entire output
+buffer---from the Mach-O header through the last string byte---is
+flushed to disk in one \texttt{write} system call, and the file
+descriptor is closed.  The callee-saved registers are restored and
+the function returns.
+
+@d MachO: finalize @{
     // ---- Write string table ----
     // Leading NUL byte
     mov w0, #0
@@ -1072,4 +1198,7 @@ _kcc_macho_err_open:
 
 // Section/segment names are now written as inline immediates in the emitter
 // (avoids linker dead-stripping trailing null bytes from local atoms)
+@| _kcc_macho_fd
+@| _kcc_macho_buf
+@| _kcc_macho_pos
 @}

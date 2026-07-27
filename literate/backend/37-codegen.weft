@@ -11,6 +11,8 @@
 \chapter{Code Generation}
 \label{ch:codegen}
 
+This chapter is where the compiler's abstract IR meets the target machine.  The code generator walks each IR function and emits ARM64 machine code using a simple ``all-spill'' strategy: every virtual register is assigned a stack slot, and each instruction loads its sources from the stack into scratch registers (x9, x10), computes the result in x11, and stores it back.  This avoids the complexity of register allocation while producing correct code.  The chapter covers the stack-frame layout, initialization of the cstring buffer for string literals, the main instruction-lowering loop, and the post-codegen fixup pass that patches string-literal symbol values.
+
 \section{Strategy}
 
 The stack frame for a generated function:
@@ -27,6 +29,8 @@ We use x9 for source~1, x10 for source~2, and x11 as the destination
 scratch register.
 
 \section{Constants}
+
+The code generator's fixed parameters---slot size, scratch register assignments, and patch-entry layout---are defined here as assembler equates so they can be referenced symbolically throughout the backend.
 
 @d CodeGen: constants @{
 // -- CodeGen constants --------------------------------------------------------
@@ -104,6 +108,7 @@ _kcc_codegen_init:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_codegen_init
 @}
 
 \section{Compile All Functions}
@@ -158,6 +163,7 @@ _kcc_codegen_all:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_codegen_all
 @}
 
 \section{Compile Function}
@@ -262,7 +268,20 @@ _kcc_codegen_func:
     mov x3, #1                     // sf = 64-bit
     bl _kcc_enc_add_imm
     bl _kcc_code_emit32
+@| _kcc_codegen_func
+@}
 
+\paragraph{Storing Register Arguments}
+After the prologue, the compiler copies each register argument
+(\texttt{x0}--\texttt{x7}) into its corresponding vreg stack slot.
+The ARM64 calling convention passes the first eight integer
+arguments in registers, so parameter~$k$ lands in register~$k$ and
+must be spilled to \texttt{[x29,\;\#16\;+\;k\,*\,8]}.  The scaled
+immediate for the unsigned-offset \textsc{str} is simply
+$k + 2$, reusing the same slot-offset formula as the rest of the
+all-spill backend.
+
+@d CodeGen: compile function @{
     // 6. Store arguments (x0-x7) to their vreg stack slots
     ldr x24, [x19, #IRF_PARAMS]   // param count
     mov x25, #0                    // param index
@@ -302,7 +321,18 @@ _kcc_codegen_func:
 
     add x25, x25, #1
     b .Lcgf_store_args
+@}
 
+\paragraph{Walking Basic Blocks}
+With the prologue in place and arguments spilled, the compiler
+enters the main loop over basic blocks.  For each BB it records
+the current code-buffer offset in the label hash table (keyed by
+BB~ID) so that backward branches can compute their displacement
+immediately.  It then walks the linked list of IR instructions
+and delegates each one to \texttt{kcc\_codegen\_instr}, passing
+the label table and patch vector as context.
+
+@d CodeGen: compile function @{
 .Lcgf_walk_bbs:
     // 7. Walk all BBs: get blocks vec from function
     ldr x24, [x19, #IRF_BLOCKS]   // blocks vec
@@ -355,7 +385,19 @@ _kcc_codegen_func:
 .Lcgf_next_bb:
     add x26, x26, #1
     b .Lcgf_bb_loop
+@}
 
+\paragraph{Patching Forward Branches and Registering the Symbol}
+Once every basic block has been lowered, two bookkeeping tasks
+remain.  First, the forward-branch patch pass resolves all
+placeholder \textsc{b} and \textsc{cbnz} instructions whose
+targets were not yet known at emission time.  Second, the
+function is registered as a defined Mach-O symbol with the
+conventional underscore prefix (\texttt{\_main} for
+\texttt{main}) and inserted into the extern hash table so that
+call sites in other functions can resolve to it.
+
+@d CodeGen: compile function @{
 .Lcgf_patch:
     // 8. Patch forward branches
     mov x0, x22                    // bb_labels ht
@@ -444,7 +486,20 @@ corresponding \textsc{str}.
 _kcc_cg_slot_offset:
     add x0, x0, #2                // imm12_scaled = vreg + 2
     ret
+@| _kcc_cg_slot_offset
+@}
 
+\paragraph{Register Transfers.}
+With the offset calculation factored out, loading and storing virtual
+registers becomes a thin wrapper around the ARM64 \textsc{ldr}/\textsc{str}
+encoding helpers.  \texttt{\_kcc\_cg\_load\_vreg} emits a 64-bit
+\texttt{LDR} from the vreg's stack slot into a scratch register
+(\texttt{x9}--\texttt{x11}), while \texttt{\_kcc\_cg\_store\_vreg}
+emits the corresponding \texttt{STR} to spill a scratch register back
+to the slot.  Both use \texttt{x29} as the base register and the
+scaled immediate computed by \texttt{\_kcc\_cg\_slot\_offset}.
+
+@d CodeGen: vreg slot offset @{
 // -- kcc_cg_load_vreg ---------------------------------------------------------
 // void kcc_cg_load_vreg(uint64_t vreg, uint64_t reg)
 //   x0 = vreg number, x1 = target register number (9, 10, or 11)
@@ -488,6 +543,8 @@ _kcc_cg_store_vreg:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_cg_load_vreg
+@| _kcc_cg_store_vreg
 @}
 
 \section{Instruction Dispatch}
@@ -620,6 +677,7 @@ _kcc_codegen_instr:
 
     // Unknown opcode: skip
     b .Lcgi_done
+@| _kcc_codegen_instr
 @}
 
 \subsection{Loading Constants}
@@ -857,7 +915,21 @@ with logical-class encoders.
     mov x1, #CG_REG_DST
     bl _kcc_cg_store_vreg
     b .Lcgi_done
+@}
 
+\paragraph{Bitwise Operations}
+The bitwise group---\textsc{and}, \textsc{orr}, \textsc{eor},
+shifts, and \textsc{mvn}---follows the same load--compute--store
+pattern as arithmetic.  Each binary bitwise operation loads the two
+source vregs into \texttt{x9} and \texttt{x10}, calls the
+appropriate logical-class encoder, and stores the result from
+\texttt{x11} to the destination slot.  Shifts use
+register-variable forms (\textsc{lsl}, \textsc{lsr}, \textsc{asr})
+rather than immediate encodings, since the shift amount comes from
+a vreg.  The unary \textsc{not} (\texttt{IR\_NOT}) uses
+\textsc{mvn} with a single source operand.
+
+@d CodeGen: instruction dispatch @{
 // ---- Bitwise operations ----
 .Lcgi_and:
     ldr x0, [x19, #IR_SRC1]
@@ -1307,7 +1379,17 @@ followed by \textsc{ret}.
     add x1, sp, #88
     bl _kcc_vec_push
     b .Lcgi_done
+@}
 
+\paragraph{Function Return}
+The \texttt{IR\_RET} handler closes the current function.  If the
+return type is not void, the source vreg is loaded into \texttt{x0}
+(the ABI return register).  The epilogue then restores the saved
+frame pointer and link register with a post-indexed \textsc{ldp}
+that also deallocates the stack frame in one instruction, followed
+by \textsc{ret} to return to the caller.
+
+@d CodeGen: instruction dispatch @{
 .Lcgi_ret:
     // Return: load return value to x0, emit epilogue
     ldr x23, [x19, #IR_SRC1]      // return value vreg (0 if void)
@@ -1491,7 +1573,21 @@ described in \S\ref{sec:emit-strings}.
     bl _kcc_code_emit32
 
     b .Lcgi_done
+@}
 
+\paragraph{Global Variable References and String Literals}
+\texttt{IR\_GLOBAL\_REF} materialises the address of a global
+variable using the two-instruction \textsc{adrp}\,+\,\textsc{add}
+idiom.  The symbol is registered via
+\texttt{kcc\_linker\_global\_sym}, which allocates space in the
+\texttt{\_\_DATA,\_\_common} zerofill section, and two relocations
+(\texttt{PAGE21} and \texttt{PAGEOFF12}) are recorded so the
+linker can patch the instruction pair at link time.
+\texttt{IR\_STRING\_LIT} delegates to a dedicated handler
+described in \S\ref{sec:emit-strings}.  The \texttt{.Lcgi\_done}
+label restores callee-saved registers and returns.
+
+@d CodeGen: instruction dispatch @{
 .Lcgi_global_ref:
     // GLOBAL_REF: SRC1 = symbol name (char*), DEST = vreg to store addr
     ldr x23, [x19, #IR_SRC1]      // symbol name
@@ -1678,6 +1774,7 @@ _kcc_codegen_patch_branches:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_codegen_patch_branches
 @}
 
 \section{String Literal Codegen}
@@ -1780,7 +1877,22 @@ _kcc_codegen_string_lit:
     adrp x0, _kcc_cstr_pos@@PAGE
     add  x0, x0, _kcc_cstr_pos@@PAGEOFF
     str x24, [x0]
+@| _kcc_codegen_string_lit
+@}
 
+\paragraph{Symbol Name Construction and Relocation Emission}
+With the string bytes safely buffered, the next step is to give
+the literal a linker-visible identity.  The code mints a local
+symbol name of the form \texttt{l\_.str.\textit{N}} by
+incrementing a monotonic counter and converting it to decimal
+with a digit-reversal loop.  It then registers the symbol
+(\texttt{N\_SECT\,|\,N\_EXT}, section~1, value~0 as a
+placeholder), records a fixup pair $(\mathit{sym\_index},
+\mathit{cstr\_offset})$, and emits the
+\textsc{adrp}\,+\,\textsc{add} relocation sequence that will let
+the linker resolve the pointer at link time.
+
+@d CodeGen: emit strings @{
     // 5. Build symbol name "l_.str.N"
     adrp x0, _kcc_cstr_count@@PAGE
     add  x0, x0, _kcc_cstr_count@@PAGEOFF
@@ -1894,7 +2006,21 @@ _kcc_codegen_string_lit:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #96
     ret
+@}
 
+\paragraph{String Data Finalization}
+After all functions have been compiled, the string data must be
+appended to the code buffer so that the \textsc{adrp}\,+\,\textsc{add}
+relocations resolve to valid addresses within the \texttt{\_\_text}
+section.  The finalization pass first records the current code
+position as the boundary between executable instructions and
+read-only data.  It then walks the fixup vector and patches each
+string symbol's value to $\mathit{code\_size} +
+\mathit{cstr\_offset}$.  Finally, it copies the accumulated
+cstring buffer to the tail of the code buffer, growing the
+buffer if the combined size exceeds its capacity.
+
+@d CodeGen: emit strings @{
 // -- kcc_codegen_emit_strings -------------------------------------------------
 // void kcc_codegen_emit_strings(void)
 // Fixes up string symbol values and appends cstring data to code buffer.
@@ -2012,6 +2138,7 @@ _kcc_codegen_emit_strings:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_codegen_emit_strings
 @}
 
 \section{CodeGen Data}
@@ -2036,4 +2163,9 @@ _kcc_cstr_pos:       .quad 0     // write position in cstring buffer
 _kcc_cstr_count:     .quad 0     // string literal counter (for naming)
 .globl _kcc_cstr_fixups
 _kcc_cstr_fixups:    .quad 0     // vec of {sym_index, cstr_offset} fixups
+@| _kcc_cg_frame_size
+@| _kcc_cstr_buf
+@| _kcc_cstr_pos
+@| _kcc_cstr_count
+@| _kcc_cstr_fixups
 @}

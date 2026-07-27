@@ -18,6 +18,9 @@
 \chapter{Diagnostic Engine}
 \label{ch:diagnostics}
 
+The C standard (\stdref{5.1.1.3}) requires that a conforming implementation issue at least one diagnostic for any syntax rule or constraint violation.
+This chapter implements a structured diagnostic engine that formats messages in the conventional \texttt{file:line:col: severity: message} form, supports three severity levels (error, warning, note), and enforces a fatal error limit to prevent cascading output from overwhelming the user.
+
 \section{Severity Levels}
 
 The C standard distinguishes only ``diagnostic message'' from other
@@ -238,6 +241,7 @@ _kcc_diag_emit:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_diag_emit
 @}
 
 \section{Convenience Wrappers}
@@ -269,7 +273,11 @@ _kcc_diag_error:
     mov x1, x0                   // line → x1
     mov x0, #DIAG_ERROR          // severity → x0
     b _kcc_diag_emit             // tail call
+@| _kcc_diag_error
 @}
+
+The warning wrapper is identical in structure, substituting
+\texttt{DIAG\_WARNING} for the severity argument.
 
 @d Diag: warning @{
 // -- kcc_diag_warning ---------------------------------------------------
@@ -282,7 +290,13 @@ _kcc_diag_warning:
     mov x1, x0
     mov x0, #DIAG_WARNING
     b _kcc_diag_emit
+@| _kcc_diag_warning
 @}
+
+The note wrapper completes the set, using \texttt{DIAG\_NOTE}
+as the severity.  Notes are typically emitted immediately after an
+error to provide additional context (e.g., ``previous definition
+was here'').
 
 @d Diag: note @{
 // -- kcc_diag_note ------------------------------------------------------
@@ -295,6 +309,7 @@ _kcc_diag_note:
     mov x1, x0
     mov x0, #DIAG_NOTE
     b _kcc_diag_emit
+@| _kcc_diag_note
 @}
 
 \section{Error Count Query}
@@ -314,6 +329,7 @@ _kcc_diag_had_errors:
     add  x0, x0, _kcc_diag_error_count@@PAGEOFF
     ldr  x0, [x0]
     ret
+@| _kcc_diag_had_errors
 @}
 
 \section{Reset}
@@ -336,6 +352,7 @@ _kcc_diag_reset:
     add  x0, x0, _kcc_diag_warn_count@@PAGEOFF
     str  xzr, [x0]
     ret
+@| _kcc_diag_reset
 @}
 
 \section{Global State}
@@ -361,4 +378,14 @@ _kcc_diag_str_warning:   .asciz "warning"
 _kcc_diag_str_note:      .asciz "note"
 _kcc_diag_unknown_file:  .asciz "<input>"
 _kcc_diag_too_many:      .asciz "kcc: fatal: too many errors emitted, stopping\n"
+@| _kcc_diag_error_count
+@| _kcc_diag_warn_count
+@| _kcc_diag_colon
+@| _kcc_diag_colon_space
+@| _kcc_diag_newline
+@| _kcc_diag_str_error
+@| _kcc_diag_str_warning
+@| _kcc_diag_str_note
+@| _kcc_diag_unknown_file
+@| _kcc_diag_too_many
 @}

@@ -10,6 +10,8 @@
 \chapter{The Driver}
 \label{ch:driver}
 
+This chapter is where execution begins.  The \texttt{\_main} function receives \texttt{argc} and \texttt{argv} from the macOS kernel, initializes the compiler's core subsystems (arena allocator, keyword table, I/O), and dispatches to the appropriate pipeline based on the command-line flags.  Supported modes include \texttt{--dump-tokens} for lexer debugging, \texttt{--dump-ast} for parser output, \texttt{--dump-ir} for IR inspection, and \texttt{-c} for full compilation to a Mach-O object file.
+
 \section{Entry Point}
 
 On macOS, the kernel passes control to \texttt{\_main} with:
@@ -110,7 +112,18 @@ _main:
     add  x0, x0, _kcc_msg_newline@@PAGEOFF
     bl _kcc_io_puts
     b .Lmain_exit
+@| _main
+@}
 
+\paragraph{Front-end diagnostic modes.}
+The first group of flags run progressively deeper prefixes of the
+compilation pipeline, stopping early to dump intermediate results.
+\texttt{--dump-tokens} opens the source, runs translation phases~1--2,
+initializes the lexer, and prints every token.  \texttt{-E} adds the
+preprocessor and dumps its output.  \texttt{--dump-ast} further adds
+the parser and prints the AST tree.
+
+@d Main: entry point @{
 .Lmain_dump_tokens:
     // --dump-tokens requires a source file argument
     cmp x19, #3
@@ -230,7 +243,17 @@ _main:
     bl _kcc_diag_had_errors
     cbnz x0, .Lmain_error_exit
     b .Lmain_exit
+@}
 
+\paragraph{Semantic analysis and IR modes.}
+\texttt{--dump-types} runs the full front-end plus semantic analysis,
+then prints each declaration with its resolved type.  \texttt{--check}
+performs the same pipeline but only reports errors---no output on
+success except a confirmation message.  \texttt{--dump-ir} extends
+the pipeline through IR construction and optimization, then prints the
+textual IR.
+
+@d Main: entry point @{
 .Lmain_dump_types:
     // --dump-types: parse + sema + print typed declarations
     cmp x19, #3
@@ -364,7 +387,17 @@ _main:
     bl _kcc_diag_had_errors
     cbnz x0, .Lmain_error_exit
     b .Lmain_exit
+@}
 
+\paragraph{Compilation and error handling.}
+The \texttt{-c} flag invokes the full pipeline through
+\texttt{\_kcc\_driver\_compile} (Chapter~\ref{ch:compile-driver}),
+which reads the source, runs every phase, and writes a Mach-O object
+file.  The remainder of the function handles usage errors for each
+flag, the no-arguments case, and the two exit paths (success with
+code~0, error with code~1).
+
+@d Main: entry point @{
 .Lmain_compile:
     // -c <source> -o <output>
     // Requires at least: kcc -c source -o output (argc >= 5)

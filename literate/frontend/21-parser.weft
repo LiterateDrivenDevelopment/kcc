@@ -15,6 +15,8 @@
 \chapter{Recursive-Descent Parser}
 \label{ch:parser}
 
+The recursive-descent parser consumes the preprocessed token stream and builds an abstract syntax tree following the grammar of \stdref{6.9}.  This chapter establishes the parser's core infrastructure: a uniform 64-byte AST node layout, arena-based allocation, token consumption helpers, error recovery, and typedef disambiguation.  It also provides the top-level \texttt{kcc\_parse} entry point that produces an \texttt{AST\_TRANS\_UNIT} node, and the \texttt{kcc\_ast\_dump} facility for inspecting the resulting tree.  The actual parsing of declarations, expressions, and statements is split across the three chapters that follow.
+
 \section{AST Node Layout}
 
 Every AST node is exactly 64 bytes, arena-allocated.  This uniform size
@@ -177,6 +179,7 @@ _kcc_ast_alloc:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ast_alloc
 @}
 
 \section{Token Consumption Helpers}
@@ -285,6 +288,10 @@ _kcc_parse_expect:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_peek
+@| _kcc_parse_advance
+@| _kcc_parse_match
+@| _kcc_parse_expect
 @}
 
 \section{Error Recovery}
@@ -366,6 +373,8 @@ _kcc_parse_sync:
 .Lsync_done:
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_parse_error
+@| _kcc_parse_sync
 @}
 
 \section{Typedef Disambiguation}
@@ -413,7 +422,18 @@ _kcc_typedef_init:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_typedef_init
+@}
 
+\paragraph{Scope Push and Pop}
+
+The parser must track typedef visibility across nested scopes.  Each time a
+compound statement (block) is entered, \texttt{kcc\_typedef\_push\_scope}
+allocates a fresh hash table and pushes it onto the scope stack vector.
+When the block ends, \texttt{kcc\_typedef\_pop\_scope} simply decrements the
+vector's count---the hash table memory is reclaimed when the arena is freed.
+
+@d Parser: typedef table @{
 // -- kcc_typedef_push_scope --------------------------------------------
 // void kcc_typedef_push_scope(void)
 // Pushes a new empty scope onto the typedef stack.
@@ -460,7 +480,20 @@ _kcc_typedef_pop_scope:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_typedef_push_scope
+@| _kcc_typedef_pop_scope
+@}
 
+\paragraph{Name Registration and Lookup}
+
+\texttt{kcc\_typedef\_add} registers a name in the topmost scope by
+retrieving the last hash table on the scope stack and inserting the name
+with a sentinel value of~1.  \texttt{kcc\_typedef\_lookup} searches scopes
+from top to bottom, returning~1 on the first hit.  This top-down search
+ensures that an inner scope's typedef shadows an outer variable of the
+same name, matching the C17 scoping rules \stdref{6.2.1}.
+
+@d Parser: typedef table @{
 // -- kcc_typedef_add ---------------------------------------------------
 // void kcc_typedef_add(const char *name, uint64_t len)
 //   x0 = pointer to name
@@ -556,6 +589,8 @@ _kcc_typedef_lookup:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_typedef_add
+@| _kcc_typedef_lookup
 @}
 
 \section{Translation Unit}
@@ -627,6 +662,7 @@ _kcc_parse:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse
 @}
 
 \section{AST Dump}
@@ -755,7 +791,20 @@ _kcc_ast_dump:
 
     // For all other nodes, just print newline and recurse into children
     b .Last_dump_generic
+@| _kcc_ast_dump
+@}
 
+\paragraph{Dumping Declarations}
+
+Each declaration handler prints the node's name (stored as a pointer in one of
+the payload fields) and then recurses into the type and initializer children.
+Aggregate declarations---structs, unions, and enums---walk a linked list of
+member or enumerator children via the \texttt{F4} next pointer.  Type-specifier
+nodes follow the same pattern: pointer types recurse into their pointee, array
+types into their element type and size expression, and function types into their
+return type and parameter list.
+
+@d Parser: dump AST @{
 .Last_dump_var_decl:
     // Print name if present
     ldr x0, [x19, #AST_F1]
@@ -804,7 +853,17 @@ _kcc_ast_dump:
     bl _kcc_ast_dump
     bl _kcc_ast_indent_dec
     b .Last_dump_next
+@}
 
+\paragraph{Dumping Aggregate and Typedef Declarations}
+
+Typedef declarations simply print their aliased name and recurse into the
+underlying type child at \texttt{F0}.  Struct and union declarations walk
+the linked list of field declarations anchored at \texttt{F1}, while enum
+declarations iterate over enumerator children the same way.  Each
+enumerator optionally carries an initializer expression in \texttt{F1}.
+
+@d Parser: dump AST @{
 .Last_dump_typedef_decl:
     ldr x0, [x19, #AST_F1]
     bl _kcc_ast_print_name_field
@@ -871,7 +930,19 @@ _kcc_ast_dump:
     bl _kcc_ast_dump
     bl _kcc_ast_indent_dec
     b .Last_dump_next
+@}
 
+\paragraph{Dumping Type Specifiers}
+
+Type-specifier nodes describe the C type system's recursive structure.
+Built-in types print their token name via \texttt{kcc\_lex\_type\_name}.
+Pointer types recurse into the pointee at \texttt{F0}, array types recurse
+into both the element type (\texttt{F0}) and the size expression
+(\texttt{F1}), and function types walk a parameter list linked through
+\texttt{F4}.  Name nodes (\texttt{AST\_IDENT\_EXPR}, \texttt{AST\_TYPE\_NAME})
+simply print the identifier stored in \texttt{F0}.
+
+@d Parser: dump AST @{
 .Last_dump_type_builtin:
     // Print the token name for the builtin type
     adrp x0, _kcc_ast_msg_space@@PAGE
@@ -929,7 +1000,19 @@ _kcc_ast_dump:
 .Last_dump_tfunc_end:
     bl _kcc_ast_indent_dec
     b .Last_dump_next
+@}
 
+\paragraph{Dumping Expressions}
+
+Expression handlers print their operator or value and then recurse into
+sub-expressions.  Binary and assignment expressions print the operator token
+name (via \texttt{kcc\_lex\_type\_name}) and recurse into left and right children.
+Unary expressions additionally distinguish prefix from postfix form.  Call
+expressions walk their argument list, member access prints the field name
+and dot-vs-arrow distinction, and \texttt{sizeof} annotates whether it
+operates on a type or an expression.
+
+@d Parser: dump AST @{
 .Last_dump_int_lit:
     // Print ' <value>'
     adrp x0, _kcc_ast_msg_space@@PAGE
@@ -1072,7 +1155,19 @@ _kcc_ast_dump:
     bl _kcc_ast_dump
     bl _kcc_ast_indent_dec
     b .Last_dump_next
+@}
 
+\paragraph{Dumping Statements and Generic Handler}
+
+Statement handlers recurse into their condition, body, and optional else or
+increment children.  The \texttt{if} handler dumps three children (condition,
+then-branch, else-branch), while \texttt{for} dumps four (init, condition,
+increment, body).  Simpler two-child nodes---\texttt{while}, \texttt{do},
+\texttt{switch}, and \texttt{case}---share a single handler.  The generic
+fallback handles any unrecognized tag by dumping only the first child, and the
+common epilogue restores callee-saved registers and returns.
+
+@d Parser: dump AST @{
 .Last_dump_if:
     // IfStmt: F0=cond, F1=then, F2=else
     mov x0, #'\n'
@@ -1284,6 +1379,11 @@ _kcc_ast_print_name_field:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ast_tag_name
+@| _kcc_ast_print_indent
+@| _kcc_ast_indent_inc
+@| _kcc_ast_indent_dec
+@| _kcc_ast_print_name_field
 @}
 
 \section{Parser Data}
@@ -1305,7 +1405,20 @@ _kcc_typedef_scopes:
 .globl _kcc_ast_indent
 _kcc_ast_indent:
     .quad 0                      // current dump indentation level
+@| _kcc_parse_error_flag
+@| _kcc_typedef_scopes
+@| _kcc_ast_indent
+@}
 
+\paragraph{Diagnostic and Dump Format Strings}
+
+The parser and AST dumper share a set of short string constants placed in
+the \texttt{\_\_TEXT,\_\_cstring} section so the linker can merge duplicates.
+These include the ``expected token'' error message, the location separator
+\texttt{" @@ "}, operator annotation prefixes, and the member-access
+indicators for dot versus arrow syntax.
+
+@d Parser: data @{
 // -- Parser string constants -------------------------------------------
 .section __TEXT,__cstring,cstring_literals
 
@@ -1341,7 +1454,16 @@ _kcc_ast_msg_type:
 
 _kcc_ast_str_unknown:
     .asciz "<unknown>"
+@}
 
+\paragraph{AST Tag Name Table}
+
+The tag name lookup table maps each \texttt{AST\_*} constant to a human-readable
+string for diagnostic output.  The table is a flat array of (tag, string-pointer)
+pairs terminated by a zero sentinel.  The corresponding name strings live in the
+\texttt{\_\_TEXT,\_\_cstring} section so the linker can deduplicate them.
+
+@d Parser: data @{
 // -- AST tag name table ------------------------------------------------
 // Each entry: .quad tag, .quad name_string_ptr
 .p2align 3
@@ -1516,4 +1638,59 @@ _kcc_ast_n_compound_lit:  .asciz "CompoundLit"
 _kcc_ast_n_paren_expr:    .asciz "ParenExpr"
 _kcc_ast_n_generic:       .asciz "GenericExpr"
 _kcc_ast_n_generic_assoc: .asciz "GenericAssoc"
+@| _kcc_ast_n_trans_unit
+@| _kcc_ast_n_var_decl
+@| _kcc_ast_n_func_decl
+@| _kcc_ast_n_param_decl
+@| _kcc_ast_n_typedef_decl
+@| _kcc_ast_n_struct_decl
+@| _kcc_ast_n_union_decl
+@| _kcc_ast_n_enum_decl
+@| _kcc_ast_n_enumerator
+@| _kcc_ast_n_field_decl
+@| _kcc_ast_n_static_assert
+@| _kcc_ast_n_type_builtin
+@| _kcc_ast_n_type_name
+@| _kcc_ast_n_type_ptr
+@| _kcc_ast_n_type_array
+@| _kcc_ast_n_type_func
+@| _kcc_ast_n_type_struct
+@| _kcc_ast_n_type_union
+@| _kcc_ast_n_type_enum
+@| _kcc_ast_n_type_quals
+@| _kcc_ast_n_compound
+@| _kcc_ast_n_expr_stmt
+@| _kcc_ast_n_if_stmt
+@| _kcc_ast_n_switch_stmt
+@| _kcc_ast_n_while_stmt
+@| _kcc_ast_n_do_stmt
+@| _kcc_ast_n_for_stmt
+@| _kcc_ast_n_goto_stmt
+@| _kcc_ast_n_continue_stmt
+@| _kcc_ast_n_break_stmt
+@| _kcc_ast_n_return_stmt
+@| _kcc_ast_n_label_stmt
+@| _kcc_ast_n_case_stmt
+@| _kcc_ast_n_default_stmt
+@| _kcc_ast_n_null_stmt
+@| _kcc_ast_n_ident_expr
+@| _kcc_ast_n_int_lit
+@| _kcc_ast_n_str_lit
+@| _kcc_ast_n_char_lit
+@| _kcc_ast_n_binary_expr
+@| _kcc_ast_n_unary_expr
+@| _kcc_ast_n_assign_expr
+@| _kcc_ast_n_cond_expr
+@| _kcc_ast_n_call_expr
+@| _kcc_ast_n_subscript
+@| _kcc_ast_n_member
+@| _kcc_ast_n_cast_expr
+@| _kcc_ast_n_sizeof_expr
+@| _kcc_ast_n_alignof_expr
+@| _kcc_ast_n_comma_expr
+@| _kcc_ast_n_init_list
+@| _kcc_ast_n_compound_lit
+@| _kcc_ast_n_paren_expr
+@| _kcc_ast_n_generic
+@| _kcc_ast_n_generic_assoc
 @}

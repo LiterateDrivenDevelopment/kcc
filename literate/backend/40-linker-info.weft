@@ -9,6 +9,8 @@
 \chapter{Linker Information}
 \label{ch:linker-info}
 
+The code generator emits branch and data-reference instructions whose final addresses are not known until link time.  This chapter manages the metadata that the linker needs to resolve those references.  It defines two data structures---relocation entries and symbol entries---and provides functions to add relocations, register defined and external symbols, look up symbols by name (using a hash table to deduplicate externs), and query the accumulated tables when the Mach-O writer serializes the object file.
+
 \section{Data Structures}
 
 A relocation entry is 24 bytes:
@@ -122,6 +124,7 @@ _kcc_linker_init:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_linker_init
 @}
 
 \section{Adding Symbols}
@@ -165,6 +168,7 @@ _kcc_linker_add_sym:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_linker_add_sym
 @}
 
 \section{Adding Relocations}
@@ -197,6 +201,7 @@ _kcc_linker_add_reloc:
 
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_linker_add_reloc
 @}
 
 \section{External Symbol Lookup}
@@ -293,6 +298,7 @@ _kcc_linker_extern:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_linker_extern
 @}
 
 \section{Global Symbol Registration}
@@ -400,6 +406,7 @@ _kcc_linker_global_sym:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_linker_global_sym
 @}
 
 \section{Linker Data}
@@ -418,4 +425,8 @@ _kcc_linker_syms:        .quad 0     // vec of symbol entries
 _kcc_linker_extern_ht:   .quad 0     // hash table for extern dedup
 .globl _kcc_globals_size
 _kcc_globals_size:       .quad 0     // total size of global data section
+@| _kcc_linker_relocs
+@| _kcc_linker_syms
+@| _kcc_linker_extern_ht
+@| _kcc_globals_size
 @}

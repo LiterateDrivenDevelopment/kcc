@@ -8,6 +8,8 @@
 \chapter{Symbol Table}
 \label{ch:symtab}
 
+The C language requires that every identifier be declared before use and that declarations obey scoping rules: a name declared inside a block shadows any outer declaration, and each name space (ordinary identifiers, tags, labels) is resolved independently (\stdref{6.2.1}).  This chapter implements the symbol table that enforces these rules.  It defines a 64-byte symbol record carrying kind, type, linkage, and scope depth, then builds three scope stacks---one per name space---where each level is a separate hash table.  The API provides functions for initialization, scope push/pop, symbol insertion, and lookup by walking the stack from innermost to outermost scope.
+
 \section{Symbol Record Layout}
 
 Each symbol is a 64-byte arena-allocated record:
@@ -32,6 +34,11 @@ Each symbol is a 64-byte arena-allocated record:
 @}
 
 \section{Initialization}
+
+The symbol table is initialised by creating three empty scope stacks---one
+each for ordinary identifiers, tag names, and labels---implemented as vecs
+of hash table pointers.  After the stacks are allocated, file scope (depth~0)
+is pushed so that top-level declarations have a scope to land in.
 
 @d Symtab: init @{
 // -- kcc_symtab_init ------------------------------------------------------
@@ -75,9 +82,16 @@ _kcc_symtab_init:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_symtab_init
 @}
 
 \section{Scope Management}
+
+Entering a compound statement or function body pushes a new scope: a fresh
+hash table is allocated and appended to both the ordinary and tags scope
+stacks, and the depth counter is incremented.  Leaving the scope pops the
+top entry from each stack and decrements the depth.  This mirrors the C
+scoping rule that each block introduces a new scope (\stdref{6.2.1}).
 
 @d Symtab: push scope @{
 // -- kcc_symtab_push_scope ------------------------------------------------
@@ -127,7 +141,13 @@ _kcc_symtab_push_scope:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_symtab_push_scope
 @}
+
+\texttt{kcc\_symtab\_pop\_scope} reverses the effect of a push: it
+decrements the count on both the ordinary and tag scope stacks and
+decreases the depth counter.  The hash tables themselves are not freed
+--- the arena reclaims all memory at program end.
 
 @d Symtab: pop scope @{
 // -- kcc_symtab_pop_scope -------------------------------------------------
@@ -165,9 +185,18 @@ _kcc_symtab_pop_scope:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_symtab_pop_scope
 @}
 
 \section{Ordinary Name Space}
+
+The ordinary name space holds variables, functions, typedefs, and
+enumeration constants (\stdref{6.2.3}).  \texttt{kcc\_symtab\_declare}
+arena-allocates a 64-byte symbol record, fills in kind, type, name,
+depth, and line number, then inserts it into the hash table at the top of
+the ordinary scope stack.  \texttt{kcc\_symtab\_lookup} walks the stack
+top-down, returning the first matching symbol---this implements C's
+inner-scope-shadows-outer rule.
 
 @d Symtab: declare @{
 // -- kcc_symtab_declare ---------------------------------------------------
@@ -240,7 +269,14 @@ _kcc_symtab_declare:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_symtab_declare
 @}
+
+\texttt{kcc\_symtab\_lookup} searches the ordinary scope stack from
+top to bottom, returning the first symbol that matches the given name.
+This top-down walk implements C's scoping rule: an inner declaration
+shadows any outer declaration of the same name.  If no scope contains
+the name, the function returns zero.
 
 @d Symtab: lookup @{
 // -- kcc_symtab_lookup ----------------------------------------------------
@@ -298,9 +334,17 @@ _kcc_symtab_lookup:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_symtab_lookup
 @}
 
 \section{Tag Name Space}
+
+Tags for \texttt{struct}, \texttt{union}, and \texttt{enum} live in a
+separate name space from ordinary identifiers (\stdref{6.2.3}).  The
+declare and lookup functions mirror the ordinary name space interface but
+operate on the tags scope stack instead.  This separation allows a program
+to use the same identifier as both a tag and an ordinary name without
+conflict.
 
 @d Symtab: declare tag @{
 // -- kcc_symtab_declare_tag -----------------------------------------------
@@ -360,7 +404,13 @@ _kcc_symtab_declare_tag:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_symtab_declare_tag
 @}
+
+\texttt{kcc\_symtab\_lookup\_tag} mirrors the ordinary lookup but walks
+the tag scope stack.  This is used when the parser encounters
+\texttt{struct~foo}, \texttt{union~bar}, or \texttt{enum~baz} to
+find the corresponding type definition.
 
 @d Symtab: lookup tag @{
 // -- kcc_symtab_lookup_tag ------------------------------------------------
@@ -413,6 +463,7 @@ _kcc_symtab_lookup_tag:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_symtab_lookup_tag
 @}
 
 \section{Label Scope}
@@ -462,7 +513,19 @@ _kcc_symtab_label_end:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_symtab_label_begin
+@| _kcc_symtab_label_end
+@}
 
+\paragraph{Name Operations.}
+With the scope established, the compiler needs to record each label it
+encounters and later verify that every \texttt{goto} target was actually
+defined.  \texttt{\_kcc\_symtab\_label\_add} inserts a label name into
+the top hash table with a sentinel value of~1, while
+\texttt{\_kcc\_symtab\_label\_lookup} probes the same table and returns
+a boolean indicating whether the label exists (\stdref{6.8.1}).
+
+@d Symtab: label scope @{
 // -- kcc_symtab_label_add -------------------------------------------------
 // void kcc_symtab_label_add(char *name, uint64_t len)
 .globl _kcc_symtab_label_add
@@ -527,9 +590,15 @@ _kcc_symtab_label_lookup:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_symtab_label_add
+@| _kcc_symtab_label_lookup
 @}
 
 \section{Symbol Table Data}
+
+The global data for the symbol table consists of three vec pointers (one
+per scope stack) and the current scope depth counter.  All four are
+zero-initialised and populated by \texttt{kcc\_symtab\_init} at startup.
 
 @d Symtab: data @{
 // -- Symbol table globals -------------------------------------------------
@@ -542,4 +611,8 @@ _kcc_sym_tags:        .quad 0       // vec* for tag scope stack
 _kcc_sym_labels:      .quad 0       // vec* for label scope stack
 .globl _kcc_sym_depth
 _kcc_sym_depth:       .quad 0       // current scope depth
+@| _kcc_sym_ordinary
+@| _kcc_sym_tags
+@| _kcc_sym_labels
+@| _kcc_sym_depth
 @}

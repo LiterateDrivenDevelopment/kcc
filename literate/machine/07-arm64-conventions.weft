@@ -6,6 +6,9 @@
 \chapter{ARM64 Conventions}
 \label{ch:arm64-conventions}
 
+Before any code can be written, the compiler must establish a contract with the hardware: which registers hold persistent state, how the stack is managed, and what Apple's platform deviates from the standard AAPCS64 ABI.
+This chapter codifies those decisions---the register map that threads global compiler state through callee-saved registers, the Apple-specific constraints that every function must obey, and the \texttt{FUNC}/\texttt{ENDFUNC}/\texttt{SYSCALL} macros that enforce them uniformly across the entire codebase.
+
 \section{Register Assignment}
 
 The AAPCS64 (ARM IHI 0055) divides the 31 general-purpose registers

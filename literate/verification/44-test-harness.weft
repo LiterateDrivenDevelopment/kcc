@@ -12,6 +12,8 @@
 \chapter{Test Harness}
 \label{ch:test-harness}
 
+A compiler that cannot verify its own output is a liability, so we maintain a separate test binary alongside the compiler itself.  This chapter implements an xUnit-style test runner in pure ARM64 assembly: each test is a function that returns zero on success and non-zero on failure, registered in a global table alongside its name.  The runner iterates through the table, calls each test, tallies pass and fail counts, and exits with a non-zero status if any test failed.
+
 \section{Runner Entry Point}
 
 The test runner's \texttt{\_main} initializes the arena and keyword
@@ -123,6 +125,7 @@ _main:
 .Ltest_exit_fail:
     mov x0, #1
     bl _kcc_sys_exit
+@| _main
 @}
 
 \section{Test Assertion Helpers}
@@ -218,6 +221,8 @@ _kcc_test_expect_tok:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_test_lex_setup
+@| _kcc_test_expect_tok
 @}
 
 \section{Runner Data}
@@ -236,4 +241,5 @@ _test_results:    .asciz "\nResults: "
 _test_passed_str: .asciz " passed, "
 _test_failed_str: .asciz " failed\n"
 _kcc_test_path:   .asciz "<test>"
+@| _kcc_test_path
 @}

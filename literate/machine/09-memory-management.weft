@@ -12,6 +12,10 @@
 \chapter{Memory Management: The Arena}
 \label{ch:arena}
 
+A compiler allocates prolifically---tokens, AST nodes, type descriptors, symbol entries---yet all of these objects share a single lifetime: one translation unit.
+The arena allocator exploits this by reducing every allocation to a pointer bump and every deallocation to a single \texttt{munmap}.
+This chapter describes the chunk layout, the initialization and allocation routines, and the aligned-allocation variant used for structures with alignment requirements beyond a byte.
+
 \section{Design Rationale}
 
 A compiler allocates thousands of small objects (tokens, AST nodes,
@@ -79,6 +83,7 @@ _kcc_arena_init:
 .Larena_init_fail:
     mov x0, #1                    // exit status = 1
     bl _kcc_sys_exit
+@| _kcc_arena_init
 @}
 
 The initialization proceeds in two steps.  First, we request a
@@ -167,6 +172,7 @@ _kcc_arena_alloc:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_arena_alloc
 @}
 
 \section{Allocation: Slow Path}
@@ -238,4 +244,5 @@ recently allocated) chunk.  We store it in the \texttt{\_\_DATA} segment.
 .data
 .p2align 3
 _kcc_arena_current: .quad 0   // pointer to current arena chunk
+@| _kcc_arena_current
 @}

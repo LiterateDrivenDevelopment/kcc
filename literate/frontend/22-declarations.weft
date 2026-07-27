@@ -14,6 +14,8 @@
 \chapter{Declaration Parsing}
 \label{ch:declarations}
 
+Declarations are the most syntactically complex part of C: a declaration combines storage-class specifiers, type specifiers, qualifiers, and declarators into a form that introduces names into scope (\stdref{6.7}).  The central difficulty is typedef disambiguation---the parser must consult the typedef table to decide whether an identifier begins a new declaration or an expression.  This chapter walks through the full declaration grammar, from top-level specifiers and nested declarators to struct/union/enum definitions, initializers, and \texttt{\_Static\_assert}.
+
 \section{Declaration}
 
 A declaration (\stdref{6.7}) has the form:
@@ -94,7 +96,20 @@ _kcc_parse_decl:
     bl _kcc_parse_expect
     mov x0, x21
     b .Ldecl_done
+@| _kcc_parse_decl
+@}
 
+\paragraph{Variable and typedef declarations.}
+When the declarator is not a function (or is a function prototype without a
+body), the parser falls through to variable and typedef handling.  A regular
+variable declaration stores its storage class in \texttt{AST\_F3} and
+optionally parses an initializer after \texttt{=}.  Multiple declarators
+sharing the same specifiers are supported via comma-separated lists, where
+each subsequent declarator is parsed against the original base type in
+\texttt{x19} and linked through \texttt{AST\_F4} into a chain rooted at the
+first declaration node.
+
+@d Decl: parse declaration @{
 .Ldecl_not_func:
     // Variable or typedef declaration
     // Check for typedef
@@ -175,7 +190,18 @@ _kcc_parse_decl:
     bl _kcc_parse_expect
     mov x0, x23                  // return first decl
     b .Ldecl_done
+@}
 
+\paragraph{Typedef registration and special forms.}
+A typedef declaration (\texttt{storage\_class == 1}) registers the declared
+name in the typedef table so the lexer can disambiguate identifiers from type
+names in subsequent parsing.  The node tag is rewritten to
+\texttt{AST\_TYPEDEF\_DECL}.  This block also handles bare type declarations
+such as \texttt{struct S \{~\ldots~\};} where no declarator follows the
+specifiers, as well as \texttt{\_Static\_assert} forwarding and error
+recovery with synchronisation to the next semicolon.
+
+@d Decl: parse declaration @{
 .Ldecl_typedef:
     // Typedef declaration: register the name
     ldr x0, [x21, #AST_F1]      // name_ptr
@@ -372,7 +398,22 @@ _kcc_parse_decl_specs:
     // Consume and ignore (inline, _Noreturn, _Thread_local)
     bl _kcc_pp_next
     b .Ldecl_specs_loop
+@| _kcc_parse_decl_specs
+@}
 
+\paragraph{Type specifier bitmask accumulation.}
+When the main loop dispatches to a builtin type keyword such as \texttt{int},
+\texttt{char}, or \texttt{long}, the parser does not build a type node
+immediately.  Instead, each keyword sets a corresponding bit in the
+accumulator register~\texttt{x23}.  This approach handles multi-keyword types
+like \texttt{unsigned long long int} correctly: once all specifiers have been
+consumed, the final bitmask encodes the full type.  The special case of two
+successive \texttt{long} keywords is detected by checking whether bit~4 is
+already set before promoting to bit~5 (\texttt{long long}).  Struct, union,
+and enum specifiers build their own type nodes via dedicated sub-parsers,
+while typedef names are looked up in the typedef table and interned.
+
+@d Decl: parse specifiers @{
 .Ldecl_type_builtin:
     // Accumulate specifier bitmask in x23
     // Each type keyword ORs its bit into x23
@@ -495,7 +536,19 @@ _kcc_parse_decl_specs:
     add x22, x22, #1
 
     b .Ldecl_specs_loop
+@}
 
+\paragraph{Assembling the final type.}
+After the specifier loop terminates --- because the current token no longer
+matches any specifier --- the accumulated state is resolved into a type node.
+If the loop consumed a struct, union, enum, or typedef name, the type is
+already stored in~\texttt{x20}.  Otherwise a \texttt{TYPE\_BUILTIN} node is
+allocated whose \texttt{AST\_F0} field holds the bitmask from~\texttt{x23}.
+When no specifiers appeared at all, the default type is \texttt{int} (the
+implicit-int rule).  Finally, if any qualifiers were collected in~\texttt{x21},
+the type is wrapped in a \texttt{TYPE\_QUALS} node before returning.
+
+@d Decl: parse specifiers @{
 .Ldecl_specs_done:
     // Build the final type node
     // If we have a builtin type and no struct/union/enum type already
@@ -630,6 +683,7 @@ _kcc_parse_declarator:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_declarator
 @}
 
 \section{Direct Declarator}
@@ -721,7 +775,20 @@ _kcc_parse_direct_declarator:
     str x21, [x0, #AST_F1]      // size expr
     mov x19, x0                  // update type
     b .Lddecl_suffix_loop
+@| _kcc_parse_direct_declarator
+@}
 
+\paragraph{Function parameter lists and grouped declarators.}
+When the suffix loop encounters an opening parenthesis, the parser must
+distinguish between a function parameter list and a grouped (parenthesised)
+declarator such as \texttt{int (*fp)(int)}.  Grouped declarators are detected
+at the start of direct-declarator parsing; by the time the suffix loop runs,
+any remaining parenthesis introduces a parameter list.  The parser builds a
+\texttt{TYPE\_FUNC} node, iterates over comma-separated parameter declarations,
+and handles the variadic \texttt{...} marker.  A \texttt{FUNC\_DECL} or
+\texttt{VAR\_DECL} node is then constructed to carry the name and type.
+
+@d Decl: parse direct declarator @{
 .Lddecl_function:
     // Function: ( param-list )
     bl _kcc_pp_next               // consume '('
@@ -844,7 +911,17 @@ _kcc_parse_direct_declarator:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@}
 
+\paragraph{Parameter declarations.}
+Each parameter in a function prototype is parsed as a miniature declaration:
+specifiers followed by a declarator.  The storage class returned by
+\texttt{kcc\_parse\_decl\_specs} is ignored since storage class specifiers
+are not meaningful for parameters.  If the next token after the specifiers
+is a closing parenthesis, comma, or ellipsis, the parameter is unnamed ---
+an abstract parameter consisting of a type alone.
+
+@d Decl: parse direct declarator @{
 // -- kcc_parse_param_decl ----------------------------------------------
 // node *kcc_parse_param_decl(void)
 // Parses a parameter declaration.
@@ -901,6 +978,7 @@ _kcc_parse_param_decl:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_param_decl
 @}
 
 \section{Abstract Declarator}
@@ -1014,9 +1092,20 @@ _kcc_parse_abstract_declarator:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_abstract_declarator
 @}
 
 \section{Struct and Union}
+
+Struct and union type specifiers (\stdref{6.7.2.1}) share the same parsing
+logic since their syntax is identical apart from the leading keyword.  The
+parser consumes \texttt{struct} or \texttt{union}, records the appropriate
+AST tag, then looks for an optional tag name and an optional brace-enclosed
+member list.  Each member is parsed as a declaration specifier followed by a
+declarator, with support for bitfield widths via the \texttt{:} syntax and
+anonymous struct/union members.  The result is wrapped in a
+\texttt{TYPE\_STRUCT} or \texttt{TYPE\_UNION} node that the declaration
+specifier loop can accumulate.
 
 @d Decl: parse struct @{
 // -- kcc_parse_struct_or_union -----------------------------------------
@@ -1092,7 +1181,19 @@ _kcc_parse_struct_or_union:
     // Parse field declarations
     mov x21, #0                  // first field
     mov x22, #0                  // last field
+@| _kcc_parse_struct_or_union
+@}
 
+\paragraph{Member list parsing.}
+With the tag determined and the opening brace consumed, the parser enters
+a loop over the struct or union members.  Each member consists of declaration
+specifiers followed by a declarator and an optional bitfield width introduced
+by a colon.  Anonymous members (a bare specifier followed immediately by a
+semicolon) are also supported, which allows anonymous inner structs and unions
+as described in \stdref{6.7.2.1}~p13.  Members are linked through
+\texttt{AST\_F4} into a singly-linked list anchored by the first field node.
+
+@d Decl: parse struct @{
 .Lstruct_field_loop:
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
@@ -1199,7 +1300,18 @@ _kcc_parse_struct_or_union:
     mov x0, #TOK_SEMI
     bl _kcc_parse_expect
     b .Lstruct_field_loop
+@}
 
+\paragraph{Struct/union node construction.}
+After the closing brace terminates the member list, the parser allocates the
+aggregate declaration node with tag \texttt{AST\_STRUCT\_DECL} or
+\texttt{AST\_UNION\_DECL}, storing the tag name in \texttt{AST\_F0} and the
+field chain in \texttt{AST\_F1}.  The declaration is then wrapped in a
+\texttt{TYPE\_STRUCT} or \texttt{TYPE\_UNION} node so it can be consumed by
+the specifier accumulator.  Forward declarations (a tag without a body) follow
+the same wrapping logic but produce an empty node with no field list.
+
+@d Decl: parse struct @{
 .Lstruct_close:
     mov x0, #TOK_RBRACE
     bl _kcc_parse_expect
@@ -1251,6 +1363,15 @@ _kcc_parse_struct_or_union:
 @}
 
 \section{Enum}
+
+An enumeration type specifier (\stdref{6.7.2.2}) introduces a set of named
+integer constants.  The parser consumes the \texttt{enum} keyword, reads an
+optional tag name, and if an opening brace follows, iterates over the
+enumerator list.  Each enumerator is an identifier with an optional
+\texttt{= constant-expression} initializer; a trailing comma before the
+closing brace is permitted.  The resulting \texttt{AST\_ENUM\_DECL} node is
+wrapped in a \texttt{TYPE\_ENUM} wrapper so it can be returned as a type
+specifier to the declaration specifier loop.
 
 @d Decl: parse enum @{
 // -- kcc_parse_enum ----------------------------------------------------
@@ -1394,6 +1515,7 @@ _kcc_parse_enum:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_parse_enum
 @}
 
 \section{Type Name}
@@ -1438,6 +1560,7 @@ _kcc_parse_type_name:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_type_name
 @}
 
 \section{Is Type Token}
@@ -1533,6 +1656,7 @@ _kcc_parse_is_type_token:
     mov x0, #0
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_parse_is_type_token
 @}
 
 \section{Initializer}
@@ -1621,9 +1745,17 @@ _kcc_parse_initializer:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_initializer
 @}
 
 \section{Static Assert}
+
+The \texttt{\_Static\_assert} declaration (\stdref{6.7.10}) provides
+compile-time assertion checking.  It takes the form
+\texttt{\_Static\_assert(constant-expression, string-literal);} and produces
+an \texttt{AST\_STATIC\_ASSERT} node carrying the condition expression and
+the diagnostic message string.  The assertion is evaluated during semantic
+analysis; at parse time we only need to extract the two operands.
 
 @d Decl: parse static assert @{
 // -- kcc_parse_static_assert -------------------------------------------
@@ -1676,9 +1808,15 @@ _kcc_parse_static_assert:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_static_assert
 @}
 
 \section{Declaration Data}
+
+This fragment reserves a place for any static data the declaration parser
+might need, such as error message strings or lookup tables.  Currently no
+additional data is required beyond what the individual parsing functions use
+locally.
 
 @d Decl: data @{
 // -- Declaration parser data (reserved) --------------------------------

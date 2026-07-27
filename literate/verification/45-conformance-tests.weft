@@ -8,6 +8,8 @@
 \chapter{Conformance Tests}
 \label{ch:conformance-tests}
 
+With the test harness from Chapter~\ref{ch:test-harness} in place, this chapter populates it with concrete test cases for the lexer.  Each test function constructs a small source string, feeds it to the lexer, and verifies that the resulting token stream matches the expected sequence of token kinds.  The suite covers keyword recognition, operator and punctuator scanning, numeric and string literal tokenization, and edge cases such as maximal-munch disambiguation.
+
 \section{Keyword Recognition}
 
 Tests that representative keywords from all categories are correctly
@@ -61,6 +63,7 @@ _test_lex_keywords:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _test_lex_keywords
 @}
 
 \section{Numeric Literals}
@@ -115,6 +118,7 @@ _test_lex_numbers:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _test_lex_numbers
 @}
 
 \section{String and Character Literals}
@@ -159,6 +163,7 @@ _test_lex_strings:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _test_lex_strings
 @}
 
 \section{Punctuators}
@@ -233,6 +238,7 @@ _test_lex_punctuators:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _test_lex_punctuators
 @}
 
 \section{Comments}
@@ -279,6 +285,7 @@ _test_lex_comments:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _test_lex_comments
 @}
 
 \section{Trigraph Replacement}
@@ -339,6 +346,7 @@ _test_lex_trigraphs:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _test_lex_trigraphs
 @}
 
 \section{Line Splicing}
@@ -384,6 +392,7 @@ _test_lex_line_splice:
     mov x0, #1
     ldp x29, x30, [sp], #16
     ret
+@| _test_lex_line_splice
 @}
 
 \section{Test Registration Table}
@@ -414,6 +423,7 @@ _kcc_test_table:
     .quad _test_lex_line_splice
     .quad 0                       // sentinel: null name
     .quad 0
+@| _kcc_test_table
 @}
 
 \section{Test Source Data}

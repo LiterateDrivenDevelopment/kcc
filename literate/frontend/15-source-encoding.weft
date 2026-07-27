@@ -14,6 +14,8 @@
 \chapter{Source Encoding --- Translation Phase 1}
 \label{ch:source-encoding}
 
+The first phase of C17 translation (\stdref{5.1.1.2}, paragraph~1) maps physical source characters to the source character set and replaces trigraph sequences with their single-character equivalents.  Although trigraphs are a historical relic from terminals that lacked certain keys, a conforming compiler must handle all nine sequences before any other processing occurs.  This chapter defines the trigraph mapping table and implements the \texttt{kcc\_source\_encode} function that performs the replacement into a writable arena buffer.
+
 \section{Trigraph Sequences}
 
 \stdref{5.2.1.1} defines exactly nine trigraph sequences:
@@ -177,4 +179,5 @@ _kcc_source_encode:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_source_encode
 @}

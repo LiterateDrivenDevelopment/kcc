@@ -8,6 +8,25 @@
 \chapter{Dead Code Elimination}
 \label{ch:dce}
 
+After constant folding and identity elimination have simplified the IR, some instructions may no longer contribute to the program's output---their destination vregs are never referenced by any subsequent instruction.  This chapter removes such dead code through a mark-and-sweep algorithm.  The mark pass records every vreg that appears as a source operand; the sweep pass deletes any instruction whose destination vreg was not marked, provided the instruction has no side effects (stores, calls, branches, and returns are always preserved).
+
+\section{Dead Code Elimination}
+
+DCE removes instructions whose results are never used.  It works in two
+passes: a \emph{mark} pass walks every instruction and records which
+vregs are live (referenced as sources), and a \emph{sweep} pass deletes
+any instruction whose destination vreg was not marked.  Instructions
+with side effects---stores, calls, branches, returns---are never deleted
+regardless of whether their result is used.
+
+\subsection{Setup and Bitmap Allocation}
+
+The function begins by allocating a dense used-vreg bitmap sized to
+the function's vreg count.  Each slot is eight bytes wide (one machine
+word) for alignment convenience; a non-zero value means the vreg is
+referenced somewhere in the function.  The bitmap is zeroed before the
+mark pass begins.
+
 @d Opt: dead code elimination @{
 // -- kcc_opt_dce ----------------------------------------------------------
 // uint64_t kcc_opt_dce(ir_func *func)
@@ -41,7 +60,20 @@ _kcc_opt_dce:
     mov x1, #0
     lsl x2, x20, #3
     bl _kcc_memset
+@| _kcc_opt_dce
+@}
 
+\subsection{Mark Pass}
+
+The mark pass iterates every instruction in every basic block and records
+which vregs are referenced as source operands.  Special care is needed
+for instructions whose fields carry non-vreg data: \texttt{IR\_CONST}
+encodes an immediate in \texttt{src1}, \texttt{IR\_CALL} stores a
+function name pointer, and branch instructions carry basic-block
+identifiers.  The pass also handles \texttt{IR\_CALL} argument arrays by
+walking each element and marking the argument vregs individually.
+
+@d Opt: dead code elimination @{
     // Pass 1: mark used vregs
     ldr x0, [x19, #IRF_BLOCKS]
     cbz x0, .Ldce_done
@@ -170,7 +202,21 @@ _kcc_opt_dce:
 .Ldce_mark_next_bb:
     add x24, x24, #1
     b .Ldce_mark_bb
+@}
 
+\subsection{Sweep Pass}
+
+Armed with the completed used-vreg bitmap, the sweep pass makes a second
+traversal over every instruction.  Any instruction whose destination vreg
+is not marked as used---and that has no side effects---is replaced with
+\texttt{IR\_NOP}.  Side-effecting instructions (\texttt{IR\_STORE},
+\texttt{IR\_BR}, \texttt{IR\_BR\_COND}, \texttt{IR\_RET},
+\texttt{IR\_CALL}) and stack allocations (\texttt{IR\_ALLOCA}) are
+unconditionally preserved.  The function returns the total number of
+eliminations so the pass manager can detect whether another round of
+optimization is warranted.
+
+@d Opt: dead code elimination @{
     // Pass 2: sweep — replace dead non-side-effect instructions with NOP
 .Ldce_sweep:
     mov x24, #0

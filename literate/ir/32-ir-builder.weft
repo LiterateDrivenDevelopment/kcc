@@ -7,6 +7,8 @@
 \chapter{IR Builder}
 \label{ch:ir-builder}
 
+With the IR data structures defined in Chapter~\ref{ch:ir-design}, we now need machinery to translate the typed AST into linear IR.  This chapter implements the IR builder, which walks the AST recursively and emits IR instructions for each expression, statement, and declaration.  Control-flow constructs (\texttt{if}/\texttt{else}, \texttt{while}, \texttt{for}, \texttt{do}/\texttt{while}, \texttt{break}/\texttt{continue}) are lowered into conditional and unconditional branches between basic blocks.  The chapter also provides the textual dump used by the \texttt{--dump-ir} flag for debugging.
+
 \section{IR Dump}
 
 We implement the dump first so that we can test the builder
@@ -142,9 +144,18 @@ _kcc_ir_dump:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #96
     ret
+@| _kcc_ir_dump
 @}
 
 \subsection{Dumping a Single Instruction}
+
+Each instruction is printed on one line with four-space indentation.
+The general format is
+\texttt{\%\textit{dest}\;=\;\textit{op}\;\textit{type}\;\textit{src1},\;\textit{src2}},
+though the exact layout varies by opcode: branches print
+\texttt{bb\textit{N}} targets, calls print the callee name and
+argument list, and side-effect-only instructions (\textsc{store},
+\textsc{ret}, \textsc{br}) omit the destination.
 
 @d IR: dump instruction @{
 // -- kcc_ir_dump_instr ----------------------------------------------------
@@ -267,7 +278,24 @@ _kcc_ir_dump_instr:
     add  x0, x0, _kcc_ir_str_unknown@@PAGEOFF
     bl _kcc_io_puts
     b .Lidi_nl
+@| _kcc_ir_dump_instr
+@}
 
+\paragraph{Binary and Comparison Operations}
+
+Every arithmetic, bitwise, and comparison opcode follows the same
+printing pattern: load the opcode's string label into \texttt{x0}
+and branch to the shared \texttt{.Lidi\_binop} handler.  That handler
+emits the format \texttt{op type \%src1, \%src2}, reading the type
+descriptor from \texttt{IR\_TYPE} and both source virtual registers
+from \texttt{IR\_SRC1} and \texttt{IR\_SRC2}.  Arithmetic opcodes
+(\textsc{add}, \textsc{sub}, \textsc{mul}, \textsc{sdiv}/\textsc{udiv},
+\textsc{smod}/\textsc{umod}) come first, followed by bitwise
+(\textsc{and}, \textsc{or}, \textsc{xor}, \textsc{shl},
+\textsc{lshr}, \textsc{ashr}) and the six signed comparison
+predicates (\textsc{cmp\_eq} through \textsc{cmp\_sge}).
+
+@d IR: dump instruction @{
 // -- Binary ops: "op type %src1, %src2" -----------------------------------
 .Lidi_add:
     adrp x0, _kcc_ir_op_add@@PAGE
@@ -367,7 +395,20 @@ _kcc_ir_dump_instr:
     ldr x0, [x19, #IR_SRC2]
     bl _kcc_io_putu
     b .Lidi_nl
+@}
 
+\paragraph{Unary and Type-Conversion Operations}
+
+Unary instructions---\textsc{neg}, \textsc{not}, and the three
+width-changing casts \textsc{sext}, \textsc{zext}, \textsc{trunc}---use
+the shared \texttt{.Lidi\_unop} handler.  The output format is
+\texttt{op type \%src1}, identical to the binary pattern but with
+only one source operand read from \texttt{IR\_SRC1}.  Sign- and
+zero-extension are semantically distinct at the IR level so that
+the backend can select the correct ARM64 widening instruction
+(\texttt{SXTW} versus \texttt{UXTW}).
+
+@d IR: dump instruction @{
 // -- Unary ops: "op type %src1" -------------------------------------------
 .Lidi_neg:
     adrp x0, _kcc_ir_op_neg@@PAGE
@@ -403,7 +444,27 @@ _kcc_ir_dump_instr:
     ldr x0, [x19, #IR_SRC1]
     bl _kcc_io_putu
     b .Lidi_nl
+@}
 
+\paragraph{Memory, Control Flow, and Miscellaneous Operations}
+
+The remaining opcodes each have their own bespoke printing logic
+because their operand layouts differ from one another.  Memory
+operations \textsc{load} and \textsc{store} include pointer
+annotations; \textsc{alloca} prints only its type.  The branch
+family uses basic-block identifiers (\texttt{bb\textit{N}}) rather
+than virtual registers: \textsc{br} takes one target while
+\textsc{br\_cond} takes a condition vreg plus true/false targets.
+\textsc{ret} checks whether the return type is \texttt{void} to
+decide if a value operand follows.  \textsc{call} prints the callee
+name prefixed with \texttt{@@}.  Finally, \textsc{const},
+\textsc{nop}, \textsc{global\_ref}, and \textsc{string\_lit} handle
+immediates, no-ops, global symbol references, and inline string
+data respectively.  The shared epilogue at \texttt{.Lidi\_nl}
+appends a newline and restores callee-saved registers before
+returning.
+
+@d IR: dump instruction @{
 // -- load: "load type, ptr %src1" -----------------------------------------
 .Lidi_load:
     adrp x0, _kcc_ir_op_load@@PAGE
@@ -689,6 +750,7 @@ _kcc_ir_dump_type_short:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_dump_type_short
 @}
 
 \section{IR Builder Entry Point}
@@ -735,6 +797,7 @@ _kcc_ir_build:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_build
 @}
 
 \section{Building a Function}
@@ -906,9 +969,17 @@ _kcc_ir_build_func:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #80
     ret
+@| _kcc_ir_build_func
 @}
 
 \section{Building Parameters}
+
+Each function parameter gets an \textsc{alloca} for its stack storage
+and a \textsc{store} that saves the incoming register value.  The
+codegen prologue copies \texttt{x0}--\texttt{x7} into vreg slots
+0--7, so the parameter's ``incoming vreg'' is simply its index.
+The alloca vreg is recorded in the \texttt{locals} hash table so
+that later identifier references find the right address.
 
 @d IR: build param @{
 // -- kcc_ir_build_param ---------------------------------------------------
@@ -982,9 +1053,17 @@ _kcc_ir_build_param:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_ir_build_param
 @}
 
 \section{Building Statements}
+
+The statement dispatcher matches the AST tag and calls the
+appropriate lowering function.  Expression statements call
+\texttt{ir\_build\_expr} and discard the result vreg.  Compound
+statements recurse over their children.  All control-flow
+statements (if, while, do, for) and break/continue have
+dedicated builders in \S\ref{sec:ir-control-flow}.
 
 @d IR: build statement @{
 // -- kcc_ir_build_stmt ----------------------------------------------------
@@ -1089,9 +1168,17 @@ _kcc_ir_build_stmt:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_build_stmt
 @}
 
 \section{Building Return}
+
+A return statement evaluates its expression (if any), emits
+\texttt{IR\_RET} with the result vreg as \texttt{SRC1}, and marks
+the current basic block as terminated.  A void return emits
+\texttt{IR\_RET} with a void type and no source operand.  The
+termination flag prevents the builder from appending further
+instructions to this block.
 
 @d IR: build return @{
 // -- kcc_ir_build_return --------------------------------------------------
@@ -1152,11 +1239,20 @@ _kcc_ir_build_return:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_build_return
 @}
 
 \section{Building Expressions}
 
-Every expression builder returns the vreg number holding the result.
+The expression dispatcher examines the AST tag of its input node and
+delegates to a specialised builder for each expression kind.  Every
+builder returns the vreg number holding the result; this convention
+lets callers compose expressions by feeding one builder's result into
+another's operand slots.  Cast and parenthesised expressions are
+handled inline: a cast simply builds its inner operand (truncation and
+extension are deferred to a later phase), and a parenthesised
+expression unwraps to its child.  The comma operator evaluates both
+sides and returns the right-hand vreg.
 
 @d IR: build expression @{
 // -- kcc_ir_build_expr ----------------------------------------------------
@@ -1276,9 +1372,17 @@ _kcc_ir_build_expr:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_build_expr
 @}
 
 \subsection{Integer Literal}
+
+An integer or character literal becomes an \texttt{IR\_CONST}
+instruction whose \texttt{SRC1} field stores the immediate value.
+The builder assigns the default type \texttt{i32} and allocates a
+fresh vreg for the result.  Character literals receive the same
+treatment because the parser stores the character's numeric value in
+\texttt{AST\_F0}.
 
 @d IR: build int literal @{
 // -- kcc_ir_build_int_lit -------------------------------------------------
@@ -1322,9 +1426,21 @@ _kcc_ir_build_int_lit:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ir_build_int_lit
 @}
 
 \subsection{Identifier (Variable Load)}
+
+Loading a variable is a two-step lookup.  First the builder searches
+the \texttt{\_kcc\_ir\_locals} hash table, which maps variable names
+to alloca vreg numbers (stored as \texttt{vreg+1} so that zero can
+serve as ``not found'').  If the name is found, a single
+\texttt{IR\_LOAD} from the alloca vreg suffices.
+
+If the name is absent from locals, the variable must be a global.
+The builder emits \texttt{IR\_GLOBAL\_REF} to materialise the
+symbol's address, then \texttt{IR\_LOAD} to fetch the value through
+that address---two instructions instead of one.
 
 @d IR: build ident @{
 // -- kcc_ir_build_ident ---------------------------------------------------
@@ -1426,9 +1542,27 @@ _kcc_ir_build_ident:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ir_build_ident
 @}
 
 \subsection{Binary Expression}
+
+Binary expressions follow one of two paths.  For ordinary operators
+(\texttt{+}, \texttt{-}, \texttt{*}, etc.) the builder evaluates both
+sides, maps the AST token to an IR opcode, and emits a single
+instruction.  For the short-circuit logical operators \texttt{\&\&}
+and \texttt{||}, it must generate control flow: evaluating the
+right-hand side only when the left-hand side does not already
+determine the result.
+
+\paragraph{Ordinary operators.}
+The builder evaluates LHS and RHS first (in that order), then
+dispatches through a token-to-opcode table covering arithmetic
+(\texttt{+~-~*~/~\%}), bitwise (\texttt{\&~|~\^{}~<<~>>}), and
+relational (\texttt{== != < <= > >=}) operators.  Each case sets
+\texttt{x23} to the corresponding IR opcode and falls through to
+the common emitter, which allocates the instruction, wires both
+source vregs, and assigns a fresh destination vreg.
 
 @d IR: build binary @{
 // -- kcc_ir_build_binary --------------------------------------------------
@@ -1556,7 +1690,23 @@ _kcc_ir_build_binary:
 
     mov x0, x23
     b .Libb_done
+@| _kcc_ir_build_binary
+@}
 
+\paragraph{Short-circuit logical AND.}
+The C standard requires that \texttt{a \&\& b} evaluate \texttt{b}
+only when \texttt{a} is nonzero.  The builder creates two fresh basic
+blocks: \emph{rhs\_bb} and \emph{merge\_bb}.  It emits a conditional
+branch on the LHS vreg: true falls through to \emph{rhs\_bb} (which
+evaluates the RHS and branches to \emph{merge\_bb}), false jumps
+directly to \emph{merge\_bb}.  The returned vreg is the RHS result
+---a simplification that avoids phi nodes (a full SSA compiler would
+merge both paths via a phi).
+
+The short-circuit \texttt{||} mirrors this logic with the branch
+targets swapped: a true LHS skips the RHS entirely.
+
+@d IR: build binary @{
 // -- Short-circuit && ----------------------------------------------------
 .Libb_short_and:
     // Evaluate LHS
@@ -1681,6 +1831,14 @@ _kcc_ir_build_binary:
 
 \subsection{Unary Expression}
 
+Unary operators dispatch on the token stored in \texttt{AST\_F0}.
+Arithmetic negation (\texttt{-}) emits \texttt{IR\_NEG}, bitwise
+complement (\texttt{\~{}}) emits \texttt{IR\_NOT}, and logical
+negation (\texttt{!}) is lowered to \texttt{IR\_CMP\_EQ} against a
+synthesised zero constant---producing~1 when the operand is zero and
+0 otherwise.  All other unary tokens (e.g.\ address-of, dereference)
+are not yet supported and return the operand unchanged.
+
 @d IR: build unary @{
 // -- kcc_ir_build_unary ---------------------------------------------------
 // uint64_t kcc_ir_build_unary(node *expr)
@@ -1787,9 +1945,23 @@ _kcc_ir_build_unary:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ir_build_unary
 @}
 
 \subsection{Assignment}
+
+Assignment handles three cases.  A simple \texttt{=} evaluates the
+RHS, looks up the LHS identifier in the locals table, and emits
+\texttt{IR\_STORE} to write the value into the variable's alloca.
+Compound assignments (\texttt{+=}, \texttt{-=}, \ldots) first load
+the current value, emit the corresponding binary operation, then
+store the result back---exactly the read-modify-write pattern.
+Finally, if the LHS identifier is not in locals, it must be a global:
+the builder emits \texttt{IR\_GLOBAL\_REF} followed by
+\texttt{IR\_STORE} through the resulting address vreg.
+
+In all cases the returned vreg is the stored value, matching the
+C semantics where assignment is an expression.
 
 @d IR: build assign @{
 // -- kcc_ir_build_assign --------------------------------------------------
@@ -1955,9 +2127,19 @@ _kcc_ir_build_assign:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ir_build_assign
 @}
 
 \subsection{Function Call}
+
+A function call walks the argument list (linked via \texttt{AST\_F4}),
+evaluates each argument expression, and stores the resulting vregs
+into an arena-allocated array.  The array layout is
+\texttt{[count, vreg0, vreg1, \ldots]} so the code generator can
+marshal arguments into the ABI-correct registers or stack slots.
+The \texttt{IR\_CALL} instruction stores the callee name in
+\texttt{SRC1} and the argument array pointer in \texttt{SRC2}; the
+destination vreg receives the return value.
 
 @d IR: build call @{
 // -- kcc_ir_build_call ----------------------------------------------------
@@ -2046,9 +2228,17 @@ _kcc_ir_build_call:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_ir_build_call
 @}
 
 \subsection{String Literal}
+
+A string literal is represented by \texttt{IR\_STRING\_LIT}, which
+carries the data pointer in \texttt{SRC1} and the byte length in
+\texttt{SRC2}.  The code generator
+(Chapter~\ref{ch:codegen}) later appends this data to the
+\texttt{\_\_text} section and emits a PC-relative reference so the
+vreg holds the string's run-time address.
 
 @d IR: build string literal @{
 // -- kcc_ir_build_string_lit ----------------------------------------------
@@ -2094,9 +2284,18 @@ _kcc_ir_build_string_lit:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ir_build_string_lit
 @}
 
 \subsection{Conditional Expression}
+
+The ternary operator \texttt{cond ? then : else} is lowered to three
+fresh basic blocks.  The condition vreg feeds an \texttt{IR\_BR\_COND}
+that routes control to the \emph{then\_bb} or \emph{else\_bb}.  Each
+arm evaluates its expression, then branches unconditionally to the
+\emph{merge\_bb}.  The returned vreg is that of the last-evaluated
+arm---a simplification that avoids phi nodes and works because the
+all-spill code generator stores every vreg to a stack slot.
 
 @d IR: build conditional @{
 // -- kcc_ir_build_cond_expr -----------------------------------------------
@@ -2190,9 +2389,19 @@ _kcc_ir_build_cond_expr:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_ir_build_cond_expr
 @}
 
 \section{Building Variable Declarations}
+
+A variable declaration emits \texttt{IR\_ALLOCA} to reserve a stack
+slot, then records the mapping \texttt{name $\to$ vreg+1} in the
+locals hash table (the \texttt{+1} bias lets zero represent ``not
+found'').  If the declaration carries an initialiser, the builder
+evaluates the expression and emits \texttt{IR\_STORE} to write the
+initial value into the alloca.  The type is resolved via
+\texttt{\_kcc\_sema\_resolve\_type}; if resolution fails, the
+builder falls back to \texttt{i32}.
 
 @d IR: build var decl @{
 // -- kcc_ir_build_var_decl ------------------------------------------------
@@ -2268,11 +2477,30 @@ _kcc_ir_build_var_decl:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_ir_build_var_decl
 @}
 
 \section{Building Control Flow}
+\label{sec:ir-control-flow}
+
+Control-flow statements create fresh basic blocks and wire them
+together with \texttt{IR\_BR} and \texttt{IR\_BR\_COND}.  Each
+builder follows the same discipline: after emitting a terminator
+(\texttt{IR\_BR}, \texttt{IR\_BR\_COND}, or \texttt{IR\_RET}), it
+sets \texttt{BB\_FLAG\_TERMINATED} on the current block so that later
+code does not accidentally append instructions after a branch.  Only
+after switching to a new block with \texttt{\_kcc\_ir\_set\_bb} can
+the builder resume emitting.
 
 \subsection{If Statement}
+
+An \texttt{if} with an else clause produces three blocks:
+\emph{then\_bb}, \emph{else\_bb}, and \emph{merge\_bb}.  The
+condition vreg feeds a conditional branch; each arm builds its body,
+then jumps to \emph{merge\_bb} (unless it was already terminated by a
+\texttt{return} or \texttt{break}).  An \texttt{if} without an else
+skips the \emph{else\_bb} and branches either to \emph{then\_bb} or
+directly to \emph{merge\_bb}.
 
 @d IR: build if @{
 // -- kcc_ir_build_if ------------------------------------------------------
@@ -2427,9 +2655,19 @@ _kcc_ir_build_if:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_ir_build_if
 @}
 
 \subsection{While Statement}
+
+A \texttt{while} loop creates three blocks: \emph{cond\_bb} (the
+loop header), \emph{body\_bb}, and \emph{exit\_bb}.  The entry block
+branches unconditionally to \emph{cond\_bb}, which evaluates the
+condition and branches to \emph{body\_bb} (true) or \emph{exit\_bb}
+(false).  After executing the body, a back-edge branches to
+\emph{cond\_bb}.  The loop stack receives \texttt{(break=exit\_bb,
+continue=cond\_bb)} so that \texttt{break} and \texttt{continue}
+inside the body emit the correct branch target.
 
 @d IR: build while @{
 // -- kcc_ir_build_while ---------------------------------------------------
@@ -2530,9 +2768,18 @@ _kcc_ir_build_while:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_ir_build_while
 @}
 
 \subsection{Do-While Statement}
+
+A \texttt{do-while} loop guarantees at least one body execution.
+The CFG is the mirror image of \texttt{while}: the entry block
+branches directly to \emph{body\_bb}, which falls through to
+\emph{cond\_bb}.  The condition evaluates its expression and branches
+back to \emph{body\_bb} (true) or out to \emph{exit\_bb} (false).
+The loop stack entries are \texttt{(break=exit\_bb,
+continue=cond\_bb)}, just as with \texttt{while}.
 
 @d IR: build do @{
 // -- kcc_ir_build_do ------------------------------------------------------
@@ -2630,9 +2877,22 @@ _kcc_ir_build_do:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_ir_build_do
 @}
 
 \subsection{For Statement}
+
+A \texttt{for} loop is the most complex control-flow construct,
+producing four blocks: \emph{cond\_bb}, \emph{body\_bb},
+\emph{incr\_bb}, and \emph{exit\_bb}.  The builder first emits the
+initialiser (which may be a declaration or expression) into the
+current block, then branches to \emph{cond\_bb}.  The condition block
+evaluates its expression (or branches unconditionally to the body for
+\texttt{for(;;)}), the body executes, control flows to
+\emph{incr\_bb} for the increment expression, and a back-edge returns
+to \emph{cond\_bb}.  Note that \texttt{continue} targets
+\emph{incr\_bb}, not \emph{cond\_bb}---ensuring the increment runs
+before the next condition test.
 
 @d IR: build for @{
 // -- kcc_ir_build_for -----------------------------------------------------
@@ -2779,9 +3039,19 @@ _kcc_ir_build_for:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #80
     ret
+@| _kcc_ir_build_for
 @}
 
 \subsection{Break and Continue}
+
+The loop stack is a fixed-size array of 16 entries (supporting up to
+16 levels of nesting), where each entry holds a
+\texttt{(break\_bb\_id, continue\_bb\_id)} pair.  Every loop builder
+pushes its targets onto the stack before building the body, and pops
+after.  \texttt{\_kcc\_ir\_build\_break} reads the break target from
+the stack top, emits \texttt{IR\_BR} to that block, and marks the
+current block terminated.  \texttt{\_kcc\_ir\_build\_continue} does
+the same with the continue target.
 
 @d IR: build break @{
 // -- Loop Stack -----------------------------------------------------------
@@ -2817,7 +3087,19 @@ _kcc_loop_pop:
     sub  x1, x1, #1
     str  x1, [x0]
     ret
+@| _kcc_loop_push
+@| _kcc_loop_pop
+@}
 
+\paragraph{Break Statement.}
+When the parser encounters a \texttt{break} statement inside a loop,
+the IR builder must emit an unconditional branch to the loop's exit
+basic block.  \texttt{\_kcc\_ir\_build\_break} reads the break target
+from the top of the loop stack, allocates an \texttt{IR\_BR} instruction
+pointing at that block, and marks the current basic block as terminated
+so that no further instructions are appended to it (\stdref{6.8.6.3}).
+
+@d IR: build break @{
 // -- kcc_ir_build_break ---------------------------------------------------
 // void kcc_ir_build_break(node *stmt)
 // Emits unconditional branch to current loop's break target (exit BB).
@@ -2855,7 +3137,13 @@ _kcc_ir_build_break:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_build_break
 @}
+
+A \texttt{continue} statement jumps to the loop's condition-test basic
+block rather than the exit.  The logic mirrors \texttt{break} except
+that it reads the continue target (offset~+8) from the loop stack
+entry instead of the break target (offset~+0).
 
 @d IR: build continue @{
 // -- kcc_ir_build_continue ------------------------------------------------
@@ -2897,9 +3185,16 @@ _kcc_ir_build_continue:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_build_continue
 @}
 
 \section{String Constants}
+
+The IR dump and builder share a set of string constants for opcode
+mnemonics, punctuation, and formatting.  These live in the
+\texttt{\_\_TEXT,\_\_cstring} section so the linker can deduplicate
+them.  The loop stack data (depth counter and 16-entry array) is
+placed in \texttt{.data} since it is mutable at run time.
 
 @d IR: builder data @{
 // -- IR builder string constants ------------------------------------------
@@ -2974,4 +3269,62 @@ _kcc_ir_ty_f64:         .asciz "f64"
 _kcc_ir_ty_ptr:         .asciz "ptr"
 _kcc_ir_ty_struct:      .asciz "struct"
 _kcc_ir_ty_unknown:     .asciz "?type"
+@| _kcc_ir_str_func
+@| _kcc_ir_str_arrow
+@| _kcc_ir_str_colon_nl
+@| _kcc_ir_str_bb
+@| _kcc_ir_str_indent
+@| _kcc_ir_str_eq
+@| _kcc_ir_str_comma
+@| _kcc_ir_str_ptr_pct
+@| _kcc_ir_str_comma_bb
+@| _kcc_ir_str_unknown
+@| _kcc_ir_op_add
+@| _kcc_ir_op_sub
+@| _kcc_ir_op_mul
+@| _kcc_ir_op_sdiv
+@| _kcc_ir_op_udiv
+@| _kcc_ir_op_smod
+@| _kcc_ir_op_umod
+@| _kcc_ir_op_neg
+@| _kcc_ir_op_and
+@| _kcc_ir_op_or
+@| _kcc_ir_op_xor
+@| _kcc_ir_op_shl
+@| _kcc_ir_op_lshr
+@| _kcc_ir_op_ashr
+@| _kcc_ir_op_not
+@| _kcc_ir_op_cmp_eq
+@| _kcc_ir_op_cmp_ne
+@| _kcc_ir_op_cmp_slt
+@| _kcc_ir_op_cmp_sle
+@| _kcc_ir_op_cmp_sgt
+@| _kcc_ir_op_cmp_sge
+@| _kcc_ir_op_load
+@| _kcc_ir_op_store
+@| _kcc_ir_op_alloca
+@| _kcc_ir_op_br
+@| _kcc_ir_op_br_cond
+@| _kcc_ir_op_ret
+@| _kcc_ir_op_call
+@| _kcc_ir_op_sext
+@| _kcc_ir_op_zext
+@| _kcc_ir_op_trunc
+@| _kcc_ir_op_const
+@| _kcc_ir_op_nop
+@| _kcc_ir_op_global_ref
+@| _kcc_ir_op_string_lit
+@| _kcc_loop_depth
+@| _kcc_loop_stack
+@| _kcc_ir_ty_void
+@| _kcc_ir_ty_i1
+@| _kcc_ir_ty_i8
+@| _kcc_ir_ty_i16
+@| _kcc_ir_ty_i32
+@| _kcc_ir_ty_i64
+@| _kcc_ir_ty_f32
+@| _kcc_ir_ty_f64
+@| _kcc_ir_ty_ptr
+@| _kcc_ir_ty_struct
+@| _kcc_ir_ty_unknown
 @}

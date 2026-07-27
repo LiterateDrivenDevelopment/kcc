@@ -9,6 +9,8 @@
 \chapter{Intermediate Representation}
 \label{ch:ir-design}
 
+The front end produces an AST tied closely to C syntax; the back end needs a flat, register-based representation amenable to optimization and machine code emission.  This chapter defines the intermediate representation that bridges the two.  The IR follows a three-address, virtual-register design organized into basic blocks and functions---similar in spirit to LLVM IR but far simpler.  We specify the 48-byte instruction layout, the basic-block and function data structures, the full opcode table covering arithmetic, comparison, memory, control flow, and function calls, and the core allocation routines that create each IR entity from the arena.
+
 \section{IR Instruction Layout}
 
 An IR instruction occupies 48 bytes:
@@ -185,11 +187,13 @@ _kcc_ir_init:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_ir_init
 @}
 
 \section{Allocating IR Nodes}
 
-Every IR structure is arena-allocated.
+Three allocation functions arena-allocate and zero-initialise the core IR
+data structures.  Each returns a pointer to the freshly allocated node.
 
 @d IR: alloc instruction @{
 // -- kcc_ir_alloc_instr ---------------------------------------------------
@@ -219,7 +223,11 @@ _kcc_ir_alloc_instr:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_alloc_instr
 @}
+
+Basic blocks are allocated with a unique ID drawn from a per-function
+counter.
 
 @d IR: alloc basic block @{
 // -- kcc_ir_alloc_bb ------------------------------------------------------
@@ -255,7 +263,11 @@ _kcc_ir_alloc_bb:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_alloc_bb
 @}
+
+A function node holds the name, parameter count, a vector of basic blocks,
+and the vreg counter.
 
 @d IR: alloc function @{
 // -- kcc_ir_alloc_func ----------------------------------------------------
@@ -306,9 +318,14 @@ _kcc_ir_alloc_func:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ir_alloc_func
 @}
 
 \section{Emitting Instructions}
+
+The emit helper appends an instruction to the current basic block's linked
+list.  It also sets the instruction's \texttt{BB} field so validation can
+check that every instruction belongs to exactly one block.
 
 @d IR: emit @{
 // -- kcc_ir_emit ----------------------------------------------------------
@@ -353,6 +370,7 @@ _kcc_ir_emit:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_emit
 @}
 
 \section{Virtual Register Allocation}
@@ -387,9 +405,15 @@ _kcc_ir_next_vreg:
     mov x0, #0
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_ir_next_vreg
 @}
 
 \section{Switching Basic Blocks}
+
+When the IR builder starts a new basic block, it calls
+\texttt{kcc\_ir\_set\_bb} to redirect subsequent \texttt{emit} calls to the
+new block.  The old current-block pointer is not saved---the builder is
+responsible for managing block references in callee-saved registers.
 
 @d IR: set current bb @{
 // -- kcc_ir_set_bb --------------------------------------------------------
@@ -428,9 +452,14 @@ _kcc_ir_set_bb:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_ir_set_bb
 @}
 
 \section{IR Module Data}
+
+Module-level state: the current function being built, the current basic
+block receiving emitted instructions, and the global function vector that
+\texttt{codegen\_all} iterates.
 
 @d IR: data @{
 // -- IR module data -------------------------------------------------------
@@ -448,4 +477,10 @@ _kcc_ir_locals:      .quad 0     // hash table: name → alloca vreg
 _kcc_ir_loop_stack:  .quad 0     // vec of (continue_bb, break_bb) pairs
 .globl _kcc_ir_bb_counter
 _kcc_ir_bb_counter:  .quad 0     // global BB id counter
+@| _kcc_ir_cur_func
+@| _kcc_ir_cur_bb
+@| _kcc_ir_funcs
+@| _kcc_ir_locals
+@| _kcc_ir_loop_stack
+@| _kcc_ir_bb_counter
 @}

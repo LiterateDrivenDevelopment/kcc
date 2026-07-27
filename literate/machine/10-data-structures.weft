@@ -11,6 +11,10 @@
 \chapter{Data Structures}
 \label{ch:data-structures}
 
+Three data structures recur throughout the compiler: a hash table for $O(1)$ lookups (keyword recognition, symbol resolution), a dynamic vector for growable sequences (token lists, IR instruction arrays), and a string intern table for canonicalizing identifiers so that pointer equality suffices for comparison.
+All three are arena-allocated, so they never individually free memory.
+This chapter presents the FNV-1a hash function, the open-addressed hash table built on top of it, the resizable vector, and the string interning layer.
+
 \section{FNV-1a Hash Function}
 
 FNV-1a (Fowler/Noll/Vo, variant ``a'') is a non-cryptographic hash
@@ -60,6 +64,7 @@ _kcc_fnv1a:
     mov x0, x2                  // return hash
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_fnv1a
 @}
 
 \section{Hash Table}
@@ -147,6 +152,7 @@ _kcc_ht_init:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ht_init
 @}
 
 \subsection{Lookup}
@@ -239,6 +245,7 @@ _kcc_ht_get:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #80
     ret
+@| _kcc_ht_get
 @}
 
 \subsection{Insertion}
@@ -339,6 +346,7 @@ _kcc_ht_put:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #96
     ret
+@| _kcc_ht_put
 @}
 
 \section{Dynamic Vector}
@@ -371,6 +379,11 @@ Offset & Field & Description \\
 @}
 
 \subsection{Initialization}
+
+\texttt{kcc\_vec\_init} creates a vector for elements of the given size.
+The header (32~bytes) and an initial backing array for 16~elements are
+both arena-allocated.  The count starts at zero; the caller never needs
+to specify an initial capacity.
 
 @d Vec: init @{
 // -- kcc_vec_init ---------------------------------------------------
@@ -410,6 +423,7 @@ _kcc_vec_init:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_vec_init
 @}
 
 \subsection{Push}
@@ -480,9 +494,15 @@ _kcc_vec_push:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_vec_push
 @}
 
 \subsection{Element Access}
+
+\texttt{kcc\_vec\_get} returns a pointer to the element at a given
+index, computed as \texttt{data + index * elem\_size}.  No bounds
+checking is performed --- the caller must ensure the index is less
+than the current count.
 
 @d Vec: get @{
 // -- kcc_vec_get ----------------------------------------------------
@@ -504,6 +524,7 @@ _kcc_vec_get:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_vec_get
 @}
 
 \section{String Interning}
@@ -515,6 +536,12 @@ optimization for the symbol table.
 
 The intern table is a hash table mapping string contents to their
 canonical arena-allocated copy.
+
+\texttt{kcc\_strtab\_init} creates the global intern table as a
+256-slot hash table and stores its pointer in \texttt{\_kcc\_strtab}.
+The capacity is generous for typical translation units; since the
+hash table never resizes, choosing a power of two large enough to
+keep the load factor low is important.
 
 @d Strtab: init @{
 // -- kcc_strtab_init ------------------------------------------------
@@ -535,6 +562,7 @@ _kcc_strtab_init:
 
     ldp x29, x30, [sp], #16
     ret
+@| _kcc_strtab_init
 @}
 
 \texttt{kcc\_strtab\_intern} looks up a string in the table.  If found,
@@ -596,13 +624,18 @@ _kcc_strtab_intern:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_strtab_intern
 @}
 
 \subsection{Global State}
+
+The string intern table maintains a single global pointer to its underlying hash table, initialized to zero (no table allocated) at program start.
+The table is created lazily on the first call to \texttt{kcc\_strtab\_intern}.
 
 @d Strtab: data @{
 // -- String intern table global state -------------------------------
 .data
 .p2align 3
 _kcc_strtab: .quad 0             // pointer to hash table
+@| _kcc_strtab
 @}

@@ -12,6 +12,8 @@
 \chapter{Statement Parsing}
 \label{ch:statements}
 
+Statement parsing converts the token stream into AST nodes representing control flow and sequencing (\stdref{6.8}).  The top-level dispatcher inspects the leading token to choose among compound statements, selection (\texttt{if}, \texttt{switch}), iteration (\texttt{while}, \texttt{do}, \texttt{for}), jumps (\texttt{goto}, \texttt{continue}, \texttt{break}, \texttt{return}), and labeled statements.  Each construct is handled by a dedicated parsing function that builds the appropriate AST node and links statement lists through the \texttt{F4} sibling pointer.
+
 \section{Statement Dispatch}
 
 \texttt{kcc\_parse\_stmt} examines the current token and dispatches to
@@ -113,7 +115,18 @@ _kcc_parse_stmt:
 .Lstmt_for:
     bl _kcc_parse_for
     b .Lstmt_done
+@| _kcc_parse_stmt
+@}
 
+\paragraph{Jump statements, labels, and expression statements.}
+The second half of the statement dispatcher handles jump statements
+(\texttt{goto}, \texttt{continue}, \texttt{break}, \texttt{return}),
+labeled statements (\texttt{case}, \texttt{default}, and identifier labels),
+and the expression-statement fallback.  The tricky case is an identifier
+at statement position: it could be a label (\texttt{ident:}) or the start
+of an expression statement, requiring one-token lookahead.
+
+@d Stmt: parse statement @{
 .Lstmt_goto:
     bl _kcc_parse_goto
     b .Lstmt_done
@@ -224,7 +237,17 @@ _kcc_parse_stmt:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@}
 
+\paragraph{Expression continuation after label lookahead.}
+When the dispatcher consumes an identifier to check for a label colon
+and discovers no colon follows, it must continue parsing the remainder
+of the expression.  The helper \texttt{kcc\_parse\_expr\_rest} takes the
+already-built identifier node (with postfix operations applied) and
+finishes parsing any binary, ternary, assignment, or comma operators
+that follow.
+
+@d Stmt: parse statement @{
 // -- kcc_parse_expr_rest -----------------------------------------------
 // node *kcc_parse_expr_rest(node *lhs)
 //   x0 = already-parsed left-hand side
@@ -345,6 +368,7 @@ _kcc_parse_expr_rest:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_expr_rest
 @}
 
 \section{Compound Statement}
@@ -452,6 +476,7 @@ _kcc_parse_compound:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_compound
 @}
 
 \section{If Statement}
@@ -517,9 +542,18 @@ _kcc_parse_if:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_parse_if
 @}
 
 \section{Switch Statement}
+
+The switch statement (\stdref{6.8.4.2}) evaluates an integer expression and
+transfers control to the matching \texttt{case} label within its body.  The
+parser consumes the \texttt{switch} keyword, expects a parenthesized
+expression, then parses the body as a single statement (typically a compound
+statement containing \texttt{case} and \texttt{default} labels).  The
+resulting \texttt{AST\_SWITCH\_STMT} node stores the controlling expression
+and the body.
 
 @d Stmt: parse switch @{
 // -- kcc_parse_switch --------------------------------------------------
@@ -559,9 +593,16 @@ _kcc_parse_switch:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_switch
 @}
 
 \section{While Statement}
+
+The while loop (\stdref{6.8.5.1}) repeatedly executes a statement as long as
+its controlling expression evaluates to nonzero.  The parser expects the
+\texttt{while} keyword followed by a parenthesized condition and a loop body
+statement.  The resulting \texttt{AST\_WHILE\_STMT} node stores the condition
+in \texttt{F0} and the body in \texttt{F1}.
 
 @d Stmt: parse while @{
 // -- kcc_parse_while ---------------------------------------------------
@@ -601,9 +642,18 @@ _kcc_parse_while:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_while
 @}
 
 \section{Do-While Statement}
+
+The do-while loop (\stdref{6.8.5.2}) executes its body at least once before
+checking the loop condition.  The syntax
+\texttt{do stmt while (expr);} requires the parser to consume the body first,
+then expect the \texttt{while} keyword, the parenthesized condition, and a
+terminating semicolon.  The resulting \texttt{AST\_DO\_STMT} node stores the
+body in \texttt{F0} and the condition in \texttt{F1}, reversing the order
+from the while loop to reflect the evaluation sequence.
 
 @d Stmt: parse do @{
 // -- kcc_parse_do ------------------------------------------------------
@@ -651,6 +701,7 @@ _kcc_parse_do:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_do
 @}
 
 \section{For Statement}
@@ -776,9 +827,17 @@ _kcc_parse_for:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@| _kcc_parse_for
 @}
 
 \section{Goto Statement}
+
+The goto statement (\stdref{6.8.6.1}) transfers control unconditionally to
+the named label within the current function.  The parser consumes the
+\texttt{goto} keyword, interns the target label identifier via the string
+table, and expects a terminating semicolon.  The resulting
+\texttt{AST\_GOTO\_STMT} node stores the interned label name pointer for
+later resolution during semantic analysis.
 
 @d Stmt: parse goto @{
 // -- kcc_parse_goto ----------------------------------------------------
@@ -818,9 +877,17 @@ _kcc_parse_goto:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_goto
 @}
 
 \section{Return Statement}
+
+The return statement (\stdref{6.8.6.4}) exits the current function,
+optionally providing a value to the caller.  If a semicolon immediately
+follows the \texttt{return} keyword, the return value is null (appropriate
+for \texttt{void} functions); otherwise the parser reads a full expression.
+The resulting \texttt{AST\_RETURN\_STMT} node stores the expression (or zero)
+in \texttt{F0}.
 
 @d Stmt: parse return @{
 // -- kcc_parse_return --------------------------------------------------
@@ -859,6 +926,7 @@ _kcc_parse_return:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_return
 @}
 
 \section{Labeled Statements}
@@ -928,9 +996,16 @@ _kcc_parse_default:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@| _kcc_parse_case
+@| _kcc_parse_default
 @}
 
 \section{Statement Data}
+
+This fragment reserves a place for any static data that the statement parser
+might need, such as error message strings or auxiliary tables.  Currently the
+statement parser requires no additional data beyond what is defined inline
+within each parsing function.
 
 @d Stmt: data @{
 // -- Statement parser data (reserved) ----------------------------------

@@ -6,7 +6,16 @@
 \chapter{IR Validation}
 \label{ch:ir-validation}
 
+Before the IR is handed to the optimizer or code generator, a validation pass checks that structural invariants hold.  This chapter implements that check.  Currently a single invariant is enforced: every basic block must end with a terminator instruction (\texttt{IR\_BR}, \texttt{IR\_BR\_COND}, or \texttt{IR\_RET}), since a missing terminator would cause the code generator to fall through into the next block, producing incorrect machine code.
+
 \section{Terminator Check}
+
+Validation currently performs a single structural check: every basic block
+must end with a terminator instruction (\texttt{IR\_BR}, \texttt{IR\_BR\_COND},
+or \texttt{IR\_RET}).  A missing terminator means the code generator would fall
+through into the next block's prologue, producing incorrect machine code.
+The current implementation is a placeholder that unconditionally returns
+success; the actual walk will be added when we need stricter IR invariants.
 
 @d IR: validate @{
 // -- kcc_ir_validate ------------------------------------------------------
@@ -58,4 +67,5 @@ _kcc_ir_validate:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_ir_validate
 @}

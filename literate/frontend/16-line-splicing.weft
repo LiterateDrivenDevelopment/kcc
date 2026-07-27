@@ -13,6 +13,8 @@
 \chapter{Line Splicing --- Translation Phase 2}
 \label{ch:line-splicing}
 
+The second phase of C17 translation (\stdref{5.1.1.2}, paragraph~2) deletes every backslash-newline pair, splicing physical source lines into logical lines.  This enables macros and string literals to span multiple lines in the source file.  Because Phase~1 has already replaced the trigraph \texttt{??/} with a real backslash, the splice pass sees all backslash characters uniformly and operates in-place on the writable arena buffer.
+
 \section{Design}
 
 Line splicing removes every \texttt{\textbackslash}\texttt{\\n} pair
@@ -93,4 +95,5 @@ _kcc_source_splice:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_source_splice
 @}

@@ -7,15 +7,34 @@
 \chapter{Peephole Optimization}
 \label{ch:peephole}
 
+Peephole optimizations examine a small window of instructions and replace patterns that can be simplified without global analysis.  This chapter implements two such optimizations on the IR.  Constant folding evaluates binary operations whose operands are both compile-time constants, replacing the operation with a single \texttt{IR\_CONST}.  Identity elimination removes trivially redundant operations such as adding zero, multiplying by one, or bitwise AND with all ones.  Both passes feed into the fixed-point loop described in Chapter~\ref{ch:ir-passes}, so a fold that creates new constants can trigger further simplifications.
+
 \section{Constant Folding}
 
-Walk every instruction in every BB.  For binary operations where
-both sources are \texttt{IR\_CONST}, replace the instruction with
-a single \texttt{IR\_CONST} holding the computed result.
+Constant folding is the classic peephole optimization: when both operands
+of a binary instruction are compile-time constants, we evaluate the
+operation at compile time and replace the instruction with a single
+\texttt{IR\_CONST}.  This eliminates work at run time and, equally
+important, feeds additional constants into later iterations---an
+\texttt{IR\_ADD} whose result becomes constant may enable a downstream
+\texttt{IR\_MUL} to fold as well.
 
-We need a way to look up whether a vreg was produced by a CONST.
-We build a simple dense map: vreg\_number → immediate\_value,
-with a parallel valid bitmap.
+The implementation works in two linear passes over the function's basic
+blocks.  Pass~1 scans every instruction and records which vregs were
+produced by \texttt{IR\_CONST}; pass~2 revisits every binary operation
+and, when both source vregs appear in the constant map, computes the
+result and rewrites the instruction in place.  A dense array indexed by
+vreg number stores the known constant values, with a parallel valid
+array so we can distinguish ``not a constant'' from ``constant zero.''
+
+\subsection{Building the Constant Map}
+
+Before folding can begin we need a fast lookup from vreg number to
+constant value.  We allocate two arena arrays sized to the function's
+vreg count: \texttt{values[]} holds the immediate and \texttt{valid[]}
+records whether a mapping exists.  Pass~1 then walks every instruction;
+for each \texttt{IR\_CONST} it finds, it stores the immediate in the
+corresponding slot and marks it valid.
 
 @d Opt: constant fold @{
 // -- kcc_opt_constfold ----------------------------------------------------
@@ -99,7 +118,19 @@ _kcc_opt_constfold:
 .Lcf_collect_next_bb:
     add x25, x25, #1
     b .Lcf_collect_bb
+@| _kcc_opt_constfold
+@}
 
+\subsection{Folding Binary Operations}
+
+With the constant map in hand, pass~2 walks every instruction a second
+time.  For each binary operation (arithmetic, bitwise, shift, or
+comparison) it checks whether both source vregs have entries in the
+map.  When they do, the two constant values are loaded and the
+appropriate operation is dispatched.  Non-binary opcodes and operations
+with at least one non-constant source are skipped untouched.
+
+@d Opt: constant fold @{
     // Pass 2: fold binary ops with two const sources
 .Lcf_pass2:
     mov x25, #0
@@ -178,7 +209,19 @@ _kcc_opt_constfold:
     cmp x1, #IR_CMP_SGT
     b.eq .Lcf_do_sgt
     b .Lcf_fold_skip
+@}
 
+\subsection{Arithmetic Dispatch}
+
+Each foldable opcode maps to a short straight-line sequence that computes
+the result in register \texttt{x4} from the two constant operands in
+\texttt{x2} and \texttt{x3}.  After the computation, control falls
+through to the replacement logic, which rewrites the original instruction
+as an \texttt{IR\_CONST} carrying the folded value, updates the constant
+map (so cascading folds work within the same pass), and increments the
+fold counter.
+
+@d Opt: constant fold @{
 .Lcf_do_add:
     add x4, x2, x3
     b .Lcf_replace

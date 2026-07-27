@@ -1829,6 +1829,49 @@ targets swapped: a true LHS skips the RHS entirely.
     ret
 @}
 
+\paragraph{End-to-end tests.}
+Comparison operators (\texttt{==}, \texttt{!=}, \texttt{<}, \texttt{>},
+\texttt{<=}, \texttt{>=}) lower to an \texttt{IR\_CMP\_*} instruction
+that the code generator implements as \texttt{CMP} followed by
+\texttt{CSET} with the appropriate condition code.  The logical
+connectives \texttt{\&\&} and \texttt{||} use short-circuit evaluation:
+the IR builder creates conditional branches so that the right-hand
+operand is only evaluated when the left-hand side does not already
+determine the result.  Logical negation \texttt{!} is lowered to
+\texttt{IR\_CMP\_EQ} against a synthesised zero constant.
+
+@d Test: codegen logical @{
+echo ""
+echo "--- Logical and Comparison ---"
+
+run_test "logical and true" \
+    "int main(void) { return 1 && 1; }" 1
+
+run_test "logical and false" \
+    "int main(void) { return 1 && 0; }" 0
+
+run_test "logical or" \
+    "int main(void) { return 0 || 1; }" 1
+
+run_test "logical not" \
+    "int main(void) { return !0; }" 1
+
+run_test "logical not true" \
+    "int main(void) { return !42; }" 0
+
+run_test "chained comparison" \
+    "int main(void) { return (3 > 2) + (2 > 1); }" 2
+
+run_test "equality" \
+    "int main(void) { return (5 == 5) + (5 != 3); }" 2
+
+run_test "less/greater" \
+    "int main(void) { return (1 < 2) + (2 > 1) + (2 <= 2) + (3 >= 3); }" 4
+
+run_test "complex logical" \
+    "int main(void) { return (1 && 0) || (1 && 1); }" 1
+@}
+
 \subsection{Unary Expression}
 
 Unary operators dispatch on the token stored in \texttt{AST\_F0}.
@@ -1963,6 +2006,25 @@ _kcc_ir_build_unary:
 @| _kcc_ir_build_unary
 @}
 
+\paragraph{End-to-end tests: pointers.}
+The address-of operator \texttt{\&x} returns the alloca vreg directly,
+which already holds the stack address of the variable.  Dereferencing a
+pointer \texttt{*p} emits \texttt{IR\_LOAD} with the pointer vreg as
+source, producing the value stored at that address.  Cast expressions
+currently pass through the inner expression unchanged, which is correct
+for same-width integer casts on a 64-bit architecture.
+
+@d Test: codegen pointers @{
+echo ""
+echo "--- Pointers ---"
+
+run_test "address and deref" \
+    "int main(void) { int x = 42; int *p = &x; return *p; }" 42
+
+run_test "cast expression" \
+    "int main(void) { long x = 42; return (int)x; }" 42
+@}
+
 \subsection{Increment and Decrement}
 
 The increment and decrement operators (\texttt{++} and \texttt{-{}-})
@@ -1991,41 +2053,6 @@ alloca vreg.  If the identifier is not a local, it falls back to
 \texttt{AST\_F2} field of the \texttt{AST\_UNARY\_EXPR} node
 carries the prefix/postfix flag (1 for prefix, 0 for postfix),
 set by the parser.
-
-\paragraph{Test programs.}
-The following C programs exercise the four operator forms.  Each
-should compile, link, and produce the indicated exit code:
-
-\begin{verbatim}
-  // postfix increment — expected exit code: 5
-  int main(void) { int x = 5; x++; return x; }
-
-  // prefix increment — expected exit code: 6
-  int main(void) { int x = 5; return ++x; }
-
-  // postfix in expression — expected exit code: 5
-  int main(void) { int x = 5; int y = x++; return y; }
-
-  // prefix in expression — expected exit code: 6
-  int main(void) { int x = 5; int y = ++x; return y; }
-
-  // standard for-loop — expected exit code: 10
-  int main(void) {
-      int s = 0;
-      for (int i = 0; i < 5; i++) s = s + 2;
-      return s;
-  }
-
-  // decrement — expected exit code: 0
-  int main(void) {
-      int x = 5;
-      while (x > 0) x--;
-      return x;
-  }
-
-  // prefix decrement — expected exit code: 4
-  int main(void) { int x = 5; return --x; }
-\end{verbatim}
 
 @d IR: build increment/decrement @{
 // -- kcc_ir_build_inc_dec -------------------------------------------------
@@ -2182,20 +2209,69 @@ store---follow directly.
     ret
 @}
 
+\paragraph{End-to-end tests.}
+The following tests verify the full compilation pipeline for all four
+operator forms.  The for-loop test with \texttt{i++} is the most
+critical: before this feature was implemented, the increment emitted
+\texttt{IR\_NOP} and the loop ran forever.
+
+@d Test: codegen increment @{
+echo ""
+echo "--- Increment / Decrement ---"
+
+run_test "postfix increment stmt" \
+    "int main(void) { int x = 5; x++; return x; }" 6
+
+run_test "prefix increment" \
+    "int main(void) { int x = 5; return ++x; }" 6
+
+run_test "postfix returns old" \
+    "int main(void) { int x = 5; int y = x++; return y; }" 5
+
+run_test "prefix returns new" \
+    "int main(void) { int x = 5; int y = ++x; return y; }" 6
+
+run_test "postfix decrement stmt" \
+    "int main(void) { int x = 5; x--; return x; }" 4
+
+run_test "prefix decrement" \
+    "int main(void) { int x = 5; return --x; }" 4
+
+run_test "for-loop with i++" \
+    "int main(void) { int s = 0; for (int i = 0; i < 5; i++) s = s + 2; return s; }" 10
+
+run_test "for-loop sum with i++" \
+    "int main(void) { int s = 0; for (int i = 0; i < 5; i++) s = s + i; return s; }" 10
+
+run_test "do-while with i++" \
+    "int main(void) { int i = 0; int s = 0; do { s = s + i; i++; } while (i <= 5); return s; }" 15
+
+run_test "while with decrement" \
+    "int main(void) { int x = 5; while (x > 0) x--; return x; }" 0
+
+run_test "triple increment" \
+    "int main(void) { int x = 0; x++; x++; x++; return x; }" 3
+@}
+
 \subsection{Assignment}
 
 Assignment handles three cases.  A simple \texttt{=} evaluates the
 RHS, looks up the LHS identifier in the locals table, and emits
 \texttt{IR\_STORE} to write the value into the variable's alloca.
-Compound assignments (\texttt{+=}, \texttt{-=}, \ldots) first load
-the current value, emit the corresponding binary operation, then
-store the result back---exactly the read-modify-write pattern.
+Compound assignments (\texttt{+=}, \texttt{-=}, \texttt{*=},
+\texttt{/=}, \texttt{\%=}, \texttt{\&=}, \texttt{|=}, \texttt{\^{}=},
+\texttt{<<=}, \texttt{>>=}) first load the current value, emit the
+corresponding binary operation, then store the result back---exactly
+the read-modify-write pattern described for increment/decrement above.
 Finally, if the LHS identifier is not in locals, it must be a global:
 the builder emits \texttt{IR\_GLOBAL\_REF} followed by
 \texttt{IR\_STORE} through the resulting address vreg.
 
-In all cases the returned vreg is the stored value, matching the
-C semantics where assignment is an expression.
+The compound path uses callee-saved registers \texttt{x23} (current
+value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
+bytes to save \texttt{x19}--\texttt{x24}.  In all cases the returned
+vreg is the stored value, matching the C semantics where assignment
+is an expression (\stdref{6.5.16}).
 
 @d IR: build assign @{
 // -- kcc_ir_build_assign --------------------------------------------------
@@ -2206,10 +2282,11 @@ C semantics where assignment is an expression.
 .globl _kcc_ir_build_assign
 .p2align 2
 _kcc_ir_build_assign:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
 
     mov x19, x0
     ldr x20, [x19, #AST_F0]     // op token
@@ -2357,11 +2434,65 @@ _kcc_ir_build_assign:
     mov x0, x21
 
 .Liba_done:
+    ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #64
     ret
 @| _kcc_ir_build_assign
+@}
+
+\paragraph{End-to-end tests.}
+Compound assignment operators (\texttt{+=}, \texttt{-=}, \texttt{*=},
+\texttt{/=}, \texttt{\%=}, \texttt{\&=}, \texttt{|=}, \texttt{\^{}=},
+\texttt{<<=}, \texttt{>>=}) follow the same read-modify-write pattern
+as increment/decrement: load the current value with
+\texttt{IR\_LOAD}, emit the corresponding binary IR opcode (mapping
+\texttt{TOK\_ADD\_ASSIGN} to \texttt{IR\_ADD}, etc.), and store the
+result back with \texttt{IR\_STORE}.  The compound path uses
+callee-saved registers \texttt{x23} (current value vreg) and
+\texttt{x24} (IR opcode), requiring a 64-byte frame to save
+\texttt{x19}--\texttt{x24}.
+
+@d Test: codegen compound @{
+echo ""
+echo "--- Compound Assignment ---"
+
+run_test "add-assign" \
+    "int main(void) { int x = 10; x += 5; return x; }" 15
+
+run_test "sub-assign" \
+    "int main(void) { int x = 10; x -= 5; return x; }" 5
+
+run_test "mul-assign" \
+    "int main(void) { int x = 10; x *= 5; return x; }" 50
+
+run_test "div-assign" \
+    "int main(void) { int x = 100; x /= 4; return x; }" 25
+
+run_test "mod-assign" \
+    "int main(void) { int x = 17; x %= 5; return x; }" 2
+
+run_test "and-assign" \
+    "int main(void) { int x = 0xFF; x &= 0x0F; return x; }" 15
+
+run_test "or-assign" \
+    "int main(void) { int x = 0xF0; x |= 0x0F; return x; }" 255
+
+run_test "xor-assign" \
+    "int main(void) { int x = 0xFF; x ^= 0x0F; return x; }" 240
+
+run_test "shl-assign" \
+    "int main(void) { int x = 1; x <<= 4; return x; }" 16
+
+run_test "shr-assign" \
+    "int main(void) { int x = 32; x >>= 2; return x; }" 8
+
+run_test "compound in loop" \
+    "int main(void) { int s = 0; for (int i = 1; i <= 5; i++) s += i; return s; }" 15
+
+run_test "chained compound" \
+    "int main(void) { int a = 1; int b = 2; a += 10; b *= 3; return a + b; }" 17
 @}
 
 \subsection{Function Call}
@@ -2463,6 +2594,39 @@ _kcc_ir_build_call:
     ldp x29, x30, [sp], #64
     ret
 @| _kcc_ir_build_call
+@}
+
+\paragraph{End-to-end tests.}
+The \texttt{IR\_CALL} instruction carries a callee name and an
+arena-allocated argument array.  The code generator loads each
+argument vreg from its stack slot into \texttt{x0}--\texttt{x7}
+(following AAPCS64), emits a \texttt{BL} with an
+\texttt{ARM64\_RELOC\_BRANCH26} relocation, and stores the return
+value from \texttt{x0} into the destination vreg's slot.  Locally
+defined functions become \texttt{N\_SECT|N\_EXT} symbols; external
+calls become \texttt{N\_UNDF|N\_EXT} symbols resolved by the linker.
+The recursive factorial test is particularly demanding: it verifies
+that the prologue and epilogue correctly save and restore the frame
+pointer and link register across a deep call chain.
+
+@d Test: codegen functions @{
+echo ""
+echo "--- Functions ---"
+
+run_test "simple call" \
+    "int foo(int x) { return x + 1; } int main(void) { return foo(41); }" 42
+
+run_test "nested calls" \
+    "int foo(int x) { return x + 1; } int main(void) { return foo(foo(1)); }" 3
+
+run_test "multi-arg" \
+    "int add(int a, int b) { return a + b; } int main(void) { return add(20, 22); }" 42
+
+run_test "three args" \
+    "int sum3(int a, int b, int c) { return a + b + c; } int main(void) { return sum3(10, 20, 12); }" 42
+
+run_test "recursive factorial" \
+    "int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); } int main(void) { return fact(5); }" 120
 @}
 
 \subsection{String Literal}
@@ -2712,6 +2876,33 @@ _kcc_ir_build_var_decl:
     ldp x29, x30, [sp], #64
     ret
 @| _kcc_ir_build_var_decl
+@}
+
+\paragraph{End-to-end tests.}
+Each local variable declaration emits an \texttt{IR\_ALLOCA}
+instruction, which the code generator maps to a unique 8-byte slot
+in the function's stack frame at offset $-(16 + \text{vreg} \times 8)$
+from the frame pointer.  An initialiser compiles to an
+\texttt{IR\_STORE} that writes the value into the slot, and every
+subsequent use compiles to an \texttt{IR\_LOAD} that reads it back.
+These tests verify that distinct locals occupy distinct slots and
+that values survive across intervening statements.
+
+@d Test: codegen locals @{
+echo ""
+echo "--- Local Variables ---"
+
+run_test "local variable" \
+    "int main(void) { int x = 10; return x; }" 10
+
+run_test "two locals" \
+    "int main(void) { int a = 3; int b = 4; return a + b; }" 7
+
+run_test "local reassignment" \
+    "int main(void) { int x = 1; x = 42; return x; }" 42
+
+run_test "char literal" \
+    "int main(void) { char c = 'A'; return c; }" 65
 @}
 
 \section{Building Control Flow}
@@ -3276,6 +3467,54 @@ _kcc_ir_build_for:
 @| _kcc_ir_build_for
 @}
 
+\paragraph{End-to-end tests.}
+The IR builder lowers each control-flow construct into a graph of basic
+blocks connected by \texttt{IR\_BR} (unconditional) and
+\texttt{IR\_BR\_COND} (conditional) terminators.  An \texttt{if/else}
+produces a diamond of four blocks (entry, true, false, merge); a
+\texttt{while} loop produces a condition block with a back-edge; a
+\texttt{for} loop adds a separate increment block that
+\texttt{continue} targets.  The code generator records each basic
+block's starting offset in a hash table and patches forward branches
+after all blocks have been emitted.  These tests use the explicit
+\texttt{i = i + 1} form to isolate loop lowering from the
+increment operators tested elsewhere.
+
+@d Test: codegen control flow @{
+echo ""
+echo "--- Control Flow ---"
+
+run_test "if true" \
+    "int main(void) { if (1) return 10; return 20; }" 10
+
+run_test "if false" \
+    "int main(void) { if (0) return 10; return 20; }" 20
+
+run_test "if-else" \
+    "int main(void) { int x = 5; if (x > 3) return 1; else return 0; }" 1
+
+run_test "nested if" \
+    "int main(void) { int x = 5; if (x > 0) { if (x > 3) return 1; return 2; } return 3; }" 1
+
+run_test "while loop" \
+    "int main(void) { int x = 0; while (x < 10) x = x + 1; return x; }" 10
+
+run_test "do-while loop" \
+    "int main(void) { int i = 0; int s = 0; do { s = s + i; i = i + 1; } while (i <= 5); return s; }" 15
+
+run_test "for loop" \
+    "int main(void) { int s = 0; for (int i = 0; i < 5; i = i + 1) s = s + 2; return s; }" 10
+
+run_test "break" \
+    "int main(void) { int i = 0; while (1) { if (i == 5) break; i = i + 1; } return i; }" 5
+
+run_test "continue" \
+    "int main(void) { int s = 0; for (int i = 0; i < 10; i = i + 1) { if (i % 2 == 0) continue; s = s + 1; } return s; }" 5
+
+run_test "multiple returns" \
+    "int f(int x) { if (x > 0) return 1; if (x < 0) return 2; return 0; } int main(void) { return f(5) + f(-3) + f(0); }" 3
+@}
+
 \subsection{Break and Continue}
 
 The loop stack is a fixed-size array of 16 entries (supporting up to
@@ -3420,6 +3659,29 @@ _kcc_ir_build_continue:
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_ir_build_continue
+@}
+
+\paragraph{End-to-end tests: miscellaneous.}
+The comma operator evaluates the left operand for its side effects,
+discards the result, and returns the right operand---the IR builder
+simply calls \texttt{kcc\_ir\_build\_expr} on each side and returns
+the second vreg.  The remaining tests guard boundary conditions:
+returning zero (ensures the epilogue does not clobber \texttt{x0})
+and returning~255 (the maximum value representable in an 8-bit exit
+status on Unix).
+
+@d Test: codegen misc @{
+echo ""
+echo "--- Miscellaneous ---"
+
+run_test "comma operator" \
+    "int main(void) { return (1, 2, 3); }" 3
+
+run_test "return zero" \
+    "int main(void) { return 0; }" 0
+
+run_test "large constant" \
+    "int main(void) { return 255; }" 255
 @}
 
 \section{String Constants}

@@ -510,6 +510,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen locals@>
 @<Test: codegen control flow@>
 @<Test: codegen increment@>
+@<Test: codegen compound@>
 @<Test: codegen logical@>
 @<Test: codegen functions@>
 @<Test: codegen pointers@>

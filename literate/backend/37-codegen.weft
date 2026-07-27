@@ -1660,6 +1660,62 @@ label restores callee-saved registers and returns.
     ret
 @}
 
+\paragraph{End-to-end tests: constants and arithmetic.}
+The code generator lowers each arithmetic \texttt{IR\_ADD}/\texttt{IR\_SUB}/\ldots{}
+instruction by loading the two source vregs from their stack slots into
+scratch registers \texttt{x9} and \texttt{x10}, executing the ARM64
+operation, and storing the result from \texttt{x11} back to the
+destination slot.  The simplest case---returning a constant---verifies
+that \texttt{IR\_CONST} correctly encodes a \texttt{MOVZ}/\texttt{MOVK}
+sequence and that \texttt{IR\_RET} loads the value into \texttt{x0}
+before the epilogue.  Subsequent tests exercise each binary operator
+and confirm that operator precedence (handled at the parser level) is
+preserved through IR lowering.
+
+@d Test: codegen constants @{
+echo ""
+echo "--- Constants and Arithmetic ---"
+
+run_test "return constant" \
+    "int main(void) { return 42; }" 42
+
+run_test "addition" \
+    "int main(void) { return 2 + 3; }" 5
+
+run_test "subtraction" \
+    "int main(void) { return 10 - 3; }" 7
+
+run_test "multiplication" \
+    "int main(void) { return 6 * 7; }" 42
+
+run_test "division" \
+    "int main(void) { return 100 / 10; }" 10
+
+run_test "modulo" \
+    "int main(void) { return 17 % 5; }" 2
+
+run_test "complex arithmetic" \
+    "int main(void) { return 2 + 3 * 4; }" 14
+
+run_test "negation" \
+    "int main(void) { return -(-42); }" 42
+
+run_test "bitwise and" \
+    "int main(void) { return 0xFF & 0x0F; }" 15
+
+run_test "bitwise or" \
+    "int main(void) { return 0xF0 | 0x0F; }" 255
+
+run_test "bitwise xor" \
+    "int main(void) { return 0xFF ^ 0x0F; }" 240
+
+run_test "left shift" \
+    "int main(void) { return 1 << 4; }" 16
+
+run_test "right shift" \
+    "int main(void) { return 32 >> 2; }" 8
+@}
+
 \section{Branch Patching}
 
 After all basic blocks have been emitted, we resolve forward branch

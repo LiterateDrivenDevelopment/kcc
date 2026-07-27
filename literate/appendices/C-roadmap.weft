@@ -430,17 +430,15 @@ Mach-O with \texttt{LC\_BUILD\_VERSION}).
 \item[\checkmark] Bitwise operators, comparisons, logical \texttt{\&\&}/\texttt{||}, unary \texttt{!}.
 \item[\checkmark] Pointers (address-of, dereference), cast expressions, negation.
 \item[\checkmark] Comma operator, \texttt{break}/\texttt{continue}, nested calls.
+\item[\checkmark] Post/pre increment and decrement (\texttt{i++}, \texttt{++i},
+      \texttt{i-{}-}, \texttt{-{}-i}): load-modify-store sequence for both
+      locals and globals.
+\item[\checkmark] Compound assignment operators (\texttt{+=}, \texttt{-=}, \texttt{*=},
+      \texttt{/=}, etc.) for both local and global variables.
 \end{itemize}
 
 \textbf{Next steps} (ordered by impact).
 \begin{enumerate}
-\item Post/pre increment and decrement (\texttt{i++}, \texttt{++i},
-      \texttt{i-{}-}, \texttt{-{}-i}): currently emits \texttt{IR\_NOP},
-      causing infinite loops in the standard \texttt{for(i=0; i<n; i++)}
-      pattern.
-\item Compound assignment operators (\texttt{+=}, \texttt{-=}, \texttt{*=},
-      \texttt{/=}, etc.): partial implementation crashes in straight-line
-      code.
 \item Ternary operator (\texttt{?:}): true-branch value not emitted.
 \item \texttt{switch}/\texttt{case}/\texttt{default}: body not lowered to
       compare-and-branch chains.

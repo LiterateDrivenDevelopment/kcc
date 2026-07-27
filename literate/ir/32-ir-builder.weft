@@ -2264,8 +2264,11 @@ Compound assignments (\texttt{+=}, \texttt{-=}, \texttt{*=},
 corresponding binary operation, then store the result back---exactly
 the read-modify-write pattern described for increment/decrement above.
 Finally, if the LHS identifier is not in locals, it must be a global:
-the builder emits \texttt{IR\_GLOBAL\_REF} followed by
-\texttt{IR\_STORE} through the resulting address vreg.
+the builder emits \texttt{IR\_GLOBAL\_REF} to materialise the
+address.  For simple assignment the value is stored directly; for
+compound operators the same load-binop-store sequence is applied,
+loading from the global address vreg before emitting the binary
+operation and storing the result back.
 
 The compound path uses callee-saved registers \texttt{x23} (current
 value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
@@ -2405,7 +2408,7 @@ _kcc_ir_build_assign:
     b .Liba_done
 
 .Liba_global_store:
-    // x22 = name ptr, x21 = rhs vreg
+    // x22 = name ptr, x21 = rhs vreg, x20 = op token
     // Emit global_ref to get address vreg
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
@@ -2421,6 +2424,76 @@ _kcc_ir_build_assign:
     mov x0, x19
     bl _kcc_ir_emit
 
+    // For compound assignment on globals, load-modify-store
+    cmp x20, #TOK_ASSIGN
+    b.eq .Liba_global_simple
+
+    // Load current value from global
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // global addr vreg
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x23, x0                  // x23 = current value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Map compound op to IR opcode (same table as local path)
+    mov x24, #IR_ADD
+    cmp x20, #TOK_ADD_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SUB
+    cmp x20, #TOK_SUB_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_MUL
+    cmp x20, #TOK_MUL_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SDIV
+    cmp x20, #TOK_DIV_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SMOD
+    cmp x20, #TOK_MOD_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_AND
+    cmp x20, #TOK_AND_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_OR
+    cmp x20, #TOK_OR_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_XOR
+    cmp x20, #TOK_XOR_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SHL
+    cmp x20, #TOK_SHL_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_ASHR
+    cmp x20, #TOK_SHR_ASSIGN
+    b.eq .Liba_global_compound
+    b .Liba_global_simple
+
+.Liba_global_compound:
+    // Emit binop: result = current_val op rhs
+    mov x0, x24
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x23, [x0, #IR_SRC1]     // current value
+    str x21, [x0, #IR_SRC2]     // rhs
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x21, x0                  // x21 = compound result vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+.Liba_global_simple:
     // Store value to global address
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
@@ -2428,7 +2501,7 @@ _kcc_ir_build_assign:
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
     str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]     // value
+    str x21, [x0, #IR_SRC1]     // value (rhs or compound result)
     str x22, [x0, #IR_SRC2]     // global addr
     bl _kcc_ir_emit
     mov x0, x21
@@ -2443,16 +2516,13 @@ _kcc_ir_build_assign:
 @}
 
 \paragraph{End-to-end tests.}
-Compound assignment operators (\texttt{+=}, \texttt{-=}, \texttt{*=},
-\texttt{/=}, \texttt{\%=}, \texttt{\&=}, \texttt{|=}, \texttt{\^{}=},
-\texttt{<<=}, \texttt{>>=}) follow the same read-modify-write pattern
-as increment/decrement: load the current value with
-\texttt{IR\_LOAD}, emit the corresponding binary IR opcode (mapping
-\texttt{TOK\_ADD\_ASSIGN} to \texttt{IR\_ADD}, etc.), and store the
-result back with \texttt{IR\_STORE}.  The compound path uses
-callee-saved registers \texttt{x23} (current value vreg) and
-\texttt{x24} (IR opcode), requiring a 64-byte frame to save
-\texttt{x19}--\texttt{x24}.
+Compound assignment operators follow the read-modify-write pattern for
+both local and global variables.  For locals, the builder loads via
+the alloca vreg; for globals, it emits \texttt{IR\_GLOBAL\_REF} to
+materialise the address, then the same load-binop-store sequence.  The
+final three tests specifically exercise the global path, which was
+initially missing and caused the RHS to overwrite the variable without
+reading its current value.
 
 @d Test: codegen compound @{
 echo ""
@@ -2493,6 +2563,15 @@ run_test "compound in loop" \
 
 run_test "chained compound" \
     "int main(void) { int a = 1; int b = 2; a += 10; b *= 3; return a + b; }" 17
+
+run_test "global add-assign" \
+    "int g; int main(void) { g = 10; g += 5; return g; }" 15
+
+run_test "global mul-assign" \
+    "int g; int main(void) { g = 6; g *= 7; return g; }" 42
+
+run_test "global sub-assign" \
+    "int g; int main(void) { g = 10; g -= 3; return g; }" 7
 @}
 
 \subsection{Function Call}

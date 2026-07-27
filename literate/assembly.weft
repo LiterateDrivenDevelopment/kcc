@@ -381,6 +381,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build while@>
 @<IR: build do@>
 @<IR: build for@>
+@<IR: build switch@>
 @<IR: build break@>
 @<IR: build continue@>
 @<IR: validate@>
@@ -516,5 +517,6 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen pointers@>
 @<Test: codegen misc@>
 @<Test: codegen ternary@>
+@<Test: codegen switch@>
 @<Test: codegen results@>
 @}

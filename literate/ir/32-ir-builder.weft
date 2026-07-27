@@ -1103,6 +1103,12 @@ _kcc_ir_build_stmt:
     b.eq .Libs_break
     cmp x0, #AST_CONTINUE_STMT
     b.eq .Libs_continue
+    cmp x0, #AST_SWITCH_STMT
+    b.eq .Libs_switch
+    cmp x0, #AST_CASE_STMT
+    b.eq .Libs_done
+    cmp x0, #AST_DEFAULT_STMT
+    b.eq .Libs_done
     cmp x0, #AST_NULL_STMT
     b.eq .Libs_done
 
@@ -1162,6 +1168,11 @@ _kcc_ir_build_stmt:
 .Libs_continue:
     mov x0, x19
     bl _kcc_ir_build_continue
+    b .Libs_done
+
+.Libs_switch:
+    mov x0, x19
+    bl _kcc_ir_build_switch
     b .Libs_done
 
 .Libs_done:
@@ -3687,6 +3698,338 @@ run_test "continue" \
 
 run_test "multiple returns" \
     "int f(int x) { if (x > 0) return 1; if (x < 0) return 2; return 0; } int main(void) { return f(5) + f(-3) + f(0); }" 3
+@}
+
+\subsection{Switch Statement}
+
+A \texttt{switch} statement (\stdref{6.8.4.2}) evaluates a controlling
+expression and transfers control to the matching \texttt{case} label.
+The IR builder lowers it to a compare-and-branch dispatch chain: for
+each \texttt{case}, a fresh basic block tests \texttt{cond\_vreg ==
+case\_val} and branches to the case body on success or to the next
+comparison on failure.  After all cases, the chain falls through to
+the \texttt{default} body if present, or to the exit block otherwise.
+
+Case bodies observe C fall-through semantics: unless a \texttt{break}
+terminates the current basic block, execution flows into the next
+case's body.  The builder achieves this by emitting an unconditional
+branch from a non-terminated body block to the next case's block.  The
+exit block is pushed onto the loop stack as a break target so that
+\texttt{break} statements inside the switch branch to it.
+
+The builder uses three passes over the compound body's item list.
+Pass~1 creates a basic block for every \texttt{case} and
+\texttt{default} label and stashes the BB pointer in an unused AST
+field (\texttt{F2} for cases, \texttt{F1} for default).  Pass~2 emits
+the dispatch chain: each comparison occupies its own basic block
+terminated by \texttt{IR\_BR\_COND}.  Pass~3 walks the items once more
+and builds each statement in the appropriate basic block, inserting
+fall-through branches between consecutive labels when the preceding
+block is not yet terminated.
+
+@d IR: build switch @{
+// -- kcc_ir_build_switch --------------------------------------------------
+// void kcc_ir_build_switch(node *stmt)
+//   x0 = AST_SWITCH_STMT (F0=expr, F1=compound body)
+// Lowers to: dispatch chain → case bodies → exit_bb
+.text
+.globl _kcc_ir_build_switch
+.p2align 2
+_kcc_ir_build_switch:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    mov x19, x0                  // x19 = switch node
+
+    // 1. Evaluate controlling expression
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // x20 = cond_vreg
+
+    // 2. Allocate exit BB
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // x21 = exit_bb
+
+    // 3. Get first item of compound body
+    ldr x0, [x19, #AST_F1]      // compound stmt
+    ldr x23, [x0, #AST_F0]      // x23 = first item (constant)
+
+    mov x22, #0                  // x22 = default_bb (null)
+
+    // ── Pass 1: create BBs for each case/default ──
+    mov x24, x23
+.Lsw_scan:
+    cbz x24, .Lsw_scan_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.ne .Lsw_scan_nocase
+    bl _kcc_ir_alloc_bb
+    str x0, [x24, #AST_F2]      // stash case BB in F2
+    b .Lsw_scan_next
+.Lsw_scan_nocase:
+    cmp x0, #AST_DEFAULT_STMT
+    b.ne .Lsw_scan_next
+    bl _kcc_ir_alloc_bb
+    str x0, [x24, #AST_F1]      // stash default BB in F1
+    mov x22, x0                  // remember default_bb
+.Lsw_scan_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lsw_scan
+.Lsw_scan_done:
+
+    // ── Pass 2: dispatch chain ──
+    // For each case: emit const + cmp_eq + br_cond in current BB,
+    // then create a fresh dispatch BB for the next comparison.
+    mov x24, x23
+.Lsw_disp:
+    cbz x24, .Lsw_disp_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.ne .Lsw_disp_next
+
+    // Get case constant value
+    ldr x0, [x24, #AST_F0]      // case expr (AST_INT_LIT)
+    ldr x25, [x0, #AST_F0]      // integer value
+
+    // Emit IR_CONST for case value
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x26, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x26, #IR_TYPE]
+    str x25, [x26, #IR_SRC1]    // immediate value
+    bl _kcc_ir_next_vreg
+    str x0, [x26, #IR_DEST]
+    mov x25, x0                  // x25 = case_const_vreg
+    mov x0, x26
+    bl _kcc_ir_emit
+
+    // Emit IR_CMP_EQ(cond_vreg, case_const_vreg)
+    mov x0, #IR_CMP_EQ
+    bl _kcc_ir_alloc_instr
+    mov x26, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x26, #IR_TYPE]
+    str x20, [x26, #IR_SRC1]    // cond_vreg
+    str x25, [x26, #IR_SRC2]    // case_const_vreg
+    bl _kcc_ir_next_vreg
+    str x0, [x26, #IR_DEST]
+    mov x25, x0                  // x25 = cmp_vreg
+    mov x0, x26
+    bl _kcc_ir_emit
+
+    // Create next dispatch BB
+    bl _kcc_ir_alloc_bb
+    mov x27, x0                  // x27 = next_dispatch_bb
+
+    // Emit IR_BR_COND: true → case_bb, false → next_dispatch_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x25, [x0, #IR_DEST]     // condition vreg
+    ldr x1, [x24, #AST_F2]      // case_bb (stashed in pass 1)
+    ldr x1, [x1, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true target
+    ldr x1, [x27, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false target
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Switch to next dispatch BB
+    mov x0, x27
+    bl _kcc_ir_set_bb
+
+.Lsw_disp_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lsw_disp
+.Lsw_disp_done:
+
+    // End of dispatch chain: branch to default or exit
+    cbz x22, .Lsw_disp_exit
+    // Branch to default_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    b .Lsw_disp_term
+.Lsw_disp_exit:
+    // Branch to exit_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+.Lsw_disp_term:
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // ── Pass 3: emit case/default bodies ──
+    // Push break target (continue=0, not valid in switch)
+    ldr x0, [x21, #BB_ID]       // break → exit_bb
+    mov x1, #0                  // no continue target
+    bl _kcc_loop_push
+
+    mov x24, x23
+.Lsw_body:
+    cbz x24, .Lsw_body_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.eq .Lsw_body_case
+    cmp x0, #AST_DEFAULT_STMT
+    b.eq .Lsw_body_default
+
+    // Regular statement: build in current BB
+    mov x0, x24
+    bl _kcc_ir_build_stmt
+    b .Lsw_body_next
+
+.Lsw_body_case:
+    ldr x25, [x24, #AST_F2]     // case_bb
+
+    // If current BB not terminated, emit fallthrough branch
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Lsw_case_set_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x25, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+.Lsw_case_set_bb:
+    mov x0, x25
+    bl _kcc_ir_set_bb
+    ldr x0, [x24, #AST_F1]      // case body statement
+    cbz x0, .Lsw_body_next
+    bl _kcc_ir_build_stmt
+    b .Lsw_body_next
+
+.Lsw_body_default:
+    // If current BB not terminated, emit fallthrough
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Lsw_default_set_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+.Lsw_default_set_bb:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x24, #AST_F0]      // default body statement
+    cbz x0, .Lsw_body_next
+    bl _kcc_ir_build_stmt
+    b .Lsw_body_next
+
+.Lsw_body_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lsw_body
+.Lsw_body_done:
+    bl _kcc_loop_pop
+
+    // If current BB not terminated, branch to exit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Lsw_set_exit
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Lsw_set_exit:
+    mov x0, x21
+    bl _kcc_ir_set_bb
+
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@| _kcc_ir_build_switch
+@}
+
+\paragraph{End-to-end tests.}
+The dispatch chain compares the controlling expression against each
+\texttt{case} constant in order and branches to the first match.
+Fall-through between cases follows C semantics: without a
+\texttt{break}, control flows into the next case body.  The
+\texttt{default} label catches any value not matched by the cases.
+
+@d Test: codegen switch @{
+echo ""
+echo "--- Switch ---"
+
+run_test "switch-case1" \
+    "int main(void) { switch (1) { case 1: return 10; case 2: return 20; } return 0; }" 10
+
+run_test "switch-case2" \
+    "int main(void) { switch (2) { case 1: return 10; case 2: return 20; } return 0; }" 20
+
+run_test "switch-default" \
+    "int main(void) { switch (5) { case 1: return 10; default: return 99; } return 0; }" 99
+
+run_test "switch-no-match" \
+    "int main(void) { switch (5) { case 1: return 10; case 2: return 20; } return 0; }" 0
+
+run_test "switch-break" \
+    "int main(void) { int r = 0; switch (2) { case 1: r = 10; break; case 2: r = 20; break; case 3: r = 30; break; } return r; }" 20
+
+run_test "switch-fallthrough" \
+    "int main(void) { int r = 0; switch (1) { case 1: r = r + 10; case 2: r = r + 20; case 3: r = r + 30; break; } return r; }" 60
+
+run_test "switch-default-fallthrough" \
+    "int main(void) { int r = 0; switch (9) { case 1: r = 1; break; default: r = 50; break; } return r; }" 50
+
+run_test "switch-var-expr" \
+    "int main(void) { int x = 3; int r = 0; switch (x) { case 1: r = 10; break; case 3: r = 30; break; } return r; }" 30
 @}
 
 \subsection{Break and Continue}

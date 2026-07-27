@@ -438,12 +438,13 @@ Mach-O with \texttt{LC\_BUILD\_VERSION}).
 \item[\checkmark] Ternary operator (\texttt{?:}): alloca rendezvous pattern
       ensures both branches store to a shared slot; merge block loads the
       result.
+\item[\checkmark] \texttt{switch}/\texttt{case}/\texttt{default}: three-pass
+      lowering (create BBs, dispatch chain, bodies) with C fall-through
+      semantics and \texttt{break} via the loop stack.
 \end{itemize}
 
 \textbf{Next steps} (ordered by impact).
 \begin{enumerate}
-\item \texttt{switch}/\texttt{case}/\texttt{default}: body not lowered to
-      compare-and-branch chains.
 \item \texttt{sizeof}: not lowered to \texttt{IR\_CONST} with the type's
       size.
 \item Multi-variable declarations (\texttt{int a=3, b=4;}): second

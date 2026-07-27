@@ -371,6 +371,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build ident@>
 @<IR: build binary@>
 @<IR: build unary@>
+@<IR: build increment/decrement@>
 @<IR: build assign@>
 @<IR: build call@>
 @<IR: build string literal@>
@@ -499,4 +500,19 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: lex line splice@>
 @<Test: registration@>
 @<Test: lex data@>
+@}
+
+\noindent\textbf{test\_codegen.sh} --- end-to-end code generation tests:
+
+@o tmp/tests/test_codegen.sh @{
+@<Test: codegen runner@>
+@<Test: codegen constants@>
+@<Test: codegen locals@>
+@<Test: codegen control flow@>
+@<Test: codegen increment@>
+@<Test: codegen logical@>
+@<Test: codegen functions@>
+@<Test: codegen pointers@>
+@<Test: codegen misc@>
+@<Test: codegen results@>
 @}

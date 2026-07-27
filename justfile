@@ -66,6 +66,11 @@ test: tangle
     echo ""
     ./tmp/test_kcc
 
+# Code generation tests: compile C programs with kcc, link, run, check exit codes
+test-codegen: build
+    chmod +x tmp/tests/test_codegen.sh
+    tmp/tests/test_codegen.sh
+
 # Weave: generate LaTeX source
 doc:
     weft -w tex kcc.weft

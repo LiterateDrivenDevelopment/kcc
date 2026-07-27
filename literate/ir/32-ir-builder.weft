@@ -1832,12 +1832,16 @@ targets swapped: a true LHS skips the RHS entirely.
 \subsection{Unary Expression}
 
 Unary operators dispatch on the token stored in \texttt{AST\_F0}.
-Arithmetic negation (\texttt{-}) emits \texttt{IR\_NEG}, bitwise
-complement (\texttt{\~{}}) emits \texttt{IR\_NOT}, and logical
-negation (\texttt{!}) is lowered to \texttt{IR\_CMP\_EQ} against a
-synthesised zero constant---producing~1 when the operand is zero and
-0 otherwise.  All other unary tokens (e.g.\ address-of, dereference)
-are not yet supported and return the operand unchanged.
+Increment and decrement (\texttt{++}/\texttt{-{}-}) are intercepted
+first and delegated to a dedicated builder (see below), because they
+require address-based read-modify-write lowering rather than a simple
+value transformation.  Arithmetic negation (\texttt{-}) emits
+\texttt{IR\_NEG}, bitwise complement (\texttt{\~{}}) emits
+\texttt{IR\_NOT}, and logical negation (\texttt{!}) is lowered to
+\texttt{IR\_CMP\_EQ} against a synthesised zero constant---producing~1
+when the operand is zero and 0 otherwise.  All other unary tokens
+(e.g.\ address-of, dereference) are not yet supported and return the
+operand unchanged.
 
 @d IR: build unary @{
 // -- kcc_ir_build_unary ---------------------------------------------------
@@ -1854,6 +1858,12 @@ _kcc_ir_build_unary:
 
     mov x19, x0
     ldr x20, [x19, #AST_F0]     // op token
+
+    // Increment/decrement need address-based lowering, not value
+    cmp x20, #TOK_INC
+    b.eq .Libu_inc_dec
+    cmp x20, #TOK_DEC
+    b.eq .Libu_inc_dec
 
     // Build operand
     ldr x0, [x19, #AST_F1]
@@ -1940,12 +1950,236 @@ _kcc_ir_build_unary:
     mov x0, x20
     b .Libu_done
 
+.Libu_inc_dec:
+    mov x0, x19                  // pass AST node
+    bl _kcc_ir_build_inc_dec
+    b .Libu_done
+
 .Libu_done:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
 @| _kcc_ir_build_unary
+@}
+
+\subsection{Increment and Decrement}
+
+The increment and decrement operators (\texttt{++} and \texttt{-{}-})
+are the only unary operators that \emph{modify} their operand: they
+read the current value, add or subtract one, and write the result back.
+The C17 standard (\stdref{6.5.2.4}, \stdref{6.5.3.1}) distinguishes
+\emph{postfix} (\texttt{x++}) from \emph{prefix} (\texttt{++x}): the
+postfix form evaluates to the value \emph{before} the modification,
+while the prefix form evaluates to the value \emph{after}.
+
+\paragraph{IR lowering pattern.}
+Both forms produce the same four-instruction sequence---only the
+returned vreg differs:
+
+\begin{verbatim}
+  %old  = load  i32, ptr %x_alloca
+  %one  = const i32, 1
+  %new  = add   i32, %old, %one    ; or sub for --
+  store i32, %new, ptr %x_alloca
+  ; result = %old (postfix) or %new (prefix)
+\end{verbatim}
+
+The builder looks up the operand in the locals table to obtain the
+alloca vreg.  If the identifier is not a local, it falls back to
+\texttt{IR\_GLOBAL\_REF} to obtain the address.  The
+\texttt{AST\_F2} field of the \texttt{AST\_UNARY\_EXPR} node
+carries the prefix/postfix flag (1 for prefix, 0 for postfix),
+set by the parser.
+
+\paragraph{Test programs.}
+The following C programs exercise the four operator forms.  Each
+should compile, link, and produce the indicated exit code:
+
+\begin{verbatim}
+  // postfix increment — expected exit code: 5
+  int main(void) { int x = 5; x++; return x; }
+
+  // prefix increment — expected exit code: 6
+  int main(void) { int x = 5; return ++x; }
+
+  // postfix in expression — expected exit code: 5
+  int main(void) { int x = 5; int y = x++; return y; }
+
+  // prefix in expression — expected exit code: 6
+  int main(void) { int x = 5; int y = ++x; return y; }
+
+  // standard for-loop — expected exit code: 10
+  int main(void) {
+      int s = 0;
+      for (int i = 0; i < 5; i++) s = s + 2;
+      return s;
+  }
+
+  // decrement — expected exit code: 0
+  int main(void) {
+      int x = 5;
+      while (x > 0) x--;
+      return x;
+  }
+
+  // prefix decrement — expected exit code: 4
+  int main(void) { int x = 5; return --x; }
+\end{verbatim}
+
+@d IR: build increment/decrement @{
+// -- kcc_ir_build_inc_dec -------------------------------------------------
+// uint64_t kcc_ir_build_inc_dec(node *expr)
+//   x0 = AST_UNARY_EXPR (F0=op, F1=operand, F2=prefix(1)/postfix(0))
+// Lowers i++, ++i, i--, --i into a load-add/sub-store sequence.
+// Returns old value (postfix) or new value (prefix).
+.text
+.globl _kcc_ir_build_inc_dec
+.p2align 2
+_kcc_ir_build_inc_dec:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                  // AST node
+    ldr x20, [x19, #AST_F0]     // op (TOK_INC or TOK_DEC)
+    ldr x21, [x19, #AST_F2]     // prefix flag (1=prefix, 0=postfix)
+
+    // Operand must be an identifier (lvalue)
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libid_zero
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libid_zero
+
+    ldr x22, [x0, #AST_F0]      // name ptr
+    cbz x22, .Libid_zero
+
+    // Look up in locals hash table
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22
+    bl _kcc_ht_get
+    cbz x0, .Libid_global
+    sub x22, x0, #1              // x22 = alloca vreg
+    b .Libid_load
+@| _kcc_ir_build_inc_dec
+@}
+
+For global variables, the builder first emits an \texttt{IR\_GLOBAL\_REF}
+to materialise the address into a vreg, then continues with the same
+load-modify-store sequence.
+
+@d IR: build increment/decrement @{
+.Libid_global:
+    // Emit GLOBAL_REF to get address vreg
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_SRC1]     // name ptr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x22, x0                  // x22 = address vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+@}
+
+The core read-modify-write sequence is shared by both local and global
+operands.  The four steps---load, constant~1, add or subtract, and
+store---follow directly.
+
+@d IR: build increment/decrement @{
+.Libid_load:
+    // Step 1: load current value
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // address vreg
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x23, x0                  // x23 = old value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Step 2: constant 1
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x2, #1
+    str x2, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x24, x0                  // x24 = const 1 vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Step 3: add (++) or sub (--)
+    cmp x20, #TOK_INC
+    mov x0, #IR_ADD
+    b.eq .Libid_binop
+    mov x0, #IR_SUB
+.Libid_binop:
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x23, [x0, #IR_SRC1]     // old value
+    str x24, [x0, #IR_SRC2]     // const 1
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x24, x0                  // x24 = new value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Step 4: store new value back
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]     // new value
+    str x22, [x0, #IR_SRC2]     // address
+    bl _kcc_ir_emit
+
+    // Return old (postfix) or new (prefix)
+    cbnz x21, .Libid_prefix
+    mov x0, x23                  // postfix: return old value
+    b .Libid_done
+.Libid_prefix:
+    mov x0, x24                  // prefix: return new value
+    b .Libid_done
+
+.Libid_zero:
+    mov x0, #0
+
+.Libid_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
 @}
 
 \subsection{Assignment}

@@ -415,21 +415,46 @@ introduce linear-scan register allocation.
 \end{enumerate}
 
 \textbf{Status.} In progress (v1 core working: constants, arithmetic,
-locals, control flow, loops, function calls, global variables, break/continue
-all compile, link, and run correctly.  Valid Mach-O with \texttt{LC\_BUILD\_VERSION}).
+locals, control flow, loops, function calls, global variables, break/continue,
+string literals, \texttt{printf}, bitwise/comparison/logical operators,
+pointers, cast, negation---all compile, link, and run correctly.  Valid
+Mach-O with \texttt{LC\_BUILD\_VERSION}).
 
-\textbf{Next steps.}
+\textbf{Completed milestones.}
 \begin{itemize}
-\item String literals: store \texttt{"..."} data in the object file and
-      produce a pointer address via \texttt{ADRP}+\texttt{ADD} relocation.
-\item Multiple call arguments: ensure \texttt{call} lowers N~arguments
-      correctly into \texttt{x0}--\texttt{x7}.
-\item External function calls (\texttt{printf}, etc.): declared-but-not-defined
-      functions remain as \texttt{N\_UNDF|N\_EXT} symbols, resolved by
-      \texttt{-lSystem} at link time.
-\item Together these enable \texttt{printf("hello \%d\textbackslash{}n", 42)}
-      to compile, link, and run.
+\item[\checkmark] Return constants, arithmetic, locals, \texttt{if}/\texttt{else}.
+\item[\checkmark] \texttt{while}, \texttt{do}/\texttt{while}, \texttt{for} (with explicit \texttt{i = i + 1}).
+\item[\checkmark] Function calls: multi-argument, variadic, external (\texttt{printf}).
+\item[\checkmark] Global variables via \texttt{ADRP}+\texttt{ADD} relocation.
+\item[\checkmark] String literals in \texttt{\_\_text} section with cstring fixups.
+\item[\checkmark] Bitwise operators, comparisons, logical \texttt{\&\&}/\texttt{||}, unary \texttt{!}.
+\item[\checkmark] Pointers (address-of, dereference), cast expressions, negation.
+\item[\checkmark] Comma operator, \texttt{break}/\texttt{continue}, nested calls.
 \end{itemize}
+
+\textbf{Next steps} (ordered by impact).
+\begin{enumerate}
+\item Post/pre increment and decrement (\texttt{i++}, \texttt{++i},
+      \texttt{i-{}-}, \texttt{-{}-i}): currently emits \texttt{IR\_NOP},
+      causing infinite loops in the standard \texttt{for(i=0; i<n; i++)}
+      pattern.
+\item Compound assignment operators (\texttt{+=}, \texttt{-=}, \texttt{*=},
+      \texttt{/=}, etc.): partial implementation crashes in straight-line
+      code.
+\item Ternary operator (\texttt{?:}): true-branch value not emitted.
+\item \texttt{switch}/\texttt{case}/\texttt{default}: body not lowered to
+      compare-and-branch chains.
+\item \texttt{sizeof}: not lowered to \texttt{IR\_CONST} with the type's
+      size.
+\item Multi-variable declarations (\texttt{int a=3, b=4;}): second
+      variable not allocated as a local.
+\item \texttt{IR\_GEP} and array/struct support: subscript (\texttt{a[i]})
+      and member access (\texttt{s.x}) require address arithmetic in the
+      codegen.
+\item Missing codegen handlers for defined IR opcodes: \texttt{IR\_UMOD},
+      \texttt{IR\_CMP\_ULT}, \texttt{IR\_CMP\_ULE}, \texttt{IR\_SEXT},
+      \texttt{IR\_ZEXT}, \texttt{IR\_TRUNC}, \texttt{IR\_BITCAST}.
+\end{enumerate}
 
 % ────────────────────────────────────────────────────────────────
 \section{Phase 8 --- Self-Hosting}

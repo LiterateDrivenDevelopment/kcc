@@ -342,14 +342,18 @@ guards against regressions as the compiler evolves.  The test harness
 framework --- written in the same bare-metal ARM64 assembly as the
 compiler itself --- with setup helpers, assertion macros, and a runner
 that reports pass/fail counts to stdout.  The conformance tests
-(Chapter~\ref{ch:conformance}) exercise the lexer against the token
+(Chapter~\ref{ch:conformance-tests}) exercise the lexer against the token
 categories defined by the C17 grammar: keywords, numeric constants,
 string and character literals, punctuators, comments, trigraphs, and
 line splicing.  Each test feeds a known input string to the lexer and
-asserts the expected token type and spelling.
+asserts the expected token type and spelling.  The code generation tests
+(Chapter~\ref{ch:codegen-tests}) take a different approach: they compile
+complete C programs with \kcc{}, link the resulting object files, execute
+the binaries, and verify that the exit code matches the expected value.
 
 @i literate/verification/44-test-harness.weft
 @i literate/verification/45-conformance-tests.weft
+@i literate/verification/46-codegen-tests.weft
 
 % ═══════════════════════════════════════════════════════════════════
 % Output Routing

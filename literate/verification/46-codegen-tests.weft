@@ -19,9 +19,10 @@ reports results in the same pass/fail format as the unit test harness.
 
 Individual test groups are defined alongside the features they exercise:
 constants and arithmetic in Chapter~\ref{ch:codegen}, local variables,
-control flow, switch statements, ternary expressions, increment/decrement,
-compound assignment, logical operators, function calls, pointers, and
-miscellaneous cases in Chapter~\ref{ch:ir-builder}.  This chapter provides the runner
+control flow, switch statements, ternary expressions, sizeof,
+increment/decrement, compound assignment, logical operators, function
+calls, pointers, and miscellaneous cases in
+Chapter~\ref{ch:ir-builder}.  This chapter provides the runner
 infrastructure that ties them together.
 
 \section{Test Runner}

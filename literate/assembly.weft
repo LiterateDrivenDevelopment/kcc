@@ -368,6 +368,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build return@>
 @<IR: build expression@>
 @<IR: build int literal@>
+@<IR: build sizeof@>
 @<IR: build ident@>
 @<IR: build binary@>
 @<IR: build unary@>
@@ -518,5 +519,6 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen misc@>
 @<Test: codegen ternary@>
 @<Test: codegen switch@>
+@<Test: codegen sizeof@>
 @<Test: codegen results@>
 @}

@@ -441,12 +441,13 @@ Mach-O with \texttt{LC\_BUILD\_VERSION}).
 \item[\checkmark] \texttt{switch}/\texttt{case}/\texttt{default}: three-pass
       lowering (create BBs, dispatch chain, bodies) with C fall-through
       semantics and \texttt{break} via the loop stack.
+\item[\checkmark] \texttt{sizeof}: lowered to \texttt{IR\_CONST} with the
+      operand type's \texttt{TY\_SIZE}; both type and expression forms
+      supported.
 \end{itemize}
 
 \textbf{Next steps} (ordered by impact).
 \begin{enumerate}
-\item \texttt{sizeof}: not lowered to \texttt{IR\_CONST} with the type's
-      size.
 \item Multi-variable declarations (\texttt{int a=3, b=4;}): second
       variable not allocated as a local.
 \item \texttt{IR\_GEP} and array/struct support: subscript (\texttt{a[i]})

@@ -1307,6 +1307,8 @@ _kcc_ir_build_expr:
     b.eq .Libe_paren
     cmp x0, #AST_STR_LIT
     b.eq .Libe_string_lit
+    cmp x0, #AST_SIZEOF_EXPR
+    b.eq .Libe_sizeof
 
     // Unhandled expression — return 0
     b .Libe_zero
@@ -1376,6 +1378,11 @@ _kcc_ir_build_expr:
     bl _kcc_ir_build_string_lit
     b .Libe_done
 
+.Libe_sizeof:
+    mov x0, x19
+    bl _kcc_ir_build_sizeof
+    b .Libe_done
+
 .Libe_zero:
     mov x0, #0
 
@@ -1438,6 +1445,115 @@ _kcc_ir_build_int_lit:
     ldp x29, x30, [sp], #48
     ret
 @| _kcc_ir_build_int_lit
+@}
+
+\subsection{Sizeof Expression}
+
+The \texttt{sizeof} operator (\stdref{6.5.3.4}) is a compile-time
+constant: it measures the size of a type without generating any
+run-time code.  The IR builder lowers it to a single
+\texttt{IR\_CONST} whose immediate value is the type's size in bytes.
+
+Two forms are possible.  When the operand is a type name
+(\texttt{AST\_F1 = 1}), the builder calls
+\texttt{\_kcc\_sema\_resolve\_type} on the type AST node to obtain a
+type descriptor and reads its \texttt{TY\_SIZE} field.  When the
+operand is an expression (\texttt{AST\_F1 = 0}), the semantic pass has
+already type-checked the operand and stored its resolved type in the
+operand node's \texttt{AST\_F3} field; the builder reads the size from
+that descriptor.  In neither case is the operand expression evaluated
+at run time.
+
+@d IR: build sizeof @{
+// -- kcc_ir_build_sizeof --------------------------------------------------
+// uint64_t kcc_ir_build_sizeof(node *expr)
+//   x0 = AST_SIZEOF_EXPR (F0=operand, F1=is_type)
+// Returns vreg holding the size constant.
+.text
+.globl _kcc_ir_build_sizeof
+.p2align 2
+_kcc_ir_build_sizeof:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = sizeof node
+
+    // Determine operand type
+    ldr x0, [x19, #AST_F1]      // is_type flag
+    cbnz x0, .Libs_sizeof_type
+
+    // sizeof(expr): operand's resolved type is in F0->AST_F3
+    ldr x0, [x19, #AST_F0]      // operand expression
+    ldr x0, [x0, #AST_F3]       // resolved type descriptor
+    b .Libs_sizeof_emit
+
+.Libs_sizeof_type:
+    // sizeof(type-name): resolve the type AST node
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+
+.Libs_sizeof_emit:
+    // x0 = type descriptor → read TY_SIZE
+    ldr x20, [x0, #TY_SIZE]     // x20 = size in bytes
+
+    // Emit IR_CONST with the size value
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x21, x0                  // x21 = instr
+
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x21, #IR_TYPE]     // sizeof yields unsigned long
+
+    str x20, [x21, #IR_SRC1]    // immediate = size
+
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x20, x0                  // save vreg
+
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    mov x0, x20                  // return vreg
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_sizeof
+@}
+
+\paragraph{End-to-end tests.}
+The sizeof operator must produce the correct size for each fundamental
+type: \texttt{char} is 1~byte, \texttt{short} is 2, \texttt{int} is 4,
+and \texttt{long} is 8 on ARM64.  The expression form
+\texttt{sizeof~expr} must also return the type's size without
+evaluating the expression.
+
+@d Test: codegen sizeof @{
+echo ""
+echo "--- Sizeof ---"
+
+run_test "sizeof-int" \
+    "int main(void) { return sizeof(int); }" 4
+
+run_test "sizeof-char" \
+    "int main(void) { return sizeof(char); }" 1
+
+run_test "sizeof-long" \
+    "int main(void) { return sizeof(long); }" 8
+
+run_test "sizeof-expr" \
+    "int main(void) { int x = 42; return sizeof(x); }" 4
+
+run_test "sizeof-ptr" \
+    "int main(void) { int *p; return sizeof(p); }" 8
+
+run_test "sizeof-arith" \
+    "int main(void) { return sizeof(int) + sizeof(char); }" 5
 @}
 
 \subsection{Identifier (Variable Load)}

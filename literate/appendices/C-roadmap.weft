@@ -435,11 +435,13 @@ Mach-O with \texttt{LC\_BUILD\_VERSION}).
       locals and globals.
 \item[\checkmark] Compound assignment operators (\texttt{+=}, \texttt{-=}, \texttt{*=},
       \texttt{/=}, etc.) for both local and global variables.
+\item[\checkmark] Ternary operator (\texttt{?:}): alloca rendezvous pattern
+      ensures both branches store to a shared slot; merge block loads the
+      result.
 \end{itemize}
 
 \textbf{Next steps} (ordered by impact).
 \begin{enumerate}
-\item Ternary operator (\texttt{?:}): true-branch value not emitted.
 \item \texttt{switch}/\texttt{case}/\texttt{default}: body not lowered to
       compare-and-branch chains.
 \item \texttt{sizeof}: not lowered to \texttt{IR\_CONST} with the type's

@@ -515,5 +515,6 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen functions@>
 @<Test: codegen pointers@>
 @<Test: codegen misc@>
+@<Test: codegen ternary@>
 @<Test: codegen results@>
 @}

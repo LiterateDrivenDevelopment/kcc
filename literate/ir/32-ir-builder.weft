@@ -2767,28 +2767,53 @@ _kcc_ir_build_string_lit:
 \subsection{Conditional Expression}
 
 The ternary operator \texttt{cond ? then : else} is lowered to three
-fresh basic blocks.  The condition vreg feeds an \texttt{IR\_BR\_COND}
-that routes control to the \emph{then\_bb} or \emph{else\_bb}.  Each
-arm evaluates its expression, then branches unconditionally to the
-\emph{merge\_bb}.  The returned vreg is that of the last-evaluated
-arm---a simplification that avoids phi nodes and works because the
-all-spill code generator stores every vreg to a stack slot.
+fresh basic blocks plus a temporary alloca that serves as a rendezvous
+point.  The condition vreg feeds an \texttt{IR\_BR\_COND} that routes
+control to the \emph{then\_bb} or \emph{else\_bb}.  Each arm evaluates
+its expression and \emph{stores} the result into the shared alloca,
+then branches unconditionally to the \emph{merge\_bb}.  The merge block
+loads the result back from the alloca, producing a single vreg that
+the caller can reference regardless of which branch executed.
+
+This store/load pattern replaces the earlier approach of ``returning
+the last vreg,'' which failed because the then-branch vreg was never
+referenced in the merge block and DCE eliminated it.  The alloca
+approach works naturally with the all-spill code generator and avoids
+phi nodes entirely.
 
 @d IR: build conditional @{
 // -- kcc_ir_build_cond_expr -----------------------------------------------
 // uint64_t kcc_ir_build_cond_expr(node *expr)
 //   x0 = AST_COND_EXPR (F0=cond, F1=then, F2=else)
+// Lowers to: alloca tmp → br_cond → then: store → br merge
+//                                  → else: store → br merge
+//            merge: load tmp → return vreg
 .text
 .globl _kcc_ir_build_cond_expr
 .p2align 2
 _kcc_ir_build_cond_expr:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
 
     mov x19, x0
+
+    // Allocate a temporary slot for the result
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x20, x0                  // x20 = alloca instr
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x25, x0                  // x25 = alloca vreg (result slot)
+    mov x0, x20
+    bl _kcc_ir_emit
 
     // Build condition
     ldr x0, [x19, #AST_F0]
@@ -2819,12 +2844,23 @@ _kcc_ir_build_cond_expr:
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
-    // Then branch
+    // Then branch: evaluate, store to alloca, branch to merge
     mov x0, x21
     bl _kcc_ir_set_bb
     ldr x0, [x19, #AST_F1]
     bl _kcc_ir_build_expr
     mov x24, x0                  // then_vreg
+
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]     // value
+    str x25, [x0, #IR_SRC2]     // alloca
+    bl _kcc_ir_emit
+
     mov x0, #IR_BR
     bl _kcc_ir_alloc_instr
     ldr x1, [x23, #BB_ID]
@@ -2837,12 +2873,23 @@ _kcc_ir_build_cond_expr:
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
-    // Else branch
+    // Else branch: evaluate, store to alloca, branch to merge
     mov x0, x22
     bl _kcc_ir_set_bb
     ldr x0, [x19, #AST_F2]
     bl _kcc_ir_build_expr
-    mov x24, x0                  // else vreg (overwrites then — simplified)
+    mov x24, x0                  // else_vreg
+
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]     // value
+    str x25, [x0, #IR_SRC2]     // alloca
+    bl _kcc_ir_emit
+
     mov x0, #IR_BR
     bl _kcc_ir_alloc_instr
     ldr x1, [x23, #BB_ID]
@@ -2855,18 +2902,66 @@ _kcc_ir_build_cond_expr:
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
-    // Merge
+    // Merge: load from alloca → result vreg
     mov x0, x23
     bl _kcc_ir_set_bb
 
-    mov x0, x24                  // simplified: return last vreg
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x25, [x0, #IR_SRC1]     // alloca vreg
+    mov x20, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x24, x0                  // result vreg
+    mov x0, x20
+    bl _kcc_ir_emit
 
+    mov x0, x24                  // return result vreg
+
+    ldr x25, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
 @| _kcc_ir_build_cond_expr
+@}
+
+\paragraph{End-to-end tests.}
+The alloca rendezvous pattern ensures that whichever branch executes,
+the result is stored to a known location and loaded in the merge block.
+These tests cover both truth values, variable conditions, initialiser
+context, nesting, use as a function argument, and sub-expression
+evaluation within the arms.
+
+@d Test: codegen ternary @{
+echo ""
+echo "--- Ternary Operator ---"
+
+run_test "ternary-true" \
+    "int main(void) { return 1 ? 42 : 99; }" 42
+
+run_test "ternary-false" \
+    "int main(void) { return 0 ? 42 : 99; }" 99
+
+run_test "ternary-var-cond" \
+    "int main(void) { int x = 1; return x ? 10 : 20; }" 10
+
+run_test "ternary-var-init" \
+    "int main(void) { int x = 1 ? 5 : 9; return x; }" 5
+
+run_test "ternary-nested" \
+    "int main(void) { return 1 ? (0 ? 1 : 2) : 3; }" 2
+
+run_test "ternary-expr-arms" \
+    "int main(void) { int a=10; int b=3; return 1 ? a+b : a-b; }" 13
+
+run_test "ternary-false-path" \
+    "int main(void) { int a=10; int b=3; return 0 ? a+b : a-b; }" 7
 @}
 
 \section{Building Variable Declarations}

@@ -266,6 +266,8 @@ _kcc_ir_dump_instr:
     b.eq .Lidi_zext
     cmp x20, #IR_TRUNC
     b.eq .Lidi_trunc
+    cmp x20, #IR_BITCAST
+    b.eq .Lidi_bitcast
     cmp x20, #IR_CONST
     b.eq .Lidi_const
     cmp x20, #IR_NOP
@@ -431,6 +433,10 @@ the backend can select the correct ARM64 widening instruction
 .Lidi_trunc:
     adrp x0, _kcc_ir_op_trunc@@PAGE
     add  x0, x0, _kcc_ir_op_trunc@@PAGEOFF
+    b .Lidi_unop
+.Lidi_bitcast:
+    adrp x0, _kcc_ir_op_bitcast@@PAGE
+    add  x0, x0, _kcc_ir_op_bitcast@@PAGEOFF
     b .Lidi_unop
 
 .Lidi_unop:
@@ -1277,10 +1283,10 @@ The expression dispatcher examines the AST tag of its input node and
 delegates to a specialised builder for each expression kind.  Every
 builder returns the vreg number holding the result; this convention
 lets callers compose expressions by feeding one builder's result into
-another's operand slots.  Cast and parenthesised expressions are
-handled inline: a cast simply builds its inner operand (truncation and
-extension are deferred to a later phase), and a parenthesised
-expression unwraps to its child.  The comma operator evaluates both
+another's operand slots.  A cast expression delegates to
+\texttt{\_kcc\_ir\_build\_cast}, which emits \texttt{IR\_TRUNC} when
+the target type is narrower than the source.  Parenthesised
+expressions unwrap to their child.  The comma operator evaluates both
 sides and returns the right-hand vreg.
 
 @d IR: build expression @{
@@ -1371,9 +1377,8 @@ _kcc_ir_build_expr:
     b .Libe_done
 
 .Libe_cast:
-    // For now, just build the inner expression
-    ldr x0, [x19, #AST_F1]
-    bl _kcc_ir_build_expr
+    mov x0, x19
+    bl _kcc_ir_build_cast
     b .Libe_done
 
 .Libe_comma:
@@ -2549,6 +2554,21 @@ run_test "address and deref" \
 
 run_test "cast expression" \
     "int main(void) { long x = 42; return (int)x; }" 42
+
+run_test "trunc int-to-char" \
+    "int main(void) { int x = 321; return (char)x; }" 65
+
+run_test "trunc mask byte" \
+    "int main(void) { int x = 256; return (char)x; }" 0
+
+run_test "trunc preserves low" \
+    "int main(void) { int x = 42; return (char)x; }" 42
+
+run_test "trunc short" \
+    "int main(void) { int x = 65537; return (short)x; }" 1
+
+run_test "cast same-width" \
+    "int main(void) { int x = 99; return (int)x; }" 99
 @}
 
 \subsection{Increment and Decrement}
@@ -3529,6 +3549,80 @@ run_test "ternary-expr-arms" \
 
 run_test "ternary-false-path" \
     "int main(void) { int a=10; int b=3; return 0 ? a+b : a-b; }" 7
+@}
+
+\section{Building Cast Expressions}
+
+An explicit cast \texttt{(T)e} compares the target type~\texttt{T}
+with the source type of the inner expression.  When the target is
+strictly narrower (by \texttt{TY\_SIZE}), the builder emits
+\texttt{IR\_TRUNC} to mask the result to the target width.
+Same-width or widening casts return the inner vreg unchanged; the
+all-spill back end treats every slot as 64~bits, so no extension
+instruction is needed for correctness at this stage.
+
+@d IR: build cast @{
+// -- kcc_ir_build_cast ----------------------------------------------------
+// uint64_t kcc_ir_build_cast(node *cast)
+//   x0 = AST_CAST_EXPR (F0=type, F1=expr, F3=resolved target type)
+// Returns vreg.
+.text
+.globl _kcc_ir_build_cast
+.p2align 2
+_kcc_ir_build_cast:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                  // cast node
+
+    // Save inner expr pointer before building
+    ldr x20, [x19, #AST_F1]     // inner expression node
+
+    // Build inner expression
+    mov x0, x20
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // src_vreg
+
+    // Get target type from cast node's F3 (set by sema)
+    ldr x22, [x19, #AST_F3]
+    cbz x22, .Lbc_done
+
+    // Get source type from inner expr's F3
+    ldr x0, [x20, #AST_F3]
+    cbz x0, .Lbc_done
+
+    // Compare sizes
+    ldr x1, [x22, #TY_SIZE]     // target size
+    ldr x2, [x0, #TY_SIZE]      // source size
+
+    cmp x1, x2
+    b.hs .Lbc_done               // target >= source: no truncation
+
+    // Target < source: emit IR_TRUNC
+    mov x0, #IR_TRUNC
+    bl _kcc_ir_alloc_instr
+    mov x20, x0                  // instr
+
+    str x22, [x20, #IR_TYPE]    // target type
+    str x21, [x20, #IR_SRC1]    // source vreg
+
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0                  // new vreg
+
+    mov x0, x20
+    bl _kcc_ir_emit
+
+.Lbc_done:
+    mov x0, x21                  // return vreg
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_cast
 @}
 
 \section{Building Variable Declarations}
@@ -4875,6 +4969,7 @@ _kcc_ir_op_call:        .asciz "call "
 _kcc_ir_op_sext:        .asciz "sext"
 _kcc_ir_op_zext:        .asciz "zext"
 _kcc_ir_op_trunc:       .asciz "trunc"
+_kcc_ir_op_bitcast:     .asciz "bitcast"
 _kcc_ir_op_const:       .asciz "const "
 _kcc_ir_op_nop:         .asciz "nop"
 _kcc_ir_op_global_ref:  .asciz "global_ref "
@@ -4943,6 +5038,7 @@ _kcc_ir_ty_unknown:     .asciz "?type"
 @| _kcc_ir_op_sext
 @| _kcc_ir_op_zext
 @| _kcc_ir_op_trunc
+@| _kcc_ir_op_bitcast
 @| _kcc_ir_op_const
 @| _kcc_ir_op_nop
 @| _kcc_ir_op_global_ref

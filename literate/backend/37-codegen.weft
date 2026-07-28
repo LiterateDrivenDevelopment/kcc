@@ -741,6 +741,11 @@ _kcc_codegen_instr:
     cmp x22, #IR_STRING_LIT
     b.eq .Lcgi_string_lit
 
+    cmp x22, #IR_TRUNC
+    b.eq .Lcgi_trunc
+    cmp x22, #IR_BITCAST
+    b.eq .Lcgi_bitcast
+
     // Unknown opcode: skip
     b .Lcgi_done
 @| _kcc_codegen_instr
@@ -1203,6 +1208,122 @@ IR opcode & ARM64 cond & Inverted \\
     mov x1, x23                    // inv_cond
     mov x2, #1                     // sf
     bl _kcc_enc_cset
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+@}
+
+\subsection{Type Conversions}
+
+\texttt{IR\_TRUNC} masks a value to the width of the target type.
+The target's \texttt{TY\_SIZE} (1, 2, or~4 bytes) selects the mask;
+the handler loads the mask into \texttt{x10} and uses
+\texttt{AND\;x11,\;x9,\;x10}.  If no type is attached or the size
+is~8, the instruction is a plain copy.
+
+\texttt{IR\_BITCAST} reinterprets the bit pattern as a different type
+without changing any bits---a no-op in the all-spill strategy.
+
+@d CodeGen: instruction dispatch @{
+// ---- Type conversions ----
+
+.Lcgi_trunc:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1          // x9 = source value
+    bl _kcc_cg_load_vreg
+
+    // Get target type size
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_trunc_copy
+    ldr x23, [x0, #TY_SIZE]
+
+    cmp x23, #1
+    b.eq .Lcgi_trunc_1
+    cmp x23, #2
+    b.eq .Lcgi_trunc_2
+    cmp x23, #4
+    b.eq .Lcgi_trunc_4
+    b .Lcgi_trunc_copy
+
+.Lcgi_trunc_1:
+    // MOVZ x10, #0xFF
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFF
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+    b .Lcgi_trunc_mask
+
+.Lcgi_trunc_2:
+    // MOVZ x10, #0xFFFF
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFFFF
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+    b .Lcgi_trunc_mask
+
+.Lcgi_trunc_4:
+    // MOVZ x10, #0xFFFF; MOVK x10, #0xFFFF, hw=1
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFFFF
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFFFF
+    mov x2, #1
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+    b .Lcgi_trunc_mask
+
+.Lcgi_trunc_mask:
+    // AND x11, x9, x10
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_and_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_trunc_copy:
+    // No masking — copy src to dest via ADD x11, x9, #0
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_bitcast:
+    // Pure type reinterpretation — copy src to dest
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_add_imm
     bl _kcc_code_emit32
 
     ldr x0, [x19, #IR_DEST]

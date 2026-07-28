@@ -247,9 +247,15 @@ _kcc_sema_resolve_type:
 The declaration checker dispatches on the AST tag to handle each
 declaration kind.  Variable declarations resolve their type and
 register a \texttt{SYM\_VAR} in the symbol table, optionally
-type-checking the initialiser.  Function declarations register a
-\texttt{SYM\_FUNC}, push a new scope for parameters and body, then
-check the body statements.  Typedef declarations register
+type-checking the initialiser.  Function declarations resolve the
+return type, wrap it in a \texttt{TY\_FUNC} descriptor via
+\texttt{\_kcc\_type\_func}, and register the resulting function type
+as \texttt{SYM\_FUNC}.  The \texttt{TY\_FUNC} wrapper is essential:
+without it, identifier lookup returns the bare return type, and
+function-decay produces the wrong kind of pointer---the call handler
+then falls back to \texttt{int}, corrupting pointer return values.
+After registration the checker pushes a scope for parameters and body,
+then checks the body statements.  Typedef declarations register
 \texttt{SYM\_TYPEDEF}.  Struct and union declarations register the
 tag in the tag namespace via \texttt{\_kcc\_symtab\_declare\_tag}.
 Enum declarations register the tag and walk the enumerator list,
@@ -322,7 +328,10 @@ _kcc_sema_check_decl:
     // Resolve return type
     ldr x0, [x19, #AST_F0]         // type node
     bl _kcc_sema_resolve_type
-    mov x21, x0                     // function type (or return type)
+    // Wrap in TY_FUNC so callers see a proper function type
+    mov x1, #0                     // no param vec for now
+    bl _kcc_type_func
+    mov x21, x0                     // TY_FUNC descriptor
 
     // Register function in symbol table
     ldr x0, [x19, #AST_F1]         // name_ptr
@@ -340,10 +349,11 @@ _kcc_sema_check_decl:
     ldr x0, [x19, #AST_F3]         // body
     cbz x0, .Lscd_done
 
-    // Store current function return type
+    // Store current function return type (extract from TY_FUNC)
+    ldr x0, [x21, #TY_F0]          // return type from TY_FUNC
     adrp x1, _kcc_sema_cur_ret@@PAGE
     add  x1, x1, _kcc_sema_cur_ret@@PAGEOFF
-    str x21, [x1]
+    str x0, [x1]
 
     // Push scope for function body
     bl _kcc_symtab_push_scope

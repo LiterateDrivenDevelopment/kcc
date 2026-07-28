@@ -187,9 +187,14 @@ Compiling one IR function proceeds in nine steps:
 \item \textbf{Patch vector.}  A vector of
       $(\mathit{code\_offset}, \mathit{target\_bb\_id})$ pairs
       for forward branches that need back-patching.
-\item \textbf{Prologue.}  Emit
-      \texttt{STP\;x29,\;x30,\;[sp,\;\#-frame\_size]!} and
-      \texttt{MOV\;x29,\;sp}.
+\item \textbf{Prologue.}  For small frames ($\leq 504$ bytes),
+      emit \texttt{STP\;x29,\;x30,\;[sp,\;\#-frame\_size]!};
+      for larger frames, emit \texttt{SUB\;sp,\;sp,\;\#frame\_size}
+      followed by \texttt{STP\;x29,\;x30,\;[sp]} using the
+      signed-offset form, because the signed 7-bit \textsc{stp}/\textsc{ldp}
+      immediate (scaled by~8) only covers $-512$
+      to~$+504$; the epilogue's positive post-index hits the
+      limit first.  Both paths finish with \texttt{MOV\;x29,\;sp}.
 \item \textbf{Store arguments.}  Copy \texttt{x0}--\texttt{x7}
       to their corresponding vreg stack slots.
 \item \textbf{Walk BBs.}  For each basic block, record its label
@@ -314,22 +319,39 @@ _kcc_codegen_func:
     bl _kcc_arena_alloc
     str x0, [x23, #VEC_DATA]
 
-    // 5. Emit prologue: stp x29, x30, [sp, #-frame_size]!
-    //                    mov x29, sp
-    // STP pre-index: imm7 = -frame_size/8
-    mov x0, #29                    // rt1 = x29
-    mov x1, #30                    // rt2 = x30
-    mov x2, #31                    // rn = sp
+    // 5. Emit prologue
+    cmp x20, #504
+    b.hi .Lcgf_large_prologue
+
+    // Small frame: stp x29, x30, [sp, #-frame_size]!
+    mov x0, #29
+    mov x1, #30
+    mov x2, #31
     neg x3, x20
-    asr x3, x3, #3                // imm7 = -frame_size / 8
+    asr x3, x3, #3
     bl _kcc_enc_stp_pre
     bl _kcc_code_emit32
+    b .Lcgf_prologue_mov
 
-    // mov x29, sp → ADD x29, sp, #0
-    mov x0, #29                    // rd = x29
+.Lcgf_large_prologue:
+    // Large frame: sub sp, sp, #frame_size  then  stp x29, x30, [sp]
+    mov x0, #31                    // rd = sp
     mov x1, #31                    // rn = sp
-    mov x2, #0                     // imm12 = 0
-    mov x3, #1                     // sf = 64-bit
+    mov x2, x20                   // imm12 = frame_size
+    mov x3, #1                    // sf = 64-bit
+    bl _kcc_enc_sub_imm
+    bl _kcc_code_emit32
+    // stp x29, x30, [sp, #0] — signed-offset form: 0xA9007BFD
+    movz w0, #0x7BFD
+    movk w0, #0xA900, lsl #16
+    bl _kcc_code_emit32
+
+.Lcgf_prologue_mov:
+    // mov x29, sp → ADD x29, sp, #0
+    mov x0, #29
+    mov x1, #31
+    mov x2, #0
+    mov x3, #1
     bl _kcc_enc_add_imm
     bl _kcc_code_emit32
 @| _kcc_codegen_func
@@ -1480,7 +1502,13 @@ the source vreg into x9, then \texttt{LDR\;x11,\;[x9]} to fetch
 the value, and store x11 to the destination slot.
 
 \texttt{IR\_STORE} is the inverse: load the value into x9 and
-the pointer into x10, then \texttt{STR\;x9,\;[x10]}.
+the pointer into x10, then \texttt{STR\;x9,\;[x10]}.  When the
+\texttt{IR\_DEST} field is nonzero it acts as an access-size
+override: 1\,$\to$\,\textsc{strb}, 2\,$\to$\,\textsc{strh},
+4\,$\to$\,32-bit \textsc{str}.  This parallels the \texttt{IR\_LOAD}
+override in \texttt{IR\_SRC2} and is used by the assignment builder
+for pointer-dereference writes (\texttt{*p\;=\;v}), where a
+64-bit store would corrupt adjacent bytes.
 
 \texttt{IR\_ALLOCA} computes the \emph{address} of the variable's
 storage.  To avoid the slot-aliasing bug (see Debugging Lessons),
@@ -1505,14 +1533,50 @@ and stores the resulting address in the destination vreg.
     mov x1, #CG_REG_SRC1
     bl _kcc_cg_load_vreg
 
-    // LDR x11, [x9, #0]
-    mov x0, #CG_REG_DST           // rt = x11
-    mov x1, #CG_REG_SRC1          // rn = x9
-    mov x2, #0                     // imm12_scaled = 0
-    mov x3, #1                     // size = 64-bit
+    // Check if this is a byte/halfword load (IR_SRC2 = access size override)
+    ldr x23, [x19, #IR_SRC2]
+    cmp x23, #1
+    b.eq .Lcgi_load_8
+    cmp x23, #2
+    b.eq .Lcgi_load_16
+    cmp x23, #4
+    b.eq .Lcgi_load_32
+
+    // Default: 64-bit load (works for alloca slots and pointer-width values)
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
     bl _kcc_enc_ldr_imm
     bl _kcc_code_emit32
-
+    b .Lcgi_load_done
+.Lcgi_load_8:
+    // LDRB x11, [x9] — byte load, zero-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #2
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_16:
+    // LDRH x11, [x9] — halfword load, zero-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #3
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_32:
+    // LDR w11, [x9] — word load, zero-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #0
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+.Lcgi_load_done:
     ldr x0, [x19, #IR_DEST]
     mov x1, #CG_REG_DST
     bl _kcc_cg_store_vreg
@@ -1521,6 +1585,7 @@ and stores the resulting address in the destination vreg.
 .Lcgi_store:
     // Store: x9 = value from src1, x10 = pointer from src2, *x10 = x9
     // IR_STORE: SRC1 = value vreg, SRC2 = pointer vreg
+    // IR_DEST = access size override (0 → 64-bit default)
     ldr x0, [x19, #IR_SRC1]
     mov x1, #CG_REG_SRC1
     bl _kcc_cg_load_vreg
@@ -1528,11 +1593,46 @@ and stores the resulting address in the destination vreg.
     mov x1, #CG_REG_SRC2
     bl _kcc_cg_load_vreg
 
-    // STR x9, [x10, #0]
-    mov x0, #CG_REG_SRC1          // rt = x9 (value)
-    mov x1, #CG_REG_SRC2          // rn = x10 (pointer)
-    mov x2, #0                     // imm12_scaled = 0
+    ldr x23, [x19, #IR_DEST]
+    cmp x23, #1
+    b.eq .Lcgi_store_8
+    cmp x23, #2
+    b.eq .Lcgi_store_16
+    cmp x23, #4
+    b.eq .Lcgi_store_32
+
+    // Default: 64-bit store (alloca slots and pointer-sized values)
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
     mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_store_8:
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
+    mov x3, #2                     // size = byte (STRB)
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_store_16:
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
+    mov x3, #3                     // size = halfword (STRH)
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_store_32:
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
+    mov x3, #0                     // size = word (STR W)
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
     b .Lcgi_done
@@ -1763,10 +1863,15 @@ followed by \textsc{ret}.
 \paragraph{Function Return}
 The \texttt{IR\_RET} handler closes the current function.  If the
 return type is not void, the source vreg is loaded into \texttt{x0}
-(the ABI return register).  The epilogue then restores the saved
-frame pointer and link register with a post-indexed \textsc{ldp}
-that also deallocates the stack frame in one instruction, followed
-by \textsc{ret} to return to the caller.
+(the ABI return register).  For small frames ($\leq 504$ bytes)
+the epilogue uses a post-indexed \textsc{ldp} that restores
+\texttt{x29}/\texttt{x30} and deallocates the frame in one
+instruction; for larger frames it uses a signed-offset \textsc{ldp}
+followed by \texttt{ADD\;sp,\;sp,\;\#frame\_size}, mirroring the
+large-frame prologue.  Both paths finish with \textsc{ret}.  The
+504-byte limit ensures the \textsc{ldp} post-index immediate
+($\mathit{frame}/8$) fits in a signed 7-bit field whose positive
+range is $0$--$63$.
 
 @d CodeGen: instruction dispatch @{
 .Lcgi_ret:
@@ -1786,19 +1891,37 @@ by \textsc{ret} to return to the caller.
     bl _kcc_cg_load_vreg
 
 .Lcgi_ret_epilogue:
-    // Emit epilogue: ldp x29, x30, [sp], #frame_size ; ret
+    // Emit epilogue
     adrp x0, _kcc_cg_frame_size@@PAGE
     add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
     ldr x24, [x0]
 
-    // LDP post-index
-    mov x0, #29                    // rt1 = x29
-    mov x1, #30                    // rt2 = x30
-    mov x2, #31                    // rn = sp
-    lsr x3, x24, #3               // imm7 = frame_size / 8
+    cmp x24, #504
+    b.hi .Lcgi_ret_large
+
+    // Small frame: ldp x29, x30, [sp], #frame_size
+    mov x0, #29
+    mov x1, #30
+    mov x2, #31
+    lsr x3, x24, #3
     bl _kcc_enc_ldp_post
     bl _kcc_code_emit32
+    b .Lcgi_ret_emit_ret
 
+.Lcgi_ret_large:
+    // Large frame: ldp x29, x30, [sp]  then  add sp, sp, #frame_size
+    // ldp x29, x30, [sp, #0] — signed-offset form: 0xA9407BFD
+    movz w0, #0x7BFD
+    movk w0, #0xA940, lsl #16
+    bl _kcc_code_emit32
+    mov x0, #31                    // rd = sp
+    mov x1, #31                    // rn = sp
+    mov x2, x24                   // imm12 = frame_size
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+.Lcgi_ret_emit_ret:
     // RET
     bl _kcc_enc_ret
     bl _kcc_code_emit32

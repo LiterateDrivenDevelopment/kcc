@@ -504,20 +504,27 @@ Load and store use the unsigned-offset form: the 12-bit immediate is pre-scaled 
 
 @d Backend: encode memory @{
 // -- kcc_enc_str_imm ----------------------------------------------------------
-// STR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled, x3=size(0=32,1=64)
-// size=1 (64-bit): 0xF9000000 | (imm12/8)<<10 | rn<<5 | rt
-// size=0 (32-bit): 0xB9000000 | (imm12/4)<<10 | rn<<5 | rt
+// STR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled,
+//   x3=size(0=32,1=64,2=byte,3=half)
 .text
 .globl _kcc_enc_str_imm
 .p2align 2
 _kcc_enc_str_imm:
-    // x2 is already scaled (divided by access size)
+    cmp w3, #2
+    b.eq .Lstr_8
+    cmp w3, #3
+    b.eq .Lstr_16
     cbz w3, .Lstr_32
-    // 64-bit
-    mov w4, #0xF9000000
+    mov w4, #0xF9000000            // 64-bit
     b .Lstr_common
 .Lstr_32:
-    mov w4, #0xB9000000
+    mov w4, #0xB9000000            // 32-bit
+    b .Lstr_common
+.Lstr_8:
+    mov w4, #0x39000000            // 8-bit (STRB)
+    b .Lstr_common
+.Lstr_16:
+    mov w4, #0x79000000            // 16-bit (STRH)
 .Lstr_common:
     orr w4, w4, w2, lsl #10       // imm12 (pre-scaled)
     orr w4, w4, w1, lsl #5        // Rn
@@ -526,17 +533,27 @@ _kcc_enc_str_imm:
     ret
 
 // -- kcc_enc_ldr_imm ----------------------------------------------------------
-// LDR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled, x3=size(0=32,1=64)
+// LDR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled,
+//   x3=size(0=32,1=64,2=byte,3=half)
 .text
 .globl _kcc_enc_ldr_imm
 .p2align 2
 _kcc_enc_ldr_imm:
+    cmp w3, #2
+    b.eq .Lldr_8
+    cmp w3, #3
+    b.eq .Lldr_16
     cbz w3, .Lldr_32
-    // 64-bit
-    mov w4, #0xF9400000
+    mov w4, #0xF9400000            // 64-bit
     b .Lldr_common
 .Lldr_32:
-    mov w4, #0xB9400000
+    mov w4, #0xB9400000            // 32-bit
+    b .Lldr_common
+.Lldr_8:
+    mov w4, #0x39400000            // 8-bit (LDRB)
+    b .Lldr_common
+.Lldr_16:
+    mov w4, #0x79400000            // 16-bit (LDRH)
 .Lldr_common:
     orr w4, w4, w2, lsl #10       // imm12 (pre-scaled)
     orr w4, w4, w1, lsl #5        // Rn

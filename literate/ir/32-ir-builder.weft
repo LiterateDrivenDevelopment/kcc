@@ -1081,6 +1081,11 @@ _kcc_ir_build_param:
     mov x0, x4                   // ht
     mov x1, x21                  // key
     add x3, x23, #1              // value = alloca vreg + 1
+    ldr x4, [x20, #TY_KIND]
+    cmp x4, #TY_PTR
+    b.ne .Libp_put
+    orr x3, x3, #0x8000000000000000
+.Libp_put:
     bl _kcc_ht_put
 
 .Libp_done:
@@ -1607,18 +1612,40 @@ run_test "sizeof-arith" \
 
 \subsection{Array Subscript}
 
-The array subscript \texttt{a[i]} lowers to two IR operations: an
-\texttt{IR\_GEP} (Get Element Pointer) that computes the address of
-the $i$-th element, and an \texttt{IR\_LOAD} that reads the value
-at that address.  The \texttt{IR\_GEP} instruction takes a base
-pointer vreg in \texttt{SRC1} and an index vreg in \texttt{SRC2};
-the code generator multiplies the index by the slot size (8~bytes in
-the all-spill model) and adds it to the base address.
+The subscript operator \texttt{e[i]} has two distinct lowerings
+depending on the declared type of the base operand.
+
+\paragraph{Array subscript.}
+When the base is a local array (\texttt{int a[N]}), the alloca vreg
+\emph{is} the array base address.  The builder emits an
+\texttt{IR\_GEP} that computes \texttt{base + index $\times$ 8}
+(the all-spill slot stride), and an \texttt{IR\_LOAD} reads the
+value at that address.
+
+\paragraph{Pointer subscript.}
+When the base is a pointer variable (\texttt{int *p}), the alloca
+holds the pointer value, which must be loaded first.  The builder
+emits \texttt{IR\_LOAD} to dereference the alloca, scales the index
+by the pointee's \texttt{TY\_SIZE} (via \texttt{IR\_CONST} +
+\texttt{IR\_MUL}), and emits \texttt{IR\_ADD} to compute the
+element address.  The resulting \texttt{LOAD}/\texttt{STORE} carries
+an access-size override so the code generator emits the correct
+width instruction (\textsc{ldrb}/\textsc{strb} for \texttt{char},
+\textsc{ldr}/\textsc{str}~\texttt{w} for \texttt{int}).
+
+The distinction relies on a tag bit in the locals hash table.
+Sema applies array-to-pointer decay (\stdref{6.3.2.1p3}), so both
+arrays and pointer variables have \texttt{TY\_PTR} in
+\texttt{AST\_F3}.  Furthermore, the symbol table's local scope is
+popped after sema completes.  To communicate the original declared
+type to the IR builder, \texttt{\_kcc\_ir\_build\_var\_decl} sets
+bit~63 of the hash value when the resolved type is \texttt{TY\_PTR}.
+The subscript address builder tests this bit with \textsc{tbnz};
+all other hash-value consumers clear it with \textsc{bic}.
 
 Two helpers split the work.
-\texttt{\_kcc\_ir\_build\_subscript\_addr} resolves the array
-identifier's alloca vreg and emits the \texttt{IR\_GEP}---it is
-shared by both read (\texttt{a[i]}) and write (\texttt{a[i]=v})
+\texttt{\_kcc\_ir\_build\_subscript\_addr} resolves the address---it is
+shared by both read (\texttt{e[i]}) and write (\texttt{e[i]=v})
 paths.  \texttt{\_kcc\_ir\_build\_subscript} calls the address
 helper and then emits an \texttt{IR\_LOAD} to produce a value vreg.
 For assignment, the assign builder calls the address helper directly
@@ -1641,13 +1668,13 @@ _kcc_ir_build_subscript_addr:
 
     mov x19, x0                  // x19 = subscript node
 
-    // Get array base address (identifier → alloca vreg)
-    ldr x0, [x19, #AST_F0]      // array expression
+    // Get base expression — check if it's a local identifier
+    ldr x0, [x19, #AST_F0]      // array/pointer expression
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_IDENT_EXPR
     b.ne .Libsa_expr
 
-    // Local array: look up alloca vreg
+    // Ident: look up in locals
     ldr x20, [x0, #AST_F0]      // name ptr
     mov x0, x20
     bl _kcc_strlen
@@ -1658,8 +1685,16 @@ _kcc_ir_build_subscript_addr:
     mov x1, x20
     bl _kcc_ht_get
     cbz x0, .Libsa_expr
-    sub x20, x0, #1              // alloca vreg
+
+    // Bit 63 of the hash value tags pointer variables (set by
+    // _kcc_ir_build_var_decl).  Pointer subscripts need load +
+    // scaled ADD; arrays use GEP with the alloca directly.
+    tbnz x0, #63, .Libsa_ptr_local
+    sub x20, x0, #1              // x20 = alloca vreg (array/scalar)
     b .Libsa_index
+
+.Libsa_ptr_local:
+    b .Libsa_ptr
 
 .Libsa_expr:
     // Fallback: build the array expression as a pointer
@@ -1673,7 +1708,7 @@ _kcc_ir_build_subscript_addr:
     bl _kcc_ir_build_expr
     mov x21, x0                  // index vreg
 
-    // Emit IR_GEP: base + index * element_size
+    // Emit IR_GEP: base + index * slot_size (8)
     mov x0, #IR_GEP
     bl _kcc_ir_alloc_instr
     mov x22, x0
@@ -1690,7 +1725,76 @@ _kcc_ir_build_subscript_addr:
     bl _kcc_ir_emit
 
     mov x0, x23                  // return GEP vreg
+    b .Libsa_done
 
+.Libsa_ptr:
+    // Pointer subscript: load pointer, scale index, emit ADD
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // x20 = loaded pointer vreg
+
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // x21 = index vreg
+
+    // Get pointee size
+    ldr x0, [x19, #AST_F0]
+    ldr x0, [x0, #AST_F3]       // TY_PTR
+    ldr x0, [x0, #TY_F0]        // pointee type
+    cbz x0, .Libsa_ptr_add
+    ldr x22, [x0, #TY_SIZE]
+    cmp x22, #1
+    b.le .Libsa_ptr_add
+
+    // Scale index by pointee size
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x22, [x23, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x22, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x21, [x23, #IR_SRC1]
+    str x22, [x23, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x21, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+.Libsa_ptr_add:
+    mov x0, #IR_ADD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]
+    str x21, [x22, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    mov x0, x23
+
+.Libsa_done:
     ldr x23, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
@@ -1708,15 +1812,31 @@ _kcc_ir_build_subscript_addr:
 .globl _kcc_ir_build_subscript
 .p2align 2
 _kcc_ir_build_subscript:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x20, x0                  // x20 = subscript node
 
     // Get element address
     bl _kcc_ir_build_subscript_addr
-    mov x19, x0                  // GEP vreg (element address)
+    mov x19, x0                  // address vreg
 
-    // Emit IR_LOAD from element address
+    // Pointer subscripts need access-size override on LOAD
+    mov x21, #0
+    ldr x0, [x20, #AST_F0]
+    cbz x0, .Libs_load
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libs_load
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Libs_load
+    ldr x0, [x0, #TY_F0]
+    cbz x0, .Libs_load
+    ldr x21, [x0, #TY_SIZE]
+
+.Libs_load:
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
     mov x20, x0
@@ -1724,7 +1844,8 @@ _kcc_ir_build_subscript:
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
     str x1, [x20, #IR_TYPE]
-    str x19, [x20, #IR_SRC1]    // pointer = GEP result
+    str x19, [x20, #IR_SRC1]    // pointer
+    str x21, [x20, #IR_SRC2]    // access size override
     bl _kcc_ir_next_vreg
     str x0, [x20, #IR_DEST]
     mov x19, x0                  // result vreg
@@ -1733,8 +1854,9 @@ _kcc_ir_build_subscript:
 
     mov x0, x19                  // return value vreg
 
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 @| _kcc_ir_build_subscript
 @}
@@ -1763,6 +1885,30 @@ run_test "array-loop-fill" \
 
 run_test "array-sum-loop" \
     "int main(void) { int a[4]; a[0]=1; a[1]=2; a[2]=3; a[3]=4; int s=0; int i=0; while(i<4){s=s+a[i];i=i+1;} return s; }" 10
+
+echo ""
+echo "--- Pointer Subscript ---"
+
+run_test "ptr-sub-write-read" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0] = 42; return p[0]; }" 42
+
+run_test "ptr-sub-multi" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0]=1; p[1]=2; p[2]=3; return p[0]+p[1]+p[2]; }" 6
+
+run_test "ptr-sub-var-index" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); int i = 2; p[i] = 99; return p[2]; }" 99
+
+run_test "ptr-sub-char" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { char *s = (char*)mmap(0,4096,3,4098,-1,0); s[0]=65; s[1]=66; return s[0]+s[1]; }" 131
+
+run_test "ptr-sub-expr-index" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0]=10; p[1]=20; p[2]=30; int j=0; return p[j+1]; }" 20
+
+run_test "ptr-sub-swap" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0]=50; p[1]=10; int t=p[0]; p[0]=p[1]; p[1]=t; return p[0]; }" 10
+
+run_test "ptr-sub-bubble" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *a = (int*)mmap(0,4096,3,4098,-1,0); a[0]=5; a[1]=3; a[2]=4; a[3]=1; a[4]=2; int i=0; while(i<4){int j=0; while(j<4-i){if(a[j]>a[j+1]){int t=a[j]; a[j]=a[j+1]; a[j+1]=t;} j=j+1;} i=i+1;} return a[0]+a[4]; }" 6
 @}
 
 \subsection{Struct Member Access}
@@ -1817,6 +1963,7 @@ _kcc_ir_build_member_addr:
     mov x1, x20
     bl _kcc_ht_get
     cbz x0, .Libma_expr
+    bic x0, x0, #0x8000000000000000
     sub x20, x0, #1              // alloca vreg
     b .Libma_find_index
 
@@ -2016,12 +2163,12 @@ _kcc_ir_build_ident:
     bl _kcc_ht_get
     // x0 = value (vreg+1) or 0 if not found
     cbz x0, .Libi_global
+    bic x0, x0, #0x8000000000000000
     sub x22, x0, #1              // x22 = alloca vreg (stored as vreg+1)
 
-    // Emit load from alloca
+    // Emit load from alloca (always 64-bit — vreg slots are 8 bytes)
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
-    // Type: default i32 (should get from sema)
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
@@ -2110,6 +2257,15 @@ opcodes to their unsigned variants (\texttt{SDIV}$\to$\texttt{UDIV},
 \texttt{SMOD}$\to$\texttt{UMOD}, \texttt{CMP\_SLT}$\to$%
 \texttt{CMP\_ULT}, \texttt{CMP\_SLE}$\to$\texttt{CMP\_ULE}).
 
+\paragraph{Pointer arithmetic scaling.}
+When \texttt{+} or \texttt{-} involves a pointer operand, the C
+standard requires the integer operand to be scaled by
+\texttt{sizeof(*ptr)} (\stdref{6.5.6}).  The builder inspects each
+operand's sema type; if one is \texttt{TY\_PTR}, it emits
+\texttt{IR\_CONST} + \texttt{IR\_MUL} to scale the non-pointer
+operand by the pointee's \texttt{TY\_SIZE}.  If the pointee size is
+$\le 1$ (e.g.\ \texttt{char~*}), no scaling is needed.
+
 @d IR: build binary @{
 // -- kcc_ir_build_binary --------------------------------------------------
 // uint64_t kcc_ir_build_binary(node *expr)
@@ -2182,9 +2338,111 @@ _kcc_ir_build_binary:
     b .Libb_op_add
 
 .Libb_op_add:  mov x23, #IR_ADD
-    b .Libb_emit
+    b .Libb_ptr_scale
 .Libb_op_sub:  mov x23, #IR_SUB
+    b .Libb_ptr_scale
+
+// Pointer arithmetic: ptr+int or int+ptr must scale the integer
+// operand by the pointed-to type's size.  x23 = opcode (ADD or SUB),
+// x21 = LHS vreg, x22 = RHS vreg.  After scaling, falls through
+// to the normal emitter.
+.Libb_ptr_scale:
+    // Check if LHS is a pointer type
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_emit
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_ps_check_rhs
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.eq .Libb_ps_scale_rhs
+
+.Libb_ps_check_rhs:
+    // Check if RHS is a pointer type (int + ptr)
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_emit
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_emit
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Libb_emit
+
+    // RHS is pointer — scale LHS (x21)
+    ldr x0, [x0, #TY_F0]
+    cbz x0, .Libb_emit
+    ldr x24, [x0, #TY_SIZE]
+    cmp x24, #1
+    b.le .Libb_emit
+
+    // Emit const + mul to scale x21
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x24, [x20, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x24, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x21, [x20, #IR_SRC1]
+    str x24, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0
+    mov x0, x20
+    bl _kcc_ir_emit
     b .Libb_emit
+
+.Libb_ps_scale_rhs:
+    // LHS is pointer — scale RHS (x22) by pointee size
+    ldr x0, [x0, #TY_F0]
+    cbz x0, .Libb_emit
+    ldr x24, [x0, #TY_SIZE]
+    cmp x24, #1
+    b.le .Libb_emit
+
+    // Emit const + mul to scale x22
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x24, [x20, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x24, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x22, [x20, #IR_SRC1]
+    str x24, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x22, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    b .Libb_emit
+
 .Libb_op_mul:  mov x23, #IR_MUL
     b .Libb_emit
 .Libb_op_sdiv: mov x23, #IR_SDIV
@@ -2461,8 +2719,10 @@ value transformation.  Arithmetic negation (\texttt{-}) emits
 \texttt{IR\_NOT}, and logical negation (\texttt{!}) is lowered to
 \texttt{IR\_CMP\_EQ} against a synthesised zero constant---producing~1
 when the operand is zero and 0 otherwise.  All other unary tokens
-(e.g.\ address-of, dereference) are not yet supported and return the
-operand unchanged.
+Address-of (\texttt{\&x}) returns the alloca vreg directly---the
+vreg produced by \texttt{IR\_ALLOCA} already holds the stack address,
+so no load is needed.  Dereference (\texttt{*p}) evaluates the pointer
+operand and emits an \texttt{IR\_LOAD} from the resulting address.
 
 @d IR: build unary @{
 // -- kcc_ir_build_unary ---------------------------------------------------
@@ -2480,13 +2740,15 @@ _kcc_ir_build_unary:
     mov x19, x0
     ldr x20, [x19, #AST_F0]     // op token
 
-    // Increment/decrement need address-based lowering, not value
+    // Operators that need special operand handling (no _kcc_ir_build_expr)
     cmp x20, #TOK_INC
     b.eq .Libu_inc_dec
     cmp x20, #TOK_DEC
     b.eq .Libu_inc_dec
+    cmp x20, #TOK_AMP
+    b.eq .Libu_addr
 
-    // Build operand
+    // Build operand (value)
     ldr x0, [x19, #AST_F1]
     bl _kcc_ir_build_expr
     mov x21, x0                  // operand vreg
@@ -2497,6 +2759,8 @@ _kcc_ir_build_unary:
     b.eq .Libu_not
     cmp x20, #TOK_BANG
     b.eq .Libu_lnot
+    cmp x20, #TOK_STAR
+    b.eq .Libu_deref
 
     // Default: return operand as-is
     mov x0, x21
@@ -2571,6 +2835,77 @@ _kcc_ir_build_unary:
     mov x0, x20
     b .Libu_done
 
+.Libu_deref:
+    // Dereference: operand vreg is a pointer, emit load through it
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    // Use pointee type from sema (AST_F3) for IR_TYPE
+    ldr x1, [x19, #AST_F3]
+    cbz x1, .Libu_deref_default
+    // Set IR_SRC2 = TY_SIZE (access size override for codegen)
+    ldr x2, [x1, #TY_SIZE]
+    str x2, [x22, #IR_SRC2]
+    b .Libu_deref_type
+.Libu_deref_default:
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str xzr, [x22, #IR_SRC2]
+.Libu_deref_type:
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_addr:
+    // Address-of: return alloca vreg directly (no load)
+    ldr x0, [x19, #AST_F1]      // operand node
+    ldr x20, [x0, #AST_F0]      // name ptr
+    cbz x20, .Libu_addr_zero
+
+    mov x0, x20
+    bl _kcc_strlen
+    mov x21, x0
+
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    mov x2, x21
+    bl _kcc_ht_get
+    cbz x0, .Libu_addr_global
+    bic x0, x0, #0x8000000000000000
+    sub x0, x0, #1              // alloca vreg (stored as vreg+1)
+    b .Libu_done
+
+.Libu_addr_global:
+    // Global: emit global_ref, return address vreg
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_addr_zero:
+    mov x0, xzr
+    b .Libu_done
+
 .Libu_inc_dec:
     mov x0, x19                  // pass AST node
     bl _kcc_ir_build_inc_dec
@@ -2616,6 +2951,18 @@ run_test "trunc short" \
 
 run_test "cast same-width" \
     "int main(void) { int x = 99; return (int)x; }" 99
+
+echo ""
+echo "--- Pointer Arithmetic ---"
+
+run_test "ptr-arith-add" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); *p = 10; *(p + 1) = 20; return *(p + 1); }" 20
+
+run_test "ptr-arith-stride" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); *(p+0)=1; *(p+1)=2; *(p+2)=3; return *(p+0)+*(p+1)+*(p+2); }" 6
+
+run_test "ptr-arith-char" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { char *s = (char*)mmap(0,4096,3,4098,-1,0); *(s+0)=65; *(s+1)=66; return *(s+0)+*(s+1); }" 131
 @}
 
 \subsection{Increment and Decrement}
@@ -2688,6 +3035,7 @@ _kcc_ir_build_inc_dec:
     mov x1, x22
     bl _kcc_ht_get
     cbz x0, .Libid_global
+    bic x0, x0, #0x8000000000000000
     sub x22, x0, #1              // x22 = alloca vreg
     b .Libid_load
 @| _kcc_ir_build_inc_dec
@@ -2861,7 +3209,12 @@ the builder emits \texttt{IR\_GLOBAL\_REF} to materialise the
 address.  For simple assignment the value is stored directly; for
 compound operators the same load-binop-store sequence is applied,
 loading from the global address vreg before emitting the binary
-operation and storing the result back.
+operation and storing the result back.  When the LHS is a
+dereference (\texttt{*p\;=\;v}), the builder records the
+pointed-to type's size in the store instruction's \texttt{IR\_DEST}
+field so that the code generator emits a type-sized write
+(\textsc{strb}/\textsc{strh}/32-bit \textsc{str}) rather than a
+full 64-bit store.
 
 The compound path uses callee-saved registers \texttt{x23} (current
 value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
@@ -2892,7 +3245,7 @@ _kcc_ir_build_assign:
     bl _kcc_ir_build_expr
     mov x21, x0                  // rhs vreg
 
-    // Get LHS — identifier, subscript, or member
+    // Get LHS — identifier, subscript, member, or dereference
     ldr x0, [x19, #AST_F1]
     cbz x0, .Liba_done
     ldr x1, [x0, #AST_TAG]
@@ -2900,6 +3253,8 @@ _kcc_ir_build_assign:
     b.eq .Liba_subscript
     cmp x1, #AST_MEMBER
     b.eq .Liba_member
+    cmp x1, #AST_UNARY_EXPR
+    b.eq .Liba_deref
     cmp x1, #AST_IDENT_EXPR
     b.ne .Liba_done
 
@@ -2917,6 +3272,7 @@ _kcc_ir_build_assign:
     mov x1, x22
     bl _kcc_ht_get
     cbz x0, .Liba_global_store
+    bic x0, x0, #0x8000000000000000
     sub x22, x0, #1              // alloca vreg (stored as vreg+1)
 
     // For compound assignment (+=, etc.), load current value first
@@ -3106,11 +3462,24 @@ _kcc_ir_build_assign:
 
 .Liba_subscript:
     // LHS is a[i]: x0 = AST_SUBSCRIPT node, x21 = rhs vreg
-    // Build GEP from subscript, then store
+    mov x23, x0                  // save subscript node
     bl _kcc_ir_build_subscript_addr
     mov x22, x0                  // x22 = element address vreg
 
-    // Emit store: rhs → element address
+    // Pointer subscripts need access-size override on STORE
+    mov x24, #0
+    ldr x0, [x23, #AST_F0]
+    cbz x0, .Liba_sub_store
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Liba_sub_store
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Liba_sub_store
+    ldr x0, [x0, #TY_F0]
+    cbz x0, .Liba_sub_store
+    ldr x24, [x0, #TY_SIZE]
+
+.Liba_sub_store:
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
     adrp x1, _kcc_type_int_s@@PAGE
@@ -3118,7 +3487,8 @@ _kcc_ir_build_assign:
     ldr x1, [x1]
     str x1, [x0, #IR_TYPE]
     str x21, [x0, #IR_SRC1]     // value
-    str x22, [x0, #IR_SRC2]     // pointer (GEP result)
+    str x22, [x0, #IR_SRC2]     // pointer
+    str x24, [x0, #IR_DEST]     // access size override
     bl _kcc_ir_emit
     mov x0, x21
     b .Liba_done
@@ -3139,6 +3509,42 @@ _kcc_ir_build_assign:
     str x22, [x0, #IR_SRC2]     // pointer (GEP result)
     bl _kcc_ir_emit
     mov x0, x21
+    b .Liba_done
+
+.Liba_deref:
+    // LHS is *expr — evaluate the pointer, store RHS through it
+    ldr x0, [x0, #AST_F0]       // check op is TOK_STAR
+    cmp x0, #TOK_STAR
+    b.ne .Liba_done
+
+    // Get access size from LHS unary expr's sema type
+    ldr x24, [x19, #AST_F1]     // unary *expr
+    ldr x24, [x24, #AST_F3]     // sema type of *expr
+    mov x23, #0                  // default: 0 = 64-bit store
+    cbz x24, .Liba_deref_eval
+    ldr x23, [x24, #TY_SIZE]    // access size in bytes
+
+.Liba_deref_eval:
+    // Evaluate the pointer expression (operand of *)
+    ldr x0, [x19, #AST_F1]      // unary expr
+    ldr x0, [x0, #AST_F1]       // operand of * (e.g., IdentExpr 'p')
+    bl _kcc_ir_build_expr
+    mov x22, x0                  // x22 = pointer vreg
+
+    // Emit store: value=x21 (rhs), ptr=x22, access_size=x23 in IR_DEST
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    str x22, [x0, #IR_SRC2]
+    str x23, [x0, #IR_DEST]     // access size override
+    bl _kcc_ir_emit
+
+    mov x0, x21
+    b .Liba_done
 
 .Liba_done:
     ldp x23, x24, [sp, #48]
@@ -3789,6 +4195,7 @@ _kcc_ir_build_var_decl:
     bl _kcc_ir_emit
 
     // Record in locals: name -> alloca vreg
+    // Bit 63 tags pointer variables for the subscript handler.
     mov x0, x20
     bl _kcc_strlen
     mov x2, x0                   // keylen
@@ -3797,6 +4204,11 @@ _kcc_ir_build_var_decl:
     ldr x0, [x0]
     mov x1, x20                  // key = name
     add x3, x23, #1              // value = alloca vreg + 1 (0 reserved for not-found)
+    ldr x4, [x21, #TY_KIND]
+    cmp x4, #TY_PTR
+    b.ne .Libvd_put
+    orr x3, x3, #0x8000000000000000
+.Libvd_put:
     bl _kcc_ht_put
 
     // Check for initializer (x19 = decl node, still valid)

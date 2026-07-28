@@ -101,6 +101,7 @@ walking each element and marking the argument vregs individually.
 
     // Skip marking SRC1 for IR_CONST (src1=immediate), IR_CALL (src1=name),
     // IR_BR (src1=BB id), IR_GLOBAL_REF (src1=name)
+    // IR_CALL_IND SRC1 is a vreg — DO mark it
     cmp x2, #IR_CONST
     b.eq .Ldce_mark_src2
     cmp x2, #IR_CALL
@@ -127,8 +128,10 @@ walking each element and marking the argument vregs individually.
     cmp x2, #IR_CONST
     b.eq .Ldce_mark_dest
 
-    // IR_CALL: SRC2 is a pointer to args array, mark each arg vreg
+    // IR_CALL/IR_CALL_IND: SRC2 is a pointer to args array, mark each arg vreg
     cmp x2, #IR_CALL
+    b.eq .Ldce_mark_call_args
+    cmp x2, #IR_CALL_IND
     b.eq .Ldce_mark_call_args
 
     cmp x1, x20
@@ -246,6 +249,8 @@ optimization is warranted.
     cmp x1, #IR_RET
     b.eq .Ldce_sweep_skip
     cmp x1, #IR_CALL
+    b.eq .Ldce_sweep_skip
+    cmp x1, #IR_CALL_IND
     b.eq .Ldce_sweep_skip
     cmp x1, #IR_NOP
     b.eq .Ldce_sweep_skip

@@ -413,6 +413,9 @@ Typedef declarations resolve the underlying type and register the name
 with kind \texttt{SYM\_TYPEDEF}.  Struct and union declarations create
 the corresponding type descriptor via \texttt{kcc\_type\_struct} or
 \texttt{kcc\_type\_union} and register the tag in the tag name space.
+The struct size is computed by resolving each field's type and summing
+\texttt{max(TY\_SIZE, 8)} per field, so that struct-typed fields
+(which occupy multiple 8-byte slots) are accounted for correctly.
 Enum declarations register both the tag itself and each enumerator
 constant as an ordinary symbol of type \texttt{int}, assigning
 consecutive integer values starting from zero.
@@ -460,17 +463,26 @@ consecutive integer values starting from zero.
 .Lscd_tag_register:
     mov x21, x0                     // type
 
-    // Compute struct size: count fields * 8
-    ldr x1, [x19, #AST_F1]         // first field
-    mov x2, #0                      // field count
+    // Compute struct size: each field is max(resolved_size, 8) bytes
+    ldr x19, [x19, #AST_F1]        // first field (x19 no longer needed)
+    mov x20, #0                     // total size accumulator
 .Lscd_count_fields:
-    cbz x1, .Lscd_set_size
-    add x2, x2, #1
-    ldr x1, [x1, #AST_F4]          // next field
+    cbz x19, .Lscd_set_size
+    ldr x0, [x19, #AST_F0]         // field type specifier
+    cbz x0, .Lscd_field_default
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lscd_field_default
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.ge .Lscd_field_add
+.Lscd_field_default:
+    mov x0, #8
+.Lscd_field_add:
+    add x20, x20, x0
+    ldr x19, [x19, #AST_F4]        // next field
     b .Lscd_count_fields
 .Lscd_set_size:
-    lsl x2, x2, #3                 // nfields * 8
-    str x2, [x21, #TY_SIZE]
+    str x20, [x21, #TY_SIZE]
 
     mov x0, x22                     // name
     bl _kcc_strlen

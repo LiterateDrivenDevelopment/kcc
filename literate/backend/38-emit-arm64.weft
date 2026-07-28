@@ -716,10 +716,24 @@ _kcc_enc_ret:
     movz w0, #0xD65F, lsl #16
     movk w0, #0x03C0
     ret
+// -- kcc_enc_blr --------------------------------------------------------------
+// uint32_t kcc_enc_blr(uint32_t rn)
+//   Encodes BLR Xn: 0xD63F0000 | (rn << 5)
+.text
+.globl _kcc_enc_blr
+.p2align 2
+_kcc_enc_blr:
+    movz w1, #0xD63F, lsl #16
+    movk w1, #0x0000
+    lsl w0, w0, #5
+    orr w0, w1, w0
+    ret
+
 @| _kcc_enc_b_cond
 @| _kcc_enc_cbz
 @| _kcc_enc_cbnz
 @| _kcc_enc_ret
+@| _kcc_enc_blr
 @}
 
 \section{System Instructions}

@@ -353,6 +353,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Parser: AST constants@>
 @<Types: constants@>
 @<Vec: constants@>
+@<Symtab: constants@>
 @<IR: constants@>
 @<IR: init@>
 @<IR: alloc instruction@>
@@ -532,5 +533,11 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen multi-var@>
 @<Test: codegen unsigned@>
 @<Test: codegen enums@>
+@<Test: codegen nested structs@>
+@<Test: codegen struct arrays@>
+@<Test: codegen global init@>
+@<Test: codegen ptr arithmetic@>
+@<Test: codegen self-hosting@>
+@<Test: codegen fnptr@>
 @<Test: codegen results@>
 @}

@@ -699,11 +699,11 @@ dimensions and function parameter lists.
 .globl _kcc_parse_direct_declarator
 .p2align 2
 _kcc_parse_direct_declarator:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
-    str x23, [sp, #48]
+    stp x23, x24, [sp, #48]
 
     mov x19, x0                  // x19 = type
     mov x20, #0                  // x20 = name_ptr
@@ -787,6 +787,15 @@ any remaining parenthesis introduces a parameter list.  The parser builds a
 \texttt{TYPE\_FUNC} node, iterates over comma-separated parameter declarations,
 and handles the variadic \texttt{...} marker.  A \texttt{FUNC\_DECL} or
 \texttt{VAR\_DECL} node is then constructed to carry the name and type.
+
+The grouped declarator handler at \texttt{.Lddecl\_grouped} first parses
+the inner declarator (e.g.\ \texttt{*fp}), then checks whether a
+parenthesised parameter list follows the closing~\texttt{)}.  When one is
+present, the handler parses it into a \texttt{TYPE\_FUNC} node and walks
+the inner declarator's type chain to replace the base type with the function
+type---implementing C's inside-out declarator semantics.  For instance,
+\texttt{int (*fp)(int, int)} produces a \texttt{VAR\_DECL} whose type is
+\texttt{ptr(func(int,int)->int)}.
 
 @d Decl: parse direct declarator @{
 .Lddecl_function:
@@ -888,13 +897,108 @@ and handles the variadic \texttt{...} marker.  A \texttt{FUNC\_DECL} or
 
 .Lddecl_grouped:
     // Grouped declarator: ( declarator )
-    // This handles things like: int (*fp)(int)
+    // Handles function pointers like: int (*fp)(int, int)
     bl _kcc_pp_next               // consume '('
     mov x0, x19
     bl _kcc_parse_declarator
-    mov x21, x0                  // save inner result
+    mov x21, x0                  // x21 = inner result (VAR_DECL)
     mov x0, #TOK_RPAREN
     bl _kcc_parse_expect
+
+    // Check for function suffix: (params)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    b.ne .Lddecl_grouped_done
+
+    // Function pointer: parse parameter list
+    bl _kcc_pp_next               // consume '('
+
+    // Build TYPE_FUNC node
+    mov x0, #AST_TYPE_FUNC
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // return type = base type
+    mov x24, x0                  // x24 = func type node
+
+    // Check for empty params ')' or void
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.eq .Lddecl_gfunc_close
+
+    // Parse parameters
+    mov x22, #0                  // first param
+    mov x23, #0                  // last param
+.Lddecl_gfunc_param_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Lddecl_gfunc_variadic
+
+    bl _kcc_parse_param_decl
+    cbz x22, .Lddecl_gfunc_first
+    str x0, [x23, #AST_F4]
+    mov x23, x0
+    b .Lddecl_gfunc_comma
+
+.Lddecl_gfunc_first:
+    mov x22, x0
+    mov x23, x0
+
+.Lddecl_gfunc_comma:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Lddecl_gfunc_store_params
+    bl _kcc_pp_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Lddecl_gfunc_variadic
+    b .Lddecl_gfunc_param_loop
+
+.Lddecl_gfunc_variadic:
+    bl _kcc_pp_next               // consume '...'
+    mov x0, #1
+    str x0, [x24, #AST_F2]      // variadic = 1
+
+.Lddecl_gfunc_store_params:
+    str x22, [x24, #AST_F1]     // store params in func type
+
+.Lddecl_gfunc_close:
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    // Patch inner declarator's type chain:
+    // Walk from x21.F0 to find where base_type (x19) is stored,
+    // replace it with the func type (x24).
+    ldr x0, [x21, #AST_F0]      // type chain root
+    cmp x0, x19                  // directly the base type?
+    b.ne .Lddecl_gfunc_walk
+    // No pointer: store func type directly
+    str x24, [x21, #AST_F0]
+    b .Lddecl_grouped_done
+
+.Lddecl_gfunc_walk:
+    // Walk type chain: each pointer's F0 → pointee
+    mov x1, x0
+.Lddecl_gfunc_walk_loop:
+    ldr x0, [x1, #AST_F0]
+    cmp x0, x19
+    b.ne .Lddecl_gfunc_walk_next
+    // Found: replace this node's F0 with func type
+    str x24, [x1, #AST_F0]
+    b .Lddecl_grouped_done
+.Lddecl_gfunc_walk_next:
+    mov x1, x0
+    b .Lddecl_gfunc_walk_loop
+
+.Lddecl_grouped_done:
     mov x0, x21
     b .Lddecl_done
 
@@ -906,10 +1010,10 @@ and handles the variadic \texttt{...} marker.  A \texttt{FUNC\_DECL} or
     str x20, [x0, #AST_F1]      // name_ptr
 
 .Lddecl_done:
-    ldr x23, [sp, #48]
+    ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
 @}
 

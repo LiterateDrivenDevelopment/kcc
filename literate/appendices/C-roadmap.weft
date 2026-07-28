@@ -481,22 +481,14 @@ non-trivial C program --- ideally a C subset of itself or an
 equivalent program --- and produce correct output.  This is the
 ultimate proof that the compiler is correct and complete.
 
-\textbf{Activities.}
-\begin{itemize}
-\item Write a C version of a significant \kcc{} subsystem
-      (e.g., the lexer or the arena allocator) and compile it
-      with \kcc{}.
-\item Differential testing: compile the same C source with both
-      \kcc{} and \texttt{clang}, then compare the behavior of
-      the two executables on a large test corpus.
-\item Bootstrap test: if feasible, write a minimal C compiler in
-      C (a ``stage-1'' compiler) and compile it with \kcc{}.
-      Then use the stage-1 compiler to compile itself.  Compare
-      the two stage-1 binaries.
-\item Performance characterization: measure compilation speed
-      and generated code quality against \texttt{clang -O0} on
-      a representative benchmark suite.
-\end{itemize}
+\textbf{Strategy.}  Phase~8 proceeds in three stages.  Stage~8a
+fixes missing C features and hardens the backend by compiling
+increasingly complex programs.  Stage~8b writes a C implementation
+of a \kcc{} subsystem (the lexer or the arena allocator) and
+compiles it with \kcc{} itself.  Stage~8c performs differential
+testing against \texttt{clang} and, if feasible, a full bootstrap
+where \kcc{} compiles a stage-1 C compiler that then compiles
+itself.
 
 \textbf{Acceptance.}
 \begin{enumerate}
@@ -510,6 +502,312 @@ ultimate proof that the compiler is correct and complete.
 \item \texttt{just weave} produces a typeset document that
       serves as a comprehensive textbook on both compiler
       construction and ARM64 systems programming.
+\end{enumerate}
+
+\textbf{Status.}  Stage~8a in progress.  171 codegen tests passing.
+The compiler handles integer arithmetic, control flow, loops,
+function calls (direct and indirect), structs (nested, arrays),
+pointers, arrays, global variables, enums, switch/case, sizeof,
+string literals, and function pointers.  A 1{,}130-line C test
+suite compiles and runs correctly: hash tables, arena allocators,
+recursive-descent parsers, linked-list manipulation, tree
+evaluators, and the sieve of Eratosthenes.
+
+\textbf{Completed milestones.}
+\begin{itemize}
+\item[\checkmark] All-spill backend: every IR opcode has a
+      codegen handler; valid Mach-O with \texttt{LC\_BUILD\_VERSION}.
+\item[\checkmark] Pointer arithmetic: scale factor clamped to
+      \texttt{max(TY\_SIZE, 8)} for the all-spill model.
+\item[\checkmark] Struct support: nested struct access (recursive
+      \texttt{build\_member\_addr}), struct arrays with correct
+      \texttt{TY\_SIZE/8} alloca slots.
+\item[\checkmark] Global initializers: emit \texttt{IR\_GLOBAL\_REF}
+      + \texttt{IR\_STORE} at top of \texttt{main()} entry block.
+\item[\checkmark] Local array decay: \texttt{build\_ident} detects
+      arrays via bit-63 pointer tag + AST field check, returns
+      alloca address without loading.
+\item[\checkmark] Function pointers: grouped-declarator parsing
+      \texttt{(*name)(params)}, \texttt{IR\_CALL\_IND} opcode with
+      \texttt{BLR} emission, function-to-pointer decay, DCE marking,
+      linker symbol precedence fix.
+\item[\checkmark] 171 codegen tests covering all features
+      (6 Phase~8 test groups: nested structs, struct arrays,
+      global init, pointer arithmetic, self-hosting patterns,
+      function pointers).
+\end{itemize}
+
+\textbf{Remaining work --- Stage 8a: missing C features.}
+
+The following features are needed before \kcc{} can compile
+a realistic subsystem of itself.
+
+\begin{itemize}
+\item \textbf{Multi-file compilation.}  The driver currently
+      compiles a single \texttt{.c} file.  Add support for
+      compiling multiple \texttt{.o} files and invoking \texttt{ld}
+      to link them, or at minimum support \texttt{\#include}
+      of a project header that declares shared prototypes.
+\item \textbf{Preprocessor in codegen path.}  The \texttt{-c}
+      pipeline must honor \texttt{\#define} and \texttt{\#include}
+      so that shared constants and struct definitions can live
+      in a header file.
+\item \textbf{Typedef support.}  The parser recognizes
+      \texttt{typedef} but codegen has not been stress-tested
+      with typedef'd structs and function pointer types.
+\item \textbf{Pointer-to-pointer.}  \texttt{char **argv},
+      arrays of pointers, and double-dereference patterns
+      are not yet tested.
+\item \textbf{Void functions.}  Functions returning \texttt{void}
+      need correct handling (no return-value load/store).
+\item \textbf{Character literals in expressions.}
+      \texttt{'A'}, \texttt{'\\n'}, and character comparisons
+      in \texttt{if}/\texttt{switch} must lower correctly.
+\item \textbf{Initializer lists.}  Array and struct initializers
+      (\texttt{int a[] = \{1,2,3\}}) are needed for lookup tables.
+\item \textbf{Static locals.}  \texttt{static int count = 0;}
+      requires a \texttt{\_\_data} section symbol with persistent
+      storage.
+\item \textbf{Forward declarations.}  Prototypes like
+      \texttt{int foo(int);} without a body must create an
+      extern symbol without emitting code.
+\end{itemize}
+
+\textbf{Remaining work --- Stage 8b: subsystem in C.}
+
+\begin{itemize}
+\item Write the \kcc{} arena allocator or lexer in C.
+\item Compile it with \kcc{} into a \texttt{.o} file.
+\item Link with the rest of the ARM64 assembly modules.
+\item Verify identical behavior via the existing test suite.
+\end{itemize}
+
+\textbf{Remaining work --- Stage 8c: validation.}
+
+\begin{itemize}
+\item Differential testing: compile the same C source with both
+      \kcc{} and \texttt{clang}, compare exit codes and output
+      on a large test corpus.
+\item Bootstrap test: write a minimal C compiler (or expression
+      evaluator) in C, compile it with \kcc{}, then use it to
+      compile itself.  Compare the two binaries.
+\item Performance characterization: measure compilation speed
+      and generated-code quality against \texttt{clang -O0}.
+\item Appendix~A: \stdref{J.3} implementation-defined behavior.
+\item Appendix~B: undefined-behavior policy matrix.
+\end{itemize}
+
+% ────────────────────────────────────────────────────────────────
+\section{Phase 9 --- Production Compiler}
+\label{sec:phase9}
+
+\textbf{Goal.}  Elevate \kcc{} from a working subset compiler to a
+conforming, efficient, and usable C17 implementation suitable for
+compiling real-world programs.  Phase~8 proves correctness on a
+significant codebase; Phase~9 fills every remaining gap in the
+language, the ABI, the optimizer, and the tooling.
+
+\textbf{Strategy.}  Phase~9 is divided into five stages, ordered by
+impact.  Stage~9a completes the C17 type system (floating point,
+unions, qualifiers).  Stage~9b makes the calling convention fully
+ABI-compliant (struct-by-value, stack arguments, variadic definitions).
+Stage~9c replaces the all-spill model with a real register allocator.
+Stage~9d adds optimization passes that bring generated-code quality
+within striking distance of \texttt{clang -O1}.  Stage~9e delivers
+the tooling and diagnostics expected of a production compiler.
+
+\subsection{Stage 9a --- Complete Type System}
+
+The current backend handles integer types only.  This stage adds
+every remaining C17 type.
+
+\begin{itemize}
+\item \textbf{Floating point.}  The type singletons (\texttt{TY\_FLOAT},
+      \texttt{TY\_DOUBLE}, \texttt{TY\_LDOUBLE}) already exist in the
+      type system but have no IR or codegen support.  Add IR opcodes
+      \texttt{IR\_FADD}, \texttt{IR\_FSUB}, \texttt{IR\_FMUL},
+      \texttt{IR\_FDIV}, \texttt{IR\_FCMP\_*}, \texttt{IR\_SITOFP},
+      \texttt{IR\_FPTOSI}, \texttt{IR\_FPEXT}, \texttt{IR\_FPTRUNC}.
+      Codegen uses NEON/FP registers \texttt{d0}--\texttt{d7} for
+      arguments and \texttt{d8}--\texttt{d15} as callee-saved
+      scratch.  Floating-point literals require a constant pool
+      in the \texttt{\_\_text} section with \texttt{LDR} (literal)
+      instructions.
+\item \textbf{Unions.}  \texttt{TY\_UNION} is defined but never
+      lowered.  The IR builder must treat unions like structs
+      whose fields all start at offset~0; \texttt{TY\_SIZE} equals
+      the largest member.  Codegen is identical to structs
+      except that \texttt{IR\_GEP} stride is always~0 for member
+      access.
+\item \textbf{\_Bool.}  \texttt{TY\_BOOL} exists as a singleton.
+      The IR builder must insert \texttt{IR\_TRUNC} to 1~bit on
+      assignment (any non-zero value becomes~1) and
+      \texttt{IR\_ZEXT} on promotion.
+\item \textbf{Type qualifiers.}  \texttt{const} objects should
+      land in \texttt{\_\_const} section.  \texttt{volatile} loads
+      and stores must not be eliminated by DCE or reordered by
+      future optimization passes.  \texttt{restrict} can be
+      ignored initially (it is a hint, not a constraint).
+\item \textbf{\_Alignof and \_Alignas.}  Lower \texttt{\_Alignof}
+      to \texttt{IR\_CONST} with the type's alignment.
+      \texttt{\_Alignas} adjusts alloca padding and
+      \texttt{\_\_data}-section alignment.
+\item \textbf{Designated initializers.}  Struct and array
+      initializers with \texttt{.field = val} and
+      \texttt{[index] = val} syntax, including nested
+      designators.
+\item \textbf{Compound literals.}  \texttt{(type)\{init\}}
+      creates a temporary with block scope; lower to an
+      anonymous alloca + initializer stores.
+\item \textbf{\_Generic.}  Type-dispatch at compile time; the
+      sema pass selects the matching association and replaces
+      the \texttt{\_Generic} node with the selected expression.
+\end{itemize}
+
+\subsection{Stage 9b --- Full ABI Compliance}
+
+The current calling convention passes at most~8 integer arguments
+in \texttt{x0}--\texttt{x7} and ignores struct-by-value semantics.
+This stage makes \kcc{} fully AAPCS64-compliant.
+
+\begin{itemize}
+\item \textbf{Stack arguments.}  When a function has more than~8
+      integer or~8 floating-point arguments, excess arguments
+      must be pushed to the stack in right-to-left order with
+      natural alignment.
+\item \textbf{Struct pass/return by value.}  Small structs
+      (${\le}16$~bytes) are passed in registers (packed into
+      \texttt{x0}--\texttt{x1} or \texttt{d0}--\texttt{d1}
+      for homogeneous FP aggregates).  Larger structs are passed
+      by pointer with an implicit copy.  Return values follow
+      the same rule; oversized returns use an \texttt{x8}
+      result-location pointer.
+\item \textbf{Variadic function definitions.}  The current
+      compiler can \emph{call} variadic functions (\texttt{printf})
+      but cannot \emph{define} them.  Implement
+      \texttt{va\_list}/\texttt{va\_start}/\texttt{va\_arg}/\texttt{va\_end}
+      as compiler builtins that manage the register save area
+      on the stack (AAPCS64~\S{}9.2).
+\item \textbf{Correct struct member alignment.}  Padding bytes
+      between struct members must match the AAPCS64 alignment
+      rules.  The type constructor must compute correct
+      \texttt{TY\_SIZE} with padding, and \texttt{IR\_GEP}
+      offsets must account for alignment gaps.
+\end{itemize}
+
+\subsection{Stage 9c --- Register Allocation}
+
+The all-spill model generates roughly $3\times$ as many
+load/store instructions as necessary.  This stage introduces
+register allocation to eliminate redundant memory traffic.
+
+\begin{itemize}
+\item \textbf{Liveness analysis.}  Compute live-in and live-out
+      sets for each basic block using iterative dataflow.
+      Build per-vreg live intervals from the BB-level results.
+\item \textbf{Linear-scan allocator.}  Assign physical registers
+      (\texttt{x9}--\texttt{x15}, \texttt{x19}--\texttt{x28},
+      \texttt{d0}--\texttt{d31}) to vregs based on sorted
+      live intervals.  Spill the vreg with the longest remaining
+      interval when registers are exhausted.
+\item \textbf{Spill code insertion.}  Spilled vregs get stack
+      slots; insert loads before uses and stores after defs.
+      Coalesce adjacent load/store pairs where possible.
+\item \textbf{Callee-saved management.}  The prologue/epilogue
+      must save and restore only the callee-saved registers
+      that the function actually uses, shrinking stack frames.
+\item \textbf{FP register allocation.}  Floating-point vregs
+      compete for \texttt{d8}--\texttt{d15} (callee-saved) and
+      \texttt{d16}--\texttt{d31} (caller-saved).
+\end{itemize}
+
+\subsection{Stage 9d --- Optimization}
+
+Phase~6 provides constant folding and dead code elimination.
+This stage adds passes that substantially improve code quality.
+
+\begin{itemize}
+\item \textbf{Common subexpression elimination (CSE).}  Hash
+      each instruction's opcode + operands; reuse an existing
+      vreg instead of recomputing an identical value.
+\item \textbf{Copy propagation.}  Replace uses of
+      \texttt{IR\_LOAD} with the original vreg when the address
+      has not been stored to since the load.
+\item \textbf{Strength reduction.}  Convert multiplications by
+      powers of two into shifts; convert divisions by constants
+      into multiply-high sequences.
+\item \textbf{Basic-block reordering.}  Place fall-through
+      successors physically after their predecessors to
+      eliminate unconditional branches.
+\item \textbf{Instruction combining.}  Fuse
+      \texttt{CMP}+\texttt{B.cond} into \texttt{CBZ}/\texttt{CBNZ}
+      where possible; fold \texttt{ADD}+\texttt{LDR} into
+      addressing modes.
+\item \textbf{Tail-call optimization.}  Replace
+      \texttt{BL}+\texttt{RET} with \texttt{B} when the callee's
+      frame is compatible.
+\item \textbf{Loop-invariant code motion (LICM).}  Hoist
+      instructions whose operands do not change inside a loop
+      to the loop's preheader block.
+\end{itemize}
+
+\subsection{Stage 9e --- Tooling and Diagnostics}
+
+A production compiler needs more than correct code generation.
+
+\begin{itemize}
+\item \textbf{DWARF debug information.}  Emit
+      \texttt{\_\_debug\_info}, \texttt{\_\_debug\_line},
+      \texttt{\_\_debug\_abbrev}, and \texttt{\_\_debug\_str}
+      sections so that \texttt{lldb} can set breakpoints,
+      inspect variables, and show source locations.
+\item \textbf{Warning system.}  Implement at least
+      \texttt{-Wall}-equivalent diagnostics: unused variables,
+      implicit int conversions, missing return statements,
+      unreachable code, shadowed declarations, comparison of
+      signed and unsigned.
+\item \textbf{Error recovery.}  The parser currently aborts on
+      the first error.  Add synchronization-point recovery
+      (skip to next \texttt{;} or \texttt{\}}) to report
+      multiple errors per compilation.
+\item \textbf{Command-line interface.}  Full flag parsing:
+      \texttt{-O0}/\texttt{-O1}/\texttt{-O2} (controls which
+      optimization passes run), \texttt{-Wall}/\texttt{-Werror},
+      \texttt{-I path} (include search path),
+      \texttt{-D name=val} (command-line defines),
+      \texttt{-S} (emit assembly text), \texttt{-E} (preprocess
+      only, already implemented), \texttt{-o output}.
+\item \textbf{Automatic linking.}  When invoked without
+      \texttt{-c}, the driver should compile to a temporary
+      \texttt{.o} and invoke \texttt{ld} to produce an
+      executable, eliminating the manual link step.
+\item \textbf{System header compatibility.}  Handle
+      \texttt{\#include <stdio.h>} by providing a minimal
+      freestanding header set or by parsing Apple SDK headers
+      (requires attribute and extension tolerance).
+\item \textbf{Source-level profiling.}  Instrument function
+      entry/exit for \texttt{-pg}-style profiling or basic
+      timing output.
+\end{itemize}
+
+\textbf{Acceptance.}
+\begin{enumerate}
+\item The full C17 type system is implemented: floating point,
+      unions, \_Bool, qualifiers, \_Generic.
+\item The calling convention matches AAPCS64: struct-by-value,
+      stack arguments, variadic definitions all work.
+\item Register allocation reduces code size by at least
+      $2\times$ compared to the all-spill baseline.
+\item \texttt{lldb} can debug \kcc{}-compiled programs with
+      source-level breakpoints and variable inspection.
+\item The compiler accepts at least two \texttt{-O} levels and
+      produces measurably better code at \texttt{-O1} vs
+      \texttt{-O0}.
+\item \texttt{tmp/kcc hello.c -o hello} compiles, links, and
+      runs without a manual \texttt{ld} invocation.
+\item \kcc{} compiles a subset of its own source or an
+      equivalent-complexity program ($>5000$ lines of C)
+      and produces a correct, debuggable executable.
 \end{enumerate}
 
 % ────────────────────────────────────────────────────────────────
@@ -528,13 +826,14 @@ Phase & Status & Milestone & Key Output & \texttt{.weft} Files \\
 4 & \checkmark & Parser                & \texttt{--dump-ast}           & 21--24 \\
 5 & \checkmark & Type system           & \texttt{--dump-types}         & 25--30 \\
 6 & \checkmark & IR + optimization     & \texttt{--dump-ir}            & 31--36 \\
-7 & $\circ$    & Backend               & \texttt{-c file.c -o file.o}  & 37--40, 42 \\
-8 &            & Self-hosting          & Differential testing          & --- \\
+7 & \checkmark & Backend               & \texttt{-c file.c -o file.o}  & 37--40, 42 \\
+8 & $\circ$    & Self-hosting          & Differential testing          & --- \\
+9 &            & Production            & \texttt{kcc hello.c -o hello} & 46--50+ \\
 \hline
 \end{tabular}
 \end{center}
 
-Total: 45 \texttt{.weft} source files, approximately 25 tangled
-assembly files, producing a single native \texttt{tmp/kcc} binary
-that compiles C17 to ARM64 Mach-O --- with no dependency on any
-existing C compiler.
+Total: 45+ \texttt{.weft} source files (growing to ${\sim}55$ by
+Phase~9), approximately 30 tangled assembly files, producing a
+single native \texttt{tmp/kcc} binary that compiles C17 to ARM64
+Mach-O --- with no dependency on any existing C compiler.

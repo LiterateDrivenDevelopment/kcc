@@ -358,10 +358,10 @@ _kcc_linker_global_sym:
     mul x1, x21, x1
     add x0, x0, x1               // sym entry ptr
 
-    // If already defined (section == 2), return immediately
+    // If already defined (section == 1 or 2), return immediately
     ldr x1, [x0, #SYM_SECTION]
-    cmp x1, #2
-    b.eq .Llgs_dedup
+    cmp x1, #0
+    b.ne .Llgs_dedup
 
     // Upgrade from extern to defined
     mov x1, #2

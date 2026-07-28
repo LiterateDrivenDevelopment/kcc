@@ -264,6 +264,8 @@ _kcc_ir_dump_instr:
     b.eq .Lidi_ret
     cmp x20, #IR_CALL
     b.eq .Lidi_call
+    cmp x20, #IR_CALL_IND
+    b.eq .Lidi_call_ind
     cmp x20, #IR_SEXT
     b.eq .Lidi_sext
     cmp x20, #IR_ZEXT
@@ -613,6 +615,22 @@ returning.
     bl _kcc_io_puts
     b .Lidi_nl
 
+// -- call_ind: "call_ind type %<vreg>(...)" --------------------------------
+.Lidi_call_ind:
+    adrp x0, _kcc_ir_op_call_ind@@PAGE
+    add  x0, x0, _kcc_ir_op_call_ind@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    // Print " %<vreg>"
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]      // SRC1 = fn-ptr vreg
+    bl _kcc_io_putu
+    b .Lidi_nl
+
 // -- const: "const type <imm>" -------------------------------------------
 .Lidi_const:
     adrp x0, _kcc_ir_op_const@@PAGE
@@ -808,6 +826,11 @@ _kcc_ir_build:
     mov x29, sp
     str x19, [sp, #16]
 
+    // Save translation unit for global init emission in main
+    adrp x1, _kcc_ir_trans_unit@@PAGE
+    add  x1, x1, _kcc_ir_trans_unit@@PAGEOFF
+    str x0, [x1]
+
     ldr x19, [x0, #AST_F0]      // first declaration
 
 .Lirb_loop:
@@ -834,6 +857,92 @@ _kcc_ir_build:
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_ir_build
+@}
+
+\subsection{Global Variable Initializers}
+
+File-scope variables with initializers (\texttt{int x = 42;}) are not
+placed in a pre-initialized data section---the all-spill model allocates
+all globals in BSS.  Instead, the builder emits store instructions at
+the top of \texttt{main()}'s entry block: an \texttt{IR\_GLOBAL\_REF}
+materialises the address, the initializer expression produces a value
+vreg, and an \texttt{IR\_STORE} writes it.  This runs before any user
+statements in \texttt{main}.
+
+@d IR: build @{
+// -- kcc_ir_emit_global_inits --------------------------------------------
+// void kcc_ir_emit_global_inits(void)
+// Walks the saved translation unit for global var_decls with initializers
+// and emits IR_GLOBAL_REF + build_expr(init) + IR_STORE into the current BB.
+.text
+.globl _kcc_ir_emit_global_inits
+.p2align 2
+_kcc_ir_emit_global_inits:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    adrp x0, _kcc_ir_trans_unit@@PAGE
+    add  x0, x0, _kcc_ir_trans_unit@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Legi_done
+    ldr x19, [x0, #AST_F0]      // first declaration
+
+.Legi_loop:
+    cbz x19, .Legi_done
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_VAR_DECL
+    b.ne .Legi_next
+
+    // Check for initializer (AST_F2)
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Legi_next
+    // Check for name (AST_F1)
+    ldr x20, [x19, #AST_F1]
+    cbz x20, .Legi_next
+
+    // Emit IR_GLOBAL_REF for this variable
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+    str x20, [x21, #IR_SRC1]    // name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x21, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x22, x0                  // x22 = address vreg
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    // Build the initializer expression
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // x21 = value vreg
+
+    // Emit IR_STORE: value -> global address
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]     // value
+    str x22, [x0, #IR_SRC2]     // address
+    bl _kcc_ir_emit
+
+.Legi_next:
+    ldr x19, [x19, #AST_F4]     // next sibling
+    b .Legi_loop
+
+.Legi_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_emit_global_inits
 @}
 
 \section{Building a Function}
@@ -962,6 +1071,15 @@ _kcc_ir_build_func:
     b .Libf_param_loop
 
 .Libf_body:
+    // If this is main(), emit global variable initializers first
+    ldr x0, [x19, #AST_F1]      // function name
+    adrp x1, _kcc_str_main@@PAGE
+    add  x1, x1, _kcc_str_main@@PAGEOFF
+    bl _kcc_strcmp
+    cbnz x0, .Libf_body_stmts
+    bl _kcc_ir_emit_global_inits
+
+.Libf_body_stmts:
     // Lower the function body (compound statement)
     ldr x0, [x19, #AST_F3]
     bl _kcc_ir_build_stmt
@@ -1661,6 +1779,20 @@ helper and then emits an \texttt{IR\_LOAD} to produce a value vreg.
 For assignment, the assign builder calls the address helper directly
 and emits an \texttt{IR\_STORE} to write the right-hand side.
 
+For arrays of structs, the element size exceeds a single eight-byte
+slot.  In that case the builder pre-scales the index by the ratio
+\texttt{TY\_SIZE~/~8} before the \texttt{IR\_GEP}, so that the
+fixed stride~8 of the GEP instruction still produces the correct byte
+offset.
+
+Global arrays require special treatment: the address produced by
+\texttt{IR\_GLOBAL\_REF} already points at element~0, so subscripting
+must \emph{not} load from it (that would misinterpret element data as
+a pointer).  The builder detects global arrays by looking up the
+symbol table for the pre-decay type (\texttt{TY\_ARRAY}), emits a
+\texttt{GLOBAL\_REF}, and feeds the resulting address vreg into the
+GEP index path.
+
 @d IR: build subscript @{
 // -- kcc_ir_build_subscript_addr ------------------------------------------
 // uint64_t kcc_ir_build_subscript_addr(node *subscript)
@@ -1707,9 +1839,42 @@ _kcc_ir_build_subscript_addr:
     b .Libsa_ptr
 
 .Libsa_expr:
-    // Fallback: global pointers and complex expressions use
-    // the pointer subscript path (scale by pointee TY_SIZE).
-    b .Libsa_ptr
+    // Check if base is a global array (needs global_ref + GEP,
+    // not global_ref + load + ADD like pointer globals).
+    ldr x0, [x19, #AST_F0]      // base expression
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libsa_ptr
+
+    // Look up in symbol table for pre-decay type
+    ldr x22, [x0, #AST_F0]      // name ptr
+    mov x0, x22
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    bl _kcc_symtab_lookup
+    cbz x0, .Libsa_ptr
+    ldr x1, [x0, #SYM_TYPE]
+    cbz x1, .Libsa_ptr
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.ne .Libsa_ptr
+
+    // Global array: emit IR_GLOBAL_REF for the base address
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_SRC1]     // name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x23, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x20, x0                  // x20 = global address vreg
+    mov x0, x23
+    bl _kcc_ir_emit
+    b .Libsa_index
 
 .Libsa_index:
     // Build index expression
@@ -1717,7 +1882,48 @@ _kcc_ir_build_subscript_addr:
     bl _kcc_ir_build_expr
     mov x21, x0                  // index vreg
 
-    // Emit IR_GEP: base + index * slot_size (8)
+    // For struct arrays (element size > 8), scale the index so
+    // that GEP stride 8 yields the correct byte offset.
+    ldr x0, [x19, #AST_F3]      // subscript result type (element type)
+    cbz x0, .Libsa_gep
+    ldr x22, [x0, #TY_SIZE]
+    cmp x22, #8
+    b.le .Libsa_gep
+
+    // scale factor = element_size / 8
+    lsr x22, x22, #3
+
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x22, [x23, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x22, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x21, [x23, #IR_SRC1]
+    str x22, [x23, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x21, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+.Libsa_gep:
+    // Emit IR_GEP: base + index * 8
     mov x0, #IR_GEP
     bl _kcc_ir_alloc_instr
     mov x22, x0
@@ -1754,6 +1960,13 @@ _kcc_ir_build_subscript_addr:
     ldr x22, [x0, #TY_SIZE]
     cmp x22, #1
     b.le .Libsa_ptr_add
+    // In the all-spill model every slot is 8 bytes; clamp
+    // the scale factor so that pointer arithmetic matches
+    // the actual array layout.
+    cmp x22, #8
+    b.ge .Libsa_ptr_scale
+    mov x22, #8
+.Libsa_ptr_scale:
 
     // Scale index by pointee size
     mov x0, #IR_CONST
@@ -1938,7 +2151,12 @@ subscript expression rather than a simple identifier---as in
 \texttt{arr[i].x}---the handler calls
 \texttt{\_kcc\_ir\_build\_subscript\_addr} to obtain the element's
 \emph{address} rather than \texttt{\_kcc\_ir\_build\_expr} which
-would dereference it.
+would dereference it.  Nested struct access (\texttt{o.a.x}) is
+handled similarly: when the object is itself an
+\texttt{AST\_MEMBER} with dot access, the handler calls itself
+recursively to obtain the inner field's \emph{address}.  Loading
+the inner field's value would produce raw struct bytes rather than
+a valid pointer, causing a crash on the subsequent GEP.
 
 Arrow access (\texttt{p->x}) requires two adjustments.  First, the
 identifier path must emit an \texttt{IR\_LOAD} to read the pointer
@@ -2058,11 +2276,20 @@ _kcc_ir_build_member_addr:
     ldr x0, [x19, #AST_F0]
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_SUBSCRIPT
-    b.ne .Libma_expr_val
+    b.ne .Libma_check_nested
     ldr x1, [x19, #AST_F2]
     cbnz x1, .Libma_expr_val     // arrow → value path
     // dot + subscript: get element address, not value
     bl _kcc_ir_build_subscript_addr
+    mov x20, x0
+    b .Libma_find_index
+.Libma_check_nested:
+    cmp x1, #AST_MEMBER
+    b.ne .Libma_expr_val
+    ldr x1, [x19, #AST_F2]
+    cbnz x1, .Libma_expr_val     // arrow → value path
+    // dot + nested member: get field address recursively
+    bl _kcc_ir_build_member_addr
     mov x20, x0
     b .Libma_find_index
 .Libma_expr_val:
@@ -2102,6 +2329,19 @@ _kcc_ir_build_member_addr:
     cbz x0, .Libma_found
 
 .Libma_field_next:
+    // Advance index by field's slot count: max(TY_SIZE, 8) / 8
+    ldr x0, [x23, #AST_F0]      // field type specifier
+    cbz x0, .Libma_field_inc1
+    bl _kcc_sema_resolve_type
+    cbz x0, .Libma_field_inc1
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.le .Libma_field_inc1
+    lsr x0, x0, #3              // TY_SIZE / 8
+    add x25, x25, x0
+    ldr x23, [x23, #AST_F4]     // next field
+    b .Libma_field_loop
+.Libma_field_inc1:
     add x25, x25, #1
     ldr x23, [x23, #AST_F4]     // next field
     b .Libma_field_loop
@@ -2245,10 +2485,21 @@ to alloca vreg numbers (stored as \texttt{vreg+1} so that zero can
 serve as ``not found'').  If the name is found, a single
 \texttt{IR\_LOAD} from the alloca vreg suffices.
 
+Local \emph{arrays} receive the same decay treatment.  The locals
+hash table tags pointer variables with bit~63; non-pointer locals
+that have a \texttt{TY\_PTR} resolved type (stored in
+\texttt{AST\_F3} by sema's array decay) must be arrays whose
+alloca vreg \emph{is} the decayed pointer.  The builder returns
+it directly instead of loading from it.
+
 If the name is absent from locals, the variable must be a global.
-The builder emits \texttt{IR\_GLOBAL\_REF} to materialise the
-symbol's address, then \texttt{IR\_LOAD} to fetch the value through
-that address---two instructions instead of one.
+For scalar and pointer globals, the builder emits
+\texttt{IR\_GLOBAL\_REF} followed by \texttt{IR\_LOAD}---two
+instructions.  Global \emph{arrays} are different: the address
+produced by \texttt{GLOBAL\_REF} already represents the decayed
+pointer to element~0, so no load is needed; the builder checks the
+symbol table for \texttt{TY\_ARRAY} and returns the address vreg
+directly.
 
 @d IR: build ident @{
 // -- kcc_ir_build_ident ---------------------------------------------------
@@ -2281,9 +2532,23 @@ _kcc_ir_build_ident:
     bl _kcc_ht_get
     // x0 = value (vreg+1) or 0 if not found
     cbz x0, .Libi_global
-    bic x0, x0, #0x8000000000000000
-    sub x22, x0, #1              // x22 = alloca vreg (stored as vreg+1)
+    // Bit 63 marks pointer variables; arrays have no tag
+    tbnz x0, #63, .Libi_local_ptr
+    // Non-pointer local (scalar or array)
+    sub x22, x0, #1              // x22 = alloca vreg
+    // Detect array decay: sema sets AST_F3 = TY_PTR for decayed arrays
+    ldr x0, [x19, #AST_F3]
+    cbz x0, .Libi_local_load
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.eq .Libi_local_array
+    b .Libi_local_load
 
+.Libi_local_ptr:
+    bic x0, x0, #0x8000000000000000
+    sub x22, x0, #1              // x22 = alloca vreg
+
+.Libi_local_load:
     // Emit load from alloca (always 64-bit — vreg slots are 8 bytes)
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
@@ -2304,8 +2569,27 @@ _kcc_ir_build_ident:
     mov x0, x20
     b .Libi_done
 
+.Libi_local_array:
+    // Local array: alloca vreg IS the decayed pointer — no load
+    mov x0, x22
+    b .Libi_done
+
 .Libi_global:
-    // Not a local — emit global_ref to get address, then load value
+    // Not a local — check if it's an array (address = decayed pointer)
+    mov x0, x20                  // name
+    mov x1, x21                  // len
+    bl _kcc_symtab_lookup
+    cbz x0, .Libi_global_scalar
+    ldr x1, [x0, #SYM_TYPE]
+    cbz x1, .Libi_global_scalar
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.eq .Libi_global_array
+    cmp x2, #TY_FUNC
+    b.eq .Libi_global_array
+
+.Libi_global_scalar:
+    // Scalar/pointer global: emit global_ref + load
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
     str x20, [x0, #IR_SRC1]     // name ptr
@@ -2335,6 +2619,27 @@ _kcc_ir_build_ident:
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
     mov x20, x0                  // x20 = loaded value vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libi_done
+
+.Libi_global_array:
+    // Array global: address IS the decayed pointer — no load needed
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0
 
     mov x0, x19
     bl _kcc_ir_emit
@@ -2463,8 +2768,9 @@ _kcc_ir_build_binary:
 
 // Pointer arithmetic: ptr+int or int+ptr must scale the integer
 // operand by the pointed-to type's size.  x23 = opcode (ADD or SUB),
-// x21 = LHS vreg, x22 = RHS vreg.  After scaling, falls through
-// to the normal emitter.
+// x21 = LHS vreg, x22 = RHS vreg.  The scale is clamped to
+// max(TY_SIZE, 8) because the all-spill model stores every element
+// in an 8-byte slot.  After scaling, falls through to the emitter.
 .Libb_ptr_scale:
     // Check if LHS is a pointer type
     ldr x0, [x19, #AST_F1]
@@ -2491,6 +2797,10 @@ _kcc_ir_build_binary:
     ldr x24, [x0, #TY_SIZE]
     cmp x24, #1
     b.le .Libb_emit
+    cmp x24, #8
+    b.ge .Libb_ps_have_scale1
+    mov x24, #8
+.Libb_ps_have_scale1:
 
     // Emit const + mul to scale x21
     mov x0, #IR_CONST
@@ -2530,6 +2840,10 @@ _kcc_ir_build_binary:
     ldr x24, [x0, #TY_SIZE]
     cmp x24, #1
     b.le .Libb_emit
+    cmp x24, #8
+    b.ge .Libb_ps_have_scale2
+    mov x24, #8
+.Libb_ps_have_scale2:
 
     // Emit const + mul to scale x22
     mov x0, #IR_CONST
@@ -4003,7 +4317,7 @@ destination vreg receives the return value.
 .globl _kcc_ir_build_call
 .p2align 2
 _kcc_ir_build_call:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -4011,13 +4325,27 @@ _kcc_ir_build_call:
 
     mov x19, x0                   // x19 = AST_CALL_EXPR node
 
-    // Get callee name (assume direct call to ident)
+    // Get callee expression
     ldr x0, [x19, #AST_F0]       // callee expr
     cbz x0, .Libc_done_zero
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_IDENT_EXPR
     b.ne .Libc_done_zero
     ldr x20, [x0, #AST_F0]       // x20 = callee name ptr
+
+    // Check if callee is a local variable (function pointer)
+    str x0, [sp, #72]            // save callee expr node
+    mov x0, x20
+    bl _kcc_strlen
+    mov x24, x0                   // x24 = name len
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    mov x2, x24
+    bl _kcc_ht_get
+    // x0 = vreg+1 (with possible bit-63 tag) or 0 if not found
+    str x0, [sp, #64]            // save locals_result
 
     // Count arguments (walk F4 chain)
     ldr x21, [x19, #AST_F1]      // x21 = first arg
@@ -4052,7 +4380,11 @@ _kcc_ir_build_call:
     b .Libc_eval_args
 .Libc_eval_done:
 
-    // Emit IR_CALL instruction
+    // Check if indirect call (callee is a local variable)
+    ldr x0, [sp, #64]            // locals_result
+    cbnz x0, .Libc_indirect
+
+    // Direct call: emit IR_CALL
     mov x0, #IR_CALL
     bl _kcc_ir_alloc_instr
     str x20, [x0, #IR_SRC1]       // callee name
@@ -4072,13 +4404,39 @@ _kcc_ir_build_call:
     mov x0, x20
     b .Libc_done
 
+.Libc_indirect:
+    // Indirect call: build callee expression to get function pointer vreg
+    ldr x0, [sp, #72]            // callee expr node
+    bl _kcc_ir_build_expr          // returns fn-ptr vreg in x0
+    mov x24, x0                    // x24 = fn-ptr vreg
+
+    // Emit IR_CALL_IND
+    mov x0, #IR_CALL_IND
+    bl _kcc_ir_alloc_instr
+    str x24, [x0, #IR_SRC1]       // fn-ptr vreg
+    str x23, [x0, #IR_SRC2]       // args array ptr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libc_done
+
 .Libc_done_zero:
     mov x0, #0
 .Libc_done:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
 @| _kcc_ir_build_call
 @}
@@ -4655,22 +5013,20 @@ _kcc_ir_build_var_decl:
     ldr x24, [x21, #TY_F1]      // array length
     cbz x24, .Libvd_emit_alloca
     ldr x21, [x21, #TY_F0]      // element type
+    // Multi-slot elements (structs): multiply length by slots per element
+    ldr x0, [x21, #TY_SIZE]
+    cmp x0, #8
+    b.le .Libvd_emit_alloca
+    lsr x0, x0, #3              // slots_per_element = TY_SIZE / 8
+    mul x24, x24, x0
     b .Libvd_emit_alloca
 
 .Libvd_struct:
-    // Count fields by walking AST_STRUCT_DECL.F1 chain
-    ldr x0, [x21, #TY_F0]       // AST_STRUCT_DECL node
-    cbz x0, .Libvd_emit_alloca
-    ldr x0, [x0, #AST_F1]       // first field
-    mov x24, #0
-.Libvd_count_fields:
-    cbz x0, .Libvd_fields_done
-    add x24, x24, #1
-    ldr x0, [x0, #AST_F4]       // next field
-    b .Libvd_count_fields
-.Libvd_fields_done:
-    cmp x24, #0
-    b.ne .Libvd_emit_alloca
+    // Use TY_SIZE / 8 to get slot count (accounts for nested structs)
+    ldr x0, [x21, #TY_SIZE]
+    lsr x24, x0, #3
+    cmp x24, #1
+    b.ge .Libvd_emit_alloca
     mov x24, #1                  // at least 1 slot
 
 .Libvd_emit_alloca:
@@ -6024,6 +6380,140 @@ run_test "enum in if" \
     "enum B { OFF, ON }; int main(void) { int x = ON; if (x == ON) return 1; return 0; }" 1
 @}
 
+The following test groups exercise features added during Phase~8 work
+on self-hosting readiness.  Each group targets a specific bug that was
+discovered and fixed: nested struct member access, struct arrays with
+multi-slot elements, local array-to-pointer decay, global variable
+initializers, and pointer arithmetic scaling in the all-spill model.
+
+@d Test: codegen nested structs @{
+echo ""
+echo "--- Nested Structs ---"
+
+run_test "nested-struct-basic" \
+    "struct Inner { int x; int y; }; struct Outer { struct Inner a; int b; }; int main(void) { struct Outer o; o.a.x = 10; o.a.y = 20; o.b = 30; return o.a.x + o.a.y + o.b; }" 60
+
+run_test "nested-struct-second-inner" \
+    "struct V { int x; int y; }; struct Box { struct V lo; struct V hi; }; int main(void) { struct Box b; b.lo.x = 1; b.lo.y = 2; b.hi.x = 3; b.hi.y = 4; return b.hi.x + b.hi.y; }" 7
+
+run_test "nested-struct-overwrite" \
+    "struct Inner { int x; int y; }; struct Outer { struct Inner a; int b; }; int main(void) { struct Outer o; o.a.x = 5; o.a.x = 9; return o.a.x; }" 9
+
+run_test "nested-struct-field-isolation" \
+    "struct Inner { int x; int y; }; struct Outer { struct Inner a; int b; }; int main(void) { struct Outer o; o.a.x = 10; o.a.y = 20; o.b = 30; return o.b; }" 30
+@}
+
+@d Test: codegen struct arrays @{
+echo ""
+echo "--- Struct Arrays ---"
+
+run_test "struct-array-basic" \
+    "struct Pair { int a; int b; }; int main(void) { struct Pair arr[3]; arr[0].a=1; arr[0].b=2; arr[1].a=3; arr[1].b=4; arr[2].a=5; arr[2].b=6; return arr[1].a + arr[2].b; }" 9
+
+run_test "struct-array-first-last" \
+    "struct Pair { int a; int b; }; int main(void) { struct Pair arr[2]; arr[0].a=10; arr[0].b=20; arr[1].a=30; arr[1].b=40; return arr[0].a + arr[1].b; }" 50
+
+run_test "struct-array-decay" \
+    "struct Pair { int a; int b; }; int main(void) { struct Pair arr[3]; arr[0].a=1; arr[0].b=2; arr[1].a=3; arr[1].b=4; arr[2].a=5; arr[2].b=6; struct Pair *p = arr; return p[1].a + p[2].b; }" 9
+
+run_test "struct-array-loop" \
+    "struct V { int x; int y; }; int main(void) { struct V a[3]; a[0].x=1; a[1].x=2; a[2].x=3; a[0].y=10; a[1].y=20; a[2].y=30; int s=0; int i=0; while(i<3){s=s+a[i].x+a[i].y; i=i+1;} return s; }" 66
+@}
+
+@d Test: codegen global init @{
+echo ""
+echo "--- Global Initializers ---"
+
+run_test "global-init-simple" \
+    "int x = 42; int main(void) { return x; }" 42
+
+run_test "global-init-two" \
+    "int x = 10; int y = 20; int main(void) { return x + y; }" 30
+
+run_test "global-init-expr" \
+    "int x = 10; int y = 20; int z; int main(void) { z = x + y; return z; }" 30
+
+run_test "global-init-zero" \
+    "int x; int y = 5; int main(void) { return x + y; }" 5
+
+run_test "global-init-overwrite" \
+    "int x = 10; int main(void) { x = 20; return x; }" 20
+
+run_test "global-init-negative" \
+    "int x = 99; int main(void) { return x - 100 + 1; }" 0
+@}
+
+@d Test: codegen ptr arithmetic @{
+echo ""
+echo "--- Pointer Arithmetic ---"
+
+run_test "ptr-arith-int-scale" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int *)mmap(0,4096,3,4098,-1,0); *p = 10; *(p + 1) = 20; *(p + 2) = 30; return *(p + 0) + *(p + 1) + *(p + 2); }" 60
+
+run_test "ptr-arith-char-scale" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { char *p = (char *)mmap(0,4096,3,4098,-1,0); *p = 1; *(p + 1) = 2; *(p + 2) = 3; return *p + *(p+1) + *(p+2); }" 6
+
+run_test "ptr-arith-reverse" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int *)mmap(0,4096,3,4098,-1,0); *(p+0)=5; *(p+1)=10; *(p+2)=15; return *(p+2); }" 15
+
+run_test "ptr-arith-loop" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int *)mmap(0,4096,3,4098,-1,0); int i=0; while(i<5){*(p+i)=i*i; i=i+1;} return *(p+3); }" 9
+@}
+
+The final test group assembles several patterns from the self-hosting
+compiler into one program: arena allocation, linked list traversal,
+recursive tree evaluation, and multi-field struct access through
+pointers.  Passing these tests gives high confidence that the backend
+can handle the patterns found in~\kcc{} itself.
+
+@d Test: codegen self-hosting @{
+echo ""
+echo "--- Self-hosting Patterns ---"
+
+run_test "arena-alloc-pattern" \
+    "void *mmap(void*,long,int,int,int,long); char *base; long pos; void init(void) { base=(char*)mmap(0,65536,3,4098,-1,0); pos=0; } char *alloc(long n) { char *p = base + pos; pos = pos + n; return p; } int main(void) { init(); char *a=alloc(8); char *b=alloc(8); return (b > a) ? 1 : 0; }" 1
+
+run_test "linked-list" \
+    "void *mmap(void*,long,int,int,int,long); char *base; long pos; void init(void) { base=(char*)mmap(0,65536,3,4098,-1,0); pos=0; } char *alloc(long n) { char *p = base + pos; pos = pos + n; return p; } struct Node { int val; struct Node *next; }; struct Node *make(int v, struct Node *nx) { struct Node *n = (struct Node *)alloc(16); n->val = v; n->next = nx; return n; } int sum(struct Node *n) { int s=0; while(n) { s=s+n->val; n=n->next; } return s; } int main(void) { init(); struct Node *list = make(1, make(2, make(3, 0))); return sum(list); }" 6
+
+run_test "recursive-tree-eval" \
+    "void *mmap(void*,long,int,int,int,long); char *base; long pos; void init(void) { base=(char*)mmap(0,65536,3,4098,-1,0); pos=0; } char *alloc(long n) { char *p = base + pos; pos = pos + n; return p; } struct N { int tag; long val; struct N *l; struct N *r; }; struct N *leaf(long v) { struct N *n=(struct N*)alloc(32); n->tag=1; n->val=v; n->l=0; n->r=0; return n; } struct N *bin(int t, struct N *a, struct N *b) { struct N *n=(struct N*)alloc(32); n->tag=t; n->l=a; n->r=b; n->val=0; return n; } long ev(struct N *n) { if(n->tag==1) return n->val; long a=ev(n->l); long b=ev(n->r); if(n->tag==2) return a+b; if(n->tag==3) return a-b; if(n->tag==4) return a*b; return 0; } int main(void) { init(); struct N *r=bin(4,bin(2,leaf(2),leaf(3)),leaf(4)); return (int)ev(r); }" 20
+
+run_test "string-compare" \
+    "int streq(char *a, char *b, int n) { int i=0; while(i<n){ if(*(a+i)!=*(b+i)) return 0; i=i+1; } return 1; } int main(void) { char *x = \"hello\"; char *y = \"hello\"; char *z = \"world\"; return streq(x,y,5) + streq(x,z,5); }" 1
+
+run_test "classify-char" \
+    "int cls(char c) { if(c>='a' && c<='z') return 1; if(c>='0' && c<='9') return 2; return 0; } int main(void) { return cls('x') + cls('3') + cls(' '); }" 3
+@}
+
+Function pointers require three pieces to work together: the parser
+must handle grouped declarators with function suffixes
+(\texttt{int~(*fp)(int,~int)}), the IR builder must distinguish
+indirect calls from direct calls, and the code generator must emit
+\texttt{BLR} instead of \texttt{BL}.  The tests below exercise local
+function pointer variables, function pointers as parameters, and
+higher-order patterns like \texttt{apply}.
+
+@d Test: codegen fnptr @{
+echo ""
+echo "--- Function Pointers ---"
+
+run_test "fnptr-basic" \
+    "int add(int a, int b) { return a + b; } int main(void) { int (*fp)(int, int) = add; return fp(3, 4); }" 7
+
+run_test "fnptr-swap" \
+    "int add(int a, int b) { return a + b; } int sub(int a, int b) { return a - b; } int main(void) { int (*fp)(int, int) = add; int r1 = fp(10, 3); fp = sub; int r2 = fp(10, 3); return r1 + r2; }" 20
+
+run_test "fnptr-param" \
+    "int add(int a, int b) { return a + b; } int apply(int (*fn)(int, int), int x, int y) { return fn(x, y); } int main(void) { return apply(add, 5, 6); }" 11
+
+run_test "fnptr-multi-ops" \
+    "int add(int a, int b) { return a + b; } int sub(int a, int b) { return a - b; } int mul(int a, int b) { return a * b; } int apply(int (*fn)(int, int), int x, int y) { return fn(x, y); } int main(void) { return apply(add, 3, 4) + apply(sub, 10, 3) + apply(mul, 2, 5); }" 24
+
+run_test "fnptr-higher-order" \
+    "int dbl(int x) { return x * 2; } int sq(int x) { return x * x; } int mapsum(int (*f)(int), int n) { int s=0; int i=1; while(i<=n){s=s+f(i); i=i+1;} return s; } int main(void) { return mapsum(dbl, 3) + mapsum(sq, 3); }" 26
+@}
+
 \section{String Constants}
 
 The IR dump and builder share a set of string constants for opcode
@@ -6036,6 +6526,7 @@ placed in \texttt{.data} since it is mutable at run time.
 // -- IR builder string constants ------------------------------------------
 .section __TEXT,__cstring,cstring_literals
 
+_kcc_str_main:          .asciz "main"
 _kcc_ir_str_func:       .asciz "func @@"
 _kcc_ir_str_arrow:      .asciz "() -> "
 _kcc_ir_str_colon_nl:   .asciz ":\n"
@@ -6079,6 +6570,7 @@ _kcc_ir_op_br:          .asciz "br bb"
 _kcc_ir_op_br_cond:     .asciz "br_cond %"
 _kcc_ir_op_ret:         .asciz "ret "
 _kcc_ir_op_call:        .asciz "call "
+_kcc_ir_op_call_ind:    .asciz "call_ind "
 _kcc_ir_op_sext:        .asciz "sext"
 _kcc_ir_op_zext:        .asciz "zext"
 _kcc_ir_op_trunc:       .asciz "trunc"
@@ -6095,6 +6587,8 @@ _kcc_ir_op_string_lit:  .asciz "string_lit "
 _kcc_loop_depth: .quad 0
 .globl _kcc_loop_stack
 _kcc_loop_stack: .space 256   // 16 levels * 16 bytes (break_bb, continue_bb)
+.globl _kcc_ir_trans_unit
+_kcc_ir_trans_unit: .quad 0
 
 // Short type names
 .section __TEXT,__cstring,cstring_literals
@@ -6150,6 +6644,7 @@ _kcc_ir_ty_unknown:     .asciz "?type"
 @| _kcc_ir_op_br_cond
 @| _kcc_ir_op_ret
 @| _kcc_ir_op_call
+@| _kcc_ir_op_call_ind
 @| _kcc_ir_op_sext
 @| _kcc_ir_op_zext
 @| _kcc_ir_op_trunc

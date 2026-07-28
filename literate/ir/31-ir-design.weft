@@ -94,11 +94,12 @@ Offset & Field & Description \\
 .equ IR_ALLOCA,  32
 .equ IR_GEP,     33
 
-// Control flow: 40-43
+// Control flow: 40-44
 .equ IR_BR,      40
 .equ IR_BR_COND, 41
 .equ IR_RET,     42
 .equ IR_CALL,    43
+.equ IR_CALL_IND, 44
 
 // Conversion: 50-53
 .equ IR_SEXT,    50

@@ -160,7 +160,22 @@ _kcc_preregister_globals:
     bl _kcc_sema_resolve_type
     cbz x0, .Lprg_next
 
-    // Read TY_SIZE; floor at 8
+    // For arrays, each element needs max(elem_size, 8) bytes
+    // to match the all-spill model's 8-byte slot minimum.
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lprg_scalar_size
+
+    ldr x21, [x0, #TY_F1]      // array length
+    ldr x0, [x0, #TY_F0]       // element type
+    ldr x1, [x0, #TY_SIZE]     // element size
+    mov x2, #8
+    cmp x1, x2
+    csel x1, x1, x2, ge        // max(elem_size, 8)
+    mul x21, x21, x1
+    b .Lprg_have_size
+
+.Lprg_scalar_size:
     ldr x21, [x0, #TY_SIZE]
     cmp x21, #8
     b.ge .Lprg_have_size
@@ -845,6 +860,8 @@ _kcc_codegen_instr:
     b.eq .Lcgi_ret
     cmp x22, #IR_CALL
     b.eq .Lcgi_call
+    cmp x22, #IR_CALL_IND
+    b.eq .Lcgi_call_ind
     cmp x22, #IR_GLOBAL_REF
     b.eq .Lcgi_global_ref
     cmp x22, #IR_STRING_LIT
@@ -2156,7 +2173,106 @@ described in \S\ref{sec:emit-strings}.
     bl _kcc_code_emit32
 
     b .Lcgi_done
+
+.Lcgi_call_ind:
+    // Indirect call: SRC1 = fn-ptr vreg, SRC2 = args array, DEST = result vreg
+    ldr x23, [x19, #IR_SRC1]      // fn-ptr vreg
+    ldr x24, [x19, #IR_DEST]
+    ldr x26, [x19, #IR_SRC2]
+
+    // Get arg count
+    mov x22, #0
+    cbz x26, .Lcgi_cind_load
+    ldr x22, [x26]
+.Lcgi_cind_load:
+
+    // Marshal arguments into x0-x7
+    cbz x22, .Lcgi_cind_args_done
+    mov x27, #0
+.Lcgi_cind_arg_loop:
+    cmp x27, x22
+    b.ge .Lcgi_cind_args_done
+    cmp x27, #8
+    b.ge .Lcgi_cind_args_done
+    add x0, x27, #1
+    ldr x0, [x26, x0, lsl #3]
+    mov x1, x27
+    bl _kcc_cg_load_vreg
+    add x27, x27, #1
+    b .Lcgi_cind_arg_loop
+.Lcgi_cind_args_done:
+
+    // Push variadic args onto stack (same as direct call)
+    cmp x22, #2
+    b.lt .Lcgi_cind_no_stack
+
+    sub x0, x22, #1
+    lsl x0, x0, #3
+    add x0, x0, #15
+    and x0, x0, #~15
+    str x0, [sp, #88]
+
+    mov x0, #31
+    mov x1, #31
+    ldr x2, [sp, #88]
+    mov x3, #1
+    bl _kcc_enc_sub_imm
+    bl _kcc_code_emit32
+
+    mov x27, #1
+.Lcgi_cind_stack_loop:
+    cmp x27, x22
+    b.ge .Lcgi_cind_no_stack
+    cmp x27, #8
+    b.ge .Lcgi_cind_no_stack
+
+    mov x0, x27
+    mov x1, #31
+    sub x2, x27, #1
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+
+    add x27, x27, #1
+    b .Lcgi_cind_stack_loop
+.Lcgi_cind_no_stack:
+
+    // Load fn-ptr vreg into x9 (scratch)
+    mov x0, x23
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+
+    // Emit BLR x9
+    mov x0, #9
+    bl _kcc_enc_blr
+    bl _kcc_code_emit32
+
+    // Store return value (x0) to dest vreg slot
+    mov x0, x24
+    mov x1, #0
+    bl _kcc_cg_store_vreg
+
+    // Restore stack if we pushed variadic args
+    cmp x22, #2
+    b.lt .Lcgi_done
+
+    mov x0, #31
+    mov x1, #31
+    ldr x2, [sp, #88]
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    b .Lcgi_done
 @}
+
+\paragraph{Indirect Calls.}
+\texttt{IR\_CALL\_IND} handles calls through function pointers.
+The code generator loads the function pointer value from the
+stack slot identified by \texttt{SRC1} into scratch register
+\texttt{x9}, marshals arguments into \texttt{x0}--\texttt{x7}
+(with variadic copies on the stack per Apple~ABI), and emits
+\texttt{BLR~x9} instead of \texttt{BL~<symbol>}.
 
 \paragraph{Global Variable References and String Literals}
 \texttt{IR\_GLOBAL\_REF} materialises the address of a global

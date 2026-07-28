@@ -528,5 +528,6 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen structs@>
 @<Test: codegen multi-var@>
 @<Test: codegen unsigned@>
+@<Test: codegen enums@>
 @<Test: codegen results@>
 @}

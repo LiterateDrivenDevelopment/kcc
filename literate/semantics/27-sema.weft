@@ -259,7 +259,12 @@ then checks the body statements.  Typedef declarations register
 \texttt{SYM\_TYPEDEF}.  Struct and union declarations register the
 tag in the tag namespace via \texttt{\_kcc\_symtab\_declare\_tag}.
 Enum declarations register the tag and walk the enumerator list,
-assigning each constant an incrementing integer value.
+assigning each constant an incrementing integer value.  The parser
+wraps standalone enum declarations in an \texttt{AST\_TYPE\_ENUM}
+node; the dispatcher unwraps it to reach the inner
+\texttt{AST\_ENUM\_DECL} before processing.  The same unwrapping
+is needed in the statement checker, since enums may be declared
+inside function bodies.
 
 @d Sema: check declaration @{
 // -- kcc_sema_check_decl --------------------------------------------------
@@ -296,6 +301,8 @@ _kcc_sema_check_decl:
     b.eq .Lscd_type_struct
     cmp x20, #AST_ENUM_DECL
     b.eq .Lscd_enum
+    cmp x20, #AST_TYPE_ENUM
+    b.eq .Lscd_type_enum
 
     // Other nodes (e.g., static_assert): skip
     b .Lscd_done
@@ -455,6 +462,11 @@ consecutive integer values starting from zero.
     bl _kcc_symtab_declare_tag
     b .Lscd_done
 
+.Lscd_type_enum:
+    // Unwrap AST_TYPE_ENUM → get EnumDecl child
+    ldr x19, [x19, #AST_F0]
+    cbz x19, .Lscd_done
+
 .Lscd_enum:
     // Register enum tag and enumerator constants
     ldr x0, [x19, #AST_F0]         // name_ptr
@@ -576,6 +588,8 @@ _kcc_sema_check_stmt:
     cmp x20, #AST_UNION_DECL
     b.eq .Lscs_decl
     cmp x20, #AST_ENUM_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_TYPE_ENUM
     b.eq .Lscs_decl
     cmp x20, #AST_STATIC_ASSERT
     b.eq .Lscs_done
@@ -903,6 +917,15 @@ element.  Undeclared identifiers fall back to \texttt{int}; a
 diagnostic is deferred to avoid crashing on implicit function
 declarations common in legacy C code.
 
+Enumeration constants receive special treatment.  When the lookup
+returns a symbol whose kind is \texttt{SYM\_ENUM\_CONST}, the AST
+node is rewritten in place: its tag becomes \texttt{AST\_INT\_LIT}
+and \texttt{F0} receives the constant's integer value from
+\texttt{SYM\_VALUE}.  The IR builder then sees a plain integer
+literal and emits \texttt{IR\_CONST}---no global reference, no
+symbol lookup at link time.  This rewrite is safe because the node
+will never be examined as an identifier again.
+
 @d Sema: expr ident @{
 // -- kcc_sema_expr_ident --------------------------------------------------
 // type_desc *kcc_sema_expr_ident(node *expr)
@@ -928,6 +951,19 @@ _kcc_sema_expr_ident:
     bl _kcc_symtab_lookup
     cbz x0, .Lsei_undeclared
 
+    // Check if this is an enum constant
+    ldr x1, [x0, #SYM_KIND]
+    cmp x1, #SYM_ENUM_CONST
+    b.ne .Lsei_normal
+
+    // Rewrite AST node: AST_IDENT_EXPR → AST_INT_LIT with enum value
+    ldr x1, [x0, #SYM_VALUE]
+    mov x0, #AST_INT_LIT
+    str x0, [x19]                   // overwrite tag
+    str x1, [x19, #AST_F0]         // store constant value
+    b .Lsei_int_type
+
+.Lsei_normal:
     // Return symbol's type
     ldr x0, [x0, #SYM_TYPE]
     // Apply function/array decay
@@ -943,7 +979,8 @@ _kcc_sema_expr_ident:
     // (diagnostic omitted for now to avoid crash on implicit declarations)
 
 .Lsei_unknown:
-    // Return int as fallback
+.Lsei_int_type:
+    // Return int as fallback / enum constant type
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]

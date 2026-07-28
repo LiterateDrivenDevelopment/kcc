@@ -5432,6 +5432,29 @@ run_test "large constant" \
     "int main(void) { return 255; }" 255
 @}
 
+Enumeration constants are rewritten to integer literals during
+semantic analysis, so the IR builder sees plain \texttt{IR\_CONST}
+instructions.  These tests verify the rewrite for file-scope enums,
+function-local enums, arithmetic on enumerators, and the implicit
+counter (\texttt{RED}=0, \texttt{GREEN}=1, etc.).
+
+@d Test: codegen enums @{
+echo ""
+echo "--- Enums ---"
+
+run_test "enum file-scope" \
+    "enum E { A, B, C }; int main(void) { return C; }" 2
+
+run_test "enum local" \
+    "int main(void) { enum { X, Y, Z }; return X + Y + Z; }" 3
+
+run_test "enum arithmetic" \
+    "enum D { N, E, S, W }; int main(void) { return W * 10 + S; }" 32
+
+run_test "enum in if" \
+    "enum B { OFF, ON }; int main(void) { int x = ON; if (x == ON) return 1; return 0; }" 1
+@}
+
 \section{String Constants}
 
 The IR dump and builder share a set of string constants for opcode

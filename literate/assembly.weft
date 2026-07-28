@@ -380,6 +380,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build string literal@>
 @<IR: build conditional@>
 @<IR: build cast@>
+@<IR: struct copy helper@>
 @<IR: build var decl@>
 @<IR: build if@>
 @<IR: build while@>
@@ -447,8 +448,10 @@ physical assembly files under \texttt{tmp/src/}.
 @<Vec: constants@>
 @<Linker: constants@>
 @<Types: constants@>
+@<Parser: AST constants@>
 @<CodeGen: constants@>
 @<CodeGen: init@>
+@<CodeGen: preregister globals@>
 @<CodeGen: compile all@>
 @<CodeGen: compile function@>
 @<CodeGen: vreg slot offset@>

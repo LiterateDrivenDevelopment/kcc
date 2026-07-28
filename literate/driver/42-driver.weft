@@ -26,6 +26,8 @@ straight-line function.  Given a source path and an output path it:
 \item Builds the IR and runs optimization passes.
 \item Initializes the code buffer, linker, and code generator
       (including the cstring buffer for string literals).
+\item Pre-registers global variable sizes so that struct globals
+      receive the correct allocation (one 8-byte slot per field).
 \item Lowers all IR to ARM64 machine code.
 \item Appends string literal data to the code section and patches
       symbol values (\texttt{kcc\_codegen\_emit\_strings}).
@@ -103,6 +105,10 @@ _kcc_driver_compile:
     bl _kcc_code_init
     bl _kcc_linker_init
     bl _kcc_codegen_init
+
+    // 13b. Pre-register global variable sizes
+    mov x0, x21                    // trans_unit
+    bl _kcc_preregister_globals
 
     // 14. Generate code
     bl _kcc_codegen_all

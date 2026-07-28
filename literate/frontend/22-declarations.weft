@@ -1188,10 +1188,14 @@ _kcc_parse_struct_or_union:
 With the tag determined and the opening brace consumed, the parser enters
 a loop over the struct or union members.  Each member consists of declaration
 specifiers followed by a declarator and an optional bitfield width introduced
-by a colon.  Anonymous members (a bare specifier followed immediately by a
-semicolon) are also supported, which allows anonymous inner structs and unions
-as described in \stdref{6.7.2.1}~p13.  Members are linked through
-\texttt{AST\_F4} into a singly-linked list anchored by the first field node.
+by a colon.  The declarator may begin with one or more pointer stars; after
+parsing the base type specifiers we consume any \texttt{*} tokens and wrap
+the type in nested \texttt{AST\_TYPE\_PTR} nodes, mirroring the logic used
+by the normal declarator parser.  Anonymous members (a bare specifier
+followed immediately by a semicolon) are also supported, which allows
+anonymous inner structs and unions as described in \stdref{6.7.2.1}~p13.
+Members are linked through \texttt{AST\_F4} into a singly-linked list
+anchored by the first field node.
 
 @d Decl: parse struct @{
 .Lstruct_field_loop:
@@ -1214,10 +1218,26 @@ as described in \stdref{6.7.2.1}~p13.  Members are linked through
     cmp  x0, #TOK_SEMI
     b.eq .Lstruct_anon_field
 
+    // Parse pointer stars in field declarator (e.g., char *name)
+.Lstruct_field_ptr:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STAR
+    b.ne .Lstruct_field_decl
+
+    bl _kcc_pp_next               // consume '*'
+    mov x0, #AST_TYPE_PTR
+    bl _kcc_ast_alloc
+    str x23, [x0, #AST_F0]       // pointee = current type
+    str xzr, [x0, #AST_F1]       // no qualifiers
+    mov x23, x0                   // x23 = pointer type
+    b .Lstruct_field_ptr
+
     // Parse field declarator
+.Lstruct_field_decl:
     mov x24, #0                  // field name
 
-.Lstruct_field_decl:
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]

@@ -89,7 +89,10 @@ _kcc_symtab_init:
 
 Entering a compound statement or function body pushes a new scope: a fresh
 hash table is allocated and appended to both the ordinary and tags scope
-stacks, and the depth counter is incremented.  Leaving the scope pops the
+stacks, and the depth counter is incremented.  The ordinary-identifier table
+uses a capacity of 256 slots---large enough for file-scope programs with
+many functions, globals, and enum constants, since the hash table does not
+resize.  Leaving the scope pops the
 top entry from each stack and decrements the depth.  This mirrors the C
 scoping rule that each block introduces a new scope (\stdref{6.2.1}).
 
@@ -107,7 +110,7 @@ _kcc_symtab_push_scope:
     // sp+24..31 used as temp storage for vec_push element
 
     // Create new ht for ordinary names
-    mov x0, #32                     // initial capacity
+    mov x0, #256                    // capacity (must exceed largest scope)
     bl _kcc_ht_init
     // Store ht pointer on stack for vec_push (needs pointer-to-element)
     str x0, [sp, #24]

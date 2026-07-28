@@ -117,6 +117,87 @@ _kcc_codegen_init:
 @| _kcc_codegen_init
 @}
 
+\section{Pre-register Global Sizes}
+
+Before code generation begins, the driver calls
+\texttt{kcc\_preregister\_globals} to walk the AST translation unit and
+pre-register every global variable in the linker with its correct
+allocation size.  Scalar and pointer globals need eight bytes, while
+struct globals need $n \times 8$ bytes (one eight-byte slot per field).
+Because \texttt{kcc\_linker\_global\_sym} deduplicates---returning
+immediately when a symbol is already defined---subsequent references
+during code generation are no-ops with respect to allocation.
+
+@d CodeGen: preregister globals @{
+// -- kcc_preregister_globals --------------------------------------------------
+// void kcc_preregister_globals(node *trans_unit)
+//   x0 = AST_TRANS_UNIT node
+// Walks top-level variable declarations, resolves their types, and
+// pre-registers each global with the linker at the correct byte size.
+.text
+.globl _kcc_preregister_globals
+.p2align 2
+_kcc_preregister_globals:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    ldr x19, [x0, #AST_F0]      // first declaration
+
+.Lprg_loop:
+    cbz x19, .Lprg_done
+
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_VAR_DECL
+    b.ne .Lprg_next
+
+    ldr x20, [x19, #AST_F1]     // name
+    cbz x20, .Lprg_next
+
+    // Resolve the declared type
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lprg_next
+
+    // Read TY_SIZE; floor at 8
+    ldr x21, [x0, #TY_SIZE]
+    cmp x21, #8
+    b.ge .Lprg_have_size
+    mov x21, #8
+.Lprg_have_size:
+
+    // Build "_" + name
+    mov x0, x20
+    bl _kcc_strlen
+    add x0, x0, #2
+    bl _kcc_arena_alloc
+    mov x22, x0
+    mov w1, #'_'
+    strb w1, [x22]
+    mov x0, x20
+    bl _kcc_strlen
+    add x2, x0, #1
+    add x0, x22, #1
+    mov x1, x20
+    bl _kcc_memcpy
+
+    mov x0, x22
+    mov x1, x21
+    bl _kcc_linker_global_sym
+
+.Lprg_next:
+    ldr x19, [x19, #AST_F4]     // next sibling
+    b .Lprg_loop
+
+.Lprg_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_preregister_globals
+@}
+
 \section{Compile All Functions}
 
 The top-level entry point iterates the IR function vector and calls
@@ -2110,8 +2191,9 @@ label restores callee-saved registers and returns.
     mov x1, x23                   // src = original name
     bl _kcc_memcpy
 
-    // Register as global symbol (defined in section 2, size=8 for now)
+    // Register as global symbol (defined in section 2)
     mov x0, x25
+    mov x1, #8                     // default 8 bytes per scalar global
     bl _kcc_linker_global_sym
     mov x25, x0                    // sym_index
 

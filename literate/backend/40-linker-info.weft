@@ -305,18 +305,22 @@ _kcc_linker_extern:
 
 When the code generator encounters an \texttt{IR\_GLOBAL\_REF}, the
 referenced global variable needs a \emph{defined} symbol in section~2
-(the \texttt{\_\_DATA,\_\_common} zerofill section).  We deduplicate
-via the same extern hash table---if a symbol was already registered
-(by a prior reference or call), we upgrade it from undefined to
-defined.
+(the \texttt{\_\_DATA,\_\_common} zerofill section).  The caller passes
+the allocation size in~\texttt{x1}: eight bytes for scalar globals,
+$n \times 8$ for struct globals with~$n$ fields.  We deduplicate via
+the same extern hash table.  If the symbol is already \emph{defined}
+(section already set to~2), we return its index without re-allocating
+space---this makes repeated references and pre-registration safe.
+If it was previously registered as an extern, we upgrade it to defined
+and allocate the requested number of bytes.
 
 @d Linker: global sym @{
 // -- kcc_linker_global_sym ----------------------------------------------------
-// uint64_t kcc_linker_global_sym(const char *name)
+// uint64_t kcc_linker_global_sym(const char *name, uint64_t size)
 //   x0 = null-terminated symbol name (already prefixed with '_')
+//   x1 = allocation size in bytes (typically 8 for scalars, N*8 for structs)
 // Returns the symbol index.  If the symbol already exists as extern,
 // upgrades it to defined in section 2.  Otherwise adds new.
-// Allocates 8 bytes of data section space per global.
 .text
 .globl _kcc_linker_global_sym
 .p2align 2
@@ -327,6 +331,7 @@ _kcc_linker_global_sym:
     str x21, [sp, #32]
 
     mov x19, x0                   // save name
+    str x1, [sp, #40]             // save size (x1)
 
     // Check if symbol already in extern hash table
     mov x0, x19
@@ -341,10 +346,10 @@ _kcc_linker_global_sym:
     bl _kcc_ht_get
     cbz x0, .Llgs_new
 
-    // Already exists — get sym_index and upgrade to defined
+    // Already exists — get sym_index
     sub x21, x0, #1               // sym_index
 
-    // Get symbol entry and set section=2, value=current data offset
+    // Get symbol entry
     adrp x0, _kcc_linker_syms@@PAGE
     add  x0, x0, _kcc_linker_syms@@PAGEOFF
     ldr x0, [x0]
@@ -353,7 +358,12 @@ _kcc_linker_global_sym:
     mul x1, x21, x1
     add x0, x0, x1               // sym entry ptr
 
-    // Set section = 2 (DATA section)
+    // If already defined (section == 2), return immediately
+    ldr x1, [x0, #SYM_SECTION]
+    cmp x1, #2
+    b.eq .Llgs_dedup
+
+    // Upgrade from extern to defined
     mov x1, #2
     str x1, [x0, #SYM_SECTION]
 
@@ -363,10 +373,12 @@ _kcc_linker_global_sym:
     ldr x2, [x1]
     str x2, [x0, #SYM_VALUE]
 
-    // Advance data section size by 8 (int64 alignment)
-    add x2, x2, #8
+    // Advance data section size by requested amount
+    ldr x3, [sp, #40]             // saved size
+    add x2, x2, x3
     str x2, [x1]
 
+.Llgs_dedup:
     mov x0, x21
     b .Llgs_done
 
@@ -383,11 +395,12 @@ _kcc_linker_global_sym:
     bl _kcc_linker_add_sym
     mov x21, x0                   // sym_index
 
-    // Advance globals size by 8
+    // Advance globals size by requested amount
     adrp x0, _kcc_globals_size@@PAGE
     add  x0, x0, _kcc_globals_size@@PAGEOFF
     ldr x1, [x0]
-    add x1, x1, #8
+    ldr x2, [sp, #40]             // saved size
+    add x1, x1, x2
     str x1, [x0]
 
     // Store in extern hash table for dedup

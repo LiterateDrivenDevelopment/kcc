@@ -414,11 +414,12 @@ introduce linear-scan register allocation.
       without warnings.
 \end{enumerate}
 
-\textbf{Status.} In progress (v1 core working: constants, arithmetic,
-locals, control flow, loops, function calls, global variables, break/continue,
-string literals, \texttt{printf}, bitwise/comparison/logical operators,
-pointers, cast, negation---all compile, link, and run correctly.  Valid
-Mach-O with \texttt{LC\_BUILD\_VERSION}).
+\textbf{Status.} Complete.  All IR opcodes have codegen handlers;
+constants, arithmetic, locals, control flow, loops, function calls,
+global variables, break/continue, string literals, \texttt{printf},
+bitwise/comparison/logical operators, pointers, cast, negation,
+unsigned operations, and type extensions all compile, link, and run
+correctly.  Valid Mach-O with \texttt{LC\_BUILD\_VERSION}.
 
 \textbf{Completed milestones.}
 \begin{itemize}
@@ -460,14 +461,16 @@ Mach-O with \texttt{LC\_BUILD\_VERSION}).
       same-width reinterpretation.  Cast expressions in the IR builder
       now emit \texttt{IR\_TRUNC} when the target type is narrower
       than the source.
+\item[\checkmark] Remaining IR opcodes: \texttt{IR\_UMOD} (unsigned
+      modulo via \texttt{UDIV}+\texttt{MSUB}), \texttt{IR\_CMP\_ULT}
+      and \texttt{IR\_CMP\_ULE} (unsigned comparisons via
+      \texttt{CSET} with \texttt{LO}/\texttt{LS} conditions),
+      \texttt{IR\_SEXT} (sign extension via hardcoded \texttt{SBFM}
+      instruction words), \texttt{IR\_ZEXT} (zero extension via
+      hardcoded \texttt{UBFM} instruction words).  The IR builder's
+      binary handler remaps signed opcodes to unsigned variants when
+      the left operand's type has \texttt{TY\_F0}=0.
 \end{itemize}
-
-\textbf{Next steps} (ordered by impact).
-\begin{enumerate}
-\item Missing codegen handlers for remaining IR opcodes: \texttt{IR\_UMOD},
-      \texttt{IR\_CMP\_ULT}, \texttt{IR\_CMP\_ULE}, \texttt{IR\_SEXT},
-      \texttt{IR\_ZEXT}.
-\end{enumerate}
 
 % ────────────────────────────────────────────────────────────────
 \section{Phase 8 --- Self-Hosting}

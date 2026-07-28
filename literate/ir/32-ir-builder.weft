@@ -244,6 +244,10 @@ _kcc_ir_dump_instr:
     b.eq .Lidi_cmp_sgt
     cmp x20, #IR_CMP_SGE
     b.eq .Lidi_cmp_sge
+    cmp x20, #IR_CMP_ULT
+    b.eq .Lidi_cmp_ult
+    cmp x20, #IR_CMP_ULE
+    b.eq .Lidi_cmp_ule
     cmp x20, #IR_LOAD
     b.eq .Lidi_load
     cmp x20, #IR_STORE
@@ -376,6 +380,14 @@ predicates (\textsc{cmp\_eq} through \textsc{cmp\_sge}).
 .Lidi_cmp_sge:
     adrp x0, _kcc_ir_op_cmp_sge@@PAGE
     add  x0, x0, _kcc_ir_op_cmp_sge@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_ult:
+    adrp x0, _kcc_ir_op_cmp_ult@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_ult@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_ule:
+    adrp x0, _kcc_ir_op_cmp_ule@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_ule@@PAGEOFF
     b .Lidi_binop
 
 .Lidi_binop:
@@ -2092,8 +2104,11 @@ dispatches through a token-to-opcode table covering arithmetic
 (\texttt{+~-~*~/~\%}), bitwise (\texttt{\&~|~\^{}~<<~>>}), and
 relational (\texttt{== != < <= > >=}) operators.  Each case sets
 \texttt{x23} to the corresponding IR opcode and falls through to
-the common emitter, which allocates the instruction, wires both
-source vregs, and assigns a fresh destination vreg.
+the common emitter.  Before allocating the instruction, the emitter
+checks the left operand's type: if unsigned, it remaps signed
+opcodes to their unsigned variants (\texttt{SDIV}$\to$\texttt{UDIV},
+\texttt{SMOD}$\to$\texttt{UMOD}, \texttt{CMP\_SLT}$\to$%
+\texttt{CMP\_ULT}, \texttt{CMP\_SLE}$\to$\texttt{CMP\_ULE}).
 
 @d IR: build binary @{
 // -- kcc_ir_build_binary --------------------------------------------------
@@ -2200,6 +2215,38 @@ _kcc_ir_build_binary:
     b .Libb_emit
 
 .Libb_emit:
+    // Check left operand type for unsigned — remap signed opcodes
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_emit_alloc
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_emit_alloc
+    ldr x0, [x0, #TY_F0]
+    cbnz x0, .Libb_emit_alloc
+
+    cmp x23, #IR_SDIV
+    b.eq .Libb_u_div
+    cmp x23, #IR_SMOD
+    b.eq .Libb_u_mod
+    cmp x23, #IR_CMP_SLT
+    b.eq .Libb_u_lt
+    cmp x23, #IR_CMP_SLE
+    b.eq .Libb_u_le
+    b .Libb_emit_alloc
+
+.Libb_u_div:
+    mov x23, #IR_UDIV
+    b .Libb_emit_alloc
+.Libb_u_mod:
+    mov x23, #IR_UMOD
+    b .Libb_emit_alloc
+.Libb_u_lt:
+    mov x23, #IR_CMP_ULT
+    b .Libb_emit_alloc
+.Libb_u_le:
+    mov x23, #IR_CMP_ULE
+    b .Libb_emit_alloc
+
+.Libb_emit_alloc:
     mov x0, x23
     bl _kcc_ir_alloc_instr
     mov x24, x0
@@ -3557,9 +3604,10 @@ An explicit cast \texttt{(T)e} compares the target type~\texttt{T}
 with the source type of the inner expression.  When the target is
 strictly narrower (by \texttt{TY\_SIZE}), the builder emits
 \texttt{IR\_TRUNC} to mask the result to the target width.
-Same-width or widening casts return the inner vreg unchanged; the
-all-spill back end treats every slot as 64~bits, so no extension
-instruction is needed for correctness at this stage.
+When the target is wider, it emits \texttt{IR\_SEXT} for signed
+source types and \texttt{IR\_ZEXT} for unsigned ones; the source
+width is passed in \texttt{IR\_SRC2}.  Same-width casts return the
+inner vreg unchanged.
 
 @d IR: build cast @{
 // -- kcc_ir_build_cast ----------------------------------------------------
@@ -3570,10 +3618,11 @@ instruction is needed for correctness at this stage.
 .globl _kcc_ir_build_cast
 .p2align 2
 _kcc_ir_build_cast:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
 
     mov x19, x0                  // cast node
 
@@ -3590,27 +3639,55 @@ _kcc_ir_build_cast:
     cbz x22, .Lbc_done
 
     // Get source type from inner expr's F3
-    ldr x0, [x20, #AST_F3]
-    cbz x0, .Lbc_done
+    ldr x23, [x20, #AST_F3]
+    cbz x23, .Lbc_done
 
     // Compare sizes
     ldr x1, [x22, #TY_SIZE]     // target size
-    ldr x2, [x0, #TY_SIZE]      // source size
+    ldr x2, [x23, #TY_SIZE]     // source size
 
     cmp x1, x2
-    b.hs .Lbc_done               // target >= source: no truncation
+    b.eq .Lbc_done               // same width: no conversion
+    b.lo .Lbc_trunc              // target < source: truncate
+    b .Lbc_extend                // target > source: extend
 
-    // Target < source: emit IR_TRUNC
+.Lbc_trunc:
     mov x0, #IR_TRUNC
     bl _kcc_ir_alloc_instr
-    mov x20, x0                  // instr
+    mov x20, x0
 
     str x22, [x20, #IR_TYPE]    // target type
     str x21, [x20, #IR_SRC1]    // source vreg
 
     bl _kcc_ir_next_vreg
     str x0, [x20, #IR_DEST]
-    mov x21, x0                  // new vreg
+    mov x21, x0
+
+    mov x0, x20
+    bl _kcc_ir_emit
+    b .Lbc_done
+
+.Lbc_extend:
+    // Choose SEXT or ZEXT based on source type signedness
+    ldr x0, [x23, #TY_F0]       // 1=signed, 0=unsigned
+    cbz x0, .Lbc_zext
+    mov x0, #IR_SEXT
+    b .Lbc_ext_emit
+.Lbc_zext:
+    mov x0, #IR_ZEXT
+
+.Lbc_ext_emit:
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+
+    str x22, [x20, #IR_TYPE]    // target type
+    str x21, [x20, #IR_SRC1]    // source vreg
+    ldr x0, [x23, #TY_SIZE]     // source width in bytes
+    str x0, [x20, #IR_SRC2]     // pass source width to codegen
+
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0
 
     mov x0, x20
     bl _kcc_ir_emit
@@ -3618,9 +3695,10 @@ _kcc_ir_build_cast:
 .Lbc_done:
     mov x0, x21                  // return vreg
 
+    ldr x23, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #64
     ret
 @| _kcc_ir_build_cast
 @}
@@ -3800,6 +3878,35 @@ run_test "multi-var no init" \
 
 run_test "multi-var in loop" \
     "int main(void) { int s = 0; int i; for (i = 0; i < 3; i++) { int a = i, b = i + 1; s = s + a + b; } return s; }" 9
+@}
+
+@d Test: codegen unsigned @{
+echo ""
+echo "--- Unsigned and Extensions ---"
+
+run_test "unsigned modulo" \
+    "int main(void) { unsigned int a = 17; unsigned int b = 5; return a % b; }" 2
+
+run_test "unsigned divide" \
+    "int main(void) { unsigned int a = 100; unsigned int b = 7; return a / b; }" 14
+
+run_test "unsigned less-than true" \
+    "int main(void) { unsigned int a = 3; unsigned int b = 5; if (a < b) return 1; return 0; }" 1
+
+run_test "unsigned less-than false" \
+    "int main(void) { unsigned int a = 5; unsigned int b = 3; if (a < b) return 1; return 0; }" 0
+
+run_test "unsigned less-equal true" \
+    "int main(void) { unsigned int a = 5; unsigned int b = 5; if (a <= b) return 1; return 0; }" 1
+
+run_test "unsigned less-equal false" \
+    "int main(void) { unsigned int a = 6; unsigned int b = 5; if (a <= b) return 1; return 0; }" 0
+
+run_test "char to int sext" \
+    "int main(void) { char c = (char)200; int x = (int)c; if (x < 0) return 1; return 0; }" 1
+
+run_test "unsigned char to int zext" \
+    "int main(void) { unsigned char c = (unsigned char)200; int x = (int)c; return x - 200; }" 0
 @}
 
 \section{Building Control Flow}
@@ -4958,6 +5065,8 @@ _kcc_ir_op_cmp_slt:     .asciz "cmp_slt"
 _kcc_ir_op_cmp_sle:     .asciz "cmp_sle"
 _kcc_ir_op_cmp_sgt:     .asciz "cmp_sgt"
 _kcc_ir_op_cmp_sge:     .asciz "cmp_sge"
+_kcc_ir_op_cmp_ult:     .asciz "cmp_ult"
+_kcc_ir_op_cmp_ule:     .asciz "cmp_ule"
 _kcc_ir_op_load:        .asciz "load "
 _kcc_ir_op_store:       .asciz "store "
 _kcc_ir_op_alloca:      .asciz "alloca "
@@ -5027,6 +5136,8 @@ _kcc_ir_ty_unknown:     .asciz "?type"
 @| _kcc_ir_op_cmp_sle
 @| _kcc_ir_op_cmp_sgt
 @| _kcc_ir_op_cmp_sge
+@| _kcc_ir_op_cmp_ult
+@| _kcc_ir_op_cmp_ule
 @| _kcc_ir_op_load
 @| _kcc_ir_op_store
 @| _kcc_ir_op_alloca

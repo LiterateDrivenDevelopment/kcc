@@ -20,7 +20,8 @@ reports results in the same pass/fail format as the unit test harness.
 Individual test groups are defined alongside the features they exercise:
 constants and arithmetic in Chapter~\ref{ch:codegen}, local variables,
 control flow, switch statements, ternary expressions, sizeof, arrays,
-structs, multi-variable declarations, increment/decrement, compound
+structs, multi-variable declarations, unsigned operations and type
+extensions, increment/decrement, compound
 assignment, logical operators, function calls, pointers, and
 miscellaneous cases in
 Chapter~\ref{ch:ir-builder}.  This chapter provides the runner

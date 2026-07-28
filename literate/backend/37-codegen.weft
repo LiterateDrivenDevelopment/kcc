@@ -688,6 +688,8 @@ _kcc_codegen_instr:
     b.eq .Lcgi_udiv
     cmp x22, #IR_SMOD
     b.eq .Lcgi_smod
+    cmp x22, #IR_UMOD
+    b.eq .Lcgi_umod
     cmp x22, #IR_NEG
     b.eq .Lcgi_neg
 
@@ -718,6 +720,10 @@ _kcc_codegen_instr:
     b.eq .Lcgi_cmp_sgt
     cmp x22, #IR_CMP_SGE
     b.eq .Lcgi_cmp_sge
+    cmp x22, #IR_CMP_ULT
+    b.eq .Lcgi_cmp_ult
+    cmp x22, #IR_CMP_ULE
+    b.eq .Lcgi_cmp_ule
 
     cmp x22, #IR_LOAD
     b.eq .Lcgi_load
@@ -745,6 +751,10 @@ _kcc_codegen_instr:
     b.eq .Lcgi_trunc
     cmp x22, #IR_BITCAST
     b.eq .Lcgi_bitcast
+    cmp x22, #IR_SEXT
+    b.eq .Lcgi_sext
+    cmp x22, #IR_ZEXT
+    b.eq .Lcgi_zext
 
     // Unknown opcode: skip
     b .Lcgi_done
@@ -969,6 +979,37 @@ with logical-class encoders.
     bl _kcc_cg_store_vreg
     b .Lcgi_done
 
+.Lcgi_umod:
+    // UMOD: x11 = x9 - (x9/x10)*x10  → udiv x11,x9,x10; msub x11,x11,x10,x9
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    // udiv x11, x9, x10
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_udiv
+    bl _kcc_code_emit32
+
+    // msub x11, x11, x10, x9  (x11 = x9 - x11*x10)
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_DST
+    mov x2, #CG_REG_SRC2
+    mov x3, #CG_REG_SRC1
+    mov x4, #1
+    bl _kcc_enc_msub
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
 .Lcgi_neg:
     // NEG x11, x9 → SUB x11, xzr, x9
     ldr x0, [x19, #IR_SRC1]
@@ -1161,6 +1202,8 @@ IR opcode & ARM64 cond & Inverted \\
 \texttt{CMP\_SLE} & LE (13) & GT (12) \\
 \texttt{CMP\_SGT} & GT (12) & LE (13) \\
 \texttt{CMP\_SGE} & GE (10) & LT (11) \\
+\texttt{CMP\_ULT} & LO/CC (3) & HS/CS (2) \\
+\texttt{CMP\_ULE} & LS (9) & HI (8) \\
 \hline
 \end{tabular}
 \end{center}
@@ -1186,6 +1229,12 @@ IR opcode & ARM64 cond & Inverted \\
     b .Lcgi_cmp_common
 .Lcgi_cmp_sge:
     mov x23, #11                   // inv_cond for GE = LT (11)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_ult:
+    mov x23, #2                    // inv_cond for LO/CC = HS/CS (2)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_ule:
+    mov x23, #8                    // inv_cond for LS = HI (8)
     b .Lcgi_cmp_common
 
 .Lcgi_cmp_common:
@@ -1223,6 +1272,12 @@ The target's \texttt{TY\_SIZE} (1, 2, or~4 bytes) selects the mask;
 the handler loads the mask into \texttt{x10} and uses
 \texttt{AND\;x11,\;x9,\;x10}.  If no type is attached or the size
 is~8, the instruction is a plain copy.
+
+\texttt{IR\_SEXT} sign-extends a narrow value to 64~bits.  The source
+width is stored in \texttt{IR\_SRC2} (1, 2, or~4 bytes); the handler
+emits \textsc{sbfm} with the appropriate \texttt{imms} field (7, 15,
+or~31).  \texttt{IR\_ZEXT} zero-extends analogously using
+\textsc{ubfm}.
 
 \texttt{IR\_BITCAST} reinterprets the bit pattern as a different type
 without changing any bits---a no-op in the all-spill strategy.
@@ -1330,6 +1385,92 @@ without changing any bits---a no-op in the all-spill strategy.
     mov x1, #CG_REG_DST
     bl _kcc_cg_store_vreg
     b .Lcgi_done
+
+.Lcgi_sext:
+    // Sign-extend: SRC2 = source width in bytes
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    ldr x23, [x19, #IR_SRC2]      // source width
+    cmp x23, #1
+    b.eq .Lcgi_sext_1
+    cmp x23, #2
+    b.eq .Lcgi_sext_2
+    cmp x23, #4
+    b.eq .Lcgi_sext_4
+    b .Lcgi_sext_copy
+
+.Lcgi_sext_1:
+    // SXTB x11, x9 → SBFM x11, x9, #0, #7 = 0x93401D2B
+    movz w0, #0x1D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_sext_2:
+    // SXTH x11, x9 → SBFM x11, x9, #0, #15 = 0x93403D2B
+    movz w0, #0x3D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_sext_4:
+    // SXTW x11, x9 → SBFM x11, x9, #0, #31 = 0x93407D2B
+    movz w0, #0x7D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_sext_copy:
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+.Lcgi_sext_store:
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_zext:
+    // Zero-extend: SRC2 = source width in bytes
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    ldr x23, [x19, #IR_SRC2]
+    cmp x23, #1
+    b.eq .Lcgi_zext_1
+    cmp x23, #2
+    b.eq .Lcgi_zext_2
+    cmp x23, #4
+    b.eq .Lcgi_zext_4
+    b .Lcgi_sext_copy              // fallback: plain copy
+
+.Lcgi_zext_1:
+    // UXTB x11, x9 → UBFM x11, x9, #0, #7 = 0xD3401D2B
+    movz w0, #0x1D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_zext_2:
+    // UXTH x11, x9 → UBFM x11, x9, #0, #15 = 0xD3403D2B
+    movz w0, #0x3D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_zext_4:
+    // 32→64: UBFM x11, x9, #0, #31 = 0xD3407D2B
+    movz w0, #0x7D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
 @}
 
 \subsection{Memory Operations}

@@ -524,5 +524,6 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen sizeof@>
 @<Test: codegen arrays@>
 @<Test: codegen structs@>
+@<Test: codegen multi-var@>
 @<Test: codegen results@>
 @}

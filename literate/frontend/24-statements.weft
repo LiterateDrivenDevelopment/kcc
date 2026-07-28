@@ -375,7 +375,10 @@ _kcc_parse_expr_rest:
 
 A compound statement (\stdref{6.8.2}) is a brace-enclosed sequence of
 declarations and statements.  It introduces a new scope for typedef
-names.
+names.  When a declaration produces multiple nodes linked via
+\texttt{F4} (e.g.\ \texttt{int a=3, b=4;}), the appender walks the
+chain to find its tail so that the next item is linked after the last
+declarator rather than overwriting the chain.
 
 @d Stmt: parse compound @{
 // -- kcc_parse_compound ------------------------------------------------
@@ -444,19 +447,29 @@ _kcc_parse_compound:
     bl _kcc_parse_decl
 
 .Lcompound_append:
-    mov x22, x0                  // x22 = new item
+    mov x22, x0                  // x22 = new item (head)
     cbz x22, .Lcompound_loop    // skip null (error recovery)
+
+    // Walk to end of F4 chain (multi-declarator: int a,b;)
+    mov x0, x22
+.Lcompound_tail:
+    ldr x1, [x0, #AST_F4]
+    cbz x1, .Lcompound_tail_done
+    mov x0, x1
+    b .Lcompound_tail
+.Lcompound_tail_done:
+    // x22 = head, x0 = tail
 
     cbz x20, .Lcompound_first
 
-    // Append: last->F4 = new
+    // Append: last->F4 = head
     str x22, [x21, #AST_F4]
-    mov x21, x22
+    mov x21, x0                  // last = tail
     b .Lcompound_loop
 
 .Lcompound_first:
     mov x20, x22
-    mov x21, x22
+    mov x21, x0                  // last = tail
     b .Lcompound_loop
 
 .Lcompound_close:

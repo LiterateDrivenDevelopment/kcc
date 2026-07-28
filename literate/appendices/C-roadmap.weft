@@ -451,12 +451,14 @@ Mach-O with \texttt{LC\_BUILD\_VERSION}).
       lookup via AST field chain walk, \texttt{IR\_GEP} for member access.
       Fixed sema to register struct tags from \texttt{AST\_TYPE\_STRUCT}
       wrappers and to look up tags for forward references.
+\item[\checkmark] Multi-variable declarations (\texttt{int a=3, b=4;}):
+      compound-statement appender now walks the \texttt{F4} tail of
+      multi-declarator chains so that subsequent items link after the last
+      declarator instead of overwriting the chain.
 \end{itemize}
 
 \textbf{Next steps} (ordered by impact).
 \begin{enumerate}
-\item Multi-variable declarations (\texttt{int a=3, b=4;}): second
-      variable not allocated as a local.
 \item Missing codegen handlers for defined IR opcodes: \texttt{IR\_UMOD},
       \texttt{IR\_CMP\_ULT}, \texttt{IR\_CMP\_ULE}, \texttt{IR\_SEXT},
       \texttt{IR\_ZEXT}, \texttt{IR\_TRUNC}, \texttt{IR\_BITCAST}.

@@ -3679,6 +3679,35 @@ run_test "char literal" \
     "int main(void) { char c = 'A'; return c; }" 65
 @}
 
+\paragraph{Multi-variable declarations.}
+C allows several variables to share one set of declaration specifiers,
+separated by commas: \texttt{int a=3, b=4;}.  The parser links the
+declarators through \texttt{F4}; the compound-statement builder walks
+the chain to its tail so that subsequent items are appended correctly.
+
+@d Test: codegen multi-var @{
+echo ""
+echo "--- Multi-Variable Declarations ---"
+
+run_test "multi-var basic" \
+    "int main(void) { int a = 3, b = 4; return a + b; }" 7
+
+run_test "multi-var three" \
+    "int main(void) { int a = 1, b = 2, c = 3; return a + b + c; }" 6
+
+run_test "multi-var after stmt" \
+    "int main(void) { int x = 10; int a = 1, b = 2; return x + a + b; }" 13
+
+run_test "multi-var before stmt" \
+    "int main(void) { int a = 5, b = 6; int c = a + b; return c; }" 11
+
+run_test "multi-var no init" \
+    "int main(void) { int a = 7, b; b = 3; return a + b; }" 10
+
+run_test "multi-var in loop" \
+    "int main(void) { int s = 0; int i; for (i = 0; i < 3; i++) { int a = i, b = i + 1; s = s + a + b; } return s; }" 9
+@}
+
 \section{Building Control Flow}
 \label{sec:ir-control-flow}
 

@@ -258,6 +258,11 @@ After registration the checker pushes a scope for parameters and body,
 then checks the body statements.  Typedef declarations register
 \texttt{SYM\_TYPEDEF}.  Struct and union declarations register the
 tag in the tag namespace via \texttt{\_kcc\_symtab\_declare\_tag}.
+After creating the type descriptor, the checker counts the struct's
+fields and sets \texttt{TY\_SIZE} to $\mathit{nfields}\times 8$,
+matching the all-spill backend's slot size.  This size is essential
+for pointer subscript on struct pointers (\texttt{arr[i].x}), where
+the stride must equal the full struct width.
 Enum declarations register the tag and walk the enumerator list,
 assigning each constant an incrementing integer value.  The parser
 wraps standalone enum declarations in an \texttt{AST\_TYPE\_ENUM}
@@ -454,6 +459,19 @@ consecutive integer values starting from zero.
 
 .Lscd_tag_register:
     mov x21, x0                     // type
+
+    // Compute struct size: count fields * 8
+    ldr x1, [x19, #AST_F1]         // first field
+    mov x2, #0                      // field count
+.Lscd_count_fields:
+    cbz x1, .Lscd_set_size
+    add x2, x2, #1
+    ldr x1, [x1, #AST_F4]          // next field
+    b .Lscd_count_fields
+.Lscd_set_size:
+    lsl x2, x2, #3                 // nfields * 8
+    str x2, [x21, #TY_SIZE]
+
     mov x0, x22                     // name
     bl _kcc_strlen
     mov x1, x0

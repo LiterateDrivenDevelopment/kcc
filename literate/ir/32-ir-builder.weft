@@ -1924,7 +1924,21 @@ The address helper \texttt{\_kcc\_ir\_build\_member\_addr} looks up
 the struct variable's alloca vreg, emits \texttt{IR\_CONST} with
 the field index, and emits \texttt{IR\_GEP}.  It is shared by both
 the read path (\texttt{s.x} in expressions) and the write path
-(\texttt{s.x = v} in assignments).
+(\texttt{s.x = v} in assignments).  When the object is a
+subscript expression rather than a simple identifier---as in
+\texttt{arr[i].x}---the handler calls
+\texttt{\_kcc\_ir\_build\_subscript\_addr} to obtain the element's
+\emph{address} rather than \texttt{\_kcc\_ir\_build\_expr} which
+would dereference it.
+
+Arrow access (\texttt{p->x}) requires two adjustments.  First, the
+identifier path must emit an \texttt{IR\_LOAD} to read the pointer
+value stored in the local variable's alloca---the alloca holds the
+address of \texttt{p}, not of the struct.  Second, the type
+resolution must dereference through the pointer type: the object's
+\texttt{AST\_F3} is \texttt{TY\_PTR}; we follow \texttt{TY\_F0} to
+reach the underlying \texttt{TY\_STRUCT} so that the field-name
+walk produces the correct index.
 
 @d IR: build member @{
 // -- kcc_ir_build_member_addr ---------------------------------------------
@@ -1965,10 +1979,39 @@ _kcc_ir_build_member_addr:
     cbz x0, .Libma_expr
     bic x0, x0, #0x8000000000000000
     sub x20, x0, #1              // alloca vreg
+
+    // Arrow access: load the pointer value from the alloca
+    ldr x1, [x19, #AST_F2]
+    cbz x1, .Libma_find_index    // dot access → alloca IS struct base
+    // alloca holds a pointer — emit load to get the actual pointer
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]    // load from alloca
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0                  // now x20 = loaded pointer value
+    mov x0, x22
+    bl _kcc_ir_emit
     b .Libma_find_index
 
 .Libma_expr:
-    // Fallback: build the object expression as a pointer
+    // Non-identifier object: arrow uses value (pointer), dot+subscript uses address
+    ldr x0, [x19, #AST_F0]
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_SUBSCRIPT
+    b.ne .Libma_expr_val
+    ldr x1, [x19, #AST_F2]
+    cbnz x1, .Libma_expr_val     // arrow → value path
+    // dot + subscript: get element address, not value
+    bl _kcc_ir_build_subscript_addr
+    mov x20, x0
+    b .Libma_find_index
+.Libma_expr_val:
     ldr x0, [x19, #AST_F0]
     bl _kcc_ir_build_expr
     mov x20, x0                  // base vreg
@@ -1977,9 +2020,15 @@ _kcc_ir_build_member_addr:
     // Find field index by walking struct type's field list
     // Get struct type from sema (AST_F3 of object expression)
     ldr x0, [x19, #AST_F0]      // object node
-    ldr x0, [x0, #AST_F3]       // resolved type (TY_STRUCT)
+    ldr x0, [x0, #AST_F3]       // resolved type
     cbz x0, .Libma_index_zero
     ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Libma_check_struct
+    ldr x0, [x0, #TY_F0]        // arrow: follow pointer to struct type
+    cbz x0, .Libma_index_zero
+    ldr x1, [x0, #TY_KIND]
+.Libma_check_struct:
     cmp x1, #TY_STRUCT
     b.ne .Libma_index_zero
 
@@ -2117,6 +2166,21 @@ run_test "struct-independent" \
 
 run_test "struct-arithmetic" \
     "struct P { int x; int y; }; int main(void) { struct P p; p.x = 3; p.y = 4; return p.x * p.x + p.y * p.y; }" 25
+
+run_test "struct-ptr-subscript" \
+    "void *mmap(void*,long,int,int,int,long); struct S { int a; int b; }; int main(void) { struct S *p = (struct S*)mmap(0,4096,3,4098,-1,0); p[0].a=10; p[0].b=20; p[1].a=30; p[1].b=40; return p[0].a + p[1].b; }" 50
+
+run_test "struct-ptr-sub-loop" \
+    "void *mmap(void*,long,int,int,int,long); struct V { int x; int y; }; int main(void) { struct V *v = (struct V*)mmap(0,4096,3,4098,-1,0); v[0].x=1; v[1].x=2; v[2].x=3; int s=0; int i=0; while(i<3){s=s+v[i].x; i=i+1;} return s; }" 6
+
+run_test "struct-arrow-write-read" \
+    "struct S { int x; int y; }; void set(struct S *p) { p->x=10; p->y=20; } int main(void) { struct S s; set(&s); return s.x + s.y; }" 30
+
+run_test "struct-arrow-second-field" \
+    "struct S { int a; int b; int c; }; int get(struct S *p) { return p->c; } int main(void) { struct S s; s.a=1; s.b=2; s.c=3; return get(&s); }" 3
+
+run_test "struct-arrow-overwrite" \
+    "struct S { int x; int y; }; void f(struct S *p) { p->x=5; p->x=9; } int main(void) { struct S s; f(&s); return s.x; }" 9
 @}
 
 \subsection{Identifier (Variable Load)}
@@ -2275,11 +2339,12 @@ $\le 1$ (e.g.\ \texttt{char~*}), no scaling is needed.
 .globl _kcc_ir_build_binary
 .p2align 2
 _kcc_ir_build_binary:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
 
     mov x19, x0                  // AST node
     ldr x20, [x19, #AST_F0]     // op token code
@@ -2531,42 +2596,58 @@ _kcc_ir_build_binary:
 
 \paragraph{Short-circuit logical AND.}
 The C standard requires that \texttt{a \&\& b} evaluate \texttt{b}
-only when \texttt{a} is nonzero.  The builder creates two fresh basic
-blocks: \emph{rhs\_bb} and \emph{merge\_bb}.  It emits a conditional
-branch on the LHS vreg: true falls through to \emph{rhs\_bb} (which
-evaluates the RHS and branches to \emph{merge\_bb}), false jumps
-directly to \emph{merge\_bb}.  The returned vreg is the RHS result
----a simplification that avoids phi nodes (a full SSA compiler would
-merge both paths via a phi).
+only when \texttt{a} is nonzero.  The builder creates three fresh
+basic blocks: \emph{rhs\_bb}, \emph{short\_bb}, and
+\emph{merge\_bb}.  It allocates a temporary variable and emits a
+conditional branch on the LHS vreg: true falls through to
+\emph{rhs\_bb} (which evaluates the RHS, stores the result, and
+branches to \emph{merge\_bb}), false jumps to \emph{short\_bb}
+(which stores zero and branches to \emph{merge\_bb}).  The returned
+vreg is a load from the temporary, ensuring a defined value on
+both paths.
 
 The short-circuit \texttt{||} mirrors this logic with the branch
-targets swapped: a true LHS skips the RHS entirely.
+targets swapped and the short-circuit value set to one.
 
 @d IR: build binary @{
 // -- Short-circuit && ----------------------------------------------------
 .Libb_short_and:
+    // Allocate temporary for merge result
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x26, x0                  // x26 = tmp alloca vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
     // Evaluate LHS
     ldr x0, [x19, #AST_F1]
     bl _kcc_ir_build_expr
     mov x21, x0                  // lhs vreg
 
-    // Create BBs: rhs_bb, merge_bb
+    // Create BBs: rhs_bb, short_bb, merge_bb
     bl _kcc_ir_alloc_bb
     mov x22, x0                  // rhs_bb
     bl _kcc_ir_alloc_bb
-    mov x23, x0                  // merge_bb
+    mov x23, x0                  // short_bb
+    bl _kcc_ir_alloc_bb
+    mov x24, x0                  // merge_bb
 
-    // Emit br_cond: if lhs, goto rhs_bb, else goto merge_bb
+    // br_cond: if lhs, goto rhs_bb, else goto short_bb
     mov x0, #IR_BR_COND
     bl _kcc_ir_alloc_instr
-    str x21, [x0, #IR_DEST]     // condition
+    str x21, [x0, #IR_DEST]
     ldr x1, [x22, #BB_ID]
-    str x1, [x0, #IR_SRC1]      // true target
+    str x1, [x0, #IR_SRC1]      // true → rhs_bb
     ldr x1, [x23, #BB_ID]
-    str x1, [x0, #IR_SRC2]      // false target
+    str x1, [x0, #IR_SRC2]      // false → short_bb
     bl _kcc_ir_emit
-
-    // Mark current BB terminated
     adrp x0, _kcc_ir_cur_bb@@PAGE
     add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
     ldr x0, [x0]
@@ -2574,19 +2655,32 @@ targets swapped: a true LHS skips the RHS entirely.
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
-    // Switch to rhs_bb
-    mov x0, x22
+    // -- short_bb: store 0 to tmp, branch to merge --
+    mov x0, x23
     bl _kcc_ir_set_bb
-
-    // Evaluate RHS
-    ldr x0, [x19, #AST_F2]
-    bl _kcc_ir_build_expr
-    mov x24, x0                  // rhs vreg
-
-    // Branch to merge
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    str xzr, [x25, #IR_SRC1]    // constant 0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // zero vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+    // store zero to tmp alloca
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = 0
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
+    // branch to merge
     mov x0, #IR_BR
     bl _kcc_ir_alloc_instr
-    ldr x1, [x23, #BB_ID]
+    ldr x1, [x24, #BB_ID]
     str x1, [x0, #IR_SRC1]
     bl _kcc_ir_emit
     adrp x0, _kcc_ir_cur_bb@@PAGE
@@ -2596,34 +2690,88 @@ targets swapped: a true LHS skips the RHS entirely.
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
-    // Switch to merge_bb — result is the rhs vreg
-    // (simplified: a real compiler would use phi nodes)
-    mov x0, x23
+    // -- rhs_bb: evaluate RHS, store to tmp, branch to merge --
+    mov x0, x22
     bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // rhs vreg
+    // store rhs to tmp alloca
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = rhs
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
+    // branch to merge
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x24, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
 
-    mov x0, x24                  // return rhs vreg
+    // -- merge_bb: load result from tmp --
+    mov x0, x24
+    bl _kcc_ir_set_bb
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    str x26, [x25, #IR_SRC1]    // load from tmp alloca
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // result vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
+    mov x0, x21
     b .Libb_done
 
 // -- Short-circuit || ----------------------------------------------------
 .Libb_short_or:
+    // Allocate temporary for merge result
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x26, x0                  // x26 = tmp alloca vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
     // Evaluate LHS
     ldr x0, [x19, #AST_F1]
     bl _kcc_ir_build_expr
     mov x21, x0
 
+    // Create BBs: short_bb, rhs_bb, merge_bb
     bl _kcc_ir_alloc_bb
-    mov x22, x0                  // rhs_bb
+    mov x22, x0                  // short_bb (lhs true → skip rhs)
     bl _kcc_ir_alloc_bb
-    mov x23, x0                  // merge_bb
+    mov x23, x0                  // rhs_bb
+    bl _kcc_ir_alloc_bb
+    mov x24, x0                  // merge_bb
 
-    // br_cond: if lhs, goto merge_bb, else goto rhs_bb
+    // br_cond: if lhs, goto short_bb, else goto rhs_bb
     mov x0, #IR_BR_COND
     bl _kcc_ir_alloc_instr
     str x21, [x0, #IR_DEST]
-    ldr x1, [x23, #BB_ID]
-    str x1, [x0, #IR_SRC1]      // true → merge (short-circuit)
     ldr x1, [x22, #BB_ID]
-    str x1, [x0, #IR_SRC2]      // false → evaluate rhs
+    str x1, [x0, #IR_SRC1]      // true → short_bb
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → rhs_bb
     bl _kcc_ir_emit
     adrp x0, _kcc_ir_cur_bb@@PAGE
     add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
@@ -2632,16 +2780,31 @@ targets swapped: a true LHS skips the RHS entirely.
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
+    // -- short_bb: store 1 to tmp, branch to merge --
     mov x0, x22
     bl _kcc_ir_set_bb
-
-    ldr x0, [x19, #AST_F2]
-    bl _kcc_ir_build_expr
-    mov x24, x0
-
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    mov x1, #1
+    str x1, [x25, #IR_SRC1]     // constant 1
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // one vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = 1
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
     mov x0, #IR_BR
     bl _kcc_ir_alloc_instr
-    ldr x1, [x23, #BB_ID]
+    ldr x1, [x24, #BB_ID]
     str x1, [x0, #IR_SRC1]
     bl _kcc_ir_emit
     adrp x0, _kcc_ir_cur_bb@@PAGE
@@ -2651,17 +2814,55 @@ targets swapped: a true LHS skips the RHS entirely.
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
+    // -- rhs_bb: evaluate RHS, store to tmp, branch to merge --
     mov x0, x23
     bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x21, x0
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = rhs
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x24, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
 
+    // -- merge_bb: load result from tmp --
     mov x0, x24
+    bl _kcc_ir_set_bb
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    str x26, [x25, #IR_SRC1]    // load from tmp alloca
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // result vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
+    mov x0, x21
     b .Libb_done
 
 .Libb_done:
+    ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
 @}
 

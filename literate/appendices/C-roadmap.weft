@@ -660,19 +660,21 @@ milestones above).
 \begin{itemize}
 \item[\checkmark] Differential testing
       (Chapter~\ref{ch:differential-testing}, \texttt{just difftest}):
-      an 86-program corpus is compiled by both \kcc{} and \texttt{clang},
+      a 90-program corpus is compiled by both \kcc{} and \texttt{clang},
       run freestanding, and compared with \texttt{clang} as the oracle.
-      \kcc{} agrees on all 84 in-scope programs with zero
-      miscompilations; two expected divergences (multi-dimensional
-      arrays and \texttt{struct} return by value) are tracked without
-      failing the build.  The sweep drove a string of fixes---function
-      pointers in \texttt{struct} fields, 32-bit integer wraparound
+      \kcc{} agrees on all 89 in-scope programs with zero
+      miscompilations; a single expected divergence (\texttt{struct}
+      return by value, Stage~9b) is tracked without failing the build.
+      The sweep drove a string of fixes---function pointers in
+      \texttt{struct} fields, 32-bit integer wraparound
       (\texttt{\_kcc\_ir\_norm32}), enumerators with explicit values,
       \texttt{sizeof} of a whole array, the comma operator in a
       \texttt{for} clause \emph{and} labels in a compound (two distinct
       callee-saved-register bugs, in \texttt{parse\_expr} and
-      \texttt{parse\_stmt}), pointer difference, and \texttt{goto}/labels
-      lowered end to end (\S\ref{sec:ir-goto}).  The harness needs no
+      \texttt{parse\_stmt}), pointer difference, \texttt{goto}/labels
+      lowered end to end (\S\ref{sec:ir-goto}), and multi-dimensional
+      arrays laid out flat with a recursive slot count
+      (\texttt{\_kcc\_ir\_type\_slots}).  The harness needs no
       hand-computed expected values, so it scales to programs far more
       complex than the code-generation suite's.
 \item Bootstrap test: write a minimal C compiler (or expression

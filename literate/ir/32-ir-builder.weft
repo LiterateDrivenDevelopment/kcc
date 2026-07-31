@@ -2129,6 +2129,54 @@ symbol table for the pre-decay type (\texttt{TY\_ARRAY}), emits a
 \texttt{GLOBAL\_REF}, and feeds the resulting address vreg into the
 GEP index path.
 
+\paragraph{Slots per type.}
+The all-spill model gives every scalar element its own eight-byte slot,
+so a multi-dimensional array \texttt{int a[3][3]} is nine consecutive
+slots, and \texttt{a[i]} names a three-slot sub-array.
+\texttt{\_kcc\_ir\_type\_slots} counts the slots a type occupies:
+\texttt{length}\,$\times$\,slots(element) for an array (recursively),
+one for a scalar that fits a slot, and $\lceil\mathrm{size}/8\rceil$ for
+a larger aggregate.  This one figure both sizes an array's alloca and
+scales a subscript index---for \texttt{a[i]} the step is the sub-array's
+slot count (three), for \texttt{a[i][j]} it is one.
+
+@d IR: build subscript @{
+// -- kcc_ir_type_slots ----------------------------------------------------
+// uint64_t kcc_ir_type_slots(type_desc *ty)
+//   Number of 8-byte all-spill slots a value of this type occupies.
+.text
+.globl _kcc_ir_type_slots
+.p2align 2
+_kcc_ir_type_slots:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    cbz x0, .Lts_one
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.eq .Lts_array
+    ldr x1, [x0, #TY_SIZE]
+    cmp x1, #8
+    b.le .Lts_one
+    add x1, x1, #7
+    lsr x0, x1, #3               // ceil(size / 8)
+    b .Lts_done
+.Lts_one:
+    mov x0, #1
+    b .Lts_done
+.Lts_array:
+    mov x19, x0
+    ldr x20, [x19, #TY_F1]       // length
+    ldr x0, [x19, #TY_F0]        // element type
+    bl _kcc_ir_type_slots
+    mul x0, x0, x20              // length * slots(element)
+.Lts_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_type_slots
+@}
+
 @d IR: build subscript @{
 // -- kcc_ir_build_subscript_addr ------------------------------------------
 // uint64_t kcc_ir_build_subscript_addr(node *subscript)
@@ -2146,9 +2194,11 @@ _kcc_ir_build_subscript_addr:
 
     mov x19, x0                  // x19 = subscript node
 
-    // Get base expression — check if it's a local identifier
+    // Get base expression — check its shape
     ldr x0, [x19, #AST_F0]      // array/pointer expression
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Libsa_nested_base
     cmp x1, #AST_IDENT_EXPR
     b.ne .Libsa_expr
 
@@ -2173,6 +2223,14 @@ _kcc_ir_build_subscript_addr:
 
 .Libsa_ptr_local:
     b .Libsa_ptr
+
+.Libsa_nested_base:
+    // base is a[i] of a multi-dimensional array: its ADDRESS is the sub-array
+    // base (contiguous), so recurse for the address rather than loading it.
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_subscript_addr
+    mov x20, x0
+    b .Libsa_index
 
 .Libsa_expr:
     // Check if base is a global array (needs global_ref + GEP,
@@ -2218,16 +2276,14 @@ _kcc_ir_build_subscript_addr:
     bl _kcc_ir_build_expr
     mov x21, x0                  // index vreg
 
-    // For struct arrays (element size > 8), scale the index so
-    // that GEP stride 8 yields the correct byte offset.
+    // Scale the index by the element's slot count so GEP's fixed stride 8
+    // lands on the right slot (struct elements and sub-arrays span >1 slot).
     ldr x0, [x19, #AST_F3]      // subscript result type (element type)
     cbz x0, .Libsa_gep
-    ldr x22, [x0, #TY_SIZE]
-    cmp x22, #8
-    b.le .Libsa_gep
-
-    // scale factor = element_size / 8
-    lsr x22, x22, #3
+    bl _kcc_ir_type_slots       // x0 = slots(element)
+    mov x22, x0
+    cmp x22, #1
+    b.le .Libsa_gep             // one slot: no scaling
 
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
@@ -2443,6 +2499,15 @@ run_test "array-loop-fill" \
 
 run_test "array-sum-loop" \
     "int main(void) { int a[4]; a[0]=1; a[1]=2; a[2]=3; a[3]=4; int s=0; int i=0; while(i<4){s=s+a[i];i=i+1;} return s; }" 10
+
+run_test "array-2d" \
+    "int main(void) { int a[3][3]; int i; int j; for (i=0;i<3;i=i+1) for (j=0;j<3;j=j+1) a[i][j]=i*3+j; return a[2][2]; }" 8
+
+run_test "array-2d-rows" \
+    "int main(void) { int a[4][2]; int i; for (i=0;i<4;i=i+1) { a[i][0]=i; a[i][1]=i*i; } return a[3][0]+a[3][1]; }" 12
+
+run_test "array-3d" \
+    "int main(void) { int a[2][2][2]; a[1][1][1]=42; a[0][1][0]=5; return a[1][1][1]+a[0][1][0]; }" 47
 
 echo ""
 echo "--- Pointer Subscript ---"
@@ -5888,13 +5953,12 @@ _kcc_ir_build_var_decl:
     bl _kcc_ir_initlist_count
     mov x24, x0
 .Libvd_array_scale:
-    mov x21, x22                // x21 = element type
+    mov x21, x22                // x21 = element type (for the alloca's IR_TYPE)
     cbz x24, .Libvd_emit_alloca
-    // Multi-slot elements (structs): multiply length by slots per element
-    ldr x0, [x21, #TY_SIZE]
-    cmp x0, #8
-    b.le .Libvd_emit_alloca
-    lsr x0, x0, #3              // slots_per_element = TY_SIZE / 8
+    // total slots = length * slots(element) — recursive, so nested arrays
+    // (int a[3][3]) get all 9 slots, structs their field count, etc.
+    mov x0, x22                 // element type
+    bl _kcc_ir_type_slots
     mul x24, x24, x0
     b .Libvd_emit_alloca
 

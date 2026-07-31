@@ -76,6 +76,11 @@ selfhost-lexer: build
     chmod +x tmp/selfhost/lexer_verify.sh
     tmp/selfhost/lexer_verify.sh
 
+# Differential tests: compile each program with kcc AND clang, compare exit codes
+difftest: build
+    chmod +x tmp/tests/difftest.sh
+    tmp/tests/difftest.sh
+
 # Code generation tests: compile C programs with kcc, link, run, check exit codes
 test-codegen: build
     chmod +x tmp/tests/test_codegen.sh

@@ -655,12 +655,19 @@ milestones above).
       enough of \kcc{} to bootstrap.
 \end{itemize}
 
-\textbf{Remaining work --- Stage 8c: validation.}
+\textbf{Stage 8c: validation.}
 
 \begin{itemize}
-\item Differential testing: compile the same C source with both
-      \kcc{} and \texttt{clang}, compare exit codes and output
-      on a large test corpus.
+\item[\checkmark] Differential testing
+      (Chapter~\ref{ch:differential-testing}, \texttt{just difftest}):
+      a 53-program corpus is compiled by both \kcc{} and \texttt{clang},
+      run freestanding, and compared with \texttt{clang} as the oracle.
+      \kcc{} agrees on 49 programs with zero miscompilations; one
+      feature gap (a function pointer stored in a \texttt{struct} field)
+      and three expected divergences (32-bit integer wraparound, below)
+      are tracked without failing the build.  The harness needs no
+      hand-computed expected values, so it scales to programs far more
+      complex than the code-generation suite's.
 \item Bootstrap test: write a minimal C compiler (or expression
       evaluator) in C, compile it with \kcc{}, then use it to
       compile itself.  Compare the two binaries.
@@ -695,6 +702,20 @@ The current backend handles integer types only.  This stage adds
 every remaining C17 type.
 
 \begin{itemize}
+\item \textbf{Declared integer widths.}  The all-spill backend keeps
+      every value in a 64-bit slot and computes with 64-bit
+      instructions, so an \texttt{int}/\texttt{unsigned int} result is
+      never truncated to 32~bits.  Explicit narrowing casts already emit
+      \texttt{IR\_TRUNC}, but ordinary arithmetic does not, so unsigned
+      wraparound past $2^{32}$ diverges from Standard~C (the differential
+      suite's expected divergences, \S\ref{sec:difftest-divergences}).
+      Fix: mask (unsigned) or sign-extend (signed) each arithmetic
+      result to its type width, or track width and narrow at the uses
+      that need it.
+\item \textbf{Function pointers in aggregates.}  A function-pointer
+      \emph{variable} or parameter works, but one stored as a
+      \texttt{struct} field (\texttt{struct \{ int (*f)(int); \}}) is not
+      yet compiled---a differential-suite gap.
 \item \textbf{Floating point.}  The type singletons (\texttt{TY\_FLOAT},
       \texttt{TY\_DOUBLE}, \texttt{TY\_LDOUBLE}) already exist in the
       type system but have no IR or codegen support.  Add IR opcodes

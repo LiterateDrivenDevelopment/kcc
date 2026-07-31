@@ -579,3 +579,20 @@ self-test, and diff against clang:
 @o tmp/selfhost/lexer_verify.sh @{
 @<Selfhost: lexer verify@>
 @}
+
+% ── Differential testing against clang ───────────────────────────────
+
+\noindent\textbf{difftest.sh} --- compile each program with \kcc{} and
+\texttt{clang}, run both, compare (Chapter~\ref{ch:differential-testing}):
+
+@o tmp/tests/difftest.sh @{
+@<Difftest: runner@>
+@<Difftest: arithmetic@>
+@<Difftest: control@>
+@<Difftest: functions@>
+@<Difftest: aggregates@>
+@<Difftest: operators@>
+@<Difftest: combinations@>
+@<Difftest: divergences@>
+@<Difftest: results@>
+@}

@@ -251,6 +251,22 @@ difftest "matrix-multiply" \
     "int main(void){ int a[2][2]; int b[2][2]; a[0][0]=1; a[0][1]=2; a[1][0]=3; a[1][1]=4; b[0][0]=5; b[0][1]=6; b[1][0]=7; b[1][1]=8; int c = a[0][0]*b[0][0] + a[0][1]*b[1][0]; return c; }"
 difftest "sizeof-2d-array" \
     "int main(void){ int a[3][4]; return (int)(sizeof(a) / sizeof(a[0][0])); }"
+difftest "sret-basic" \
+    "struct P { int x; int y; }; struct P make(int a, int b){ struct P p; p.x = a; p.y = b; return p; } int main(void){ struct P q = make(15, 27); return q.x + q.y; }"
+difftest "sret-zero-arg" \
+    "struct P { int x; int y; }; struct P make(void){ struct P p; p.x = 10; p.y = 20; return p; } int main(void){ struct P q = make(); return q.x + q.y; }"
+difftest "sret-three-fields" \
+    "struct P { int a; int b; int c; }; struct P make(void){ struct P p; p.a = 1; p.b = 2; p.c = 3; return p; } int main(void){ struct P q = make(); return q.a + q.b + q.c; }"
+difftest "sret-assign" \
+    "struct P { int x; int y; }; struct P make(int a){ struct P p; p.x = a; p.y = a * 2; return p; } int main(void){ struct P q; q = make(7); return q.x + q.y; }"
+difftest "sret-assign-global" \
+    "struct P { int x; int y; }; struct P g; struct P make(int a){ struct P p; p.x = a; p.y = a * 3; return p; } int main(void){ g = make(5); return g.x + g.y; }"
+difftest "sret-member-of-temp" \
+    "struct P { int x; int y; }; struct P make(void){ struct P p; p.x = 5; p.y = 9; return p; } int main(void){ return make().y; }"
+difftest "sret-passthrough" \
+    "struct P { int x; int y; }; struct P mk(int a){ struct P p; p.x = a; p.y = a + 1; return p; } struct P wrap(int a){ return mk(a); } int main(void){ struct P q = wrap(20); return q.x + q.y; }"
+difftest "sret-five-args" \
+    "struct P { int x; int y; }; struct P make(int a, int b, int c, int d, int e){ struct P p; p.x = a + b + c; p.y = d + e; return p; } int main(void){ struct P q = make(1, 2, 3, 4, 5); return q.x + q.y; }"
 @}
 
 \section{Operators and Edge Cases}
@@ -439,20 +455,20 @@ difftest "ptr-arith-untouched" \
 \section{Known Divergences}
 \label{sec:difftest-gaps}
 
-One construct the sweep exposed remains open: a \texttt{struct} returned
-\emph{by value} is not marshalled per the ABI (Stage~9b).  It is
-reported without failing the build; an \texttt{XPASS} would signal it
-has been implemented---as \texttt{goto} (\S\ref{sec:ir-goto}) and
-multi-dimensional arrays (\S\ref{sec:ir-subscript}) both did once
-lowered, after which they graduated to real tests above.
+The sweep's last open construct---a \texttt{struct} returned \emph{by
+value}---has now been lowered (\S\ref{sec:struct-return}) and graduated
+to the real \texttt{sret-*} tests above, following the same path
+\texttt{goto} (\S\ref{sec:ir-goto}) and multi-dimensional arrays
+(\S\ref{sec:ir-subscript}) took once implemented.  No expected
+divergence remains: every program the corpus exercises either agrees
+with clang or is an honest feature gap that \kcc{} refuses to compile.
+The \texttt{difftest\_xfail} harness stays in place so the next
+discovered divergence has a home.
 
 @d Difftest: gaps @{
 echo ""
 echo "--- Known Divergences (Stage 9 features) ---"
-
-difftest_xfail "struct-by-value-return" \
-    "struct P { int x; int y; }; struct P make(int a, int b){ struct P p; p.x = a; p.y = b; return p; } int main(void){ struct P p = make(15, 27); return p.x + p.y; }" \
-    "struct return by value (Stage 9b)"
+echo "  (none — the struct return-by-value divergence has been resolved)"
 @}
 
 \section{Results}

@@ -660,23 +660,24 @@ milestones above).
 \begin{itemize}
 \item[\checkmark] Differential testing
       (Chapter~\ref{ch:differential-testing}, \texttt{just difftest}):
-      a 90-program corpus is compiled by both \kcc{} and \texttt{clang},
+      a 97-program corpus is compiled by both \kcc{} and \texttt{clang},
       run freestanding, and compared with \texttt{clang} as the oracle.
-      \kcc{} agrees on all 89 in-scope programs with zero
-      miscompilations; a single expected divergence (\texttt{struct}
-      return by value, Stage~9b) is tracked without failing the build.
-      The sweep drove a string of fixes---function pointers in
-      \texttt{struct} fields, 32-bit integer wraparound
-      (\texttt{\_kcc\_ir\_norm32}), enumerators with explicit values,
-      \texttt{sizeof} of a whole array, the comma operator in a
-      \texttt{for} clause \emph{and} labels in a compound (two distinct
-      callee-saved-register bugs, in \texttt{parse\_expr} and
-      \texttt{parse\_stmt}), pointer difference, \texttt{goto}/labels
-      lowered end to end (\S\ref{sec:ir-goto}), and multi-dimensional
+      \kcc{} agrees on every program with zero miscompilations and no
+      remaining expected divergence.  The sweep drove a string of
+      fixes---function pointers in \texttt{struct} fields, 32-bit
+      integer wraparound (\texttt{\_kcc\_ir\_norm32}), enumerators with
+      explicit values, \texttt{sizeof} of a whole array, the comma
+      operator in a \texttt{for} clause \emph{and} labels in a compound
+      (two distinct callee-saved-register bugs, in \texttt{parse\_expr}
+      and \texttt{parse\_stmt}), pointer difference, \texttt{goto}/labels
+      lowered end to end (\S\ref{sec:ir-goto}), multi-dimensional
       arrays laid out flat with a recursive slot count
-      (\texttt{\_kcc\_ir\_type\_slots}).  The harness needs no
-      hand-computed expected values, so it scales to programs far more
-      complex than the code-generation suite's.
+      (\texttt{\_kcc\_ir\_type\_slots}), and---last of the sweep's
+      open constructs---\texttt{struct} return by value via a hidden
+      result pointer (\S\ref{sec:struct-return}), which uncovered a
+      latent \texttt{(void)}-parameter miscount along the way.  The
+      harness needs no hand-computed expected values, so it scales to
+      programs far more complex than the code-generation suite's.
 \item Bootstrap test: write a minimal C compiler (or expression
       evaluator) in C, compile it with \kcc{}, then use it to
       compile itself.  Compare the two binaries.
@@ -764,13 +765,23 @@ This stage makes \kcc{} fully AAPCS64-compliant.
       integer or~8 floating-point arguments, excess arguments
       must be pushed to the stack in right-to-left order with
       natural alignment.
-\item \textbf{Struct pass/return by value.}  Small structs
-      (${\le}16$~bytes) are passed in registers (packed into
-      \texttt{x0}--\texttt{x1} or \texttt{d0}--\texttt{d1}
-      for homogeneous FP aggregates).  Larger structs are passed
-      by pointer with an implicit copy.  Return values follow
-      the same rule; oversized returns use an \texttt{x8}
-      result-location pointer.
+\item[\checkmark] \textbf{Struct return by value.}  Implemented
+      (\S\ref{sec:struct-return}) with a \emph{hidden result pointer}:
+      the caller allocates the destination and passes its address as
+      a trailing argument; the callee copies the aggregate there and
+      returns \texttt{void}.  Because \kcc{} lays every struct field
+      in its own 8-byte slot, this one convention covers structs of
+      any size uniformly (rather than packing ${\le}16$-byte structs
+      into \texttt{x0}--\texttt{x1}), and it is self-consistent for
+      \kcc{}-to-\kcc{} calls, which is all the corpus requires.  A
+      later refinement can adopt the exact AAPCS64 register-packing
+      and \texttt{x8} rules for interoperation with \texttt{clang}
+      object files.
+\item \textbf{Struct pass by value.}  A struct \emph{argument}
+      (as opposed to a return) is still passed as a single slot.
+      Small structs (${\le}16$~bytes) should be packed into
+      \texttt{x0}--\texttt{x1}; larger ones passed by pointer with an
+      implicit copy.
 \item \textbf{Variadic function definitions.}  The current
       compiler can \emph{call} variadic functions (\texttt{printf})
       but cannot \emph{define} them.  Implement

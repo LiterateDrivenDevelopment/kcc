@@ -869,6 +869,14 @@ materialises the address, the initializer expression produces a value
 vreg, and an \texttt{IR\_STORE} writes it.  This runs before any user
 statements in \texttt{main}.
 
+A brace-enclosed initializer for a file-scope array
+(\texttt{int t[3] = \{7, 8, 9\}}) is lowered the same way, one
+\texttt{\_kcc\_ir\_emit\_indexed\_store} per element against the single
+\texttt{IR\_GLOBAL\_REF} base.  Because BSS is already zero, a short
+list needs no explicit tail fill: the unmentioned elements retain
+their zero image.  These global tables are exactly the lookup tables a
+self-hosted lexer relies on.
+
 @d IR: build @{
 // -- kcc_ir_emit_global_inits --------------------------------------------
 // void kcc_ir_emit_global_inits(void)
@@ -917,6 +925,12 @@ _kcc_ir_emit_global_inits:
     mov x0, x21
     bl _kcc_ir_emit
 
+    // Aggregate initializer? (BSS is already zero, so only write given elems)
+    ldr x0, [x19, #AST_F2]
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.eq .Legi_initlist
+
     // Build the initializer expression
     ldr x0, [x19, #AST_F2]
     bl _kcc_ir_build_expr
@@ -932,6 +946,25 @@ _kcc_ir_emit_global_inits:
     str x21, [x0, #IR_SRC1]     // value
     str x22, [x0, #IR_SRC2]     // address
     bl _kcc_ir_emit
+    b .Legi_next
+
+.Legi_initlist:
+    ldr x20, [x0, #AST_F0]      // first element (name no longer needed)
+    mov x21, #0                  // element index
+.Legi_il_loop:
+    cbz x20, .Legi_next
+    mov x0, x20
+    bl _kcc_ir_build_expr
+    mov x2, x0                   // value
+    mov x0, x22                  // base = global address vreg
+    mov x1, x21                  // index
+    adrp x3, _kcc_type_int_s@@PAGE
+    add  x3, x3, _kcc_type_int_s@@PAGEOFF
+    ldr x3, [x3]
+    bl _kcc_ir_emit_indexed_store
+    add x21, x21, #1
+    ldr x20, [x20, #AST_F4]      // next element
+    b .Legi_il_loop
 
 .Legi_next:
     ldr x19, [x19, #AST_F4]     // next sibling
@@ -4987,6 +5020,122 @@ _kcc_ir_emit_struct_copy:
 @| _kcc_ir_emit_struct_copy
 @}
 
+\paragraph{Aggregate initializer lists.}
+A brace-enclosed initializer such as \texttt{int a[3] = \{10, 20, 30\}}
+or \texttt{struct P p = \{3, 4\}} is parsed into an
+\texttt{AST\_INIT\_LIST} whose elements hang off \texttt{F0} and chain
+through \texttt{F4}.  In the all-spill model an array element and a
+struct field alike occupy one eight-byte slot at their ordinal
+position, so a single loop lowers both aggregate kinds: element~$i$ of
+the list is written to slot~$i$ of the destination.  Two small helpers
+support this.  \texttt{\_kcc\_ir\_initlist\_count} counts the top-level
+elements---used to size an implicitly-bounded array
+(\texttt{int a[] = \{\ldots\}}), whose length the declarator leaves
+unspecified.  \texttt{\_kcc\_ir\_emit\_indexed\_store} emits the
+\texttt{IR\_CONST$+$IR\_GEP$+$IR\_STORE} triple that places one value
+at a given index, factoring the register juggling out of the
+declaration builder's loop.  The stride is the eight-byte slot, so
+these writes are read back correctly by the subscript
+(\S\ref{sec:ir-subscript}) and member-access lowerings.
+
+When a list is shorter than the aggregate (\texttt{int a[4] = \{5,
+6\}}), \stdref{6.7.9} requires the unmentioned elements to be
+initialised as if they had static storage duration---that is, to
+zero.  The builder therefore records the total slot count when it
+sizes the alloca and, after the provided values are placed, stores a
+single reused zero constant into every remaining slot.  Nested
+aggregates and designated initializers (\texttt{[i] =}, \texttt{.f =})
+are not yet handled; the elements are taken positionally.  String
+initialisers for character arrays (\texttt{char s[] = "abc"}) remain
+pending.  File-scope aggregates take the same positional shape but are
+seeded by \texttt{\_kcc\_ir\_emit\_global\_inits} rather than here.
+
+@d IR: aggregate init helpers @{
+// -- kcc_ir_initlist_count ------------------------------------------------
+// uint64_t kcc_ir_initlist_count(node *init_list)
+//   x0 = AST_INIT_LIST node → count of top-level elements (F0 chained via F4)
+.text
+.globl _kcc_ir_initlist_count
+.p2align 2
+_kcc_ir_initlist_count:
+    ldr x0, [x0, #AST_F0]       // first element
+    mov x1, #0
+.Lilc_loop:
+    cbz x0, .Lilc_done
+    add x1, x1, #1
+    ldr x0, [x0, #AST_F4]
+    b .Lilc_loop
+.Lilc_done:
+    mov x0, x1
+    ret
+
+// -- kcc_ir_emit_indexed_store --------------------------------------------
+// void kcc_ir_emit_indexed_store(base_vreg, index, value_vreg, type *ty)
+//   x0 = base alloca vreg, x1 = element index, x2 = value vreg, x3 = store type
+// Emits IR_CONST(index) + IR_GEP(base,index) + IR_STORE(value,addr).
+.text
+.globl _kcc_ir_emit_indexed_store
+.p2align 2
+_kcc_ir_emit_indexed_store:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // base vreg
+    mov x20, x1                  // index
+    mov x21, x2                  // value vreg
+    mov x22, x3                  // store type
+
+    // IR_CONST index
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x20, [x23, #IR_SRC1]     // const value = index
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x20, x0                  // x20 = index vreg
+    mov x0, x23
+    bl _kcc_ir_emit
+
+    // IR_GEP base + index
+    mov x0, #IR_GEP
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x19, [x23, #IR_SRC1]     // base pointer
+    str x20, [x23, #IR_SRC2]     // index vreg
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x20, x0                  // x20 = element address vreg
+    mov x0, x23
+    bl _kcc_ir_emit
+
+    // IR_STORE value -> element address
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]      // value
+    str x20, [x0, #IR_SRC2]      // address
+    bl _kcc_ir_emit
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_initlist_count
+@| _kcc_ir_emit_indexed_store
+@}
+
 @d IR: build var decl @{
 // -- kcc_ir_build_var_decl ------------------------------------------------
 // void kcc_ir_build_var_decl(node *decl)
@@ -5036,9 +5185,20 @@ _kcc_ir_build_var_decl:
     b .Libvd_emit_alloca
 
 .Libvd_array:
-    ldr x24, [x21, #TY_F1]      // array length
+    ldr x24, [x21, #TY_F1]      // array length (0 if unspecified: int a[])
+    ldr x22, [x21, #TY_F0]      // element type
+    cbnz x24, .Libvd_array_scale
+    // Implicit size — infer length from the initializer list element count
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libvd_array_scale
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.ne .Libvd_array_scale
+    bl _kcc_ir_initlist_count
+    mov x24, x0
+.Libvd_array_scale:
+    mov x21, x22                // x21 = element type
     cbz x24, .Libvd_emit_alloca
-    ldr x21, [x21, #TY_F0]      // element type
     // Multi-slot elements (structs): multiply length by slots per element
     ldr x0, [x21, #TY_SIZE]
     cmp x0, #8
@@ -5056,6 +5216,8 @@ _kcc_ir_build_var_decl:
     mov x24, #1                  // at least 1 slot
 
 .Libvd_emit_alloca:
+    str x24, [sp, #72]          // total slot count (for init-list zero-fill)
+
     // Emit alloca — SRC1 = slot count
     mov x0, #IR_ALLOCA
     bl _kcc_ir_alloc_instr
@@ -5086,6 +5248,11 @@ _kcc_ir_build_var_decl:
     // Check for initializer (x19 = decl node, still valid)
     ldr x0, [x19, #AST_F2]      // init expr
     cbz x0, .Libvd_done
+
+    // Brace-enclosed aggregate initializer (arrays and flat structs)
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.eq .Libvd_initlist
 
     // Struct types need field-by-field copy
     ldr x1, [x21, #TY_KIND]
@@ -5175,6 +5342,54 @@ _kcc_ir_build_var_decl:
     str x24, [x0, #IR_SRC1]
     str x23, [x0, #IR_SRC2]
     bl _kcc_ir_emit
+    b .Libvd_done
+
+.Libvd_initlist:
+    // x0 = AST_INIT_LIST; x21 = element/aggregate type; x23 = base alloca vreg
+    ldr x20, [x0, #AST_F0]      // first element (name no longer needed in x20)
+    mov x22, #0                  // element index
+.Libvd_il_loop:
+    cbz x20, .Libvd_il_zerofill
+    mov x0, x20
+    bl _kcc_ir_build_expr        // element value vreg
+    mov x2, x0                   // value
+    mov x0, x23                  // base
+    mov x1, x22                  // index
+    mov x3, x21                  // store type
+    bl _kcc_ir_emit_indexed_store
+    add x22, x22, #1
+    ldr x20, [x20, #AST_F4]      // next element
+    b .Libvd_il_loop
+
+.Libvd_il_zerofill:
+    ldr x24, [sp, #72]          // total slot count
+    cmp x22, x24
+    b.ge .Libvd_done
+
+    // reusable zero constant for the remaining slots
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x19, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x19, #IR_TYPE]
+    str xzr, [x19, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // x20 = zero value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+.Libvd_il_zf_loop:
+    cmp x22, x24
+    b.ge .Libvd_done
+    mov x0, x23                  // base
+    mov x1, x22                  // index
+    mov x2, x20                  // zero value
+    mov x3, x21                  // store type
+    bl _kcc_ir_emit_indexed_store
+    add x22, x22, #1
+    b .Libvd_il_zf_loop
 
 .Libvd_done:
     ldp x23, x24, [sp, #48]
@@ -6518,6 +6733,44 @@ run_test "ptrarr-param" \
 
 run_test "charpp-argv-like" \
     "int slen(char*s){int n=0; while(s[n]) n=n+1; return n;} int main(void){ char *words[2]; words[0]=\"hi\"; words[1]=\"abc\"; char **w=words; return slen(w[1]); }" 3
+@}
+
+\subsection{Initializer Lists}
+
+Brace-enclosed initializers seed an aggregate positionally, one value
+per eight-byte slot.  The tests below cover explicit and implicit
+array bounds, a short list whose tail must zero-fill
+(\S\ref{sec:ir-subscript} reads the same slots back), flat struct
+initialization, and a file-scope lookup table---the shape a
+self-hosted lexer's character-class tables take.
+
+@d Test: codegen init lists @{
+echo ""
+echo "--- Initializer Lists ---"
+
+run_test "initlist-array-explicit" \
+    "int main(void){ int a[3]={10,20,30}; return a[0]+a[1]+a[2]; }" 60
+
+run_test "initlist-array-implicit" \
+    "int main(void){ int a[]={4,5,6,7}; return a[3]; }" 7
+
+run_test "initlist-array-partial-zero" \
+    "int main(void){ int a[4]={5,6}; return a[0]+a[1]+a[2]+a[3]; }" 11
+
+run_test "initlist-array-index-loop" \
+    "int main(void){ int a[5]={2,4,6,8,10}; int s=0; int i=0; while(i<5){s=s+a[i]; i=i+1;} return s; }" 30
+
+run_test "initlist-struct-flat" \
+    "struct P{int x;int y;}; int main(void){ struct P p={3,4}; return p.x+p.y; }" 7
+
+run_test "initlist-struct-partial-zero" \
+    "struct P{int x;int y;int z;}; int main(void){ struct P p={3,4}; return p.x+p.y+p.z; }" 7
+
+run_test "initlist-global-table" \
+    "int t[4]={7,8,9,10}; int main(void){ return t[1]+t[3]; }" 18
+
+run_test "initlist-global-lut" \
+    "int digit[10]={0,1,2,3,4,5,6,7,8,9}; int main(void){ int s=0; int i=0; while(i<10){s=s+digit[i]; i=i+1;} return s; }" 45
 @}
 
 The final test group assembles several patterns from the self-hosting

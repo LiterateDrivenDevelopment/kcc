@@ -382,6 +382,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build conditional@>
 @<IR: build cast@>
 @<IR: struct copy helper@>
+@<IR: aggregate init helpers@>
 @<IR: build var decl@>
 @<IR: build if@>
 @<IR: build while@>
@@ -538,6 +539,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen global init@>
 @<Test: codegen ptr arithmetic@>
 @<Test: codegen pointer arrays@>
+@<Test: codegen init lists@>
 @<Test: codegen self-hosting@>
 @<Test: codegen fnptr@>
 @<Test: codegen results@>

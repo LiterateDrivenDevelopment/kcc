@@ -504,13 +504,14 @@ itself.
       construction and ARM64 systems programming.
 \end{enumerate}
 
-\textbf{Status.}  Stage~8a in progress.  177 codegen tests passing.
+\textbf{Status.}  Stage~8a in progress.  185 codegen tests passing.
 The compiler handles integer arithmetic, control flow, loops,
 function calls (direct and indirect), structs (nested, arrays),
-pointers, pointer-to-pointer and arrays of pointers, arrays, global
-variables, enums, switch/case, sizeof, character literals, string
-literals, void functions, forward-declared prototypes, and function
-pointers.  A 1{,}130-line C test suite compiles and runs correctly:
+pointers, pointer-to-pointer and arrays of pointers, arrays,
+brace-enclosed array and struct initializers (local and file-scope),
+global variables, enums, switch/case, sizeof, character literals,
+string literals, void functions, forward-declared prototypes, and
+function pointers.  A 1{,}130-line C test suite compiles and runs correctly:
 hash tables, arena allocators, recursive-descent parsers, linked-list
 manipulation, tree evaluators, and the sieve of Eratosthenes.
 
@@ -542,10 +543,17 @@ manipulation, tree evaluators, and the sieve of Eratosthenes.
       from the declared kind rather than the array element, so a
       pointer-array is indexed from its alloca base via GEP instead
       of being mis-lowered as a scalar pointer.
-\item[\checkmark] 177 codegen tests covering all features
-      (7 Phase~8 test groups: nested structs, struct arrays,
-      global init, pointer arithmetic, pointer arrays, self-hosting
-      patterns, function pointers).
+\item[\checkmark] Brace-enclosed initializer lists: positional
+      \texttt{IR\_GEP$+$IR\_STORE} per element for both arrays and
+      flat structs, implicit array bounds inferred from the element
+      count, zero-fill of the unspecified tail, and file-scope lookup
+      tables via \texttt{\_kcc\_ir\_emit\_global\_inits} (BSS supplies
+      the zero image).  String initializers for char arrays and
+      designated initializers remain for Phase~9.
+\item[\checkmark] 185 codegen tests covering all features
+      (8 Phase~8 test groups: nested structs, struct arrays,
+      global init, pointer arithmetic, pointer arrays, initializer
+      lists, self-hosting patterns, function pointers).
 \end{itemize}
 
 \textbf{Remaining work --- Stage 8a: missing C features.}
@@ -566,17 +574,19 @@ a realistic subsystem of itself.
 \item \textbf{Typedef support.}  The parser recognizes
       \texttt{typedef} but codegen has not been stress-tested
       with typedef'd structs and function pointer types.
-\item \textbf{Initializer lists.}  Array and struct initializers
-      (\texttt{int a[] = \{1,2,3\}}) are needed for lookup tables.
 \item \textbf{Static locals.}  \texttt{static int count = 0;}
       requires a \texttt{\_\_data} section symbol with persistent
       storage.
+\item \textbf{String initializers for char arrays.}
+      \texttt{char s[] = "abc"} must copy the literal bytes into the
+      array rather than storing the string pointer.
 \end{itemize}
 
 \noindent Pointer-to-pointer, arrays of pointers, void functions,
-forward-declared prototypes, and character literals in expressions
-were originally listed here; all are now implemented and covered by
-the codegen suite (see the completed milestones above).
+forward-declared prototypes, character literals, and brace-enclosed
+initializer lists (array and flat-struct, local and file-scope) were
+originally listed here; all are now implemented and covered by the
+codegen suite (see the completed milestones above).
 
 \textbf{Remaining work --- Stage 8b: subsystem in C.}
 

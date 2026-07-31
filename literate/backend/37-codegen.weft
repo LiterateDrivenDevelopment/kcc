@@ -357,7 +357,14 @@ Compiling one IR function proceeds in nine steps:
 \item \textbf{Function start.}  Record the current code-buffer
       offset so the linker symbol gets the correct value.
 \item \textbf{BB label table.}  Allocate a hash table that maps
-      BB~IDs to code offsets, used by branch instructions.
+      BB~IDs to code offsets, used by branch instructions.  The table
+      is open-addressed and never resizes, so it must be sized to the
+      function up front: its capacity is the next power of two at or
+      above four times the block count (never below~64).  A fixed
+      capacity would spin forever in \texttt{ht\_put} once a large
+      function---a real tokenizer's \texttt{lex\_next}, say---exceeded
+      it; sizing to the block count keeps the load factor low and the
+      insertion loop bounded.
 \item \textbf{Patch vector.}  A vector of
       $(\mathit{code\_offset}, \mathit{target\_bb\_id})$ pairs
       for forward branches that need back-patching.
@@ -474,8 +481,23 @@ _kcc_codegen_func:
     bl _kcc_code_current_pos
     mov x21, x0                    // x21 = func_start_offset
 
-    // 3. Initialize BB label hash table (bb_id → code_offset)
+    // 3. Initialize BB label hash table (bb_id → code_offset), sized to
+    //    the function's BB count: next power of two >= 4*bb_count, min 64.
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x0, [x0, #VEC_COUNT]      // bb_count
+    lsl x0, x0, #2                // 4 * bb_count (keeps load factor low)
+    cmp x0, #64
+    b.ls .Lcgf_bbcap_min
+    sub x0, x0, #1
+    clz x1, x0
+    mov x2, #64
+    sub x1, x2, x1                // 64 - clz(x-1)
+    mov x2, #1
+    lsl x0, x2, x1               // next power of two
+    b .Lcgf_bbcap_done
+.Lcgf_bbcap_min:
     mov x0, #64
+.Lcgf_bbcap_done:
     bl _kcc_ht_init
     mov x22, x0                    // x22 = bb_labels ht
 

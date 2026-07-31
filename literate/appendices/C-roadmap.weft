@@ -524,7 +524,10 @@ manipulation, tree evaluators, and the sieve of Eratosthenes.
 Stage~8b has begun: \kcc{}'s own arena allocator, re-written in C and
 compiled by \kcc{}, replaces the hand-written assembly arena in a
 \texttt{kcc\_selfhost} binary that passes all 201 codegen tests
-(Chapter~\ref{ch:self-hosting-arena}).
+(Chapter~\ref{ch:self-hosting-arena}); and a 250-line C tokenizer,
+compiled by \kcc{}, self-tests green and matches \texttt{clang}
+(Chapter~\ref{ch:self-hosting-lexer}), a program whose size flushed out
+two codegen bugs now fixed.
 
 \textbf{Completed milestones.}
 \begin{itemize}
@@ -639,8 +642,17 @@ milestones above).
       all 201 codegen tests, exercising the C arena's fast and slow
       paths across every allocation the compiler makes.  \kcc{} has
       compiled a correctness-critical piece of itself.
-\item Remaining: port a larger subsystem (the lexer) and, eventually,
-      compile enough of \kcc{} to bootstrap.
+\item[\checkmark] A branch-heavy tokenizer in C
+      (Chapter~\ref{ch:self-hosting-lexer}) is compiled by \kcc{},
+      self-tests green, and agrees with \texttt{clang}
+      (\texttt{just selfhost-lexer}).  Building it exposed and fixed two
+      real codegen bugs a 250-line program reaches but the unit tests
+      do not: the basic-block label table overflowed on large functions
+      (fixed-size open-addressed hash $\to$ sized to the block count),
+      and address-of assumed a bare identifier (\texttt{\&a[i]} now
+      dispatches on operand shape).
+\item Remaining: port more of the front-end and, eventually, compile
+      enough of \kcc{} to bootstrap.
 \end{itemize}
 
 \textbf{Remaining work --- Stage 8c: validation.}

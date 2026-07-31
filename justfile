@@ -71,6 +71,11 @@ selfhost: build
     chmod +x tmp/selfhost/selfhost.sh
     tmp/selfhost/selfhost.sh
 
+# Self-hosting (Stage 8b): compile a C tokenizer with kcc, self-test, diff clang
+selfhost-lexer: build
+    chmod +x tmp/selfhost/lexer_verify.sh
+    tmp/selfhost/lexer_verify.sh
+
 # Code generation tests: compile C programs with kcc, link, run, check exit codes
 test-codegen: build
     chmod +x tmp/tests/test_codegen.sh

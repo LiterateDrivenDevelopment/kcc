@@ -1,0 +1,406 @@
+% 48-self-hosting-lexer.weft — Stage 8b: a tokenizer written in C,
+% compiled by kcc, and checked against clang.
+
+\chapter{Self-Hosting: A Tokenizer in C}
+\label{ch:self-hosting-lexer}
+
+The arena of Chapter~\ref{ch:self-hosting-arena} was small enough to
+drop straight back into the compiler.  A tokenizer is a larger test: it
+branches heavily, keeps mutable cursor state, indexes tables, and builds
+tokens through pointers.  Rather than swap it into \kcc{}'s own
+front-end---which would entangle it with the parser and preprocessor---%
+this chapter takes the tokenizer as a self-contained \emph{program}: a
+faithful C re-implementation of the scanning logic of
+Chapter~\ref{ch:lexer}, using the same token codes, that tokenizes
+embedded source buffers and asserts the result.  \kcc{} compiles it;
+its own assertions and a differential comparison against \texttt{clang}
+judge it.
+
+Writing it flushed out two real defects in \kcc{}, both triggered only
+by a function of this size and shape, and both now fixed:
+
+\begin{itemize}
+\item The code generator's basic-block label table was a fixed
+      64-slot, open-addressed hash with no resize.  A function with more
+      than that many blocks---\texttt{lex\_next} has well over sixty---%
+      overflowed it, and \texttt{ht\_put} spun forever.  The table is
+      now sized to the block count (\S\ref{sec:preregister-globals}
+      neighbourhood, in \texttt{codegen\_func}).
+\item The address-of operator assumed its operand was always a bare
+      identifier.  \texttt{\&tokens[n]}---a subscript---was mis-read as a
+      name and lowered to a bogus global reference.  \texttt{\&} now
+      dispatches on operand shape.
+\end{itemize}
+
+That a 250-line program surfaced two codegen bugs is the point of
+Stage~8b: real code exercises feature \emph{combinations} the unit
+tests never reach.
+
+\section{Token Codes}
+
+The codes match Chapter~\ref{ch:lexer} exactly, so a token stream from
+this C lexer is directly comparable to \kcc{}'s own.  Only the subset
+the tests reference is named; the rest share the same numbering.
+
+@l c
+@d Selfhost: lexer tokens @{
+#define TOK_EOF        0
+#define TOK_IDENT      1
+#define TOK_NUMBER     2
+#define TOK_CHAR_LIT   3
+#define TOK_STRING_LIT 4
+#define TOK_UNKNOWN    5
+
+#define TOK_INT       27
+#define TOK_RETURN    31
+#define TOK_IF        25
+#define TOK_ELSE      19
+#define TOK_WHILE     43
+#define TOK_FOR       23
+#define TOK_VOID      41
+#define TOK_CHAR      13
+#define TOK_STRUCT    36
+
+#define TOK_LPAREN    60
+#define TOK_RPAREN    61
+#define TOK_LBRACE    62
+#define TOK_RBRACE    63
+#define TOK_SEMI      66
+#define TOK_STAR      73
+#define TOK_PLUS      74
+#define TOK_ARROW     69
+#define TOK_INC       70
+#define TOK_EQ        86
+#define TOK_ASSIGN    94
+#define TOK_LE        84
+#define TOK_ELLIPSIS 107
+
+struct Token {
+    int type;
+    int start;
+    int len;
+    int line;
+    int col;
+};
+@}
+
+\section{State and the Keyword Table}
+
+Like the assembly lexer, cursor state lives in globals.  The keyword
+table is two parallel arrays---names and codes---initialised with
+brace-enclosed lists.  The name array is an array of \texttt{char~*}
+seeded with string literals, which is precisely the pointer-array
+initializer form Stage~8a added; getting it wrong would surface as a
+mis-classified keyword.
+
+@l c
+@d Selfhost: lexer state @{
+
+const char *g_src;
+int g_pos;
+int g_line;
+int g_line_start;
+
+#define NKW 9
+char *kw_names[NKW] = { "int", "return", "if", "else", "while",
+                        "for", "void", "char", "struct" };
+int   kw_codes[NKW] = { TOK_INT, TOK_RETURN, TOK_IF, TOK_ELSE, TOK_WHILE,
+                        TOK_FOR, TOK_VOID, TOK_CHAR, TOK_STRUCT };
+@}
+
+\section{Character Classes and Keyword Lookup}
+
+Character classification is expressed as range tests rather than a
+lookup table---simpler, and equally within \kcc{}'s reach.  A keyword is
+recognised by scanning the parallel arrays: the candidate must match the
+identifier text and end exactly at its length, so \texttt{intx} is an
+identifier, not \texttt{int} followed by \texttt{x}.
+
+@l c
+@d Selfhost: lexer classify @{
+
+int is_alpha(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+int is_digit(int c) { return c >= '0' && c <= '9'; }
+int is_alnum(int c) { return is_alpha(c) || is_digit(c); }
+int is_space(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+int kw_match(const char *kw, const char *s, int len) {
+    int i = 0;
+    while (i < len) {
+        if (kw[i] == 0) return 0;
+        if (kw[i] != s[i]) return 0;
+        i = i + 1;
+    }
+    return kw[len] == 0;
+}
+
+int lookup_kw(const char *s, int len) {
+    int i = 0;
+    while (i < NKW) {
+        if (kw_match(kw_names[i], s, len)) return kw_codes[i];
+        i = i + 1;
+    }
+    return TOK_IDENT;
+}
+@}
+
+\section{The Cursor}
+
+\texttt{peek} reads the current byte; \texttt{advance} steps forward,
+tracking line and column by remembering where each line began.
+\texttt{skip\_trivia} consumes whitespace and both comment forms before
+each token.
+
+@l c
+@d Selfhost: lexer cursor @{
+
+int peek(void) { return g_src[g_pos]; }
+
+void advance(void) {
+    if (g_src[g_pos] == '\n') {
+        g_line = g_line + 1;
+        g_line_start = g_pos + 1;
+    }
+    g_pos = g_pos + 1;
+}
+
+void skip_trivia(void) {
+    while (peek() != 0) {
+        int c = peek();
+        if (is_space(c)) { advance(); }
+        else if (c == '/' && g_src[g_pos + 1] == '/') {
+            while (peek() != 0 && peek() != '\n') advance();
+        }
+        else if (c == '/' && g_src[g_pos + 1] == '*') {
+            advance(); advance();
+            while (peek() != 0) {
+                if (peek() == '*' && g_src[g_pos + 1] == '/') { advance(); advance(); return; }
+                advance();
+            }
+        }
+        else { return; }
+    }
+}
+@}
+
+\section{Scanning One Token}
+
+\texttt{lex\_next} records the start position, line, and column, then
+classifies by first character: identifier or keyword, pp-number,
+string, character constant, or a punctuator scanned with maximal
+munch---three-character \texttt{...} first, then the two-character
+operators, then the single-character remainder.  The result is written
+through the caller's \texttt{Token} pointer.
+
+@l c
+@d Selfhost: lexer next @{
+
+int lex_next(struct Token *t) {
+    skip_trivia();
+    int start = g_pos;
+    int col = start - g_line_start + 1;
+    int line = g_line;
+    int c = peek();
+
+    t->start = start;
+    t->line = line;
+    t->col = col;
+
+    if (c == 0) { t->type = TOK_EOF; t->len = 0; return TOK_EOF; }
+
+    if (is_alpha(c)) {
+        while (is_alnum(peek())) advance();
+        int len = g_pos - start;
+        t->len = len;
+        t->type = lookup_kw(g_src + start, len);
+        return t->type;
+    }
+    if (is_digit(c)) {
+        while (is_alnum(peek()) || peek() == '.') advance();
+        t->len = g_pos - start;
+        t->type = TOK_NUMBER;
+        return TOK_NUMBER;
+    }
+    if (c == '"') {
+        advance();
+        while (peek() != 0 && peek() != '"') {
+            if (peek() == '\\') advance();
+            advance();
+        }
+        if (peek() == '"') advance();
+        t->len = g_pos - start;
+        t->type = TOK_STRING_LIT;
+        return TOK_STRING_LIT;
+    }
+    if (c == '\'') {
+        advance();
+        while (peek() != 0 && peek() != '\'') {
+            if (peek() == '\\') advance();
+            advance();
+        }
+        if (peek() == '\'') advance();
+        t->len = g_pos - start;
+        t->type = TOK_CHAR_LIT;
+        return TOK_CHAR_LIT;
+    }
+
+    int c1 = g_src[g_pos + 1];
+    if (c == '.' && c1 == '.' && g_src[g_pos + 2] == '.') {
+        advance(); advance(); advance();
+        t->len = 3; t->type = TOK_ELLIPSIS; return TOK_ELLIPSIS;
+    }
+    if (c == '-' && c1 == '>') { advance(); advance(); t->len = 2; t->type = TOK_ARROW; return TOK_ARROW; }
+    if (c == '+' && c1 == '+') { advance(); advance(); t->len = 2; t->type = TOK_INC; return TOK_INC; }
+    if (c == '=' && c1 == '=') { advance(); advance(); t->len = 2; t->type = TOK_EQ; return TOK_EQ; }
+    if (c == '<' && c1 == '=') { advance(); advance(); t->len = 2; t->type = TOK_LE; return TOK_LE; }
+
+    advance();
+    t->len = 1;
+    if (c == '(') t->type = TOK_LPAREN;
+    else if (c == ')') t->type = TOK_RPAREN;
+    else if (c == '{') t->type = TOK_LBRACE;
+    else if (c == '}') t->type = TOK_RBRACE;
+    else if (c == ';') t->type = TOK_SEMI;
+    else if (c == '*') t->type = TOK_STAR;
+    else if (c == '+') t->type = TOK_PLUS;
+    else if (c == '=') t->type = TOK_ASSIGN;
+    else t->type = TOK_UNKNOWN;
+    return t->type;
+}
+@}
+
+\section{Tokenizing a Buffer}
+
+\texttt{lex\_all} resets the cursor and fills an array of tokens until
+end of input or the caller's capacity.  Its \texttt{lex\_next(\&out[n])}
+call is the one that exposed the address-of defect: \texttt{\&out[n]} is
+the address of a subscript on a pointer parameter.
+
+@l c
+@d Selfhost: lexer all @{
+
+int lex_all(const char *src, struct Token *out, int max) {
+    g_src = src; g_pos = 0; g_line = 1; g_line_start = 0;
+    int n = 0;
+    while (n < max) {
+        int ty = lex_next(&out[n]);
+        n = n + 1;
+        if (ty == TOK_EOF) return n;
+    }
+    return n;
+}
+@}
+
+\section{The Self-Test}
+
+\texttt{main} tokenizes four representative inputs and checks token
+counts, types, lengths, and---for the character literal after a
+newline---line and column tracking.  It returns~0 only when every check
+holds, so the exit status alone certifies the run; a distinct non-zero
+code per check pinpoints any failure.
+
+@l c
+@d Selfhost: lexer main @{
+
+int main(void) {
+    struct Token toks[64];
+
+    int n = lex_all("int main(void){ return 42; }", toks, 64);
+    if (n != 11) return 1;
+    if (toks[0].type != TOK_INT) return 2;
+    if (toks[1].type != TOK_IDENT) return 3;
+    if (toks[2].type != TOK_LPAREN) return 4;
+    if (toks[3].type != TOK_VOID) return 5;
+    if (toks[4].type != TOK_RPAREN) return 6;
+    if (toks[5].type != TOK_LBRACE) return 7;
+    if (toks[6].type != TOK_RETURN) return 8;
+    if (toks[7].type != TOK_NUMBER) return 9;
+    if (toks[7].len != 2) return 10;
+    if (toks[8].type != TOK_SEMI) return 11;
+    if (toks[10].type != TOK_EOF) return 12;
+
+    n = lex_all("a->b ++ x == y // trailing\n", toks, 64);
+    if (n != 8) return 13;
+    if (toks[1].type != TOK_ARROW) return 14;
+    if (toks[3].type != TOK_INC) return 15;
+    if (toks[5].type != TOK_EQ) return 16;
+
+    n = lex_all("char *s = \"hi\";\n'x'", toks, 64);
+    if (toks[4].type != TOK_STRING_LIT) return 17;
+    if (toks[4].len != 4) return 18;
+    int i = 0;
+    int found = 0;
+    while (i < n) {
+        if (toks[i].type == TOK_CHAR_LIT) {
+            if (toks[i].line != 2) return 19;
+            if (toks[i].col != 1) return 20;
+            found = 1;
+        }
+        i = i + 1;
+    }
+    if (found == 0) return 21;
+
+    n = lex_all("f(int a, ...) /* skip */ ;", toks, 64);
+    i = 0; found = 0;
+    while (i < n) { if (toks[i].type == TOK_ELLIPSIS) found = 1; i = i + 1; }
+    if (found == 0) return 22;
+
+    return 0;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: lexer @{
+@<Selfhost: lexer tokens@>
+@<Selfhost: lexer state@>
+@<Selfhost: lexer classify@>
+@<Selfhost: lexer cursor@>
+@<Selfhost: lexer next@>
+@<Selfhost: lexer all@>
+@<Selfhost: lexer main@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-lexer-verify}
+
+\texttt{just selfhost-lexer} compiles \texttt{tmp/selfhost/lexer.c} with
+\kcc{}, links it freestanding (entry \texttt{\_main}, no libc), and runs
+it: exit~0 means every assertion held.  It then compiles the identical
+source with \texttt{clang} and confirms the two binaries agree---%
+differential testing in miniature, and a preview of Stage~8c.  A match
+means \kcc{} generated correct code for a real, branch-heavy,
+table-driven program.
+
+@d Selfhost: lexer verify @{
+#!/usr/bin/env bash
+# just selfhost-lexer — compile the C tokenizer with kcc, self-test, diff clang.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+
+echo "[1/2] compiling + running the tokenizer built by kcc"
+tmp/kcc -c "$SH/lexer.c" -o "$SH/lexer_kcc.o" >/dev/null
+ld "$SH/lexer_kcc.o" -o "$SH/lexer_kcc" -lSystem -syslibroot "$SDK" -e _main -arch arm64
+set +e
+"$SH/lexer_kcc"; kcc_rc=$?
+set -e
+echo "      kcc-compiled tokenizer self-test exit: $kcc_rc (expect 0)"
+
+echo "[2/2] differential check against clang"
+clang -c "$SH/lexer.c" -o "$SH/lexer_clang.o"
+ld "$SH/lexer_clang.o" -o "$SH/lexer_clang" -lSystem -syslibroot "$SDK" -e _main -arch arm64
+set +e
+"$SH/lexer_clang"; clang_rc=$?
+set -e
+echo "      clang-compiled tokenizer self-test exit: $clang_rc (expect 0)"
+
+if [ "$kcc_rc" -eq 0 ] && [ "$kcc_rc" -eq "$clang_rc" ]; then
+    echo "PASS: kcc and clang agree, tokenizer self-test green"
+    exit 0
+fi
+echo "FAIL: kcc=$kcc_rc clang=$clang_rc"
+exit 1
+@}

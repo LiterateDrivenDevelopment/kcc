@@ -565,3 +565,17 @@ re-run the codegen suite:
 @o tmp/selfhost/selfhost.sh @{
 @<Selfhost: verify@>
 @}
+
+\noindent\textbf{lexer.c} --- a tokenizer in C
+(Chapter~\ref{ch:self-hosting-lexer}), with its self-test:
+
+@o tmp/selfhost/lexer.c @{
+@<Selfhost: lexer@>
+@}
+
+\noindent\textbf{lexer\_verify.sh} --- compile it with \kcc{}, run the
+self-test, and diff against clang:
+
+@o tmp/selfhost/lexer_verify.sh @{
+@<Selfhost: lexer verify@>
+@}

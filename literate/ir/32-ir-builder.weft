@@ -3421,11 +3421,22 @@ value transformation.  Arithmetic negation (\texttt{-}) emits
 \texttt{IR\_NEG}, bitwise complement (\texttt{\~{}}) emits
 \texttt{IR\_NOT}, and logical negation (\texttt{!}) is lowered to
 \texttt{IR\_CMP\_EQ} against a synthesised zero constant---producing~1
-when the operand is zero and 0 otherwise.  All other unary tokens
-Address-of (\texttt{\&x}) returns the alloca vreg directly---the
-vreg produced by \texttt{IR\_ALLOCA} already holds the stack address,
-so no load is needed.  Dereference (\texttt{*p}) evaluates the pointer
-operand and emits an \texttt{IR\_LOAD} from the resulting address.
+when the operand is zero and 0 otherwise.
+
+Address-of (\texttt{\&e}) dispatches on the shape of its operand
+rather than assuming a bare variable.  For an identifier it returns the
+storage address directly---the vreg produced by \texttt{IR\_ALLOCA}
+already holds the stack address, or a file-scope name yields an
+\texttt{IR\_GLOBAL\_REF}---so no load is needed.  For a subscript
+\texttt{\&a[i]} or a member \texttt{\&s.f} it reuses the very address
+computation the assignment and load paths use
+(\texttt{build\_subscript\_addr}, \texttt{build\_member\_addr}),
+returning the element or field address.  Without this dispatch,
+\texttt{\&a[i]} would mis-read the subscript node as if it were an
+identifier and emit a nonsensical global reference---the exact defect a
+tokenizer's \texttt{lex\_next(\&tokens[n])} call surfaces.
+Dereference (\texttt{*p}) evaluates the pointer operand and emits an
+\texttt{IR\_LOAD} from the resulting address.
 
 @d IR: build unary @{
 // -- kcc_ir_build_unary ---------------------------------------------------
@@ -3567,15 +3578,23 @@ _kcc_ir_build_unary:
     b .Libu_done
 
 .Libu_addr:
-    // Address-of: return alloca vreg directly (no load)
-    ldr x0, [x19, #AST_F1]      // operand node
-    ldr x20, [x0, #AST_F0]      // name ptr
-    cbz x20, .Libu_addr_zero
+    // Address-of: dispatch on the operand's shape.
+    ldr x21, [x19, #AST_F1]      // operand node
+    cbz x21, .Libu_addr_zero
+    ldr x0, [x21, #AST_TAG]
+    cmp x0, #AST_SUBSCRIPT
+    b.eq .Libu_addr_subscript
+    cmp x0, #AST_MEMBER
+    b.eq .Libu_addr_member
+    cmp x0, #AST_IDENT_EXPR
+    b.ne .Libu_addr_zero         // unsupported operand → 0
 
+    // &ident: the variable's storage address (alloca vreg, or global_ref)
+    ldr x20, [x21, #AST_F0]      // name ptr
+    cbz x20, .Libu_addr_zero
     mov x0, x20
     bl _kcc_strlen
     mov x21, x0
-
     adrp x0, _kcc_ir_locals@@PAGE
     add  x0, x0, _kcc_ir_locals@@PAGEOFF
     ldr x0, [x0]
@@ -3585,6 +3604,18 @@ _kcc_ir_build_unary:
     cbz x0, .Libu_addr_global
     bic x0, x0, #0x8000000000000000
     sub x0, x0, #1              // alloca vreg (stored as vreg+1)
+    b .Libu_done
+
+.Libu_addr_subscript:
+    // &a[i]: the element address is exactly the subscript's GEP result
+    mov x0, x21
+    bl _kcc_ir_build_subscript_addr
+    b .Libu_done
+
+.Libu_addr_member:
+    // &s.f / &s->f: the member address
+    mov x0, x21
+    bl _kcc_ir_build_member_addr
     b .Libu_done
 
 .Libu_addr_global:

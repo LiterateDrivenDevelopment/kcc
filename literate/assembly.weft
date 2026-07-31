@@ -171,6 +171,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<PP: define@>
 @<PP: undef@>
 @<PP: conditional@>
+@<PP: resolve include@>
 @<PP: include@>
 @<PP: error directive@>
 @<PP: directive dispatch@>
@@ -542,6 +543,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen pointer arrays@>
 @<Test: codegen init lists@>
 @<Test: codegen static locals@>
+@<Test: codegen preprocessor@>
 @<Test: codegen self-hosting@>
 @<Test: codegen fnptr@>
 @<Test: codegen results@>

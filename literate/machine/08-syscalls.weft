@@ -105,6 +105,15 @@ ENDFUNC
 
 Open a file by pathname.  Returns a file descriptor or $-1$ on error.
 
+Unlike the other wrappers, \texttt{open} inspects the carry flag the
+kernel sets on failure and collapses the raw \texttt{errno} it leaves
+in \reg{x0} to a uniform $-1$.  Callers---\texttt{source\_open} and the
+preprocessor's include probing---test for $-1$, and a bare
+\texttt{errno} (a small positive integer) would otherwise be mistaken
+for a valid descriptor, so this normalisation is what lets a missing
+\texttt{\#include} surface as a clean diagnostic instead of a later
+crash on a bogus file descriptor.
+
 @d Syscall: open @{
 // -- SYS_open ---------------------------------------------------
 // int kcc_sys_open(const char *path, int flags, mode_t mode)
@@ -114,7 +123,13 @@ Open a file by pathname.  Returns a file descriptor or $-1$ on error.
 // Returns fd in x0, or -1 on error.
 FUNC kcc_sys_open
     SYSCALL SYS_open
-ENDFUNC
+    b.cs .Lsys_open_err          // carry set → errno in x0, normalise to -1
+    ldp x29, x30, [sp], #16
+    ret
+.Lsys_open_err:
+    mov x0, #-1
+    ldp x29, x30, [sp], #16
+    ret
 @}
 
 \subsection{close}

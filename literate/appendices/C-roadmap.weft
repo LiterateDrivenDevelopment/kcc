@@ -180,9 +180,12 @@ build the diagnostic engine required by \stdref{5.1.1.3}.
       \texttt{\_\_STDC\_VERSION\_\_}) are set correctly.
 \end{enumerate}
 
-\textbf{Status.} Complete (core directives: \texttt{\#define} object-like,
-\texttt{\#include}, \texttt{\#if}/\texttt{\#ifdef}/\texttt{\#endif},
-\texttt{\#error}; predefined macros).
+\textbf{Status.} Complete (core directives: \texttt{\#define}
+object-like and function-like,
+\texttt{\#include} of a quoted header resolved relative to the
+including file, \texttt{\#if}/\texttt{\#ifdef}/\texttt{\#endif},
+\texttt{\#error}; predefined macros).  A \texttt{-I} system search path
+remains for Phase~9.
 
 % ────────────────────────────────────────────────────────────────
 \section{Phase 4 --- Parser}
@@ -504,14 +507,16 @@ itself.
       construction and ARM64 systems programming.
 \end{enumerate}
 
-\textbf{Status.}  Stage~8a in progress.  191 codegen tests passing.
+\textbf{Status.}  Stage~8a in progress.  198 codegen tests passing.
 The compiler handles integer arithmetic, control flow, loops,
 function calls (direct and indirect), structs (nested, arrays),
 pointers, pointer-to-pointer and arrays of pointers, arrays,
 brace-enclosed array and struct initializers (local and file-scope),
 static locals, global variables, enums, switch/case, sizeof, character
 literals, string literals, void functions, forward-declared prototypes,
-and function pointers.  A 1{,}130-line C test suite compiles and runs correctly:
+function pointers, and the preprocessor on the \texttt{-c} path
+(\texttt{\#define}, \texttt{\#ifdef}, and \texttt{\#include} of a
+source-relative header).  A 1{,}130-line C test suite compiles and runs correctly:
 hash tables, arena allocators, recursive-descent parsers, linked-list
 manipulation, tree evaluators, and the sieve of Eratosthenes.
 
@@ -559,10 +564,19 @@ manipulation, tree evaluators, and the sieve of Eratosthenes.
       \texttt{\_kcc\_ir\_emit\_global\_inits} emits the one-time
       initialiser at program start.  Nested-block statics and static
       aggregates remain for Phase~9.
-\item[\checkmark] 191 codegen tests covering all features
-      (9 Phase~8 test groups: nested structs, struct arrays,
+\item[\checkmark] Preprocessor on the \texttt{-c} path: object- and
+      function-like \texttt{\#define}, \texttt{\#ifdef}/\texttt{\#ifndef}
+      conditionals, and \texttt{\#include} of a quoted header resolved
+      relative to the including file's directory (then the working
+      directory).  \texttt{\_kcc\_sys\_open} was fixed to collapse the
+      kernel's carry-flag \texttt{errno} to $-1$ so a missing header
+      produces a clean diagnostic instead of crashing on a bogus
+      descriptor.  A \texttt{-I} system search path is left to Phase~9.
+\item[\checkmark] 198 codegen tests covering all features
+      (10 Phase~8 test groups: nested structs, struct arrays,
       global init, pointer arithmetic, pointer arrays, initializer
-      lists, static locals, self-hosting patterns, function pointers).
+      lists, static locals, preprocessor, self-hosting patterns,
+      function pointers).
 \end{itemize}
 
 \textbf{Remaining work --- Stage 8a: missing C features.}
@@ -571,15 +585,11 @@ The following features are needed before \kcc{} can compile
 a realistic subsystem of itself.
 
 \begin{itemize}
-\item \textbf{Multi-file compilation.}  The driver currently
-      compiles a single \texttt{.c} file.  Add support for
-      compiling multiple \texttt{.o} files and invoking \texttt{ld}
-      to link them, or at minimum support \texttt{\#include}
-      of a project header that declares shared prototypes.
-\item \textbf{Preprocessor in codegen path.}  The \texttt{-c}
-      pipeline must honor \texttt{\#define} and \texttt{\#include}
-      so that shared constants and struct definitions can live
-      in a header file.
+\item \textbf{Multi-file compilation.}  Shared declarations can now
+      live in a header included with \texttt{\#include}, but the driver
+      still compiles one \texttt{.c} at a time.  A full build needs to
+      compile several translation units and invoke \texttt{ld} to link
+      the resulting \texttt{.o} files together.
 \item \textbf{Typedef support.}  The parser recognizes
       \texttt{typedef} but codegen has not been stress-tested
       with typedef'd structs and function pointer types.

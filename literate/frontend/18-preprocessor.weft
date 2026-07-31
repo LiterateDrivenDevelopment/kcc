@@ -1303,6 +1303,120 @@ current lexer and source states are pushed onto the context stack.
 When the included file reaches EOF, the state is restored and
 processing continues in the including file.
 
+\paragraph{Locating the file.}
+A quoted include is resolved (\stdref{6.10.2}) relative to the
+directory of the file that contains the directive, then---failing
+that---by the name as given, which the operating system interprets
+against the current working directory.  This is what allows a project
+header to sit beside the \texttt{.c} file that includes it regardless
+of where the compiler was invoked.  \texttt{\_kcc\_pp\_resolve\_include}
+performs the search: it splices the directory prefix of the current
+source path onto the include name, probes that candidate with a
+throwaway \texttt{open}, and returns the first path that exists (or the
+bare name as a last resort).  A \texttt{\_kcc\_pp\_file\_exists} helper
+wraps the probe, relying on \texttt{\_kcc\_sys\_open} returning $-1$ for
+a file that cannot be opened.  Angle-bracket includes are resolved the
+same way for now; a dedicated system search path (\texttt{-I}
+directories) is left to Phase~9.
+
+@d PP: resolve include @{
+.text
+// -- _kcc_pp_file_exists --------------------------------------------
+// uint64_t _kcc_pp_file_exists(const char *path)
+//   x0 = null-terminated path → 1 if it can be opened, else 0
+.p2align 2
+_kcc_pp_file_exists:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    mov x1, #0                   // O_RDONLY
+    mov x2, #0
+    bl _kcc_sys_open
+    cmn x0, #1                   // x0 == -1 ?
+    b.eq .Lfe_no
+    bl _kcc_sys_close            // opened: close the probe fd
+    mov x0, #1
+    ldp x29, x30, [sp], #16
+    ret
+.Lfe_no:
+    mov x0, #0
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- _kcc_pp_resolve_include ----------------------------------------
+// char *_kcc_pp_resolve_include(const char *name)
+//   x0 = include name → openable path (arena), or 0 if not found.
+// Searches the including file's directory first, then the name as given.
+.p2align 2
+_kcc_pp_resolve_include:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                  // name
+    bl _kcc_strlen
+    mov x20, x0                  // namelen
+
+    adrp x0, _kcc_src_path@@PAGE
+    add  x0, x0, _kcc_src_path@@PAGEOFF
+    ldr  x21, [x0]               // including file path
+    cbz x21, .Lri_raw
+
+    // dirlen = length up to and including the last '/'
+    mov x22, #0
+    mov x23, #0
+.Lri_scan:
+    ldrb w0, [x21, x23]
+    cbz w0, .Lri_scan_done
+    cmp w0, #'/'
+    b.ne .Lri_scan_next
+    add x22, x23, #1
+.Lri_scan_next:
+    add x23, x23, #1
+    b .Lri_scan
+.Lri_scan_done:
+    cbz x22, .Lri_raw            // no directory prefix
+
+    add x0, x22, x20
+    add x0, x0, #1
+    bl _kcc_arena_alloc
+    mov x24, x0                  // candidate = dir + name + null
+    mov x0, x24
+    mov x1, x21
+    mov x2, x22
+    bl _kcc_memcpy
+    add x0, x24, x22
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_memcpy
+    add x0, x24, x22
+    strb wzr, [x0, x20]
+
+    mov x0, x24
+    bl _kcc_pp_file_exists
+    cbz x0, .Lri_raw
+    mov x0, x24
+    b .Lri_done
+
+.Lri_raw:
+    mov x0, x19
+    bl _kcc_pp_file_exists
+    cbz x0, .Lri_none
+    mov x0, x19
+    b .Lri_done
+
+.Lri_none:
+    mov x0, #0
+
+.Lri_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
 @d PP: include @{
 .text
 // -- _kcc_pp_do_include ---------------------------------------------
@@ -1384,6 +1498,12 @@ _kcc_pp_do_include:
     // Skip rest of directive line
     bl _kcc_pp_skip_line
 
+    // Resolve against the including file's directory, then the name as given
+    mov  x0, x21
+    bl _kcc_pp_resolve_include
+    mov  x21, x0
+    cbz  x21, .Lincl_notfound
+
     // Push current state onto context stack
     mov  x0, #PP_CTX_INCLUDE
     bl _kcc_pp_ctx_push
@@ -1414,6 +1534,21 @@ _kcc_pp_do_include:
     ldp x29, x30, [sp], #64
     ret
 
+.Lincl_notfound:
+    // File located nowhere on the search path (directive line already skipped)
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_notfound@@PAGE
+    add  x2, x2, _kcc_pp_err_notfound@@PAGEOFF
+    bl _kcc_diag_error
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 .Lincl_err:
     adrp x0, _kcc_pp_dir_line@@PAGE
     add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
@@ -1428,6 +1563,63 @@ _kcc_pp_do_include:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@}
+
+\paragraph{End-to-end tests.}
+The preprocessor already runs ahead of the code generator, so these
+tests compile and execute programs that lean on it: object-like and
+function-like macros, conditional compilation, and---through
+\texttt{run\_test\_include}---a shared header that supplies both a macro
+constant and a \texttt{struct} definition to the translation unit that
+includes it.  The last case is the one that matters for self-hosting: a
+project header sitting beside its \texttt{.c} file must be found and its
+declarations honoured on the \texttt{-c} path.
+
+@d Test: codegen preprocessor @{
+echo ""
+echo "--- Preprocessor ---"
+
+run_test "pp-define-const" \
+    "#define ANSWER 42
+int main(void){ return ANSWER; }" 42
+
+run_test "pp-define-arith" \
+    "#define N 5
+#define M 3
+int main(void){ return N * M; }" 15
+
+run_test "pp-define-funclike" \
+    "#define SQ(x) ((x)*(x))
+int main(void){ return SQ(6); }" 36
+
+run_test "pp-ifdef-true" \
+    "#define DEBUG
+int main(void){
+#ifdef DEBUG
+  return 7;
+#else
+  return 0;
+#endif
+}" 7
+
+run_test "pp-ifndef-else" \
+    "int main(void){
+#ifdef NOPE
+  return 0;
+#else
+  return 9;
+#endif
+}" 9
+
+run_test_include "pp-include-macro" \
+    "#define LIMIT 7" \
+    "#include \"defs.h\"
+int main(void){ return LIMIT + 3; }" 10
+
+run_test_include "pp-include-struct" \
+    "struct Pair { int a; int b; };" \
+    "#include \"defs.h\"
+int main(void){ struct Pair p; p.a = 4; p.b = 6; return p.a + p.b; }" 10
 @}
 
 \section{Error Directive}
@@ -2983,6 +3175,7 @@ _kcc_pp_err_stray_elif:   .asciz "#elif without matching #if"
 _kcc_pp_err_stray_else:   .asciz "#else without matching #if"
 _kcc_pp_err_stray_endif:  .asciz "#endif without matching #if"
 _kcc_pp_err_include:      .asciz "#include expects \"file\" or <file>"
+_kcc_pp_err_notfound:     .asciz "#include file not found"
 _kcc_pp_err_unterm_cond:  .asciz "unterminated conditional directive"
 _kcc_pp_err_unterm_args:  .asciz "unterminated macro argument list"
 _kcc_pp_err_depth:        .asciz "maximum include/expansion depth exceeded"

@@ -36,6 +36,11 @@ object file, links it with the system linker, runs the resulting binary,
 and compares the actual exit code against the expectation.  Failures print
 the expected and actual values for diagnosis.
 
+A sibling \texttt{run\_test\_include} additionally writes a companion
+header \texttt{defs.h} next to the source before compiling, so that
+tests can exercise \texttt{\#include "defs.h"} and confirm the
+preprocessor resolves a header sitting beside the translation unit.
+
 @d Test: codegen runner @{
 #!/bin/bash
 # kcc code generation test suite
@@ -77,6 +82,43 @@ run_test() {
     fi
 
     # Run
+    "$TMPDIR/t"
+    local actual=$?
+
+    if [ "$actual" -eq "$expected" ]; then
+        PASS=$((PASS + 1))
+        printf "  %-40s PASS\n" "$name..."
+    else
+        FAIL=$((FAIL + 1))
+        printf "  %-40s FAIL (expected %d, got %d)\n" "$name..." "$expected" "$actual"
+    fi
+}
+
+# Variant for #include: writes a companion header "defs.h" beside the source
+# so that the preprocessor's source-relative resolution locates it.
+run_test_include() {
+    local name="$1"
+    local header="$2"
+    local src="$3"
+    local expected="$4"
+    TOTAL=$((TOTAL + 1))
+
+    echo "$header" > "$TMPDIR/defs.h"
+    echo "$src" > "$TMPDIR/t.c"
+
+    if ! $KCC -c "$TMPDIR/t.c" -o "$TMPDIR/t.o" 2>/dev/null; then
+        FAIL=$((FAIL + 1))
+        printf "  %-40s FAIL (compile error)\n" "$name..."
+        return
+    fi
+    if ! ld "$TMPDIR/t.o" -o "$TMPDIR/t" \
+            -lSystem -syslibroot "$SDK" \
+            -e _main -arch arm64 2>/dev/null; then
+        FAIL=$((FAIL + 1))
+        printf "  %-40s FAIL (link error)\n" "$name..."
+        return
+    fi
+
     "$TMPDIR/t"
     local actual=$?
 

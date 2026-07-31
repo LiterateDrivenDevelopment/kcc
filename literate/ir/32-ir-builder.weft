@@ -3072,6 +3072,7 @@ _kcc_ir_build_binary:
     b .Libb_emit_alloc
 
 .Libb_emit_alloc:
+    mov x25, x23                 // preserve opcode across the alloc
     mov x0, x23
     bl _kcc_ir_alloc_instr
     mov x24, x0
@@ -3091,9 +3092,130 @@ _kcc_ir_build_binary:
     mov x0, x24
     bl _kcc_ir_emit
 
+    // Truncate 32-bit integer results of width-growing ops to their width
+    mov x2, #0
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_norm_lhs
+    ldr x2, [x0, #AST_F3]        // lhs sema type
+.Libb_norm_lhs:
+    mov x3, #0
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_norm_rhs
+    ldr x3, [x0, #AST_F3]        // rhs sema type
+.Libb_norm_rhs:
+    mov x0, x23                  // result vreg
+    mov x1, x25                  // opcode
+    bl _kcc_ir_norm32
+    mov x23, x0
+
     mov x0, x23
     b .Libb_done
 @| _kcc_ir_build_binary
+@}
+
+\paragraph{Truncating to the declared width.}
+The all-spill backend computes in 64-bit registers, so an
+\texttt{int} or \texttt{unsigned int} sum that overflows 32~bits keeps
+its extra high bits---an unsigned wraparound past $2^{32}$ then differs
+from Standard~C.  \texttt{\_kcc\_ir\_norm32} closes that gap for the
+operations that can \emph{grow} a value past its width
+(\texttt{+}, \texttt{-}, \texttt{*}, \texttt{<<}): when both operands are
+integers no wider than \texttt{int}, it appends an \texttt{IR\_SEXT} or
+\texttt{IR\_ZEXT} (source width~4) that re-canonicalises the result to
+32~bits---sign-extending a signed result, zero-extending an unsigned
+one.  Operands wider than \texttt{int} (a \texttt{long}) or of pointer
+type fall outside the kind window and are left in 64~bits, so pointer
+arithmetic and \texttt{long} computations are untouched.  For values
+that never leave 32-bit range the extension is a no-op, so nothing else
+changes.
+
+@d IR: build binary @{
+// -- kcc_ir_norm32 --------------------------------------------------------
+// uint64_t kcc_ir_norm32(vreg, opcode, lhs_type, rhs_type)
+//   x0 = op result vreg, x1 = IR opcode, x2 = lhs sema type, x3 = rhs sema type
+// For width-growing ops (ADD/SUB/MUL/SHL/NEG/NOT) whose operands are both
+// <=32-bit integers, emit IR_SEXT/IR_ZEXT to truncate the result to 32-bit
+// width; returns the (possibly new) vreg.  Unary callers pass the operand
+// type as both lhs_type and rhs_type.
+.text
+.globl _kcc_ir_norm32
+.p2align 2
+_kcc_ir_norm32:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // vreg
+    mov x20, x1                  // opcode
+    mov x21, x2                  // lhs type
+
+    cmp x20, #IR_ADD
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_SUB
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_MUL
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_SHL
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_NEG
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_NOT
+    b.eq .Lnorm_op_ok
+    b .Lnorm_skip
+.Lnorm_op_ok:
+
+    // lhs: a <=32-bit integer? (TY_KIND in [TY_BOOL(2)..TY_INT(5)])
+    cbz x21, .Lnorm_skip
+    ldr x0, [x21, #TY_KIND]
+    sub x0, x0, #2
+    cmp x0, #3
+    b.hi .Lnorm_skip
+
+    // rhs: also a <=32-bit integer?
+    cbz x3, .Lnorm_skip
+    ldr x0, [x3, #TY_KIND]
+    sub x0, x0, #2
+    cmp x0, #3
+    b.hi .Lnorm_skip
+
+    // Unsigned result if either operand is unsigned (TY_F0 == 0)
+    ldr x0, [x21, #TY_F0]        // lhs signed flag
+    ldr x1, [x3, #TY_F0]         // rhs signed flag
+    mov x20, #IR_SEXT
+    cbz x0, .Lnorm_unsigned
+    cbz x1, .Lnorm_unsigned
+    b .Lnorm_emit
+.Lnorm_unsigned:
+    mov x20, #IR_ZEXT
+
+.Lnorm_emit:
+    mov x0, x20
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x21, #IR_TYPE]
+    str x19, [x21, #IR_SRC1]     // source = op result vreg
+    mov x1, #4
+    str x1, [x21, #IR_SRC2]      // source width = 4 bytes (32-bit)
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x19, x0                  // normalised vreg
+    mov x0, x21
+    bl _kcc_ir_emit
+    mov x0, x19
+    b .Lnorm_done
+
+.Lnorm_skip:
+    mov x0, x19
+.Lnorm_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_norm32
 @}
 
 \paragraph{Short-circuit logical AND.}
@@ -3494,8 +3616,8 @@ _kcc_ir_build_unary:
     mov x20, x0
     mov x0, x22
     bl _kcc_ir_emit
-    mov x0, x20
-    b .Libu_done
+    mov x1, #IR_NEG
+    b .Libu_norm
 
 .Libu_not:
     mov x0, #IR_NOT
@@ -3511,6 +3633,19 @@ _kcc_ir_build_unary:
     mov x20, x0
     mov x0, x22
     bl _kcc_ir_emit
+    mov x1, #IR_NOT
+
+.Libu_norm:
+    // Truncate an unsigned -a / ~a result to 32-bit width (x1 = opcode)
+    mov x2, #0
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libu_norm_emit
+    ldr x2, [x0, #AST_F3]        // operand sema type
+.Libu_norm_emit:
+    mov x3, x2
+    mov x0, x20                  // result vreg
+    bl _kcc_ir_norm32
+    mov x20, x0
     mov x0, x20
     b .Libu_done
 
@@ -3971,13 +4106,15 @@ is an expression (\stdref{6.5.16}).
 .globl _kcc_ir_build_assign
 .p2align 2
 _kcc_ir_build_assign:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
 
     mov x19, x0
+    ldr x0, [x19, #AST_F3]      // assignment result type (= LHS type)
+    str x0, [sp, #64]           // stashed for compound-assign width normalisation
     ldr x20, [x19, #AST_F0]     // op token
 
     // Check for struct assignment (simple assign only)
@@ -4097,6 +4234,14 @@ _kcc_ir_build_assign:
     mov x0, x19
     bl _kcc_ir_emit
 
+    // Truncate the compound result to the destination's declared width
+    mov x0, x21                  // result vreg
+    mov x1, x24                  // opcode
+    ldr x2, [sp, #64]            // LHS type
+    mov x3, x2
+    bl _kcc_ir_norm32
+    mov x21, x0
+
 .Liba_store:
     // Emit store
     mov x0, #IR_STORE
@@ -4213,6 +4358,14 @@ _kcc_ir_build_assign:
     mov x21, x0                  // x21 = compound result vreg
     mov x0, x19
     bl _kcc_ir_emit
+
+    // Truncate the compound result to the destination's declared width
+    mov x0, x21
+    mov x1, x24                  // opcode
+    ldr x2, [sp, #64]            // LHS type
+    mov x3, x2
+    bl _kcc_ir_norm32
+    mov x21, x0
 
 .Liba_global_simple:
     // Store value to global address
@@ -4413,7 +4566,7 @@ _kcc_ir_build_assign:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
 @| _kcc_ir_build_assign
 @}

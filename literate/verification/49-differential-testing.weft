@@ -312,43 +312,70 @@ difftest "fnptr-in-struct" \
     "struct Ops { int (*f)(int, int); }; int add(int a, int b){ return a + b; } int main(void){ struct Ops o; o.f = add; return o.f(20, 22); }"
 @}
 
-\section{Known Divergences}
-\label{sec:difftest-divergences}
+\section{Integer Width}
+\label{sec:difftest-width}
 
-The first bug this suite caught was not a bug at all but a documented
-limitation of the backend.  \kcc{}'s all-spill model keeps every value
-in a 64-bit slot and computes with 64-bit instructions; it does
-\emph{not} truncate an \texttt{int} or \texttt{unsigned int} result back
-to 32~bits.  For values that never approach $2^{32}$ this is invisible,
-and the whole corpus above agrees with \texttt{clang}.  But an unsigned
-computation that wraps past $2^{32}$---\texttt{0u - 1}, or a sum that
-overflows 32~bits---keeps \kcc{}'s extra high bits, so the two compilers
-part ways.  Modelling declared integer widths (masking or
-sign-extending results to the type) is a Stage~9a task; until then these
-cases are recorded as \emph{expected} divergences, reported but not
-failing the build.  Should \kcc{} ever agree, the runner flags an
-\texttt{XPASS} so the entry can graduate to a real test.
+The first divergence this suite caught was a real one and is now fixed.
+\kcc{}'s all-spill model keeps every value in a 64-bit slot and computes
+with 64-bit instructions, so it once left an \texttt{int} or
+\texttt{unsigned int} result un-truncated: a computation that wrapped
+past $2^{32}$ kept the extra high bits and disagreed with
+\texttt{clang}.  \texttt{\_kcc\_ir\_norm32} re-canonicalises the result of each
+width-growing operation to its declared width---sign-extending a signed
+result, zero-extending an unsigned one.  It is called from all three
+sites that produce such results: ordinary binary operators
+(\texttt{build\_binary}), compound assignment for both locals and
+globals (\texttt{build\_assign}), and unary negation and complement
+(\texttt{build\_unary}).  The tests below pin the behaviour down:
+unsigned wraparound on \texttt{+}, \texttt{-}, \texttt{*}, \texttt{<<},
+compound \texttt{+=}/\texttt{*=}, and unary \texttt{-}/\texttt{\~{}};
+unsigned comparison and division after a wrap; the
+usual-arithmetic-conversion case where a signed operand meets an
+unsigned one; and---as guards against over-eager masking---%
+\texttt{long} and pointer computations that must stay 64-bit.  The
+\texttt{xfail} machinery remains for the next genuine limitation; at
+present there are none.
 
 @d Difftest: divergences @{
 echo ""
-echo "--- Known Divergences (32-bit width, Stage 9a) ---"
+echo "--- Integer Width (32-bit truncation) ---"
 
-difftest_xfail "u32-wrap-sub" \
-    "int main(void){ unsigned int a = 0; a = a - 1; return (int)(a % 251); }" \
-    "no 32-bit truncation"
-difftest_xfail "u32-wrap-add" \
-    "int main(void){ unsigned int a = 0xFFFFFFFF; a = a + 1; return (int)(a % 100); }" \
-    "no 32-bit truncation"
-difftest_xfail "u32-overflow-sum" \
-    "int main(void){ unsigned int a = 4000000000; unsigned int b = 1000000000; return (int)((a + b) % 1000); }" \
-    "no 32-bit truncation"
+difftest "u32-wrap-sub" \
+    "int main(void){ unsigned int a = 0; a = a - 1; return (int)(a % 251); }"
+difftest "u32-wrap-add" \
+    "int main(void){ unsigned int a = 0xFFFFFFFF; a = a + 1; return (int)(a % 100); }"
+difftest "u32-overflow-sum" \
+    "int main(void){ unsigned int a = 4000000000; unsigned int b = 1000000000; return (int)((a + b) % 1000); }"
+difftest "u32-mul-overflow" \
+    "int main(void){ unsigned int a = 100000; unsigned int b = 100000; return (int)((a * b) % 1000); }"
+difftest "u32-shl-overflow" \
+    "int main(void){ unsigned int a = 0xFFFFFFFF; return (int)((a << 4) % 100); }"
+difftest "u32-cmp-after-wrap" \
+    "int main(void){ unsigned int a = 0; a = a - 1; unsigned int b = 5; return a > b; }"
+difftest "uac-signed-unsigned" \
+    "int main(void){ int a = -1; unsigned int b = 10; return (int)((a + b) % 100); }"
+difftest "u32-compound-add" \
+    "int main(void){ unsigned int a = 0xFFFFFFFF; a += 1; return (int)(a % 100); }"
+difftest "u32-compound-mul" \
+    "int main(void){ unsigned int a = 100000; a *= 100000; return (int)(a % 1000); }"
+difftest "u32-compound-global" \
+    "unsigned int g; int main(void){ g = 0xFFFFFFFF; g += 1; return (int)(g % 100); }"
+difftest "u32-negate" \
+    "int main(void){ unsigned int a = 5; unsigned int b = -a; return (int)(b % 251); }"
+difftest "u32-complement" \
+    "int main(void){ unsigned int a = 0; unsigned int b = ~a; return (int)(b % 251); }"
+difftest "long-stays-64" \
+    "int main(void){ long a = 4000000000; long b = 1000000000; return (int)((a + b) % 1000); }"
+difftest "ptr-arith-untouched" \
+    "int main(void){ int a[10]; int i = 0; while (i < 10) { a[i] = i; i = i + 1; } int *p = a; return *(p + 7); }"
 @}
 
 \section{Results}
 
 The suite fails only on a mismatch---a genuine wrong answer.  Gaps
-(features \kcc{} cannot yet compile) and expected divergences
-(\S\ref{sec:difftest-divergences}) are tallied and reported so both
+(features \kcc{} cannot yet compile) and any expected divergences
+(the \texttt{xfail} machinery, currently unused) are tallied and
+reported so both
 frontiers stay visible, but neither fails the build.
 
 @d Difftest: results @{

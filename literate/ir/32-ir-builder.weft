@@ -877,6 +877,20 @@ list needs no explicit tail fill: the unmentioned elements retain
 their zero image.  These global tables are exactly the lookup tables a
 self-hosted lexer relies on.
 
+A second pass then seeds the \texttt{static} locals
+(\S\ref{sec:ir-static-locals}).  Since these are hoisted to globals but
+their declarations live inside function bodies, this pass walks each
+function's top-level statement list for \texttt{static} declarations
+that carry an initialiser and emits the same
+\texttt{IR\_GLOBAL\_REF$+$IR\_STORE} against the mangled symbol.
+Running it here---at the top of \texttt{main}---is what gives a static
+its \emph{initialise once} semantics: the store executes at program
+start rather than on every entry to the declaring function.  A static
+without an initialiser, or one initialised to zero, needs nothing here;
+BSS already supplies the zero.  Static locals declared inside nested
+blocks are not yet swept by this pass, so a non-zero initialiser on one
+is not applied (its storage still persists, starting at zero).
+
 @d IR: build @{
 // -- kcc_ir_emit_global_inits --------------------------------------------
 // void kcc_ir_emit_global_inits(void)
@@ -898,7 +912,7 @@ _kcc_ir_emit_global_inits:
     ldr x19, [x0, #AST_F0]      // first declaration
 
 .Legi_loop:
-    cbz x19, .Legi_done
+    cbz x19, .Legi_statics
     ldr x0, [x19, #AST_TAG]
     cmp x0, #AST_VAR_DECL
     b.ne .Legi_next
@@ -969,6 +983,72 @@ _kcc_ir_emit_global_inits:
 .Legi_next:
     ldr x19, [x19, #AST_F4]     // next sibling
     b .Legi_loop
+
+.Legi_statics:
+    // Second pass: one-time initialisers for static locals, hoisted globals
+    adrp x0, _kcc_ir_trans_unit@@PAGE
+    add  x0, x0, _kcc_ir_trans_unit@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Legi_done
+    ldr x19, [x0, #AST_F0]      // first top-level decl
+.Legi_fn_loop:
+    cbz x19, .Legi_done
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_FUNC_DECL
+    b.ne .Legi_fn_next
+    ldr x0, [x19, #AST_F3]      // function body (compound stmt)
+    cbz x0, .Legi_fn_next
+    ldr x20, [x0, #AST_F0]      // first body item
+.Legi_stmt_loop:
+    cbz x20, .Legi_fn_next
+    ldr x0, [x20, #AST_TAG]
+    cmp x0, #AST_VAR_DECL
+    b.ne .Legi_stmt_next
+    ldr x0, [x20, #AST_F3]      // storage class (3 = static)
+    cmp x0, #3
+    b.ne .Legi_stmt_next
+    ldr x0, [x20, #AST_F2]      // initializer
+    cbz x0, .Legi_stmt_next
+
+    // GLOBAL_REF(mangled) + build_expr(init) + STORE
+    mov x0, x20
+    bl _kcc_ir_static_name
+    mov x21, x0                  // mangled name
+
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // x21 = address vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    ldr x0, [x20, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x22, x0                  // value vreg
+
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // value
+    str x21, [x0, #IR_SRC2]     // address
+    bl _kcc_ir_emit
+
+.Legi_stmt_next:
+    ldr x20, [x20, #AST_F4]
+    b .Legi_stmt_loop
+.Legi_fn_next:
+    ldr x19, [x19, #AST_F4]
+    b .Legi_fn_loop
 
 .Legi_done:
     ldp x21, x22, [sp, #32]
@@ -1047,6 +1127,13 @@ _kcc_ir_build_func:
     bl _kcc_ht_init
     adrp x1, _kcc_ir_locals@@PAGE
     add  x1, x1, _kcc_ir_locals@@PAGEOFF
+    str x0, [x1]
+
+    // Reset statics hash table (static locals visible only in this function)
+    mov x0, #16
+    bl _kcc_ht_init
+    adrp x1, _kcc_ir_statics@@PAGE
+    add  x1, x1, _kcc_ir_statics@@PAGEOFF
     str x0, [x1]
 
     // Create entry basic block
@@ -2609,6 +2696,19 @@ _kcc_ir_build_ident:
     b .Libi_done
 
 .Libi_global:
+    // static local hoisted to a global? redirect onto its mangled symbol
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libi_global_notstatic
+    mov x1, x20                  // key = source name
+    mov x2, x21                  // keylen
+    bl _kcc_ht_get
+    cbz x0, .Libi_global_notstatic
+    mov x20, x0                  // x20 = mangled name ptr
+    b .Libi_global_scalar
+
+.Libi_global_notstatic:
     // Not a local — check if it's an array (address = decayed pointer)
     mov x0, x20                  // name
     mov x1, x21                  // len
@@ -3983,6 +4083,22 @@ _kcc_ir_build_assign:
 
 .Liba_global_store:
     // x22 = name ptr, x21 = rhs vreg, x20 = op token
+    // static local? redirect the store onto its mangled global
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Liba_global_ref_emit
+    mov x23, x0                  // ht
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    mov x0, x23
+    mov x1, x22                  // key = source name
+    bl _kcc_ht_get
+    cbz x0, .Liba_global_ref_emit
+    mov x22, x0                  // x22 = mangled name
+
+.Liba_global_ref_emit:
     // Emit global_ref to get address vreg
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
@@ -5136,6 +5252,80 @@ _kcc_ir_emit_indexed_store:
 @| _kcc_ir_emit_indexed_store
 @}
 
+\subsection{Static Locals}
+\label{sec:ir-static-locals}
+
+A \texttt{static} local has block scope but static storage duration: it
+is initialised once, before the program starts, and retains its value
+across calls.  The all-spill model already has a natural home for such
+storage---the BSS globals every ordinary file-scope variable uses---so
+the builder \emph{hoists} each static local to a synthetic global
+rather than giving it a stack alloca.
+
+Two functions may each declare their own \texttt{static int i}, so the
+hoisted global needs a name that is unique yet reproducible from the
+declaration alone.  \texttt{\_kcc\_ir\_static\_name} supplies it by
+formatting the declaration node's own address as
+\texttt{sl\_}\meta{16 hex digits}.  Because the name is a pure function
+of the node pointer, the two passes that must agree on it---the
+declaration builder, which records the mapping and suppresses the
+alloca, and \texttt{\_kcc\_ir\_emit\_global\_inits}, which emits the
+one-time initialiser at program start---derive the identical string
+independently, with no shared table.  The symbol itself is created
+lazily by the code generator when it lowers the first
+\texttt{IR\_GLOBAL\_REF} that names it.
+
+@d IR: static local helper @{
+// -- kcc_ir_static_name ---------------------------------------------------
+// char *kcc_ir_static_name(node *decl)
+//   x0 = declaration node → arena string "sl_" + 16 hex digits of the node
+//        pointer, the unique symbol name for this static local's global.
+.text
+.globl _kcc_ir_static_name
+.p2align 2
+_kcc_ir_static_name:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                  // node pointer = value to encode
+
+    mov x0, #24
+    bl _kcc_arena_alloc
+    mov x20, x0
+
+    mov w1, #'s'
+    strb w1, [x20]
+    mov w1, #'l'
+    strb w1, [x20, #1]
+    mov w1, #'_'
+    strb w1, [x20, #2]
+
+    add x2, x20, #3              // write cursor
+    mov x3, #60                  // shift, most-significant nibble first
+.Lisn_loop:
+    lsr x4, x19, x3
+    and x4, x4, #0xf
+    cmp x4, #10
+    b.lt .Lisn_dec
+    add x4, x4, #87             // 'a' - 10
+    b .Lisn_put
+.Lisn_dec:
+    add x4, x4, #48             // '0'
+.Lisn_put:
+    strb w4, [x2], #1
+    subs x3, x3, #4
+    b.ge .Lisn_loop
+
+    strb wzr, [x2]               // null terminator
+
+    mov x0, x20
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_static_name
+@}
+
 @d IR: build var decl @{
 // -- kcc_ir_build_var_decl ------------------------------------------------
 // void kcc_ir_build_var_decl(node *decl)
@@ -5153,6 +5343,11 @@ _kcc_ir_build_var_decl:
     mov x19, x0                  // x19 = decl node (KEEP)
     ldr x20, [x19, #AST_F1]     // x20 = name
     cbz x20, .Libvd_done
+
+    // static local? hoist to a global instead of an alloca
+    ldr x0, [x19, #AST_F3]      // storage class (3 = static)
+    cmp x0, #3
+    b.eq .Libvd_static
 
     // Resolve type
     ldr x0, [x19, #AST_F0]
@@ -5390,6 +5585,22 @@ _kcc_ir_build_var_decl:
     bl _kcc_ir_emit_indexed_store
     add x22, x22, #1
     b .Libvd_il_zf_loop
+
+.Libvd_static:
+    // Hoist: record source-name -> mangled global; skip alloca and init
+    mov x0, x19
+    bl _kcc_ir_static_name
+    mov x21, x0                  // mangled name ptr
+
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20                  // key = source name
+    mov x3, x21                  // value = mangled name ptr
+    bl _kcc_ht_put
 
 .Libvd_done:
     ldp x23, x24, [sp, #48]
@@ -6771,6 +6982,38 @@ run_test "initlist-global-table" \
 
 run_test "initlist-global-lut" \
     "int digit[10]={0,1,2,3,4,5,6,7,8,9}; int main(void){ int s=0; int i=0; while(i<10){s=s+digit[i]; i=i+1;} return s; }" 45
+@}
+
+\subsection{Static Locals}
+
+A \texttt{static} local keeps its value across calls and is initialised
+just once.  The tests exercise persistence across repeated calls, the
+initialise-once rule (a non-zero seed applied at program start, not on
+each entry), the implicit zero of an uninitialised static, a static
+that shadows a like-named file-scope global, and two functions whose
+identically-named statics must stay distinct.
+
+@d Test: codegen static locals @{
+echo ""
+echo "--- Static Locals ---"
+
+run_test "static-persist" \
+    "int next(void){ static int c=0; c=c+1; return c; } int main(void){ next(); next(); return next(); }" 3
+
+run_test "static-init-once" \
+    "int f(void){ static int x=10; x=x+5; return x; } int main(void){ f(); return f(); }" 20
+
+run_test "static-zero-default" \
+    "int g(void){ static int n; n=n+2; return n; } int main(void){ g(); g(); return g(); }" 6
+
+run_test "static-compound-assign" \
+    "int acc(int v){ static int t=0; t+=v; return t; } int main(void){ acc(10); acc(20); return acc(5); }" 35
+
+run_test "static-shadows-global" \
+    "int c=100; int inc(void){ static int c=0; c=c+1; return c; } int main(void){ inc(); inc(); return inc()+c; }" 103
+
+run_test "static-two-distinct" \
+    "int a(void){ static int c=0; c=c+1; return c; } int b(void){ static int c=50; c=c+1; return c; } int main(void){ b(); b(); return a()*10 + (b()-50); }" 13
 @}
 
 The final test group assembles several patterns from the self-hosting

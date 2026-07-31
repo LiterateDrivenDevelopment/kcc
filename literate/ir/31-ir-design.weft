@@ -462,6 +462,16 @@ Module-level state: the current function being built, the current basic
 block receiving emitted instructions, and the global function vector that
 \texttt{codegen\_all} iterates.
 
+Alongside the \texttt{locals} table sits a second per-function map,
+\texttt{statics}, keyed the same way (source name) but holding the
+\emph{mangled} symbol name of a \texttt{static} local rather than an
+alloca vreg.  A static local has no stack storage---it is hoisted to a
+uniquely-named global (\S\ref{sec:ir-static-locals})---so the
+identifier and assignment builders consult this table, before falling
+back to a file-scope global, to redirect a reference onto the hoisted
+symbol.  Like \texttt{locals} it is re-initialised for each function so
+that a static's name is visible only within its defining function.
+
 @d IR: data @{
 // -- IR module data -------------------------------------------------------
 .data
@@ -474,6 +484,8 @@ _kcc_ir_cur_bb:      .quad 0     // current basic block for emission
 _kcc_ir_funcs:       .quad 0     // vec of all IR functions
 .globl _kcc_ir_locals
 _kcc_ir_locals:      .quad 0     // hash table: name → alloca vreg
+.globl _kcc_ir_statics
+_kcc_ir_statics:     .quad 0     // hash table: name → mangled static-local symbol
 .globl _kcc_ir_loop_stack
 _kcc_ir_loop_stack:  .quad 0     // vec of (continue_bb, break_bb) pairs
 .globl _kcc_ir_bb_counter
@@ -482,6 +494,7 @@ _kcc_ir_bb_counter:  .quad 0     // global BB id counter
 @| _kcc_ir_cur_bb
 @| _kcc_ir_funcs
 @| _kcc_ir_locals
+@| _kcc_ir_statics
 @| _kcc_ir_loop_stack
 @| _kcc_ir_bb_counter
 @}

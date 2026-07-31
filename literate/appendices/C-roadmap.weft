@@ -504,14 +504,14 @@ itself.
       construction and ARM64 systems programming.
 \end{enumerate}
 
-\textbf{Status.}  Stage~8a in progress.  185 codegen tests passing.
+\textbf{Status.}  Stage~8a in progress.  191 codegen tests passing.
 The compiler handles integer arithmetic, control flow, loops,
 function calls (direct and indirect), structs (nested, arrays),
 pointers, pointer-to-pointer and arrays of pointers, arrays,
 brace-enclosed array and struct initializers (local and file-scope),
-global variables, enums, switch/case, sizeof, character literals,
-string literals, void functions, forward-declared prototypes, and
-function pointers.  A 1{,}130-line C test suite compiles and runs correctly:
+static locals, global variables, enums, switch/case, sizeof, character
+literals, string literals, void functions, forward-declared prototypes,
+and function pointers.  A 1{,}130-line C test suite compiles and runs correctly:
 hash tables, arena allocators, recursive-descent parsers, linked-list
 manipulation, tree evaluators, and the sieve of Eratosthenes.
 
@@ -550,10 +550,19 @@ manipulation, tree evaluators, and the sieve of Eratosthenes.
       tables via \texttt{\_kcc\_ir\_emit\_global\_inits} (BSS supplies
       the zero image).  String initializers for char arrays and
       designated initializers remain for Phase~9.
-\item[\checkmark] 185 codegen tests covering all features
-      (8 Phase~8 test groups: nested structs, struct arrays,
+\item[\checkmark] Static locals: hoisted to a per-declaration global
+      named \texttt{sl\_}\meta{node address} by
+      \texttt{\_kcc\_ir\_static\_name}, so no stack alloca is emitted.
+      A per-function \texttt{statics} table redirects identifier and
+      assignment references onto the mangled symbol (shadowing any
+      like-named file-scope global), and a second pass in
+      \texttt{\_kcc\_ir\_emit\_global\_inits} emits the one-time
+      initialiser at program start.  Nested-block statics and static
+      aggregates remain for Phase~9.
+\item[\checkmark] 191 codegen tests covering all features
+      (9 Phase~8 test groups: nested structs, struct arrays,
       global init, pointer arithmetic, pointer arrays, initializer
-      lists, self-hosting patterns, function pointers).
+      lists, static locals, self-hosting patterns, function pointers).
 \end{itemize}
 
 \textbf{Remaining work --- Stage 8a: missing C features.}
@@ -574,19 +583,16 @@ a realistic subsystem of itself.
 \item \textbf{Typedef support.}  The parser recognizes
       \texttt{typedef} but codegen has not been stress-tested
       with typedef'd structs and function pointer types.
-\item \textbf{Static locals.}  \texttt{static int count = 0;}
-      requires a \texttt{\_\_data} section symbol with persistent
-      storage.
 \item \textbf{String initializers for char arrays.}
       \texttt{char s[] = "abc"} must copy the literal bytes into the
       array rather than storing the string pointer.
 \end{itemize}
 
 \noindent Pointer-to-pointer, arrays of pointers, void functions,
-forward-declared prototypes, character literals, and brace-enclosed
-initializer lists (array and flat-struct, local and file-scope) were
-originally listed here; all are now implemented and covered by the
-codegen suite (see the completed milestones above).
+forward-declared prototypes, character literals, brace-enclosed
+initializer lists (array and flat-struct, local and file-scope), and
+static locals were originally listed here; all are now implemented and
+covered by the codegen suite (see the completed milestones above).
 
 \textbf{Remaining work --- Stage 8b: subsystem in C.}
 

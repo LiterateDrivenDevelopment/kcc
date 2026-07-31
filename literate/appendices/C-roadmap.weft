@@ -662,12 +662,15 @@ milestones above).
       (Chapter~\ref{ch:differential-testing}, \texttt{just difftest}):
       a 53-program corpus is compiled by both \kcc{} and \texttt{clang},
       run freestanding, and compared with \texttt{clang} as the oracle.
-      \kcc{} agrees on 49 programs with zero miscompilations; one
-      feature gap (a function pointer stored in a \texttt{struct} field)
-      and three expected divergences (32-bit integer wraparound, below)
-      are tracked without failing the build.  The harness needs no
-      hand-computed expected values, so it scales to programs far more
-      complex than the code-generation suite's.
+      \kcc{} agrees on all 50 in-scope programs with zero
+      miscompilations; the three remaining entries are expected
+      divergences (32-bit integer wraparound, below) tracked without
+      failing the build.  The one gap the harness first exposed---a
+      function pointer stored in a \texttt{struct} field---has since been
+      fixed (the field declarator now goes through the full declarator
+      parser, and a non-identifier call target dispatches indirectly).
+      The harness needs no hand-computed expected values, so it scales to
+      programs far more complex than the code-generation suite's.
 \item Bootstrap test: write a minimal C compiler (or expression
       evaluator) in C, compile it with \kcc{}, then use it to
       compile itself.  Compare the two binaries.
@@ -712,10 +715,6 @@ every remaining C17 type.
       Fix: mask (unsigned) or sign-extend (signed) each arithmetic
       result to its type width, or track width and narrow at the uses
       that need it.
-\item \textbf{Function pointers in aggregates.}  A function-pointer
-      \emph{variable} or parameter works, but one stored as a
-      \texttt{struct} field (\texttt{struct \{ int (*f)(int); \}}) is not
-      yet compiled---a differential-suite gap.
 \item \textbf{Floating point.}  The type singletons (\texttt{TY\_FLOAT},
       \texttt{TY\_DOUBLE}, \texttt{TY\_LDOUBLE}) already exist in the
       type system but have no IR or codegen support.  Add IR opcodes

@@ -1292,14 +1292,20 @@ _kcc_parse_struct_or_union:
 With the tag determined and the opening brace consumed, the parser enters
 a loop over the struct or union members.  Each member consists of declaration
 specifiers followed by a declarator and an optional bitfield width introduced
-by a colon.  The declarator may begin with one or more pointer stars; after
-parsing the base type specifiers we consume any \texttt{*} tokens and wrap
-the type in nested \texttt{AST\_TYPE\_PTR} nodes, mirroring the logic used
-by the normal declarator parser.  Anonymous members (a bare specifier
-followed immediately by a semicolon) are also supported, which allows
-anonymous inner structs and unions as described in \stdref{6.7.2.1}~p13.
-Members are linked through \texttt{AST\_F4} into a singly-linked list
-anchored by the first field node.
+by a colon.  Rather than re-implement declarator parsing, the member loop
+calls the full \texttt{\_kcc\_parse\_declarator} on the base specifiers---the
+same routine used for ordinary declarations---so a field may carry any
+declarator the language allows: pointers, arrays, and crucially the grouped
+\emph{function-pointer} form \texttt{int (*f)(int)}.  The node it returns
+already holds the field's full type in \texttt{AST\_F0} and its name in
+\texttt{AST\_F1}, so the loop simply retags it as an \texttt{AST\_FIELD\_DECL}
+and records the bitfield width, if any, in \texttt{AST\_F2}.  Parsing each
+comma-separated declarator against the \emph{original} base type also fixes a
+latent bug where \texttt{int *a, b;} wrongly made \texttt{b} a pointer.
+Anonymous members (a bare specifier followed immediately by a semicolon) are
+still supported, allowing anonymous inner structs and unions as described in
+\stdref{6.7.2.1}~p13.  Members are linked through \texttt{AST\_F4} into a
+singly-linked list anchored by the first field node.
 
 @d Decl: parse struct @{
 .Lstruct_field_loop:
@@ -1322,74 +1328,38 @@ anchored by the first field node.
     cmp  x0, #TOK_SEMI
     b.eq .Lstruct_anon_field
 
-    // Parse pointer stars in field declarator (e.g., char *name)
-.Lstruct_field_ptr:
-    adrp x0, _kcc_tok_type@@PAGE
-    add  x0, x0, _kcc_tok_type@@PAGEOFF
-    ldr  x0, [x0]
-    cmp  x0, #TOK_STAR
-    b.ne .Lstruct_field_decl
-
-    bl _kcc_pp_next               // consume '*'
-    mov x0, #AST_TYPE_PTR
-    bl _kcc_ast_alloc
-    str x23, [x0, #AST_F0]       // pointee = current type
-    str xzr, [x0, #AST_F1]       // no qualifiers
-    mov x23, x0                   // x23 = pointer type
-    b .Lstruct_field_ptr
-
-    // Parse field declarator
+    // Parse the full field declarator (pointers, grouped function-pointer
+    // declarators, arrays) against the base type, then reuse the returned
+    // node as the field by retagging it.
 .Lstruct_field_decl:
-    mov x24, #0                  // field name
+    mov x0, x23                  // base type specifiers
+    bl _kcc_parse_declarator
+    mov x24, x0                  // x24 = field node (VAR_DECL / FUNC_DECL shape)
+    cbz x24, .Lstruct_field_semi
+    mov x0, #AST_FIELD_DECL
+    str x0, [x24, #AST_TAG]      // retag as a struct/union field
+    str xzr, [x24, #AST_F2]      // bitwidth default 0
+    str xzr, [x24, #AST_F4]      // no sibling yet
 
+    // Optional bitfield ': width'
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
-    cmp  x0, #TOK_IDENT
-    b.ne .Lstruct_field_colon
-
-    adrp x0, _kcc_tok_start@@PAGE
-    add  x0, x0, _kcc_tok_start@@PAGEOFF
-    ldr  x0, [x0]
-    adrp x1, _kcc_tok_len@@PAGE
-    add  x1, x1, _kcc_tok_len@@PAGEOFF
-    ldr  x1, [x1]
-    bl _kcc_strtab_intern
-    mov x24, x0                  // field name
-
-    bl _kcc_pp_next               // consume name
-
-.Lstruct_field_colon:
-    // Check for bitfield ':'
-    mov x0, #0                   // bitwidth (default 0)
-    adrp x1, _kcc_tok_type@@PAGE
-    add  x1, x1, _kcc_tok_type@@PAGEOFF
-    ldr  x1, [x1]
-    cmp  x1, #TOK_COLON
-    b.ne .Lstruct_field_build
-
+    cmp  x0, #TOK_COLON
+    b.ne .Lstruct_field_append
     bl _kcc_pp_next               // consume ':'
-    bl _kcc_parse_cond_expr       // parse bitwidth
-    // x0 = bitwidth expr
+    bl _kcc_parse_cond_expr       // bitwidth expr
+    str x0, [x24, #AST_F2]
 
-.Lstruct_field_build:
-    str x0, [sp, #-16]!         // push bitwidth (preserve across alloc)
-    mov x0, #AST_FIELD_DECL
-    bl _kcc_ast_alloc
-    ldr x1, [sp], #16           // pop bitwidth
-    str x23, [x0, #AST_F0]      // type
-    str x24, [x0, #AST_F1]      // name_ptr
-    str x1, [x0, #AST_F2]       // bitwidth
-
-    // Append
+.Lstruct_field_append:
     cbz x21, .Lstruct_field_first
-    str x0, [x22, #AST_F4]
-    mov x22, x0
+    str x24, [x22, #AST_F4]
+    mov x22, x24
     b .Lstruct_field_more
 
 .Lstruct_field_first:
-    mov x21, x0
-    mov x22, x0
+    mov x21, x24
+    mov x22, x24
 
 .Lstruct_field_more:
     // Check for ',' (more declarators with same type)

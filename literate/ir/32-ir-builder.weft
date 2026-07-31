@@ -4488,6 +4488,15 @@ The \texttt{IR\_CALL} instruction stores the callee name in
 \texttt{SRC1} and the argument array pointer in \texttt{SRC2}; the
 destination vreg receives the return value.
 
+The callee decides direct versus indirect dispatch.  A bare name that
+is not a local variable is a direct \texttt{IR\_CALL} by symbol.
+Anything else---a function-pointer variable, or \emph{any} other
+expression such as a struct field \texttt{o.f}, a dereference
+\texttt{(*pp)}, or a subscript \texttt{table[i]}---is evaluated for its
+function-pointer value and dispatched through \texttt{IR\_CALL\_IND}.
+Routing every non-identifier callee to that same path is what lets a
+function pointer stored in a \texttt{struct} field be called.
+
 @d IR: build call @{
 // -- kcc_ir_build_call ----------------------------------------------------
 // uint64_t kcc_ir_build_call(node *expr)
@@ -4509,13 +4518,14 @@ _kcc_ir_build_call:
     // Get callee expression
     ldr x0, [x19, #AST_F0]       // callee expr
     cbz x0, .Libc_done_zero
+    str x0, [sp, #72]            // save callee expr node (indirect path rebuilds it)
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_IDENT_EXPR
-    b.ne .Libc_done_zero
+    b.ne .Libc_callee_indirect   // non-ident callee (o.f, (*pp), a[i]) → indirect
+
     ldr x20, [x0, #AST_F0]       // x20 = callee name ptr
 
-    // Check if callee is a local variable (function pointer)
-    str x0, [sp, #72]            // save callee expr node
+    // Direct name, or a local function-pointer variable?
     mov x0, x20
     bl _kcc_strlen
     mov x24, x0                   // x24 = name len
@@ -4526,8 +4536,16 @@ _kcc_ir_build_call:
     mov x2, x24
     bl _kcc_ht_get
     // x0 = vreg+1 (with possible bit-63 tag) or 0 if not found
-    str x0, [sp, #64]            // save locals_result
+    str x0, [sp, #64]            // locals_result: 0 → direct call by name
+    b .Libc_count_start
 
+.Libc_callee_indirect:
+    // A callee that is any expression other than a bare name: evaluate it
+    // for its function-pointer value and dispatch indirectly.
+    mov x0, #1
+    str x0, [sp, #64]            // force the indirect path
+
+.Libc_count_start:
     // Count arguments (walk F4 chain)
     ldr x21, [x19, #AST_F1]      // x21 = first arg
     mov x22, #0                    // x22 = arg count
@@ -7099,6 +7117,12 @@ run_test "fnptr-multi-ops" \
 
 run_test "fnptr-higher-order" \
     "int dbl(int x) { return x * 2; } int sq(int x) { return x * x; } int mapsum(int (*f)(int), int n) { int s=0; int i=1; while(i<=n){s=s+f(i); i=i+1;} return s; } int main(void) { return mapsum(dbl, 3) + mapsum(sq, 3); }" 26
+
+run_test "fnptr-struct-field" \
+    "struct Ops { int (*f)(int, int); }; int add(int a, int b) { return a + b; } int main(void) { struct Ops o; o.f = add; return o.f(20, 22); }" 42
+
+run_test "fnptr-struct-arrow" \
+    "struct C { int (*op)(int); }; int dbl(int x) { return x * 2; } int apply(struct C *c, int v) { return c->op(v); } int main(void) { struct C c; c.op = dbl; return apply(&c, 21); }" 42
 @}
 
 \section{String Constants}

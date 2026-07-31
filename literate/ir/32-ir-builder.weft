@@ -2913,7 +2913,20 @@ _kcc_ir_build_binary:
     cbz x0, .Libb_ps_check_rhs
     ldr x1, [x0, #TY_KIND]
     cmp x1, #TY_PTR
-    b.eq .Libb_ps_scale_rhs
+    b.ne .Libb_ps_check_rhs
+
+    // LHS is a pointer.  ptr - ptr is a pointer difference: fall through to
+    // the ptrdiff handler; ptr + int / ptr - int scales the integer.
+    cmp x23, #IR_SUB
+    b.ne .Libb_ps_scale_rhs
+    ldr x2, [x19, #AST_F2]
+    cbz x2, .Libb_ps_scale_rhs
+    ldr x2, [x2, #AST_F3]
+    cbz x2, .Libb_ps_scale_rhs
+    ldr x2, [x2, #TY_KIND]
+    cmp x2, #TY_PTR
+    b.eq .Libb_ptr_diff
+    b .Libb_ps_scale_rhs
 
 .Libb_ps_check_rhs:
     // Check if RHS is a pointer type (int + ptr)
@@ -3009,6 +3022,72 @@ _kcc_ir_build_binary:
     mov x0, x20
     bl _kcc_ir_emit
     b .Libb_emit
+
+.Libb_ptr_diff:
+    // Pointer difference: (lhs - rhs) / stride.  The stride mirrors the one
+    // ptr+int scaling uses so the two are consistent: 1 for byte-sized
+    // pointees, otherwise max(pointee_size, 8) for the all-spill slot model.
+    ldr x0, [x19, #AST_F1]
+    ldr x0, [x0, #AST_F3]
+    ldr x0, [x0, #TY_F0]           // pointee type
+    mov x24, #8
+    cbz x0, .Libb_pd_have
+    ldr x1, [x0, #TY_SIZE]
+    cmp x1, #1
+    b.le .Libb_pd_stride1          // byte-sized pointee: stride 1
+    mov x2, #8
+    cmp x1, #8
+    csel x24, x1, x2, ge           // max(size, 8)
+    b .Libb_pd_have
+.Libb_pd_stride1:
+    mov x24, #1
+.Libb_pd_have:
+    // SUB: byte difference of the two addresses
+    mov x0, #IR_SUB
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_long_s@@PAGE
+    add  x1, x1, _kcc_type_long_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x21, [x20, #IR_SRC1]
+    str x22, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0                    // x21 = byte difference
+    mov x0, x20
+    bl _kcc_ir_emit
+    // CONST stride
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_long_s@@PAGE
+    add  x1, x1, _kcc_type_long_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x24, [x20, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x22, x0                    // x22 = stride
+    mov x0, x20
+    bl _kcc_ir_emit
+    // SDIV: element count = byte difference / stride
+    mov x0, #IR_SDIV
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_long_s@@PAGE
+    add  x1, x1, _kcc_type_long_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x21, [x20, #IR_SRC1]
+    str x22, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x23, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    mov x0, x23
+    b .Libb_done
 
 .Libb_op_mul:  mov x23, #IR_MUL
     b .Libb_emit

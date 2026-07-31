@@ -521,6 +521,31 @@ consecutive integer values starting from zero.
 .Lscd_enum_loop:
     cbz x22, .Lscd_done
 
+    // Explicit value (= expr) resets the running counter (§6.7.2.2).
+    ldr x0, [x22, #AST_F1]         // value expr, or 0
+    cbz x0, .Lscd_enum_reg
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INT_LIT
+    b.eq .Lscd_enum_lit
+    cmp x1, #AST_CHAR_LIT
+    b.eq .Lscd_enum_lit
+    cmp x1, #AST_UNARY_EXPR
+    b.ne .Lscd_enum_reg            // unsupported const form: keep the counter
+    ldr x1, [x0, #AST_F0]          // unary op token
+    cmp x1, #TOK_MINUS
+    b.ne .Lscd_enum_reg
+    ldr x1, [x0, #AST_F1]          // operand
+    cbz x1, .Lscd_enum_reg
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_INT_LIT
+    b.ne .Lscd_enum_reg
+    ldr x20, [x1, #AST_F0]
+    neg x20, x20                   // = -literal
+    b .Lscd_enum_reg
+.Lscd_enum_lit:
+    ldr x20, [x0, #AST_F0]         // = literal
+
+.Lscd_enum_reg:
     ldr x0, [x22, #AST_F0]         // name_ptr
     cbz x0, .Lscd_enum_next
     mov x21, x0
@@ -1493,8 +1518,10 @@ evaluated at run time).  In both cases the result type is
 .text
 .p2align 2
 _kcc_sema_expr_sizeof:
-    stp x29, x30, [sp, #-16]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
 
     // Check if operand is a type or expression
     ldr x1, [x19, #AST_F1]         // is_type flag
@@ -1503,6 +1530,38 @@ _kcc_sema_expr_sizeof:
     // Expression operand: type-check it
     ldr x0, [x19, #AST_F0]
     bl _kcc_sema_expr
+
+    // sizeof does not decay arrays (§6.3.2.1): if the operand names an
+    // array, restore its array type so the size is the whole array, not a
+    // pointer.  sema_expr already decayed it to a pointer in AST_F3.  The
+    // operand is the node whose AST_F3 the IR builder reads; the name may
+    // sit under one or more parentheses, so descend to the inner expression.
+    ldr x20, [x19, #AST_F0]        // operand node (IR builder reads its AST_F3)
+    mov x1, x20
+.Lses_unwrap:
+    ldr x0, [x1, #AST_TAG]
+    cmp x0, #AST_PAREN_EXPR
+    b.ne .Lses_inner
+    ldr x1, [x1, #AST_F0]
+    cbnz x1, .Lses_unwrap
+    b .Lses_result
+.Lses_inner:
+    cmp x0, #AST_IDENT_EXPR
+    b.ne .Lses_result
+    ldr x21, [x1, #AST_F0]         // name ptr
+    cbz x21, .Lses_result
+    mov x0, x21
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x21
+    bl _kcc_symtab_lookup
+    cbz x0, .Lses_result
+    ldr x0, [x0, #SYM_TYPE]
+    cbz x0, .Lses_result
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lses_result
+    str x0, [x20, #AST_F3]         // set the un-decayed array type on the operand
     b .Lses_result
 
 .Lses_type:
@@ -1515,7 +1574,9 @@ _kcc_sema_expr_sizeof:
     adrp x0, _kcc_type_long_u@@PAGE
     add  x0, x0, _kcc_type_long_u@@PAGEOFF
     ldr  x0, [x0]
-    ldp x29, x30, [sp], #16
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 @}
 

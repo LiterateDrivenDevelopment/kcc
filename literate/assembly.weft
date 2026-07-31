@@ -593,6 +593,8 @@ self-test, and diff against clang:
 @<Difftest: aggregates@>
 @<Difftest: operators@>
 @<Difftest: combinations@>
+@<Difftest: language@>
 @<Difftest: divergences@>
+@<Difftest: gaps@>
 @<Difftest: results@>
 @}

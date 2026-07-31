@@ -660,18 +660,19 @@ milestones above).
 \begin{itemize}
 \item[\checkmark] Differential testing
       (Chapter~\ref{ch:differential-testing}, \texttt{just difftest}):
-      a 53-program corpus is compiled by both \kcc{} and \texttt{clang},
+      an 83-program corpus is compiled by both \kcc{} and \texttt{clang},
       run freestanding, and compared with \texttt{clang} as the oracle.
-      \kcc{} agrees with \texttt{clang} on all 59 programs---zero
-      miscompilations, zero gaps, zero divergences.  Both frontiers the
-      harness first mapped have since been closed: the gap (a function
-      pointer stored in a \texttt{struct} field) by routing struct-field
-      declarators through the full declarator parser and dispatching
-      non-identifier call targets indirectly; and the divergence (32-bit
-      integer wraparound) by \texttt{\_kcc\_ir\_norm32}, which truncates
-      each width-growing result to its declared width.  The harness needs
-      no hand-computed expected values, so it scales to programs far more
-      complex than the code-generation suite's.
+      \kcc{} agrees on all 80 in-scope programs with zero
+      miscompilations; three expected divergences (multi-dimensional
+      arrays, \texttt{struct} return by value, and \texttt{goto}) are
+      tracked without failing the build.  The sweep drove a string of
+      fixes---function pointers in \texttt{struct} fields, 32-bit integer
+      wraparound (\texttt{\_kcc\_ir\_norm32}), enumerators with explicit
+      values, \texttt{sizeof} of a whole array, the comma operator in a
+      \texttt{for} clause (a callee-saved-register bug in
+      \texttt{parse\_expr} that hung the loop), and pointer difference.
+      The harness needs no hand-computed expected values, so it scales to
+      programs far more complex than the code-generation suite's.
 \item Bootstrap test: write a minimal C compiler (or expression
       evaluator) in C, compile it with \kcc{}, then use it to
       compile itself.  Compare the two binaries.

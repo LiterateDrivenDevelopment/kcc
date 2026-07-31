@@ -312,6 +312,54 @@ difftest "fnptr-in-struct" \
     "struct Ops { int (*f)(int, int); }; int add(int a, int b){ return a + b; } int main(void){ struct Ops o; o.f = add; return o.f(20, 22); }"
 @}
 
+\section{Language Features}
+
+A broad sweep across language constructs, several of which the harness
+first flagged as bugs and which are now fixed: enumerators with explicit
+values, \texttt{sizeof} of a whole array (which must not decay to a
+pointer), the comma operator in a \texttt{for} clause (a parser register
+bug that hung the loop), and pointer difference.  The rest exercise
+\texttt{goto}, dense \texttt{switch}, deep recursion, eight-argument
+calls, pointer comparison, and a spread of operators.
+
+@d Difftest: language @{
+echo ""
+echo "--- Language Features ---"
+
+difftest "enum-explicit" \
+    "enum E { A, B, C, D = 10, E2 }; int main(void){ return A + B + C + D + E2; }"
+difftest "enum-negative" \
+    "enum E { X = -1, Y, Z = 100, W }; int main(void){ return X + Y + Z + W + 100; }"
+difftest "sizeof-array-count" \
+    "int main(void){ int a[10]; return (int)(sizeof(a) / sizeof(a[0])); }"
+difftest "sizeof-array-bytes" \
+    "int main(void){ char a[25]; return (int)sizeof(a); }"
+difftest "for-comma-update" \
+    "int main(void){ int s = 0; int i; for (i = 0; i < 5; i = i + 1, s = s + 10) { } return s; }"
+difftest "for-comma-both" \
+    "int main(void){ int s = 0; int i; int j; for (i = 0, j = 10; i < j; i = i + 1, j = j - 1) { s = s + 1; } return s; }"
+difftest "ptr-diff-index" \
+    "int main(void){ int a[10]; int *p = &a[2]; int *q = &a[7]; return (int)(q - p); }"
+difftest "ptr-diff-strlen" \
+    "int slen(char *s){ char *p = s; while (*p) p = p + 1; return (int)(p - s); } int main(void){ return slen(\"hello world\"); }"
+difftest "switch-dense" \
+    "int f(int x){ switch (x) { case 0: return 10; case 1: return 20; case 2: return 30; case 3: return 40; default: return 99; } } int main(void){ return f(2) + f(5); }"
+difftest "nested-switch" \
+    "int main(void){ int a = 1; int b = 2; int r = 0; switch (a) { case 1: switch (b) { case 2: r = 7; break; default: r = 1; } break; default: r = 0; } return r; }"
+difftest "ackermann" \
+    "int ack(int m, int n){ if (m == 0) return n + 1; if (n == 0) return ack(m - 1, 1); return ack(m - 1, ack(m, n - 1)); } int main(void){ return ack(2, 3); }"
+difftest "eight-args" \
+    "int f(int a, int b, int c, int d, int e, int g, int h, int i){ return a + b + c + d + e + g + h + i; } int main(void){ return f(1, 2, 3, 4, 5, 6, 7, 8); }"
+difftest "ptr-compare" \
+    "int main(void){ int a[5]; int *p = a; int *e = a + 5; int c = 0; while (p < e) { c = c + 1; p = p + 1; } return c; }"
+difftest "assign-chain" \
+    "int main(void){ int a; int b; int c; a = b = c = 7; return a + b + c; }"
+difftest "hex-octal" \
+    "int main(void){ int a = 0xFF; int b = 0777; return a + b; }"
+difftest "char-escapes" \
+    "int main(void){ char n = '\\n'; char t = '\\t'; char z = '\\0'; return n + t + z; }"
+@}
+
 \section{Integer Width}
 \label{sec:difftest-width}
 
@@ -370,12 +418,39 @@ difftest "ptr-arith-untouched" \
     "int main(void){ int a[10]; int i = 0; while (i < 10) { a[i] = i; i = i + 1; } int *p = a; return *(p + 7); }"
 @}
 
+\section{Known Divergences}
+\label{sec:difftest-gaps}
+
+Three constructs the sweep exposed remain open, each a substantial
+feature rather than a quick fix, so they are recorded as expected
+divergences.  A multi-dimensional array (\texttt{int a[3][3]}) is not
+laid out or indexed correctly by the all-spill model; a \texttt{struct}
+returned \emph{by value} is not marshalled per the ABI (Stage~9b); and
+\texttt{goto} with labels is unsupported end to end---the parser drops
+the labelled statements and neither the IR builder nor the code
+generator lowers a label.  All three are reported without failing the
+build; an \texttt{XPASS} would signal that one has been implemented.
+
+@d Difftest: gaps @{
+echo ""
+echo "--- Known Divergences (Stage 9 features) ---"
+
+difftest_xfail "multidim-array" \
+    "int main(void){ int a[3][3]; int i; int j; for (i = 0; i < 3; i = i + 1) for (j = 0; j < 3; j = j + 1) a[i][j] = i * 3 + j; return a[2][2]; }" \
+    "multi-dimensional arrays"
+difftest_xfail "struct-by-value-return" \
+    "struct P { int x; int y; }; struct P make(int a, int b){ struct P p; p.x = a; p.y = b; return p; } int main(void){ struct P p = make(15, 27); return p.x + p.y; }" \
+    "struct return by value (Stage 9b)"
+difftest_xfail "goto-label" \
+    "int main(void){ int i = 0; int s = 0; loop: if (i >= 10) goto end; s = s + i; i = i + 1; goto loop; end: return s; }" \
+    "goto and labels unsupported"
+@}
+
 \section{Results}
 
 The suite fails only on a mismatch---a genuine wrong answer.  Gaps
-(features \kcc{} cannot yet compile) and any expected divergences
-(the \texttt{xfail} machinery, currently unused) are tallied and
-reported so both
+(features \kcc{} cannot yet compile) and expected divergences
+(\S\ref{sec:difftest-gaps}) are tallied and reported so both
 frontiers stay visible, but neither fails the build.
 
 @d Difftest: results @{

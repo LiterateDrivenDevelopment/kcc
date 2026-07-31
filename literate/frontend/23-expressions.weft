@@ -99,7 +99,7 @@ parses an assignment expression, then checks for the comma operator
 _kcc_parse_expr:
     stp x29, x30, [sp, #-32]!
     mov x29, sp
-    str x19, [sp, #16]
+    stp x19, x20, [sp, #16]     // x20 is used for the comma rhs below
 
     bl _kcc_parse_assign_expr
     mov x19, x0                  // x19 = lhs
@@ -131,7 +131,7 @@ _kcc_parse_expr:
 .Lexpr_done:
     mov x0, x19
 
-    ldr x19, [sp, #16]
+    ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_parse_expr

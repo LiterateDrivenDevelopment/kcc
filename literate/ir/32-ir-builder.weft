@@ -1136,6 +1136,13 @@ _kcc_ir_build_func:
     add  x1, x1, _kcc_ir_statics@@PAGEOFF
     str x0, [x1]
 
+    // Reset label table (label names visible only in this function)
+    mov x0, #16
+    bl _kcc_ht_init
+    adrp x1, _kcc_ir_labels@@PAGE
+    add  x1, x1, _kcc_ir_labels@@PAGEOFF
+    str x0, [x1]
+
     // Create entry basic block
     bl _kcc_ir_alloc_bb
     mov x24, x0                  // x24 = entry BB
@@ -1200,6 +1207,10 @@ _kcc_ir_build_func:
     bl _kcc_ir_emit_global_inits
 
 .Libf_body_stmts:
+    // Pre-allocate a BB for every label so forward gotos resolve
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_prescan_labels
+
     // Lower the function body (compound statement)
     ldr x0, [x19, #AST_F3]
     bl _kcc_ir_build_stmt
@@ -1335,6 +1346,182 @@ _kcc_ir_build_param:
 @| _kcc_ir_build_param
 @}
 
+\section{Labels and Goto}
+\label{sec:ir-goto}
+
+\texttt{goto} may jump \emph{forward} to a label not yet seen, so the
+target basic block must exist before any \texttt{goto} is lowered.
+Before building a function body, \texttt{\_kcc\_ir\_prescan\_labels}
+walks it recursively---through compounds, both arms of an \texttt{if},
+loop and \texttt{switch} bodies, and nested labels---allocating a basic
+block for every \texttt{AST\_LABEL\_STMT} and recording
+name\,$\to$\,block in a per-function table.  Because a block joins the
+function's ordered block list only when \texttt{set\_bb} makes it
+current, these pre-allocated blocks stay out of the emission order until
+their label is actually reached, so code order is preserved.
+
+Lowering then uses two small helpers.
+\texttt{\_kcc\_ir\_branch\_to} ends the current block with an
+\texttt{IR\_BR} to a target block and marks it terminated---unless it
+already has a terminator, in which case it is a no-op.
+\texttt{\_kcc\_ir\_label\_bb} resolves a name to its pre-allocated block.
+A \emph{label} branches the current block into its own block (a
+fall-through) and continues there; a \emph{goto} branches to the target
+and opens a fresh block for any unreachable statements that follow.
+
+@d IR: build goto @{
+// -- kcc_ir_branch_to -----------------------------------------------------
+// void kcc_ir_branch_to(bb *target)
+//   Ends the current BB with IR_BR to target (and marks it terminated),
+//   unless the current BB already has a terminator.
+.text
+.globl _kcc_ir_branch_to
+.p2align 2
+_kcc_ir_branch_to:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // target BB
+
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lbrt_done
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Lbrt_done
+
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x19, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+.Lbrt_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_label_bb ------------------------------------------------------
+// bb *kcc_ir_label_bb(const char *name)   → pre-allocated BB, or 0
+.text
+.globl _kcc_ir_label_bb
+.p2align 2
+_kcc_ir_label_bb:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_ir_labels@@PAGE
+    add  x0, x0, _kcc_ir_labels@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Llbb_none
+    mov x1, x19
+    bl _kcc_ht_get
+    b .Llbb_done
+.Llbb_none:
+    mov x0, #0
+.Llbb_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_prescan_labels ------------------------------------------------
+// void kcc_ir_prescan_labels(node *stmt)
+//   Recursively allocate a BB for every label and register name -> BB.
+.text
+.globl _kcc_ir_prescan_labels
+.p2align 2
+_kcc_ir_prescan_labels:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0
+    cbz x19, .Lps_done
+    ldr x20, [x19, #AST_TAG]
+
+    cmp x20, #AST_COMPOUND
+    b.eq .Lps_compound
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lps_label
+    cmp x20, #AST_IF_STMT
+    b.eq .Lps_if
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lps_body_f1
+    cmp x20, #AST_SWITCH_STMT
+    b.eq .Lps_body_f1
+    cmp x20, #AST_CASE_STMT
+    b.eq .Lps_body_f1
+    cmp x20, #AST_DO_STMT
+    b.eq .Lps_body_f0
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Lps_body_f0
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lps_body_f3
+    b .Lps_done
+
+.Lps_compound:
+    ldr x19, [x19, #AST_F0]
+.Lps_comp_loop:
+    cbz x19, .Lps_done
+    mov x0, x19
+    bl _kcc_ir_prescan_labels
+    ldr x19, [x19, #AST_F4]
+    b .Lps_comp_loop
+
+.Lps_label:
+    ldr x21, [x19, #AST_F0]      // label name
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // new BB
+    mov x0, x21
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_ir_labels@@PAGE
+    add  x0, x0, _kcc_ir_labels@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x21
+    mov x3, x20
+    bl _kcc_ht_put
+    ldr x0, [x19, #AST_F1]       // labelled statement
+    bl _kcc_ir_prescan_labels
+    b .Lps_done
+
+.Lps_if:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_prescan_labels
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_prescan_labels
+    b .Lps_done
+.Lps_body_f0:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_prescan_labels
+    b .Lps_done
+.Lps_body_f1:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_prescan_labels
+    b .Lps_done
+.Lps_body_f3:
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_prescan_labels
+.Lps_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_branch_to
+@| _kcc_ir_label_bb
+@| _kcc_ir_prescan_labels
+@}
+
 \section{Building Statements}
 
 The statement dispatcher matches the AST tag and calls the
@@ -1342,7 +1529,8 @@ appropriate lowering function.  Expression statements call
 \texttt{ir\_build\_expr} and discard the result vreg.  Compound
 statements recurse over their children.  All control-flow
 statements (if, while, do, for) and break/continue have
-dedicated builders in \S\ref{sec:ir-control-flow}.
+dedicated builders in \S\ref{sec:ir-control-flow}; labels and
+\texttt{goto} use the helpers of \S\ref{sec:ir-goto}.
 
 @d IR: build statement @{
 // -- kcc_ir_build_stmt ----------------------------------------------------
@@ -1355,7 +1543,7 @@ dedicated builders in \S\ref{sec:ir-control-flow}.
 _kcc_ir_build_stmt:
     stp x29, x30, [sp, #-32]!
     mov x29, sp
-    str x19, [sp, #16]
+    stp x19, x20, [sp, #16]
 
     cbz x0, .Libs_done
     mov x19, x0
@@ -1384,6 +1572,10 @@ _kcc_ir_build_stmt:
     b.eq .Libs_continue
     cmp x0, #AST_SWITCH_STMT
     b.eq .Libs_switch
+    cmp x0, #AST_LABEL_STMT
+    b.eq .Libs_label
+    cmp x0, #AST_GOTO_STMT
+    b.eq .Libs_goto
     cmp x0, #AST_CASE_STMT
     b.eq .Libs_done
     cmp x0, #AST_DEFAULT_STMT
@@ -1392,6 +1584,29 @@ _kcc_ir_build_stmt:
     b.eq .Libs_done
 
     // Unhandled statement type — skip
+    b .Libs_done
+
+.Libs_label:
+    // Fall the current block into the label's block, then build the body
+    ldr x0, [x19, #AST_F0]      // label name
+    bl _kcc_ir_label_bb
+    cbz x0, .Libs_label_inner
+    mov x20, x0                  // x20 = label BB
+    bl _kcc_ir_branch_to
+    mov x0, x20
+    bl _kcc_ir_set_bb
+.Libs_label_inner:
+    ldr x0, [x19, #AST_F1]      // labelled statement
+    bl _kcc_ir_build_stmt
+    b .Libs_done
+
+.Libs_goto:
+    ldr x0, [x19, #AST_F0]      // target label name
+    bl _kcc_ir_label_bb
+    cbz x0, .Libs_done
+    bl _kcc_ir_branch_to        // branch to target, terminate current block
+    bl _kcc_ir_alloc_bb         // fresh block for unreachable trailing code
+    bl _kcc_ir_set_bb
     b .Libs_done
 
 .Libs_compound:
@@ -1455,7 +1670,7 @@ _kcc_ir_build_stmt:
     b .Libs_done
 
 .Libs_done:
-    ldr x19, [sp, #16]
+    ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_ir_build_stmt
@@ -6582,6 +6797,15 @@ run_test "break" \
 
 run_test "continue" \
     "int main(void) { int s = 0; for (int i = 0; i < 10; i = i + 1) { if (i % 2 == 0) continue; s = s + 1; } return s; }" 5
+
+run_test "goto backward loop" \
+    "int main(void) { int i = 0; int s = 0; loop: if (i >= 5) goto end; s = s + i; i = i + 1; goto loop; end: return s; }" 10
+
+run_test "goto forward" \
+    "int main(void) { int x = 5; if (x > 0) goto pos; return 1; pos: return 42; }" 42
+
+run_test "goto cleanup" \
+    "int f(int n) { int r = 0; if (n < 0) goto done; r = n * 2; done: return r; } int main(void) { return f(21); }" 42
 
 run_test "multiple returns" \
     "int f(int x) { if (x > 0) return 1; if (x < 0) return 2; return 0; } int main(void) { return f(5) + f(-3) + f(0); }" 3

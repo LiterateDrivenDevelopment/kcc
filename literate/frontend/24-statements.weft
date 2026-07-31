@@ -34,7 +34,7 @@ An identifier at the start could be either a label (if followed by
 _kcc_parse_stmt:
     stp x29, x30, [sp, #-32]!
     mov x29, sp
-    str x19, [sp, #16]
+    stp x19, x20, [sp, #16]     // x20 is used by the labeled-statement path
 
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
@@ -234,7 +234,7 @@ of an expression statement, requiring one-token lookahead.
     mov x0, x19
 
 .Lstmt_done:
-    ldr x19, [sp, #16]
+    ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
 @}

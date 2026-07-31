@@ -366,6 +366,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build@>
 @<IR: build function@>
 @<IR: build param@>
+@<IR: build goto@>
 @<IR: build statement@>
 @<IR: build return@>
 @<IR: build expression@>

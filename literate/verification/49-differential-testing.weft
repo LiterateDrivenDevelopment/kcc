@@ -342,6 +342,14 @@ difftest "ptr-diff-index" \
     "int main(void){ int a[10]; int *p = &a[2]; int *q = &a[7]; return (int)(q - p); }"
 difftest "ptr-diff-strlen" \
     "int slen(char *s){ char *p = s; while (*p) p = p + 1; return (int)(p - s); } int main(void){ return slen(\"hello world\"); }"
+difftest "goto-loop" \
+    "int main(void){ int i = 0; int s = 0; loop: if (i >= 10) goto end; s = s + i; i = i + 1; goto loop; end: return s; }"
+difftest "goto-forward" \
+    "int main(void){ int x = 5; if (x > 0) goto pos; return 1; pos: return 42; }"
+difftest "goto-cleanup" \
+    "int f(int n){ int r = 0; if (n < 0) goto done; r = n * 2; done: return r; } int main(void){ return f(21); }"
+difftest "goto-break-out" \
+    "int main(void){ int s = 0; int i = 0; while (i < 5) { if (i == 3) goto out; s = s + i; i = i + 1; } out: return s + 10; }"
 difftest "switch-dense" \
     "int f(int x){ switch (x) { case 0: return 10; case 1: return 20; case 2: return 30; case 3: return 40; default: return 99; } } int main(void){ return f(2) + f(5); }"
 difftest "nested-switch" \
@@ -421,15 +429,15 @@ difftest "ptr-arith-untouched" \
 \section{Known Divergences}
 \label{sec:difftest-gaps}
 
-Three constructs the sweep exposed remain open, each a substantial
-feature rather than a quick fix, so they are recorded as expected
-divergences.  A multi-dimensional array (\texttt{int a[3][3]}) is not
-laid out or indexed correctly by the all-spill model; a \texttt{struct}
-returned \emph{by value} is not marshalled per the ABI (Stage~9b); and
-\texttt{goto} with labels is unsupported end to end---the parser drops
-the labelled statements and neither the IR builder nor the code
-generator lowers a label.  All three are reported without failing the
-build; an \texttt{XPASS} would signal that one has been implemented.
+Two constructs the sweep exposed remain open, each a substantial
+backend feature rather than a quick fix, so they are recorded as
+expected divergences.  A multi-dimensional array (\texttt{int a[3][3]})
+is not laid out or indexed correctly by the all-spill model, and a
+\texttt{struct} returned \emph{by value} is not marshalled per the ABI
+(Stage~9b).  Both are reported without failing the build; an
+\texttt{XPASS} would signal that one has been implemented---as
+\texttt{goto} did once its labels were lowered
+(\S\ref{sec:ir-goto}), after which it graduated to a real test above.
 
 @d Difftest: gaps @{
 echo ""
@@ -441,9 +449,6 @@ difftest_xfail "multidim-array" \
 difftest_xfail "struct-by-value-return" \
     "struct P { int x; int y; }; struct P make(int a, int b){ struct P p; p.x = a; p.y = b; return p; } int main(void){ struct P p = make(15, 27); return p.x + p.y; }" \
     "struct return by value (Stage 9b)"
-difftest_xfail "goto-label" \
-    "int main(void){ int i = 0; int s = 0; loop: if (i >= 10) goto end; s = s + i; i = i + 1; goto loop; end: return s; }" \
-    "goto and labels unsupported"
 @}
 
 \section{Results}

@@ -507,16 +507,18 @@ itself.
       construction and ARM64 systems programming.
 \end{enumerate}
 
-\textbf{Status.}  Stage~8a in progress.  198 codegen tests passing.
+\textbf{Status.}  Stage~8a in progress.  201 codegen tests passing.
 The compiler handles integer arithmetic, control flow, loops,
 function calls (direct and indirect), structs (nested, arrays),
 pointers, pointer-to-pointer and arrays of pointers, arrays,
 brace-enclosed array and struct initializers (local and file-scope),
 static locals, global variables, enums, switch/case, sizeof, character
 literals, string literals, void functions, forward-declared prototypes,
-function pointers, and the preprocessor on the \texttt{-c} path
+function pointers, the preprocessor on the \texttt{-c} path
 (\texttt{\#define}, \texttt{\#ifdef}, and \texttt{\#include} of a
-source-relative header).  A 1{,}130-line C test suite compiles and runs correctly:
+source-relative header), and multi-file compilation (several
+translation units in one invocation, sharing functions and
+\texttt{extern} globals across objects).  A 1{,}130-line C test suite compiles and runs correctly:
 hash tables, arena allocators, recursive-descent parsers, linked-list
 manipulation, tree evaluators, and the sieve of Eratosthenes.
 
@@ -572,11 +574,23 @@ manipulation, tree evaluators, and the sieve of Eratosthenes.
       kernel's carry-flag \texttt{errno} to $-1$ so a missing header
       produces a clean diagnostic instead of crashing on a bogus
       descriptor.  A \texttt{-I} system search path is left to Phase~9.
-\item[\checkmark] 198 codegen tests covering all features
-      (10 Phase~8 test groups: nested structs, struct arrays,
+\item[\checkmark] Multi-file compilation:
+      \texttt{\_kcc\_driver\_compile} now returns a status so
+      \texttt{\_kcc\_driver\_compile\_all} can loop it over every source
+      argument, writing one object per input
+      (\texttt{.c}$\to$\texttt{.o}).  \texttt{extern} data is honoured:
+      an \texttt{extern} declaration reserves no storage, and a
+      reference to a global not defined in the current unit is emitted
+      as an undefined external symbol (via a \texttt{defined\_globals}
+      set feeding the \texttt{IR\_GLOBAL\_REF} handler's choice between
+      \texttt{linker\_global\_sym} and \texttt{linker\_extern}), so two
+      objects can share a global without colliding.  Automatic linking
+      (invoking \texttt{ld}) is left to Phase~9.
+\item[\checkmark] 201 codegen tests covering all features
+      (11 Phase~8 test groups: nested structs, struct arrays,
       global init, pointer arithmetic, pointer arrays, initializer
-      lists, static locals, preprocessor, self-hosting patterns,
-      function pointers).
+      lists, static locals, preprocessor, multi-file, self-hosting
+      patterns, function pointers).
 \end{itemize}
 
 \textbf{Remaining work --- Stage 8a: missing C features.}
@@ -585,24 +599,25 @@ The following features are needed before \kcc{} can compile
 a realistic subsystem of itself.
 
 \begin{itemize}
-\item \textbf{Multi-file compilation.}  Shared declarations can now
-      live in a header included with \texttt{\#include}, but the driver
-      still compiles one \texttt{.c} at a time.  A full build needs to
-      compile several translation units and invoke \texttt{ld} to link
-      the resulting \texttt{.o} files together.
 \item \textbf{Typedef support.}  The parser recognizes
       \texttt{typedef} but codegen has not been stress-tested
       with typedef'd structs and function pointer types.
 \item \textbf{String initializers for char arrays.}
       \texttt{char s[] = "abc"} must copy the literal bytes into the
       array rather than storing the string pointer.
+\item \textbf{Automatic linking.}  \kcc{} now emits one object per
+      source, but the resulting \texttt{.o} files are still handed to
+      \texttt{ld} by the caller; invoking the linker from the driver is
+      a Phase~9 convenience.
 \end{itemize}
 
 \noindent Pointer-to-pointer, arrays of pointers, void functions,
 forward-declared prototypes, character literals, brace-enclosed
-initializer lists (array and flat-struct, local and file-scope), and
-static locals were originally listed here; all are now implemented and
-covered by the codegen suite (see the completed milestones above).
+initializer lists (array and flat-struct, local and file-scope),
+static locals, and multi-file compilation (multiple translation units
+with shared \texttt{extern} data) were originally listed here; all are
+now implemented and covered by the codegen suite (see the completed
+milestones above).
 
 \textbf{Remaining work --- Stage 8b: subsystem in C.}
 

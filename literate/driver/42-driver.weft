@@ -123,13 +123,13 @@ _kcc_driver_compile:
 
     // 16. Success
     mov x0, #0
-    bl _kcc_sys_exit
+    b .Ldc_return
 
 .Ldc_error:
     bl _kcc_io_flush
     mov x0, #1
-    bl _kcc_sys_exit
 
+.Ldc_return:
     ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
@@ -137,6 +137,220 @@ _kcc_driver_compile:
 @| _kcc_driver_compile
 @}
 
+\section{Compiling Several Translation Units}
+
+The pipeline above compiles one file; a real project has many.  So that
+a single \texttt{kcc~-c} invocation can turn a whole subsystem into
+object files---the shape the self-hosting build needs---the driver
+loops \texttt{\_kcc\_driver\_compile} over every source argument.  This
+is why that function now \emph{returns} a status (0~success, 1~failure)
+instead of exiting: the loop must survive an individual file's outcome,
+accumulate the failures, and exit once at the end with the combined
+result.
+
+Because every per-translation-unit subsystem (\texttt{ir\_init},
+\texttt{code\_init}, \texttt{linker\_init}, the string, typedef, type,
+and symbol tables) reinitialises its state at the top of
+\texttt{\_kcc\_driver\_compile}, each file starts from a clean slate;
+only the arena grows monotonically, which is harmless.
+
+Cross-unit sharing works through ordinary external linkage.  A
+function called without a definition in the current file already
+becomes an undefined symbol the linker resolves against the object
+that defines it.  Data is symmetric once \texttt{extern} is honoured:
+a plain file-scope \texttt{int total;} reserves storage, while
+\texttt{extern int total;} in another unit references that same storage
+without redefining it (\S\ref{sec:preregister-globals}).
+
+\paragraph{Naming the object file.}
+When the output is not given explicitly, each object file takes the
+name of its source with a \texttt{.c} suffix rewritten to \texttt{.o}
+(or \texttt{.o} appended if there is no such suffix).
+
+@d Driver: compile @{
+// -- kcc_driver_obj_name ------------------------------------------------------
+// char *kcc_driver_obj_name(const char *src)
+//   x0 = source path → arena path with ".c" rewritten to ".o"
+.text
+.globl _kcc_driver_obj_name
+.p2align 2
+_kcc_driver_obj_name:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                    // src
+    bl _kcc_strlen
+    mov x20, x0                    // len
+
+    add x0, x20, #3                // len + ".o" + null
+    bl _kcc_arena_alloc
+    mov x21, x0                    // dst
+
+    mov x0, x21
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_memcpy
+
+    // ".c" suffix? (len >= 2, src[len-2]=='.', src[len-1]=='c')
+    cmp x20, #2
+    b.lt .Lobj_append
+    sub x2, x20, #2
+    ldrb w3, [x19, x2]
+    cmp w3, #'.'
+    b.ne .Lobj_append
+    sub x2, x20, #1
+    ldrb w3, [x19, x2]
+    cmp w3, #'c'
+    b.ne .Lobj_append
+
+    // Rewrite the trailing 'c' to 'o'
+    sub x2, x20, #1
+    mov w3, #'o'
+    strb w3, [x21, x2]             // dst[len-1] = 'o'
+    strb wzr, [x21, x20]           // null at len
+    mov x0, x21
+    b .Lobj_done
+
+.Lobj_append:
+    mov w3, #'.'
+    strb w3, [x21, x20]
+    add x2, x20, #1
+    mov w3, #'o'
+    strb w3, [x21, x2]
+    add x2, x20, #2
+    strb wzr, [x21, x2]
+    mov x0, x21
+
+.Lobj_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_driver_compile_all ---------------------------------------------------
+// void kcc_driver_compile_all(int argc, char **argv)
+//   x0 = argc, x1 = argv.  Handles "-c": compiles every source argument
+//   (argv[2..]) to an object file, honouring "-o <file>" only when there is
+//   exactly one source.  Exits 0 if all compiles succeed, else 1.
+.text
+.globl _kcc_driver_compile_all
+.p2align 2
+_kcc_driver_compile_all:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+
+    mov x19, x0                    // argc
+    mov x20, x1                    // argv
+
+    // Pass 1: locate an explicit "-o <out>" and count source files
+    mov x21, #0                    // explicit out (0 = none)
+    mov x22, #0                    // source count
+    mov x23, #2                    // i = 2 (skip argv[0], argv[1]=-c)
+.Lca_scan:
+    cmp x23, x19
+    b.ge .Lca_scan_done
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
+    adrp x1, _kcc_opt_o@@PAGE
+    add  x1, x1, _kcc_opt_o@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_scan_o
+    add x22, x22, #1               // a source
+    add x23, x23, #1
+    b .Lca_scan
+.Lca_scan_o:
+    add x23, x23, #1               // step to the -o value
+    cmp x23, x19
+    b.ge .Lca_scan_done
+    ldr x21, [x20, x23, lsl #3]    // explicit out
+    add x23, x23, #1
+    b .Lca_scan
+.Lca_scan_done:
+    cbz x22, .Lca_no_input
+
+    // Pass 2: compile each source
+    mov x24, #0                    // error accumulator
+    mov x23, #2
+.Lca_loop:
+    cmp x23, x19
+    b.ge .Lca_finish
+    ldr x25, [x20, x23, lsl #3]    // argv[i]
+    mov x0, x25
+    adrp x1, _kcc_opt_o@@PAGE
+    add  x1, x1, _kcc_opt_o@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_skip_o
+
+    // Output name: explicit only when there is a single source
+    cmp x22, #1
+    b.ne .Lca_derive
+    cbz x21, .Lca_derive
+    mov x0, x21
+    b .Lca_have_out
+.Lca_derive:
+    mov x0, x25
+    bl _kcc_driver_obj_name
+.Lca_have_out:
+    mov x1, x0                     // out
+    mov x0, x25                    // src
+    bl _kcc_driver_compile
+    orr x24, x24, x0               // remember any failure
+    add x23, x23, #1
+    b .Lca_loop
+.Lca_skip_o:
+    add x23, x23, #2               // skip "-o" and its value
+    b .Lca_loop
+
+.Lca_finish:
+    bl _kcc_io_flush
+    mov x0, x24
+    bl _kcc_sys_exit
+
+.Lca_no_input:
+    adrp x0, _kcc_driver_err_noinput@@PAGE
+    add  x0, x0, _kcc_driver_err_noinput@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+@| _kcc_driver_obj_name
+@| _kcc_driver_compile_all
+@}
+
 @d Driver: data @{
-// -- Driver data (none needed beyond main strings) ----------------------------
+// -- Driver string constants --------------------------------------------------
+.section __TEXT,__cstring,cstring_literals
+_kcc_opt_o:
+    .asciz "-o"
+_kcc_driver_err_noinput:
+    .asciz "kcc: error: no input files\n"
+@}
+
+\section{Multi-file Tests}
+
+These tests split a program across two translation units that share
+declarations through a prototype: one file defines the functions, the
+other calls them.  A single \texttt{kcc~-c~a.c~b.c} compiles both, and
+the system linker resolves the cross-object references---the end-to-end
+shape a self-hosting build takes.
+
+@d Test: codegen multifile @{
+echo ""
+echo "--- Multi-file Compilation ---"
+
+run_test_multi "multi-two-units" \
+    "int helper(int x){ return x * 10; }" \
+    "int helper(int x); int main(void){ return helper(4) + 2; }" 42
+
+run_test_multi "multi-extern-global" \
+    "int total; void add(int n){ total = total + n; }" \
+    "extern int total; void add(int n); int main(void){ add(5); add(7); return total; }" 12
+
+run_test_multi "multi-mutual-call" \
+    "int dbl(int x); int quad(int x){ return dbl(dbl(x)); }" \
+    "int quad(int x); int dbl(int x){ return x + x; } int main(void){ return quad(6); }" 24
 @}

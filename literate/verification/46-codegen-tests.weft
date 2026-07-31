@@ -40,6 +40,10 @@ A sibling \texttt{run\_test\_include} additionally writes a companion
 header \texttt{defs.h} next to the source before compiling, so that
 tests can exercise \texttt{\#include "defs.h"} and confirm the
 preprocessor resolves a header sitting beside the translation unit.
+A second sibling \texttt{run\_test\_multi} writes two source files and
+compiles them with a single \texttt{kcc~-c~a.c~b.c} invocation, then
+links both objects, exercising multi-translation-unit builds and
+cross-object symbol resolution.
 
 @d Test: codegen runner @{
 #!/bin/bash
@@ -112,6 +116,43 @@ run_test_include() {
         return
     fi
     if ! ld "$TMPDIR/t.o" -o "$TMPDIR/t" \
+            -lSystem -syslibroot "$SDK" \
+            -e _main -arch arm64 2>/dev/null; then
+        FAIL=$((FAIL + 1))
+        printf "  %-40s FAIL (link error)\n" "$name..."
+        return
+    fi
+
+    "$TMPDIR/t"
+    local actual=$?
+
+    if [ "$actual" -eq "$expected" ]; then
+        PASS=$((PASS + 1))
+        printf "  %-40s PASS\n" "$name..."
+    else
+        FAIL=$((FAIL + 1))
+        printf "  %-40s FAIL (expected %d, got %d)\n" "$name..." "$expected" "$actual"
+    fi
+}
+
+# Variant for multi-file compilation: compiles two translation units in a
+# single "kcc -c a.c b.c" invocation, then links both objects together.
+run_test_multi() {
+    local name="$1"
+    local file_a="$2"
+    local file_b="$3"
+    local expected="$4"
+    TOTAL=$((TOTAL + 1))
+
+    echo "$file_a" > "$TMPDIR/a.c"
+    echo "$file_b" > "$TMPDIR/b.c"
+
+    if ! $KCC -c "$TMPDIR/a.c" "$TMPDIR/b.c" >/dev/null 2>&1; then
+        FAIL=$((FAIL + 1))
+        printf "  %-40s FAIL (compile error)\n" "$name..."
+        return
+    fi
+    if ! ld "$TMPDIR/a.o" "$TMPDIR/b.o" -o "$TMPDIR/t" \
             -lSystem -syslibroot "$SDK" \
             -e _main -arch arm64 2>/dev/null; then
         FAIL=$((FAIL + 1))

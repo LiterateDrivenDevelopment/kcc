@@ -544,6 +544,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen init lists@>
 @<Test: codegen static locals@>
 @<Test: codegen preprocessor@>
+@<Test: codegen multifile@>
 @<Test: codegen self-hosting@>
 @<Test: codegen fnptr@>
 @<Test: codegen results@>

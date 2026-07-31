@@ -111,6 +111,13 @@ _kcc_codegen_init:
     bl _kcc_arena_alloc
     str x0, [x19, #VEC_DATA]
 
+    // Fresh set of globals defined in this translation unit
+    mov x0, #32
+    bl _kcc_ht_init
+    adrp x1, _kcc_cg_defined_globals@@PAGE
+    add  x1, x1, _kcc_cg_defined_globals@@PAGEOFF
+    str x0, [x1]
+
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
@@ -118,6 +125,7 @@ _kcc_codegen_init:
 @}
 
 \section{Pre-register Global Sizes}
+\label{sec:preregister-globals}
 
 Before code generation begins, the driver calls
 \texttt{kcc\_preregister\_globals} to walk the AST translation unit and
@@ -127,6 +135,17 @@ struct globals need $n \times 8$ bytes (one eight-byte slot per field).
 Because \texttt{kcc\_linker\_global\_sym} deduplicates---returning
 immediately when a symbol is already defined---subsequent references
 during code generation are no-ops with respect to allocation.
+
+A global declared \texttt{extern} is a \emph{declaration}, not a
+definition: its storage lives in another translation unit, so this pass
+skips it and reserves no bytes.  The names it does define are recorded
+in a per-unit \texttt{defined\_globals} set.  This set is what lets the
+\texttt{IR\_GLOBAL\_REF} handler decide, for each reference, between a
+locally defined symbol and an undefined external one: a name absent
+from the set is emitted through \texttt{kcc\_linker\_extern} so the
+linker resolves it against whichever object supplies the definition.
+Without the set, every reference would define its own copy and two
+objects naming the same global would collide.
 
 @d CodeGen: preregister globals @{
 // -- kcc_preregister_globals --------------------------------------------------
@@ -138,15 +157,17 @@ during code generation are no-ops with respect to allocation.
 .globl _kcc_preregister_globals
 .p2align 2
 _kcc_preregister_globals:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
 
-    ldr x19, [x0, #AST_F0]      // first declaration
+    ldr x23, [x0, #AST_F0]      // first declaration (kept for the static pass)
+    mov x19, x23
 
 .Lprg_loop:
-    cbz x19, .Lprg_done
+    cbz x19, .Lprg_statics
 
     ldr x0, [x19, #AST_TAG]
     cmp x0, #AST_VAR_DECL
@@ -154,6 +175,11 @@ _kcc_preregister_globals:
 
     ldr x20, [x19, #AST_F1]     // name
     cbz x20, .Lprg_next
+
+    // extern globals are declarations, not definitions: emit no storage
+    ldr x0, [x19, #AST_F3]      // storage class (2 = extern)
+    cmp x0, #2
+    b.eq .Lprg_next
 
     // Resolve the declared type
     ldr x0, [x19, #AST_F0]
@@ -201,14 +227,66 @@ _kcc_preregister_globals:
     mov x1, x21
     bl _kcc_linker_global_sym
 
+    // Remember the source name as defined-in-this-TU
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_cg_defined_globals@@PAGE
+    add  x0, x0, _kcc_cg_defined_globals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20                  // key = source name
+    mov x3, #1                   // present
+    bl _kcc_ht_put
+
 .Lprg_next:
     ldr x19, [x19, #AST_F4]     // next sibling
     b .Lprg_loop
 
+.Lprg_statics:
+    // Second pass: static locals are defined here too, under their mangled
+    // names.  Record each so IR_GLOBAL_REF treats it as locally defined.
+    mov x19, x23
+.Lprg_fn_loop:
+    cbz x19, .Lprg_done
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_FUNC_DECL
+    b.ne .Lprg_fn_next
+    ldr x0, [x19, #AST_F3]      // function body
+    cbz x0, .Lprg_fn_next
+    ldr x20, [x0, #AST_F0]      // first body statement
+.Lprg_st_loop:
+    cbz x20, .Lprg_fn_next
+    ldr x0, [x20, #AST_TAG]
+    cmp x0, #AST_VAR_DECL
+    b.ne .Lprg_st_next
+    ldr x0, [x20, #AST_F3]      // storage class (3 = static)
+    cmp x0, #3
+    b.ne .Lprg_st_next
+
+    mov x0, x20
+    bl _kcc_ir_static_name
+    mov x21, x0                  // mangled name
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_cg_defined_globals@@PAGE
+    add  x0, x0, _kcc_cg_defined_globals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x21                  // key = mangled name
+    mov x3, #1
+    bl _kcc_ht_put
+
+.Lprg_st_next:
+    ldr x20, [x20, #AST_F4]
+    b .Lprg_st_loop
+.Lprg_fn_next:
+    ldr x19, [x19, #AST_F4]
+    b .Lprg_fn_loop
+
 .Lprg_done:
+    ldr x23, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #64
     ret
 @| _kcc_preregister_globals
 @}
@@ -2307,11 +2385,31 @@ label restores callee-saved registers and returns.
     mov x1, x23                   // src = original name
     bl _kcc_memcpy
 
-    // Register as global symbol (defined in section 2)
+    // Defined in this TU, or an external reference (extern / another TU)?
+    mov x0, x23
+    bl _kcc_strlen
+    mov x2, x0                     // keylen
+    adrp x0, _kcc_cg_defined_globals@@PAGE
+    add  x0, x0, _kcc_cg_defined_globals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x23                    // key = source name
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_gref_extern
+
+    // Defined here: reserve BSS storage (section 2)
     mov x0, x25
     mov x1, #8                     // default 8 bytes per scalar global
     bl _kcc_linker_global_sym
     mov x25, x0                    // sym_index
+    b .Lcgi_gref_reloc
+
+.Lcgi_gref_extern:
+    // Defined elsewhere: emit an undefined external symbol for the linker
+    mov x0, x25
+    bl _kcc_linker_extern
+    mov x25, x0                    // sym_index
+
+.Lcgi_gref_reloc:
 
     // Emit ADRP x11, symbol@@PAGE (with PAGE21 reloc)
     bl _kcc_code_current_pos
@@ -2921,10 +3019,13 @@ _kcc_cstr_pos:       .quad 0     // write position in cstring buffer
 _kcc_cstr_count:     .quad 0     // string literal counter (for naming)
 .globl _kcc_cstr_fixups
 _kcc_cstr_fixups:    .quad 0     // vec of {sym_index, cstr_offset} fixups
+.globl _kcc_cg_defined_globals
+_kcc_cg_defined_globals: .quad 0 // hash set: globals defined in this TU
 @| _kcc_cg_frame_size
 @| _kcc_cg_vreg_count
 @| _kcc_cstr_buf
 @| _kcc_cstr_pos
 @| _kcc_cstr_count
 @| _kcc_cstr_fixups
+@| _kcc_cg_defined_globals
 @}

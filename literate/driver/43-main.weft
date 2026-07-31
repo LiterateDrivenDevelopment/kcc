@@ -390,23 +390,27 @@ textual IR.
 @}
 
 \paragraph{Compilation and error handling.}
-The \texttt{-c} flag invokes the full pipeline through
-\texttt{\_kcc\_driver\_compile} (Chapter~\ref{ch:compile-driver}),
-which reads the source, runs every phase, and writes a Mach-O object
-file.  The remainder of the function handles usage errors for each
-flag, the no-arguments case, and the two exit paths (success with
-code~0, error with code~1).
+The \texttt{-c} flag hands the whole argument vector to
+\texttt{\_kcc\_driver\_compile\_all} (Chapter~\ref{ch:compile-driver}),
+which compiles \emph{each} source argument through the full pipeline
+and writes one Mach-O object file per input---so a multi-file subsystem
+builds in a single invocation.  An explicit \texttt{-o} names the
+output only when there is exactly one source; otherwise each object
+takes its source's name with \texttt{.c} rewritten to \texttt{.o}.  The
+remainder of the function handles usage errors for each flag, the
+no-arguments case, and the two exit paths (success with code~0, error
+with code~1).
 
 @d Main: entry point @{
 .Lmain_compile:
-    // -c <source> -o <output>
-    // Requires at least: kcc -c source -o output (argc >= 5)
-    cmp x19, #5
+    // -c <source...> [-o <output>]
+    // At minimum one source: kcc -c source.c  (argc >= 3)
+    cmp x19, #3
     b.lt .Lmain_compile_usage
 
-    ldr x0, [x20, #16]            // argv[2] = source file
-    ldr x1, [x20, #32]            // argv[4] = output file
-    bl _kcc_driver_compile
+    mov x0, x19                   // argc
+    mov x1, x20                   // argv
+    bl _kcc_driver_compile_all    // compiles each source, then exits
     b .Lmain_exit
 
 .Lmain_compile_usage:
@@ -528,5 +532,5 @@ _kcc_err_ir_usage:
 _kcc_opt_compile:
     .asciz "-c"
 _kcc_err_compile_usage:
-    .asciz "kcc: error: usage: kcc -c <source.c> -o <output.o>\n"
+    .asciz "kcc: error: usage: kcc -c <source.c>... [-o <output.o>]\n"
 @}

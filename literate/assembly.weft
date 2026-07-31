@@ -549,3 +549,19 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen fnptr@>
 @<Test: codegen results@>
 @}
+
+% ── Self-hosting (Stage 8b): the arena in C, compiled by kcc ──────────
+
+\noindent\textbf{arena.c} --- \kcc{}'s arena allocator, ported to C
+(Chapter~\ref{ch:self-hosting-arena}):
+
+@o tmp/selfhost/arena.c @{
+@<Selfhost: arena@>
+@}
+
+\noindent\textbf{selfhost.sh} --- compile it with \kcc{}, relink, and
+re-run the codegen suite:
+
+@o tmp/selfhost/selfhost.sh @{
+@<Selfhost: verify@>
+@}

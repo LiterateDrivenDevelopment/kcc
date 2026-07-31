@@ -17,7 +17,7 @@ default: build
 
 # Tangle: extract .s files from .weft literate sources
 tangle:
-    mkdir -p tmp/src tmp/tests tmp/docs
+    mkdir -p tmp/src tmp/tests tmp/docs tmp/selfhost
     weft kcc.weft
 
 # Assemble: compile each .s to .o
@@ -65,6 +65,11 @@ test: tangle
         -e _main -arch arm64
     echo ""
     ./tmp/test_kcc
+
+# Self-hosting (Stage 8b): compile kcc's arena in C with kcc, relink, run the suite
+selfhost: build
+    chmod +x tmp/selfhost/selfhost.sh
+    tmp/selfhost/selfhost.sh
 
 # Code generation tests: compile C programs with kcc, link, run, check exit codes
 test-codegen: build

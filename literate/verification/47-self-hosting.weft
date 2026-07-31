@@ -1,0 +1,191 @@
+% 47-self-hosting.weft — Stage 8b: the arena allocator, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Arena in C}
+\label{ch:self-hosting-arena}
+
+Every preceding chapter builds \kcc{} out of hand-written ARM64
+assembly.  This chapter closes a loop: it re-implements one of the
+compiler's own subsystems---the arena allocator of
+Chapter~\ref{ch:arena}---in C, compiles that C with \kcc{}, and links
+the resulting object back into the compiler in place of the assembly
+version.  If the twice-removed compiler (assembly \kcc{} compiling C
+that becomes part of \kcc{}) still passes the entire code-generation
+suite, then \kcc{} has demonstrably compiled a non-trivial, correctness-%
+critical piece of itself.  This is the first concrete step of
+Stage~8b.
+
+The arena is the ideal candidate.  It is small, self-contained, and
+exercised by \emph{every} other subsystem: tokens, AST nodes, types,
+symbols, IR, and machine code all draw their storage from it.  A single
+mistake in the C port---a mis-computed offset, a botched pointer
+comparison, an off-by-one in the alignment---would corrupt allocations
+and cascade into failures across the whole suite.  Passing all 201
+tests is therefore a strong signal that the features this port relies
+on (\texttt{struct} layout, \texttt{->} access, pointer casts and
+arithmetic, external calls, globals, the ternary and bitwise operators)
+are correct together, not merely in isolation.
+
+\section{Interface and Chunk Layout}
+
+The C port must be a drop-in replacement, so it exports exactly the
+symbols the assembly arena did---\texttt{kcc\_arena\_init},
+\texttt{kcc\_arena\_alloc}, and the global \texttt{kcc\_arena\_current}---%
+and it depends only on the two syscall wrappers the assembly arena
+already used.  Those wrappers stay in assembly; the port calls them as
+ordinary \texttt{extern} functions, and the linker resolves the
+references across objects exactly as \S\ref{sec:preregister-globals}
+describes.
+
+The \texttt{Chunk} structure mirrors the 24-byte header of
+Chapter~\ref{ch:arena} field for field: \texttt{next} at offset~0,
+\texttt{limit} at~8, \texttt{avail} at~16.  In the all-spill model each
+struct field occupies one eight-byte slot, so this C layout and the
+assembly layout coincide byte for byte---which is what lets the port
+read and write the same header a future chunk allocation will expect.
+\texttt{limit} and \texttt{avail} are \texttt{char~*} so that pointer
+arithmetic on them counts bytes rather than being scaled.
+
+@l c
+@d Selfhost: arena preamble @{
+struct Chunk {
+    struct Chunk *next;
+    char *limit;
+    char *avail;
+};
+
+void *kcc_sys_mmap(void *addr, long len, int prot, int flags, int fd, long off);
+void  kcc_sys_exit(int status);
+
+struct Chunk *kcc_arena_current;
+@}
+
+\section{Initialization}
+
+\texttt{kcc\_arena\_init} requests a 64\,KiB private, anonymous mapping
+from the kernel (\texttt{prot}~=~\texttt{PROT\_READ|PROT\_WRITE}~=~3,
+\texttt{flags}~=~\texttt{MAP\_PRIVATE|MAP\_ANON}~=~\texttt{0x1002}~=~4098),
+bails out with status~1 on failure, and writes the three header fields:
+an empty \texttt{next}, a \texttt{limit} one past the mapping, and an
+\texttt{avail} pointing just past the 24-byte header.  The finished
+chunk becomes the current one.  The failure test casts the returned
+pointer to \texttt{long} and compares against $-1$
+(\texttt{MAP\_FAILED}), mirroring the assembly's \texttt{cmn} check.
+
+@l c
+@d Selfhost: arena init @{
+
+void kcc_arena_init(void) {
+    struct Chunk *c = (struct Chunk *)kcc_sys_mmap(0, 65536, 3, 4098, -1, 0);
+    if ((long)c == -1) kcc_sys_exit(1);
+    c->next = 0;
+    c->limit = (char *)c + 65536;
+    c->avail = (char *)c + 24;
+    kcc_arena_current = c;
+}
+@}
+
+\section{Allocation}
+
+\texttt{kcc\_arena\_alloc} first rounds the request up to the next
+multiple of eight with the classic \texttt{(size + 7) \& \textasciitilde 7}.
+The fast path is a single bounds check: if the bumped \texttt{avail}
+would still fit under \texttt{limit}, it advances the pointer and
+returns the old value.  Both operands of the comparison are
+\texttt{char~*}, so \texttt{p + size} is a true byte offset.
+
+When the current chunk cannot satisfy the request, the slow path maps a
+fresh chunk sized to the larger of the default 64\,KiB and the request
+plus a header, links it ahead of the current chunk, and serves the
+allocation from it.  Unlike the assembly version---which conservatively
+set every chunk's \texttt{limit} to base~+~64\,KiB---this port sets
+\texttt{limit} to base~+~\emph{actual size}, so an oversized chunk is
+fully usable; for every allocation the test suite makes, the two behave
+identically.
+
+@l c
+@d Selfhost: arena alloc @{
+
+void *kcc_arena_alloc(long size) {
+    size = (size + 7) & ~7;
+    struct Chunk *c = kcc_arena_current;
+    char *p = c->avail;
+    if (p + size <= c->limit) {
+        c->avail = p + size;
+        return p;
+    }
+    long need = size + 24;
+    long chunksz = need > 65536 ? need : 65536;
+    struct Chunk *n = (struct Chunk *)kcc_sys_mmap(0, chunksz, 3, 4098, -1, 0);
+    if ((long)n == -1) kcc_sys_exit(2);
+    n->next = c;
+    n->limit = (char *)n + chunksz;
+    char *base = (char *)n + 24;
+    n->avail = base + size;
+    kcc_arena_current = n;
+    return base;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+The three fragments compose into one C translation unit, routed by the
+assembly file to \texttt{tmp/selfhost/arena.c}.  This is the file
+\texttt{just selfhost} feeds to \kcc{}.
+
+@l c
+@d Selfhost: arena @{
+@<Selfhost: arena preamble@>
+@<Selfhost: arena init@>
+@<Selfhost: arena alloc@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-verify}
+
+The \texttt{just selfhost} recipe performs the whole loop.  It compiles
+\texttt{tmp/selfhost/arena.c} with the assembly-built \kcc{}
+(\texttt{kcc -c arena.c -o arena\_c.o}), then relinks a second compiler
+binary, \texttt{tmp/kcc\_selfhost}, from all the usual objects but with
+the hand-written \texttt{arena.o} swapped out for the freshly compiled
+\texttt{arena\_c.o}.  Finally it points the code-generation suite at
+that binary.
+
+The passing criterion is unforgiving and complete: \texttt{kcc\_selfhost}
+must reproduce all 201 results of the assembly-built compiler.  Because
+the arena underlies every allocation, and because the 201 programs
+between them allocate enough to spill past a single 64\,KiB chunk many
+times over, a green run means the C arena---compiled by \kcc{}---is
+byte-for-byte behaviourally equivalent to the assembly original, slow
+path and all.
+
+@d Selfhost: verify @{
+#!/usr/bin/env bash
+# just selfhost — compile kcc's arena in C with kcc, relink, run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 linker codegen emit_macho driver"
+
+echo "[1/3] compiling tmp/selfhost/arena.c with kcc"
+tmp/kcc -c "$SH/arena.c" -o "$SH/arena_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost (arena.o -> kcc-compiled arena_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "arena" ]; then OBJ="$OBJ $SH/arena_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted arena"
+cp tmp/kcc "$SH/kcc_asm_backup"
+cp tmp/kcc_selfhost tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup" tmp/kcc
+exit $status
+@}

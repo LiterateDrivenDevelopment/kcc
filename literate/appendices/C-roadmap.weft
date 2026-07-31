@@ -521,6 +521,10 @@ translation units in one invocation, sharing functions and
 \texttt{extern} globals across objects).  A 1{,}130-line C test suite compiles and runs correctly:
 hash tables, arena allocators, recursive-descent parsers, linked-list
 manipulation, tree evaluators, and the sieve of Eratosthenes.
+Stage~8b has begun: \kcc{}'s own arena allocator, re-written in C and
+compiled by \kcc{}, replaces the hand-written assembly arena in a
+\texttt{kcc\_selfhost} binary that passes all 201 codegen tests
+(Chapter~\ref{ch:self-hosting-arena}).
 
 \textbf{Completed milestones.}
 \begin{itemize}
@@ -619,13 +623,24 @@ with shared \texttt{extern} data) were originally listed here; all are
 now implemented and covered by the codegen suite (see the completed
 milestones above).
 
-\textbf{Remaining work --- Stage 8b: subsystem in C.}
+\textbf{Stage 8b: subsystem in C.}
 
 \begin{itemize}
-\item Write the \kcc{} arena allocator or lexer in C.
-\item Compile it with \kcc{} into a \texttt{.o} file.
-\item Link with the rest of the ARM64 assembly modules.
-\item Verify identical behavior via the existing test suite.
+\item[\checkmark] The \kcc{} arena allocator is re-implemented in C
+      (Chapter~\ref{ch:self-hosting-arena}), a faithful port of the
+      assembly arena of Chapter~\ref{ch:arena} with the same exported
+      symbols and 24-byte chunk layout.
+\item[\checkmark] \texttt{just selfhost} compiles it with \kcc{}
+      (\texttt{kcc -c arena.c -o arena\_c.o}), relinks a
+      \texttt{kcc\_selfhost} binary with the hand-written
+      \texttt{arena.o} replaced by the C-compiled object, and runs the
+      full code-generation suite against it.
+\item[\checkmark] Behaviour is identical: \texttt{kcc\_selfhost} passes
+      all 201 codegen tests, exercising the C arena's fast and slow
+      paths across every allocation the compiler makes.  \kcc{} has
+      compiled a correctness-critical piece of itself.
+\item Remaining: port a larger subsystem (the lexer) and, eventually,
+      compile enough of \kcc{} to bootstrap.
 \end{itemize}
 
 \textbf{Remaining work --- Stage 8c: validation.}

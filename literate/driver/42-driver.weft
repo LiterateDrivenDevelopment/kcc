@@ -748,6 +748,8 @@ int main(void){ return (int) sqrt(49.0); }"
 run_e2e "header-vararg-sprintf" 23 "#include <stdio.h>
 #include <stdlib.h>
 int main(void){ char buf[16]; sprintf(buf, \"%d\", 123); return atoi(buf) - 100; }"
+run_e2e "header-std-streams" 9 "#include <stdio.h>
+int main(void){ fprintf(stdout, \"out %d\n\", 1); fprintf(stderr, \"err %d\n\", 2); return 9; }"
 
 # A missing symbol must make the driver fail (no executable, nonzero status).
 printf 'int gone(void); int main(void){ return gone(); }\n' > "$TMP/bad.c"

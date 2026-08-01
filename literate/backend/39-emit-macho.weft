@@ -898,10 +898,12 @@ is not, so the \texttt{pcrel} bit is cleared for that case.
     ldr x3, [x5, x3, lsl #3]     // x3 = remap[original_index]
 
     // Pack: (sym_idx & 0xFFFFFF) | (pcrel<<24) | (length<<25) | (extern<<27) | (type<<28)
-    // pcrel: BRANCH26=1, PAGE21=1, PAGEOFF12=0
+    // pcrel: BRANCH26/PAGE21/GOT_LOAD_PAGE21=1, PAGEOFF12/GOT_LOAD_PAGEOFF12=0
     and w0, w3, #0xFFFFFF          // r_symbolnum (remapped)
-    // Determine pcrel based on type
+    // Determine pcrel based on type: the two PAGEOFF12 forms are absolute
     cmp w4, #ARM64_RELOC_PAGEOFF12
+    b.eq .Lmf_reloc_no_pcrel
+    cmp w4, #ARM64_RELOC_GOT_LOAD_PAGEOFF12
     b.eq .Lmf_reloc_no_pcrel
     orr w0, w0, #(1 << 24)        // r_pcrel = 1
 .Lmf_reloc_no_pcrel:

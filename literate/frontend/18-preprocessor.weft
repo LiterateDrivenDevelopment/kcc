@@ -1634,17 +1634,15 @@ header carries an \verb|#ifndef| guard so double inclusion is a no-op.  The
 lookup is a linear scan of a name/text table---ten entries, so nothing
 fancier is warranted.
 
-One deliberate omission: \texttt{stdin}, \texttt{stdout}, and \texttt{stderr}
-are absent from \texttt{stdio.h}.  They are not functions but \emph{data}
-objects imported from \texttt{libSystem} (\verb|__stdinp| and friends), and a
-dylib-imported datum must be reached through the GOT rather than a direct
-\verb|adrp|/\verb|add| pair---which is what kcc's back end currently emits for
-any global reference.  Function symbols are unaffected: they route through
-the lazy-binding stubs, so \texttt{printf}, \texttt{fopen}, and even
-\texttt{fprintf} to a \texttt{FILE*} returned by \texttt{fopen} all link
-cleanly.  GOT-indirect addressing for imported data is a back-end task left
-for later; until then a program wanting the standard streams must obtain a
-\texttt{FILE*} some other way.
+The standard streams \texttt{stdin}, \texttt{stdout}, and \texttt{stderr} are
+included.  They are not functions but \emph{data} objects imported from
+\texttt{libSystem} (\verb|__stdinp| and friends), which the header exposes as
+\texttt{extern} declarations with the usual macro aliases.  A dylib-imported
+datum has no fixed image address, so a reference to one must load its address
+through the global offset table rather than form it with a direct
+\verb|adrp|/\verb|add| pair; the back end's \texttt{IR\_GLOBAL\_REF} handler
+does exactly this for every external data symbol, so
+\texttt{fprintf(stderr, \ldots)} now links and runs.
 
 @d Preprocessor: builtin headers @{
 // char *_kcc_pp_builtin_header(const char *name)
@@ -1705,7 +1703,7 @@ _kcc_hdr_string: .asciz "#ifndef _STRING_H\n#define _STRING_H\nunsigned long str
 
 _kcc_hdr_stdlib: .asciz "#ifndef _STDLIB_H\n#define _STDLIB_H\nvoid *malloc(unsigned long size);\nvoid *calloc(unsigned long n, unsigned long size);\nvoid *realloc(void *ptr, unsigned long size);\nvoid free(void *ptr);\nvoid exit(int status);\nvoid abort(void);\nint atoi(char *s);\nlong atol(char *s);\nint abs(int x);\nlong labs(long x);\nint rand(void);\nvoid srand(unsigned int seed);\n#endif\n"
 
-_kcc_hdr_stdio: .asciz "#ifndef _STDIO_H\n#define _STDIO_H\ntypedef void FILE;\nint printf(char *fmt, ...);\nint fprintf(FILE *stream, char *fmt, ...);\nint sprintf(char *str, char *fmt, ...);\nint snprintf(char *str, unsigned long size, char *fmt, ...);\nint puts(char *s);\nint putchar(int c);\nint fputs(char *s, FILE *stream);\nint fputc(int c, FILE *stream);\nint getchar(void);\nint scanf(char *fmt, ...);\nint sscanf(char *str, char *fmt, ...);\nFILE *fopen(char *path, char *mode);\nint fclose(FILE *stream);\nunsigned long fread(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nunsigned long fwrite(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nint fflush(FILE *stream);\nint fgetc(FILE *stream);\nchar *fgets(char *s, int n, FILE *stream);\nint remove(char *path);\n#endif\n"
+_kcc_hdr_stdio: .asciz "#ifndef _STDIO_H\n#define _STDIO_H\ntypedef void FILE;\nextern FILE *__stdinp;\nextern FILE *__stdoutp;\nextern FILE *__stderrp;\n#define stdin __stdinp\n#define stdout __stdoutp\n#define stderr __stderrp\nint printf(char *fmt, ...);\nint fprintf(FILE *stream, char *fmt, ...);\nint sprintf(char *str, char *fmt, ...);\nint snprintf(char *str, unsigned long size, char *fmt, ...);\nint puts(char *s);\nint putchar(int c);\nint fputs(char *s, FILE *stream);\nint fputc(int c, FILE *stream);\nint getchar(void);\nint scanf(char *fmt, ...);\nint sscanf(char *str, char *fmt, ...);\nFILE *fopen(char *path, char *mode);\nint fclose(FILE *stream);\nunsigned long fread(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nunsigned long fwrite(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nint fflush(FILE *stream);\nint fgetc(FILE *stream);\nchar *fgets(char *s, int n, FILE *stream);\nint remove(char *path);\n#endif\n"
 
 .data
 .align 3

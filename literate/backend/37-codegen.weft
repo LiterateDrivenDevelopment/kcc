@@ -147,6 +147,20 @@ linker resolves it against whichever object supplies the definition.
 Without the set, every reference would define its own copy and two
 objects naming the same global would collide.
 
+The two cases also differ in \emph{how} the address is formed.  A locally
+defined global has an address inside the image, reachable with a direct
+\textsc{adrp}+\textsc{add} page/offset pair.  An external one may be
+defined in another object---or imported from a dynamic library, like the
+standard streams \texttt{stdin}/\texttt{stdout}/\texttt{stderr} (which are
+the \texttt{libSystem} data symbols \texttt{\_\_stdinp} and friends).  A
+dylib datum has no fixed image address; it is reached only through the
+global offset table, so the handler emits \textsc{adrp}\;\texttt{GOTPAGE}
+followed by an \textsc{ldr}\;\texttt{GOTPAGEOFF} that loads the symbol's
+resolved address from a GOT slot the linker binds.  The same GOT form works
+for an ordinary cross-object extern (the linker simply points the slot at
+the local definition), so all external references take it uniformly; only
+the load, not the code generator, pays for the extra indirection.
+
 @d CodeGen: preregister globals @{
 // -- kcc_preregister_globals --------------------------------------------------
 // void kcc_preregister_globals(node *trans_unit)
@@ -2974,48 +2988,64 @@ label restores callee-saved registers and returns.
     bl _kcc_ht_get
     cbz x0, .Lcgi_gref_extern
 
-    // Defined here: reserve BSS storage (section 2)
+    // Defined here: reserve BSS storage (section 2) and address it directly
+    // with an ADRP/ADD pair, since a local symbol has an image address.
     mov x0, x25
     mov x1, #8                     // default 8 bytes per scalar global
     bl _kcc_linker_global_sym
     mov x25, x0                    // sym_index
-    b .Lcgi_gref_reloc
 
-.Lcgi_gref_extern:
-    // Defined elsewhere: emit an undefined external symbol for the linker
-    mov x0, x25
-    bl _kcc_linker_extern
-    mov x25, x0                    // sym_index
-
-.Lcgi_gref_reloc:
-
-    // Emit ADRP x11, symbol@@PAGE (with PAGE21 reloc)
     bl _kcc_code_current_pos
-    mov x0, x0                     // offset
     mov x1, #ARM64_RELOC_PAGE21
-    mov x2, x25                    // sym_index
+    mov x2, x25
     bl _kcc_linker_add_reloc
-
     mov x0, #CG_REG_DST           // rd = x11
     mov x1, #0                     // imm21 = 0 (linker patches)
     bl _kcc_enc_adrp
     bl _kcc_code_emit32
 
-    // Emit ADD x11, x11, symbol@@PAGEOFF (with PAGEOFF12 reloc)
     bl _kcc_code_current_pos
-    mov x0, x0                     // offset
     mov x1, #ARM64_RELOC_PAGEOFF12
-    mov x2, x25                    // sym_index
+    mov x2, x25
     bl _kcc_linker_add_reloc
-
     mov x0, #CG_REG_DST           // rd = x11
     mov x1, #CG_REG_DST           // rn = x11
     mov x2, #0                     // imm12 = 0 (linker patches)
     mov x3, #1                     // sf = 64-bit
     bl _kcc_enc_add_imm
     bl _kcc_code_emit32
+    b .Lcgi_gref_store
 
-    // Store x11 (address of global) to dest vreg slot
+.Lcgi_gref_extern:
+    // Defined elsewhere (another TU or a dylib import): reach the symbol's
+    // address through the GOT with ADRP GOTPAGE + LDR GOTPAGEOFF, so that
+    // dylib-imported data (stdin/stdout/stderr) resolves via a bound GOT slot.
+    mov x0, x25
+    bl _kcc_linker_extern
+    mov x25, x0                    // sym_index
+
+    bl _kcc_code_current_pos
+    mov x1, #ARM64_RELOC_GOT_LOAD_PAGE21
+    mov x2, x25
+    bl _kcc_linker_add_reloc
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #0                     // imm21 = 0 (linker patches)
+    bl _kcc_enc_adrp
+    bl _kcc_code_emit32
+
+    bl _kcc_code_current_pos
+    mov x1, #ARM64_RELOC_GOT_LOAD_PAGEOFF12
+    mov x2, x25
+    bl _kcc_linker_add_reloc
+    mov x0, #CG_REG_DST           // rt = x11
+    mov x1, #CG_REG_DST           // rn = x11
+    mov x2, #0                     // imm12 = 0 (linker patches)
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+
+.Lcgi_gref_store:
+    // x11 now holds the global's address (loaded from the GOT for externs).
     mov x0, x24
     mov x1, #CG_REG_DST
     bl _kcc_cg_store_vreg

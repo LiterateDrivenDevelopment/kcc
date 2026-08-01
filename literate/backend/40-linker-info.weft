@@ -54,9 +54,11 @@ Offset & Field & Description \\
 .equ SYM_ENTRY_SIZE, 32
 
 // -- Mach-O relocation types --------------------------------------------------
-.equ ARM64_RELOC_BRANCH26,  2
-.equ ARM64_RELOC_PAGE21,    3
-.equ ARM64_RELOC_PAGEOFF12, 4
+.equ ARM64_RELOC_BRANCH26,          2
+.equ ARM64_RELOC_PAGE21,            3
+.equ ARM64_RELOC_PAGEOFF12,         4
+.equ ARM64_RELOC_GOT_LOAD_PAGE21,   5
+.equ ARM64_RELOC_GOT_LOAD_PAGEOFF12, 6
 
 // -- Mach-O symbol flags ------------------------------------------------------
 .equ N_UNDF,   0x00

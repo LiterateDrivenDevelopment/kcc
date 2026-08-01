@@ -986,9 +986,13 @@ A production compiler needs more than correct code generation.
       pre-existing variadic-ABI limitation: multi-fixed-argument variadic
       calls (\texttt{fprintf}, \texttt{sprintf}, \texttt{snprintf}) now lay
       out the Apple variadic stack from the prototype's fixed-parameter count
-      instead of assuming one.  The remaining gap is the standard streams
-      \texttt{stdin}/\texttt{stdout}/\texttt{stderr}, which are dylib-imported
-      \emph{data} and need GOT-indirect addressing (a back-end task).
+      instead of assuming one.  The standard streams
+      \texttt{stdin}/\texttt{stdout}/\texttt{stderr}---dylib-imported
+      \emph{data}---also work now: the back end reaches every external data
+      symbol through the GOT (\textsc{adrp}\;\texttt{GOTPAGE} +
+      \textsc{ldr}\;\texttt{GOTPAGEOFF}) rather than a direct
+      \textsc{adrp}/\textsc{add}, so \texttt{ld} binds the slot to
+      \texttt{libSystem}'s \texttt{\_\_stdoutp} and friends.
 \item \textbf{Source-level profiling.}  Instrument function
       entry/exit for \texttt{-pg}-style profiling or basic
       timing output.

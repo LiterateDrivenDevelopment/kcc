@@ -500,7 +500,7 @@ _kcc_enc_cset:
 
 \section{Memory Encoding}
 
-Load and store use the unsigned-offset form: the 12-bit immediate is pre-scaled by the access size (divided by~8 for 64-bit, by~4 for 32-bit). \textsc{stp} (pre-index) and \textsc{ldp} (post-index) use a 7-bit signed immediate scaled by~8, encoded in bits [21:15]. \textsc{mov}\;$R_d, R_m$ is encoded as \texttt{ORR\;Rd,\;xzr,\;Rm}.
+Load and store use the unsigned-offset form: the 12-bit immediate is pre-scaled by the access size (divided by~8 for 64-bit, by~4 for 32-bit). The load encoder also provides the three sign-extending narrow forms \textsc{ldrsb}, \textsc{ldrsh}, and \textsc{ldrsw} (size codes 5, 6, 4), which set \texttt{opc}\;$=$\;\texttt{10} to extend a byte, halfword, or word into the full 64-bit register---needed now that packed struct fields and array elements are addressed at their natural width and a signed narrow value must keep its sign in the eight-byte spill slot. \textsc{stp} (pre-index) and \textsc{ldp} (post-index) use a 7-bit signed immediate scaled by~8, encoded in bits [21:15]. \textsc{mov}\;$R_d, R_m$ is encoded as \texttt{ORR\;Rd,\;xzr,\;Rm}.
 
 @d Backend: encode memory @{
 // -- kcc_enc_str_imm ----------------------------------------------------------
@@ -534,7 +534,9 @@ _kcc_enc_str_imm:
 
 // -- kcc_enc_ldr_imm ----------------------------------------------------------
 // LDR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled,
-//   x3=size(0=32,1=64,2=byte,3=half)
+//   x3=size(0=32,1=64,2=byte,3=half,4=LDRSW,5=LDRSB,6=LDRSH)
+// Codes 4--6 sign-extend a narrow load into the full 64-bit register
+// (opc=10 in bits [23:22]); the unsigned forms 0/2/3 zero-extend (opc=01).
 .text
 .globl _kcc_enc_ldr_imm
 .p2align 2
@@ -543,6 +545,12 @@ _kcc_enc_ldr_imm:
     b.eq .Lldr_8
     cmp w3, #3
     b.eq .Lldr_16
+    cmp w3, #4
+    b.eq .Lldr_sw
+    cmp w3, #5
+    b.eq .Lldr_sb
+    cmp w3, #6
+    b.eq .Lldr_sh
     cbz w3, .Lldr_32
     mov w4, #0xF9400000            // 64-bit
     b .Lldr_common
@@ -554,6 +562,15 @@ _kcc_enc_ldr_imm:
     b .Lldr_common
 .Lldr_16:
     mov w4, #0x79400000            // 16-bit (LDRH)
+    b .Lldr_common
+.Lldr_sw:
+    mov w4, #0xB9800000            // LDRSW (32→64 signed)
+    b .Lldr_common
+.Lldr_sb:
+    mov w4, #0x39800000            // LDRSB (8→64 signed)
+    b .Lldr_common
+.Lldr_sh:
+    mov w4, #0x79800000            // LDRSH (16→64 signed)
 .Lldr_common:
     orr w4, w4, w2, lsl #10       // imm12 (pre-scaled)
     orr w4, w4, w1, lsl #5        // Rn

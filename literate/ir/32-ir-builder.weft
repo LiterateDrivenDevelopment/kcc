@@ -912,10 +912,11 @@ is not applied (its storage still persists, starting at zero).
 .globl _kcc_ir_emit_global_inits
 .p2align 2
 _kcc_ir_emit_global_inits:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
 
     adrp x0, _kcc_ir_trans_unit@@PAGE
     add  x0, x0, _kcc_ir_trans_unit@@PAGEOFF
@@ -975,18 +976,38 @@ _kcc_ir_emit_global_inits:
     b .Legi_next
 
 .Legi_initlist:
-    ldr x20, [x0, #AST_F0]      // first element (name no longer needed)
+    // Determine the element/aggregate type for byte-accurate offsets:
+    // for an array, the element type; for a struct, the struct type itself.
+    ldr x0, [x19, #AST_F0]      // declared type spec
+    bl _kcc_sema_resolve_type
+    cbz x0, .Legi_il_int
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Legi_il_typed
+    ldr x0, [x0, #TY_F0]        // array element type
+    b .Legi_il_typed
+.Legi_il_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+.Legi_il_typed:
+    mov x23, x0                  // element/aggregate type
+
+    ldr x20, [x19, #AST_F2]     // init list node
+    ldr x20, [x20, #AST_F0]     // first element
     mov x21, #0                  // element index
 .Legi_il_loop:
     cbz x20, .Legi_next
     mov x0, x20
     bl _kcc_ir_build_expr
-    mov x2, x0                   // value
-    mov x0, x22                  // base = global address vreg
+    mov x24, x0                  // value
+    mov x0, x23                  // element/aggregate type
     mov x1, x21                  // index
-    adrp x3, _kcc_type_int_s@@PAGE
-    add  x3, x3, _kcc_type_int_s@@PAGEOFF
-    ldr x3, [x3]
+    bl _kcc_ir_elem_off_width    // x0 = byte offset, x1 = width
+    mov x3, x1                   // width
+    mov x1, x0                   // byte offset
+    mov x0, x22                  // base = global address vreg
+    mov x2, x24                  // value
     bl _kcc_ir_emit_indexed_store
     add x21, x21, #1
     ldr x20, [x20, #AST_F4]      // next element
@@ -1063,9 +1084,10 @@ _kcc_ir_emit_global_inits:
     b .Legi_fn_loop
 
 .Legi_done:
+    ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #64
     ret
 @| _kcc_ir_emit_global_inits
 @}
@@ -2435,15 +2457,16 @@ symbol table for the pre-decay type (\texttt{TY\_ARRAY}), emits a
 GEP index path.
 
 \paragraph{Slots per type.}
-The all-spill model gives every scalar element its own eight-byte slot,
-so a multi-dimensional array \texttt{int a[3][3]} is nine consecutive
-slots, and \texttt{a[i]} names a three-slot sub-array.
-\texttt{\_kcc\_ir\_type\_slots} counts the slots a type occupies:
-\texttt{length}\,$\times$\,slots(element) for an array (recursively),
-one for a scalar that fits a slot, and $\lceil\mathrm{size}/8\rceil$ for
-a larger aggregate.  This one figure both sizes an array's alloca and
-scales a subscript index---for \texttt{a[i]} the step is the sub-array's
-slot count (three), for \texttt{a[i][j]} it is one.
+Aggregates are laid out byte-accurately (see \texttt{\_kcc\_type\_layout}),
+but the all-spill frame still allocates storage in whole eight-byte slots.
+\texttt{\_kcc\_ir\_type\_slots} bridges the two: it forces a layout and then
+rounds the real byte size up to a whole number of slots,
+$\max(1,\lceil\mathrm{TY\_SIZE}/8\rceil)$.  For \texttt{int a[4]} that is two
+slots (sixteen bytes) rather than the four the old one-slot-per-element model
+used; the packed sixteen-byte object is addressed with byte-accurate strides
+by the subscript and member code below.  This figure sizes an alloca; the
+subscript's element step now comes from the element's real size, not from a
+slot count.
 
 @d IR: build subscript @{
 // -- kcc_ir_type_slots ----------------------------------------------------
@@ -2457,29 +2480,135 @@ _kcc_ir_type_slots:
     mov x29, sp
     stp x19, x20, [sp, #16]
     cbz x0, .Lts_one
-    ldr x1, [x0, #TY_KIND]
-    cmp x1, #TY_ARRAY
-    b.eq .Lts_array
-    ldr x1, [x0, #TY_SIZE]
-    cmp x1, #8
+    // Force a byte-accurate layout, then round the real size up to whole
+    // 8-byte all-spill slots.  Arrays and structs are sized uniformly.
+    bl _kcc_type_layout          // x0 = TY_SIZE in bytes
+    cmp x0, #8
     b.le .Lts_one
-    add x1, x1, #7
-    lsr x0, x1, #3               // ceil(size / 8)
+    add x0, x0, #7
+    lsr x0, x0, #3               // ceil(size / 8)
     b .Lts_done
 .Lts_one:
     mov x0, #1
-    b .Lts_done
-.Lts_array:
-    mov x19, x0
-    ldr x20, [x19, #TY_F1]       // length
-    ldr x0, [x19, #TY_F0]        // element type
-    bl _kcc_ir_type_slots
-    mul x0, x0, x20              // length * slots(element)
 .Lts_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_ir_type_slots
+@}
+
+\paragraph{Access widths.}
+Once fields and array elements are packed, a memory access must name its
+exact width and signedness or it will read or clobber neighbouring bytes.
+An eight-byte slot load of a two-byte \texttt{short} field would drag in the
+next field's low bytes; an eight-byte store would overwrite them.  Two
+helpers translate a scalar type into the access-size override the code
+generator understands.  \texttt{\_kcc\_ir\_store\_width} returns the byte
+width $1$, $2$, or $4$ for a narrow integer (and $0$---meaning the natural
+eight-byte slot---for anything pointer-width or aggregate).  Stores need no
+signedness because they simply truncate.  \texttt{\_kcc\_ir\_load\_width}
+additionally encodes signedness, because a narrow load must extend into the
+full 64-bit slot: it returns $1/2/4$ for unsigned \texttt{LDRB}/\texttt{LDRH}/%
+\texttt{LDR w} and $5/6/7$ for signed \texttt{LDRSB}/\texttt{LDRSH}/%
+\texttt{LDRSW}.  A signed \texttt{int} field holding $-1$ thus round-trips as
+$-1$ rather than $2^{32}-1$.
+
+@d IR: access width @{
+// -- kcc_ir_store_width ---------------------------------------------------
+// uint64_t kcc_ir_store_width(type_desc *ty)
+//   Store access-size override: 1/2/4 for a narrow scalar, 0 for the
+//   natural 8-byte slot (pointers, long, aggregates).
+.text
+.globl _kcc_ir_store_width
+.p2align 2
+_kcc_ir_store_width:
+    cbz x0, .Lsw_default
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_BOOL
+    b.eq .Lsw_one
+    cmp x1, #TY_ENUM
+    b.eq .Lsw_int_size
+    cmp x1, #TY_CHAR
+    b.lt .Lsw_default          // void
+    cmp x1, #TY_LLONG
+    b.gt .Lsw_default          // float/double/ptr/array/struct
+.Lsw_int_size:
+    ldr x2, [x0, #TY_SIZE]
+    cmp x2, #4
+    b.eq .Lsw_from_size
+    cmp x2, #2
+    b.eq .Lsw_from_size
+    cmp x2, #1
+    b.eq .Lsw_from_size
+    b .Lsw_default             // 8-byte long → natural slot
+.Lsw_from_size:
+    mov x0, x2
+    ret
+.Lsw_one:
+    mov x0, #1
+    ret
+.Lsw_default:
+    mov x0, #0
+    ret
+
+// -- kcc_ir_load_width ----------------------------------------------------
+// uint64_t kcc_ir_load_width(type_desc *ty)
+//   Load access-size override: 1/2/4 unsigned, 5/6/7 signed, 0 = 8-byte.
+.text
+.globl _kcc_ir_load_width
+.p2align 2
+_kcc_ir_load_width:
+    cbz x0, .Llw_default
+    ldr x1, [x0, #TY_KIND]
+    ldr x2, [x0, #TY_SIZE]
+    cmp x1, #TY_BOOL
+    b.eq .Llw_unsigned
+    cmp x1, #TY_ENUM
+    b.eq .Llw_signed
+    cmp x1, #TY_CHAR
+    b.lt .Llw_default          // void
+    cmp x1, #TY_LLONG
+    b.gt .Llw_default          // float/double/ptr/array/struct
+    ldr x3, [x0, #TY_F0]       // integer signedness (1 = signed)
+    cbz x3, .Llw_unsigned
+.Llw_signed:
+    cmp x2, #1
+    b.eq .Llw_s8
+    cmp x2, #2
+    b.eq .Llw_s16
+    cmp x2, #4
+    b.eq .Llw_s32
+    b .Llw_default             // 8-byte → natural slot
+.Llw_s8:
+    mov x0, #5
+    ret
+.Llw_s16:
+    mov x0, #6
+    ret
+.Llw_s32:
+    mov x0, #7
+    ret
+.Llw_unsigned:
+    cmp x2, #1
+    b.eq .Llw_u8
+    cmp x2, #2
+    b.eq .Llw_u16
+    cmp x2, #4
+    b.eq .Llw_u32
+    b .Llw_default
+.Llw_u8:
+    mov x0, #1
+    ret
+.Llw_u16:
+    mov x0, #2
+    ret
+.Llw_u32:
+    mov x0, #4
+    ret
+.Llw_default:
+    mov x0, #0
+    ret
+@| _kcc_ir_store_width _kcc_ir_load_width
 @}
 
 @d IR: build subscript @{
@@ -2581,14 +2710,15 @@ _kcc_ir_build_subscript_addr:
     bl _kcc_ir_build_expr
     mov x21, x0                  // index vreg
 
-    // Scale the index by the element's slot count so GEP's fixed stride 8
-    // lands on the right slot (struct elements and sub-arrays span >1 slot).
+    // Scale the index by the element's real byte size so the stride-1 GEP
+    // lands on the right byte (a[i] steps by sizeof(element), including
+    // packed structs and sub-arrays).
     ldr x0, [x19, #AST_F3]      // subscript result type (element type)
     cbz x0, .Libsa_gep
-    bl _kcc_ir_type_slots       // x0 = slots(element)
+    bl _kcc_type_layout         // x0 = element size in bytes
     mov x22, x0
     cmp x22, #1
-    b.le .Libsa_gep             // one slot: no scaling
+    b.le .Libsa_gep             // size 1: index is already the byte offset
 
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
@@ -2620,7 +2750,7 @@ _kcc_ir_build_subscript_addr:
     bl _kcc_ir_emit
 
 .Libsa_gep:
-    // Emit IR_GEP: base + index * 8
+    // Emit IR_GEP: base + byte offset (index already scaled by element size)
     mov x0, #IR_GEP
     bl _kcc_ir_alloc_instr
     mov x22, x0
@@ -2629,7 +2759,7 @@ _kcc_ir_build_subscript_addr:
     ldr x1, [x1]
     str x1, [x22, #IR_TYPE]
     str x20, [x22, #IR_SRC1]    // base pointer
-    str x21, [x22, #IR_SRC2]    // index
+    str x21, [x22, #IR_SRC2]    // byte offset
     bl _kcc_ir_next_vreg
     str x0, [x22, #IR_DEST]
     mov x23, x0                  // result vreg
@@ -2649,21 +2779,16 @@ _kcc_ir_build_subscript_addr:
     bl _kcc_ir_build_expr
     mov x21, x0                  // x21 = index vreg
 
-    // Get pointee size
+    // Get pointee size (real, byte-accurate — the array it points into is
+    // now packed at the same stride, so no clamp to 8 is needed).
     ldr x0, [x19, #AST_F0]
     ldr x0, [x0, #AST_F3]       // TY_PTR
     ldr x0, [x0, #TY_F0]        // pointee type
     cbz x0, .Libsa_ptr_add
-    ldr x22, [x0, #TY_SIZE]
+    bl _kcc_type_layout         // x22 = sizeof(pointee)
+    mov x22, x0
     cmp x22, #1
-    b.le .Libsa_ptr_add
-    // In the all-spill model every slot is 8 bytes; clamp
-    // the scale factor so that pointer arithmetic matches
-    // the actual array layout.
-    cmp x22, #8
-    b.ge .Libsa_ptr_scale
-    mov x22, #8
-.Libsa_ptr_scale:
+    b.le .Libsa_ptr_add         // size 1: index is already the byte offset
 
     // Scale index by pointee size
     mov x0, #IR_CONST
@@ -2742,18 +2867,11 @@ _kcc_ir_build_subscript:
     bl _kcc_ir_build_subscript_addr
     mov x19, x0                  // address vreg
 
-    // Pointer subscripts need access-size override on LOAD
-    mov x21, #0
-    ldr x0, [x20, #AST_F0]
-    cbz x0, .Libs_load
-    ldr x0, [x0, #AST_F3]
-    cbz x0, .Libs_load
-    ldr x1, [x0, #TY_KIND]
-    cmp x1, #TY_PTR
-    b.ne .Libs_load
-    ldr x0, [x0, #TY_F0]
-    cbz x0, .Libs_load
-    ldr x21, [x0, #TY_SIZE]
+    // Element load width+sign from the subscript result (element) type —
+    // covers both array and pointer element sizes now that they are packed.
+    ldr x0, [x20, #AST_F3]
+    bl _kcc_ir_load_width
+    mov x21, x0
 
 .Libs_load:
     mov x0, #IR_LOAD
@@ -3004,8 +3122,8 @@ _kcc_ir_build_member_addr:
     mov x20, x0                  // base vreg
 
 .Libma_find_index:
-    // Find field index by walking struct type's field list
-    // Get struct type from sema (AST_F3 of object expression)
+    // Find the field's byte offset by walking the struct type's field list.
+    // Get struct type from sema (AST_F3 of object expression).
     ldr x0, [x19, #AST_F0]      // object node
     ldr x0, [x0, #AST_F3]       // resolved type
     cbz x0, .Libma_index_zero
@@ -3017,14 +3135,19 @@ _kcc_ir_build_member_addr:
     ldr x1, [x0, #TY_KIND]
 .Libma_check_struct:
     cmp x1, #TY_STRUCT
+    b.eq .Libma_have_struct
+    cmp x1, #TY_UNION
     b.ne .Libma_index_zero
+.Libma_have_struct:
+    // Ensure the aggregate is laid out (per-field byte offsets in AST_F3).
+    mov x25, x0                 // preserve struct type across the call
+    bl _kcc_type_layout
 
     // Walk field list: TY_F0 = AST_STRUCT_DECL, F1 = first field
-    ldr x0, [x0, #TY_F0]        // AST_STRUCT_DECL
+    ldr x0, [x25, #TY_F0]       // AST_STRUCT_DECL
     cbz x0, .Libma_index_zero
     ldr x23, [x0, #AST_F1]      // first field
     ldr x24, [x19, #AST_F1]     // member name to find
-    mov x25, #0                  // field index counter
 
 .Libma_field_loop:
     cbz x23, .Libma_index_zero
@@ -3035,47 +3158,33 @@ _kcc_ir_build_member_addr:
     cbz x0, .Libma_found
 
 .Libma_field_next:
-    // Advance index by field's slot count: max(TY_SIZE, 8) / 8
-    ldr x0, [x23, #AST_F0]      // field type specifier
-    cbz x0, .Libma_field_inc1
-    bl _kcc_sema_resolve_type
-    cbz x0, .Libma_field_inc1
-    ldr x0, [x0, #TY_SIZE]
-    cmp x0, #8
-    b.le .Libma_field_inc1
-    lsr x0, x0, #3              // TY_SIZE / 8
-    add x25, x25, x0
-    ldr x23, [x23, #AST_F4]     // next field
-    b .Libma_field_loop
-.Libma_field_inc1:
-    add x25, x25, #1
     ldr x23, [x23, #AST_F4]     // next field
     b .Libma_field_loop
 
 .Libma_found:
-    mov x21, x25                 // field index
+    ldr x21, [x23, #AST_F3]      // field byte offset (set by _kcc_type_layout)
     b .Libma_emit_const
 
 .Libma_index_zero:
     mov x21, #0
 
 .Libma_emit_const:
-    // Emit IR_CONST for field index
+    // Emit IR_CONST for the field's byte offset
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
     mov x22, x0
-    str x21, [x22, #IR_SRC1]    // constant value = field index
+    str x21, [x22, #IR_SRC1]    // constant value = field byte offset
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
     str x1, [x22, #IR_TYPE]
     bl _kcc_ir_next_vreg
     str x0, [x22, #IR_DEST]
-    mov x21, x0                  // index vreg
+    mov x21, x0                  // offset vreg
     mov x0, x22
     bl _kcc_ir_emit
 
-    // Emit IR_GEP: base + field_index * slot_size
+    // Emit IR_GEP: base + byte offset (stride 1)
     mov x0, #IR_GEP
     bl _kcc_ir_alloc_instr
     mov x22, x0
@@ -3115,19 +3224,28 @@ _kcc_ir_build_member:
     mov x29, sp
     stp x19, x20, [sp, #16]
 
+    mov x19, x0                  // save member node (for field type)
+
     // Get field address
     bl _kcc_ir_build_member_addr
-    mov x19, x0                  // GEP vreg (field address)
+    mov x20, x0                  // GEP vreg (field address)
+
+    // Field access width + signedness from the member's resolved type.
+    ldr x0, [x19, #AST_F3]      // field type
+    bl _kcc_ir_load_width
+    mov x19, x0                  // load-size override
 
     // Emit IR_LOAD from field address
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
-    mov x20, x0
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x20, #IR_TYPE]
-    str x19, [x20, #IR_SRC1]    // pointer = GEP result
+    mov x1, x0
+    adrp x2, _kcc_type_int_s@@PAGE
+    add  x2, x2, _kcc_type_int_s@@PAGEOFF
+    ldr x2, [x2]
+    str x2, [x1, #IR_TYPE]
+    str x20, [x1, #IR_SRC1]     // pointer = GEP result
+    str x19, [x1, #IR_SRC2]     // access-size override
+    mov x20, x1                  // load instr
     bl _kcc_ir_next_vreg
     str x0, [x20, #IR_DEST]
     mov x19, x0                  // result vreg
@@ -3486,10 +3604,10 @@ _kcc_ir_build_binary:
     b .Libb_ptr_scale
 
 // Pointer arithmetic: ptr+int or int+ptr must scale the integer
-// operand by the pointed-to type's size.  x23 = opcode (ADD or SUB),
-// x21 = LHS vreg, x22 = RHS vreg.  The scale is clamped to
-// max(TY_SIZE, 8) because the all-spill model stores every element
-// in an 8-byte slot.  After scaling, falls through to the emitter.
+// operand by the pointed-to type's real byte size.  x23 = opcode
+// (ADD or SUB), x21 = LHS vreg, x22 = RHS vreg.  Since arrays are now
+// packed at their natural stride, the scale is the exact pointee size
+// (no clamp to 8).  After scaling, falls through to the emitter.
 .Libb_ptr_scale:
     // Check if LHS is a pointer type
     ldr x0, [x19, #AST_F1]
@@ -3523,16 +3641,13 @@ _kcc_ir_build_binary:
     cmp x1, #TY_PTR
     b.ne .Libb_emit
 
-    // RHS is pointer — scale LHS (x21)
+    // RHS is pointer — scale LHS (x21) by the real pointee size
     ldr x0, [x0, #TY_F0]
     cbz x0, .Libb_emit
-    ldr x24, [x0, #TY_SIZE]
+    bl _kcc_type_layout
+    mov x24, x0
     cmp x24, #1
     b.le .Libb_emit
-    cmp x24, #8
-    b.ge .Libb_ps_have_scale1
-    mov x24, #8
-.Libb_ps_have_scale1:
 
     // Emit const + mul to scale x21
     mov x0, #IR_CONST
@@ -3566,16 +3681,13 @@ _kcc_ir_build_binary:
     b .Libb_emit
 
 .Libb_ps_scale_rhs:
-    // LHS is pointer — scale RHS (x22) by pointee size
+    // LHS is pointer — scale RHS (x22) by the real pointee size
     ldr x0, [x0, #TY_F0]
     cbz x0, .Libb_emit
-    ldr x24, [x0, #TY_SIZE]
+    bl _kcc_type_layout
+    mov x24, x0
     cmp x24, #1
     b.le .Libb_emit
-    cmp x24, #8
-    b.ge .Libb_ps_have_scale2
-    mov x24, #8
-.Libb_ps_have_scale2:
 
     // Emit const + mul to scale x22
     mov x0, #IR_CONST
@@ -3609,22 +3721,16 @@ _kcc_ir_build_binary:
     b .Libb_emit
 
 .Libb_ptr_diff:
-    // Pointer difference: (lhs - rhs) / stride.  The stride mirrors the one
-    // ptr+int scaling uses so the two are consistent: 1 for byte-sized
-    // pointees, otherwise max(pointee_size, 8) for the all-spill slot model.
+    // Pointer difference: (lhs - rhs) / stride.  The stride is the real
+    // pointee size, mirroring the ptr+int scaling so the two are consistent.
     ldr x0, [x19, #AST_F1]
     ldr x0, [x0, #AST_F3]
     ldr x0, [x0, #TY_F0]           // pointee type
-    mov x24, #8
+    mov x24, #1
     cbz x0, .Libb_pd_have
-    ldr x1, [x0, #TY_SIZE]
-    cmp x1, #1
-    b.le .Libb_pd_stride1          // byte-sized pointee: stride 1
-    mov x2, #8
-    cmp x1, #8
-    csel x24, x1, x2, ge           // max(size, 8)
-    b .Libb_pd_have
-.Libb_pd_stride1:
+    bl _kcc_type_layout            // real pointee size (matches ptr+int stride)
+    mov x24, x0
+    cbnz x24, .Libb_pd_have
     mov x24, #1
 .Libb_pd_have:
     // SUB: byte difference of the two addresses
@@ -4413,17 +4519,19 @@ _kcc_ir_build_unary:
     // Use pointee type from sema (AST_F3) for IR_TYPE
     ldr x1, [x19, #AST_F3]
     cbz x1, .Libu_deref_default
-    // Set IR_SRC2 = TY_SIZE (access size override for codegen)
-    ldr x2, [x1, #TY_SIZE]
-    str x2, [x22, #IR_SRC2]
+    str x1, [x22, #IR_TYPE]
+    // Access width+sign override from the pointee type.
+    mov x0, x1
+    bl _kcc_ir_load_width
+    str x0, [x22, #IR_SRC2]
     b .Libu_deref_type
 .Libu_deref_default:
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
     str xzr, [x22, #IR_SRC2]
 .Libu_deref_type:
-    str x1, [x22, #IR_TYPE]
     str x21, [x22, #IR_SRC1]
     bl _kcc_ir_next_vreg
     str x0, [x22, #IR_DEST]
@@ -5121,18 +5229,11 @@ _kcc_ir_build_assign:
     bl _kcc_ir_build_subscript_addr
     mov x22, x0                  // x22 = element address vreg
 
-    // Pointer subscripts need access-size override on STORE
-    mov x24, #0
-    ldr x0, [x23, #AST_F0]
-    cbz x0, .Liba_sub_store
-    ldr x0, [x0, #AST_F3]
-    cbz x0, .Liba_sub_store
-    ldr x1, [x0, #TY_KIND]
-    cmp x1, #TY_PTR
-    b.ne .Liba_sub_store
-    ldr x0, [x0, #TY_F0]
-    cbz x0, .Liba_sub_store
-    ldr x24, [x0, #TY_SIZE]
+    // Store width from the element (subscript result) type — covers both
+    // array and pointer element sizes now that elements are packed.
+    ldr x0, [x23, #AST_F3]
+    bl _kcc_ir_store_width
+    mov x24, x0
 
 .Liba_sub_store:
     mov x0, #IR_STORE
@@ -5150,8 +5251,14 @@ _kcc_ir_build_assign:
 
 .Liba_member:
     // LHS is s.x: x0 = AST_MEMBER node, x21 = rhs vreg
+    mov x23, x0                  // save member node
     bl _kcc_ir_build_member_addr
     mov x22, x0                  // x22 = field address vreg
+
+    // Store width from the field type (so a narrow field is not clobbered)
+    ldr x0, [x23, #AST_F3]
+    bl _kcc_ir_store_width
+    mov x24, x0
 
     // Emit store: rhs → field address
     mov x0, #IR_STORE
@@ -5162,6 +5269,7 @@ _kcc_ir_build_assign:
     str x1, [x0, #IR_TYPE]
     str x21, [x0, #IR_SRC1]     // value
     str x22, [x0, #IR_SRC2]     // pointer (GEP result)
+    str x24, [x0, #IR_DEST]     // access size override
     bl _kcc_ir_emit
     mov x0, x21
     b .Liba_done
@@ -6048,17 +6156,22 @@ would copy only the first 8-byte slot.  Instead, the builder
 resolves the source struct's base address---an alloca vreg for
 locals or a \texttt{global\_ref} for globals---and calls
 \texttt{\_kcc\_ir\_emit\_struct\_copy}, which emits a
-\texttt{GEP$+$LOAD$+$GEP$+$STORE} sequence per field.  The
-same helper is reused by the assignment builder for statements
-like \texttt{cur = saved;}.
+\texttt{GEP$+$LOAD$+$GEP$+$STORE} sequence per 8-byte slot
+(\texttt{ceil(TY\_SIZE/8)} of them).  Copying whole slots rather than
+individual fields is safe because every aggregate alloca is rounded up to
+whole slots, so the trailing padding bytes belong to the object; and it
+keeps the copy independent of the packed field layout.  The same helper is
+reused by the assignment builder for statements like \texttt{cur = saved;}.
 
 @d IR: struct copy helper @{
 // -- kcc_ir_emit_struct_copy ----------------------------------------------
-// void kcc_ir_emit_struct_copy(src_base_vreg, dst_base_vreg, field_count)
+// void kcc_ir_emit_struct_copy(src_base_vreg, dst_base_vreg, slot_count)
 //   x0 = source base vreg
 //   x1 = destination base vreg
-//   x2 = number of fields to copy
-// Emits GEP+LOAD+GEP+STORE per field.
+//   x2 = number of 8-byte slots to copy (ceil(TY_SIZE/8))
+// Emits GEP+LOAD+GEP+STORE per 8-byte slot.  Since every aggregate alloca
+// is rounded up to whole slots, copying by slot (including any trailing
+// padding) stays within the object's storage.
 .text
 .globl _kcc_ir_emit_struct_copy
 .p2align 2
@@ -6071,15 +6184,15 @@ _kcc_ir_emit_struct_copy:
 
     mov x19, x0                  // src base vreg
     mov x20, x1                  // dst base vreg
-    str x2, [sp, #64]            // field count
-    mov x22, #0                  // loop counter
+    str x2, [sp, #64]            // slot count
+    mov x22, #0                  // loop counter (slot index)
 
 .Liesc_loop:
     ldr x0, [sp, #64]
     cmp x22, x0
     b.ge .Liesc_done
 
-    // IR_CONST field_index
+    // IR_CONST byte offset = slot index * 8 (stride-1 GEP adds it directly)
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
     mov x21, x0
@@ -6087,7 +6200,8 @@ _kcc_ir_emit_struct_copy:
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
     str x1, [x21, #IR_TYPE]
-    str x22, [x21, #IR_SRC1]
+    lsl x3, x22, #3             // byte offset
+    str x3, [x21, #IR_SRC1]
     bl _kcc_ir_next_vreg
     str x0, [x21, #IR_DEST]
     mov x24, x0                  // x24 = idx_vreg
@@ -6323,9 +6437,10 @@ _kcc_ir_initlist_count:
     ret
 
 // -- kcc_ir_emit_indexed_store --------------------------------------------
-// void kcc_ir_emit_indexed_store(base_vreg, index, value_vreg, type *ty)
-//   x0 = base alloca vreg, x1 = element index, x2 = value vreg, x3 = store type
-// Emits IR_CONST(index) + IR_GEP(base,index) + IR_STORE(value,addr).
+// void kcc_ir_emit_indexed_store(base_vreg, byte_offset, value_vreg, width)
+//   x0 = base vreg, x1 = byte offset, x2 = value vreg, x3 = store width
+//        (0 = 8-byte slot, else 1/2/4)
+// Emits IR_CONST(byte_offset) + IR_GEP(base,offset) + IR_STORE(value,addr).
 .text
 .globl _kcc_ir_emit_indexed_store
 .p2align 2
@@ -6337,11 +6452,11 @@ _kcc_ir_emit_indexed_store:
     str x23, [sp, #48]
 
     mov x19, x0                  // base vreg
-    mov x20, x1                  // index
+    mov x20, x1                  // byte offset
     mov x21, x2                  // value vreg
-    mov x22, x3                  // store type
+    mov x22, x3                  // store width
 
-    // IR_CONST index
+    // IR_CONST byte offset
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
     mov x23, x0
@@ -6349,14 +6464,14 @@ _kcc_ir_emit_indexed_store:
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
     str x1, [x23, #IR_TYPE]
-    str x20, [x23, #IR_SRC1]     // const value = index
+    str x20, [x23, #IR_SRC1]     // const value = byte offset
     bl _kcc_ir_next_vreg
     str x0, [x23, #IR_DEST]
-    mov x20, x0                  // x20 = index vreg
+    mov x20, x0                  // x20 = offset vreg
     mov x0, x23
     bl _kcc_ir_emit
 
-    // IR_GEP base + index
+    // IR_GEP base + byte offset
     mov x0, #IR_GEP
     bl _kcc_ir_alloc_instr
     mov x23, x0
@@ -6365,19 +6480,23 @@ _kcc_ir_emit_indexed_store:
     ldr x1, [x1]
     str x1, [x23, #IR_TYPE]
     str x19, [x23, #IR_SRC1]     // base pointer
-    str x20, [x23, #IR_SRC2]     // index vreg
+    str x20, [x23, #IR_SRC2]     // byte offset vreg
     bl _kcc_ir_next_vreg
     str x0, [x23, #IR_DEST]
     mov x20, x0                  // x20 = element address vreg
     mov x0, x23
     bl _kcc_ir_emit
 
-    // IR_STORE value -> element address
+    // IR_STORE value -> element address (IR_DEST = access-size override)
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
-    str x22, [x0, #IR_TYPE]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
     str x21, [x0, #IR_SRC1]      // value
     str x20, [x0, #IR_SRC2]      // address
+    str x22, [x0, #IR_DEST]      // width override
     bl _kcc_ir_emit
 
     ldr x23, [sp, #48]
@@ -6385,8 +6504,83 @@ _kcc_ir_emit_indexed_store:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+
+// -- kcc_ir_elem_off_width ------------------------------------------------
+// (byte_offset, width) kcc_ir_elem_off_width(type *ty, uint64_t index)
+//   x0 = element type (array) or aggregate type (struct/union), x1 = index
+// Returns x0 = byte offset of the index-th initializer element,
+//         x1 = its store-width override.  For an array-element type the
+//   stride is uniform (index * size); for a struct/union the offset comes
+//   from the index-th field's laid-out AST_F3 and the width from its type.
+.text
+.globl _kcc_ir_elem_off_width
+.p2align 2
+_kcc_ir_elem_off_width:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // type
+    mov x20, x1                  // index
+    cbz x19, .Leow_scalar
+    ldr x2, [x19, #TY_KIND]
+    cmp x2, #TY_STRUCT
+    b.eq .Leow_struct
+    cmp x2, #TY_UNION
+    b.eq .Leow_struct
+
+    // Array element: uniform stride = index * sizeof(element)
+    mov x0, x19
+    bl _kcc_type_layout          // element size
+    mul x21, x20, x0             // byte offset
+    mov x0, x19
+    bl _kcc_ir_store_width
+    mov x1, x0                   // width
+    mov x0, x21                  // offset
+    b .Leow_ret
+
+.Leow_scalar:
+    lsl x0, x20, #3              // fallback: 8-byte slots
+    mov x1, #0
+    b .Leow_ret
+
+.Leow_struct:
+    mov x0, x19
+    bl _kcc_type_layout          // ensure per-field offsets
+    ldr x21, [x19, #TY_F0]       // struct decl
+    cbz x21, .Leow_struct_zero
+    ldr x21, [x21, #AST_F1]      // first field
+.Leow_walk:
+    cbz x21, .Leow_struct_zero
+    cbz x20, .Leow_found
+    ldr x21, [x21, #AST_F4]      // next field
+    sub x20, x20, #1
+    b .Leow_walk
+.Leow_found:
+    ldr x20, [x21, #AST_F3]      // field byte offset
+    ldr x1, [x21, #AST_F0]       // field type spec
+    cbz x1, .Leow_found_w0
+    mov x0, x1
+    bl _kcc_sema_resolve_type
+    bl _kcc_ir_store_width
+    mov x1, x0                   // width
+    mov x0, x20                  // offset
+    b .Leow_ret
+.Leow_found_w0:
+    mov x0, x20
+    mov x1, #0
+    b .Leow_ret
+.Leow_struct_zero:
+    mov x0, #0
+    mov x1, #0
+.Leow_ret:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
 @| _kcc_ir_initlist_count
 @| _kcc_ir_emit_indexed_store
+@| _kcc_ir_elem_off_width
 @}
 
 \subsection{Static Locals}
@@ -6531,20 +6725,20 @@ _kcc_ir_build_var_decl:
 .Libvd_array_scale:
     mov x21, x22                // x21 = element type (for the alloca's IR_TYPE)
     cbz x24, .Libvd_emit_alloca
-    // total slots = length * slots(element) — recursive, so nested arrays
-    // (int a[3][3]) get all 9 slots, structs their field count, etc.
+    // Byte-accurate: total bytes = length * element size, rounded up to
+    // whole 8-byte slots.  int a[4] is 16 bytes → two slots (not four).
     mov x0, x22                 // element type
-    bl _kcc_ir_type_slots
-    mul x24, x24, x0
+    bl _kcc_type_layout         // element size in bytes
+    mul x24, x24, x0            // total bytes
+    add x24, x24, #7
+    lsr x24, x24, #3            // ceil(bytes / 8)
     b .Libvd_emit_alloca
 
 .Libvd_struct:
-    // Use TY_SIZE / 8 to get slot count (accounts for nested structs)
-    ldr x0, [x21, #TY_SIZE]
-    lsr x24, x0, #3
-    cmp x24, #1
-    b.ge .Libvd_emit_alloca
-    mov x24, #1                  // at least 1 slot
+    // Slot count = ceil(TY_SIZE / 8) over the packed struct size.
+    mov x0, x21
+    bl _kcc_ir_type_slots
+    mov x24, x0
 
 .Libvd_emit_alloca:
     str x24, [sp, #72]          // total slot count (for init-list zero-fill)
@@ -6695,28 +6889,14 @@ _kcc_ir_build_var_decl:
     b .Libvd_done
 
 .Libvd_initlist:
-    // x0 = AST_INIT_LIST; x21 = element/aggregate type; x23 = base alloca vreg
-    ldr x20, [x0, #AST_F0]      // first element (name no longer needed in x20)
-    mov x22, #0                  // element index
-.Libvd_il_loop:
-    cbz x20, .Libvd_il_zerofill
-    mov x0, x20
-    bl _kcc_ir_build_expr        // element value vreg
-    mov x2, x0                   // value
-    mov x0, x23                  // base
-    mov x1, x22                  // index
-    mov x3, x21                  // store type
-    bl _kcc_ir_emit_indexed_store
-    add x22, x22, #1
-    ldr x20, [x20, #AST_F4]      // next element
-    b .Libvd_il_loop
-
-.Libvd_il_zerofill:
+    // x0 = AST_INIT_LIST; x21 = element/aggregate type; x23 = base alloca vreg;
+    // [sp,#72] = total slot count.  Zero the whole region first (slot by
+    // slot), then write each given element at its byte-accurate offset, so
+    // the two loops need not agree on element vs. slot indexing.
+    ldr x20, [x0, #AST_F0]      // first element
     ldr x24, [sp, #72]          // total slot count
-    cmp x22, x24
-    b.ge .Libvd_done
 
-    // reusable zero constant for the remaining slots
+    // one reusable zero constant
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
     mov x19, x0
@@ -6727,19 +6907,40 @@ _kcc_ir_build_var_decl:
     str xzr, [x19, #IR_SRC1]
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
-    mov x20, x0                  // x20 = zero value vreg
+    str x0, [sp, #72]           // stash zero vreg (slot count now in x24)
     mov x0, x19
     bl _kcc_ir_emit
+
+    mov x22, #0                  // slot index
 .Libvd_il_zf_loop:
     cmp x22, x24
-    b.ge .Libvd_done
+    b.ge .Libvd_il_write
     mov x0, x23                  // base
-    mov x1, x22                  // index
-    mov x2, x20                  // zero value
-    mov x3, x21                  // store type
+    lsl x1, x22, #3             // byte offset = slot * 8
+    ldr x2, [sp, #72]           // zero vreg
+    mov x3, #0                   // width = 8-byte slot
     bl _kcc_ir_emit_indexed_store
     add x22, x22, #1
     b .Libvd_il_zf_loop
+
+.Libvd_il_write:
+    mov x22, #0                  // element index
+.Libvd_il_loop:
+    cbz x20, .Libvd_done
+    mov x0, x20
+    bl _kcc_ir_build_expr        // element value vreg
+    str x0, [sp, #72]           // stash value vreg
+    mov x0, x21                  // element/aggregate type
+    mov x1, x22                  // element index
+    bl _kcc_ir_elem_off_width    // x0 = byte offset, x1 = width
+    mov x3, x1                   // width
+    mov x1, x0                   // byte offset
+    mov x0, x23                  // base
+    ldr x2, [sp, #72]           // value vreg
+    bl _kcc_ir_emit_indexed_store
+    add x22, x22, #1
+    ldr x20, [x20, #AST_F4]      // next element
+    b .Libvd_il_loop
 
 .Libvd_static:
     // Hoist: record source-name -> mangled global; skip alloca and init

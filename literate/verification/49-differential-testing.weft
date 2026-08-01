@@ -291,6 +291,54 @@ and function boundaries.  Every observable value is an \texttt{int}
 (the exit code), so the truncating \texttt{(int)} cast is always the
 final step.
 
+\section{Struct Layout}
+
+These cases pin down the byte-accurate aggregate layout
+(\S\ref{sec:production-readiness}).  \texttt{clang} is the oracle for
+\texttt{sizeof} and alignment, so a struct whose size is padded to the
+wrong boundary---or a field read at the wrong offset or width---diverges
+immediately.  They cover padding between members of different sizes, the
+final tail padding that rounds a struct up to its alignment, arrays of
+odd-sized structs (whose stride is not a multiple of eight), signed narrow
+fields that must sign-extend on load, pointer arithmetic that must step by
+the real element size, and nested aggregates.
+
+@d Difftest: struct layout @{
+echo ""
+echo "--- Struct Layout ---"
+
+difftest "sizeof-struct-2int" \
+    "struct P { int x; int y; }; int main(void){ return sizeof(struct P); }"
+difftest "sizeof-struct-3int" \
+    "struct P { int a; int b; int c; }; int main(void){ return sizeof(struct P); }"
+difftest "sizeof-struct-char-int" \
+    "struct P { char c; int x; }; int main(void){ return sizeof(struct P); }"
+difftest "sizeof-struct-mixed" \
+    "struct P { char a; char b; int c; char d; }; int main(void){ return sizeof(struct P); }"
+difftest "sizeof-struct-short" \
+    "struct P { short a; char b; }; int main(void){ return sizeof(struct P); }"
+difftest "struct-pad-access" \
+    "struct P { char c; int x; }; int main(void){ struct P p; p.c = 7; p.x = 100; return p.c + p.x; }"
+difftest "struct-char-signed-field" \
+    "struct P { char c; int x; }; int main(void){ struct P p; p.c = -1; p.x = 5; return p.c < 0 ? 42 : 0; }"
+difftest "struct-short-field-sum" \
+    "struct P { short a; short b; int c; }; int main(void){ struct P p; p.a = 300; p.b = 12; p.c = 7; return p.a + p.b + p.c; }"
+difftest "struct-array-oddsize" \
+    "struct P { int a; int b; int c; }; int main(void){ struct P v[3]; int i = 0; for (i = 0; i < 3; i = i + 1){ v[i].a = i; v[i].b = i + 1; v[i].c = i + 2; } return v[2].a + v[2].b + v[2].c + sizeof(v); }"
+difftest "struct-array-stride-ptrdiff" \
+    "struct P { int a; int b; int c; }; int main(void){ struct P v[4]; return (int)(&v[3] - &v[0]); }"
+difftest "struct-nested-layout" \
+    "struct In { int a; int b; }; struct Out { int x; struct In in; int y; }; int main(void){ struct Out o; o.x = 1; o.in.a = 2; o.in.b = 3; o.y = 4; return o.x + o.in.a + o.in.b + o.y + sizeof(struct Out); }"
+difftest "sizeof-int-array" \
+    "int main(void){ int a[7]; return sizeof(a); }"
+difftest "sizeof-char-array" \
+    "int main(void){ char a[10]; return sizeof(a); }"
+difftest "char-array-packing" \
+    "int main(void){ char s[4]; s[0] = 65; s[1] = 66; s[2] = 67; s[3] = 0; return s[0] + s[1] + s[2] + sizeof(s); }"
+difftest "int-ptr-stride" \
+    "int main(void){ int a[5]; int *p = a; int i = 0; for (i = 0; i < 5; i = i + 1) *(p + i) = i * 2; return a[4] + (int)(&a[4] - a); }"
+@}
+
 @d Difftest: floating point @{
 echo ""
 echo "--- Floating Point ---"

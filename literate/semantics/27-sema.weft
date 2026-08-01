@@ -413,12 +413,170 @@ Typedef declarations resolve the underlying type and register the name
 with kind \texttt{SYM\_TYPEDEF}.  Struct and union declarations create
 the corresponding type descriptor via \texttt{kcc\_type\_struct} or
 \texttt{kcc\_type\_union} and register the tag in the tag name space.
-The struct size is computed by resolving each field's type and summing
-\texttt{max(TY\_SIZE, 8)} per field, so that struct-typed fields
-(which occupy multiple 8-byte slots) are accounted for correctly.
+The struct size, alignment, and per-field byte offsets are computed by
+\texttt{\_kcc\_type\_layout} (below), which lays out the aggregate
+following the standard C rules rather than the earlier one-slot-per-field
+approximation.
 Enum declarations register both the tag itself and each enumerator
 constant as an ordinary symbol of type \texttt{int}, assigning
 consecutive integer values starting from zero.
+
+\paragraph{Aggregate Layout}
+
+\texttt{\_kcc\_type\_layout} computes the byte-accurate layout of a
+\texttt{struct} or \texttt{union} following \stdref{6.7.2.1}: each member
+is placed at the next offset that satisfies its alignment, the aggregate's
+alignment is the maximum member alignment, and the total size is padded up
+to that alignment.  For a \texttt{union} every member sits at offset~0 and
+the size is the largest member's size.  The routine is idempotent and
+memoised: once \texttt{TY\_SIZE} is non-zero the cached layout is returned,
+so it is safe to call from any later phase (\texttt{sizeof}, alloca sizing,
+member addressing) to force a lazy layout.  Each member's byte offset is
+stored in its declaration node's \texttt{AST\_F3} slot, from which the IR
+builder reads it when addressing a member.  Because a member of aggregate
+type must be laid out before its own offset can be known, the routine
+recurses into nested aggregates first, and it recomputes array sizes from
+the (possibly just-laid-out) element type; C forbids a struct from
+containing itself by value, so the recursion always terminates.
+\texttt{\_kcc\_type\_align} returns a type's alignment, reading
+\texttt{TY\_ALIGN} directly for scalars, pointers, and already-laid-out
+aggregates, and recursing through the element type of an array.
+
+@d Sema: struct layout @{
+// -- kcc_type_align -------------------------------------------------------
+// uint64_t kcc_type_align(type_desc *ty)
+//   Alignment in bytes; 8 for null/unknown.  Arrays inherit element align.
+.text
+.globl _kcc_type_align
+.p2align 2
+_kcc_type_align:
+    cbz x0, .Lta_def
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lta_read
+    ldr x0, [x0, #TY_F0]        // element type
+    b _kcc_type_align           // tail recurse
+.Lta_read:
+    ldr x0, [x0, #TY_ALIGN]
+    cbz x0, .Lta_def
+    ret
+.Lta_def:
+    mov x0, #8
+    ret
+
+// -- kcc_type_layout ------------------------------------------------------
+// uint64_t kcc_type_layout(type_desc *ty)
+//   Ensures ty (and any aggregate it transitively contains) has a
+//   byte-accurate TY_SIZE/TY_ALIGN, and stores each struct/union member's
+//   byte offset in its field decl's AST_F3.  Returns TY_SIZE.  Idempotent.
+.text
+.globl _kcc_type_layout
+.p2align 2
+_kcc_type_layout:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    cbz x0, .Ltl_zero
+    mov x19, x0                 // ty
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.eq .Ltl_array
+    cmp x1, #TY_STRUCT
+    b.eq .Ltl_aggregate
+    cmp x1, #TY_UNION
+    b.eq .Ltl_aggregate
+    // Scalar / pointer / enum: already sized by its constructor.
+    ldr x0, [x19, #TY_SIZE]
+    b .Ltl_ret
+
+.Ltl_array:
+    ldr x20, [x19, #TY_F0]      // element type
+    ldr x21, [x19, #TY_F1]      // length
+    mov x0, x20
+    bl _kcc_type_layout         // ensure element laid out → element size
+    mul x0, x0, x21
+    str x0, [x19, #TY_SIZE]     // size = element_size * length
+    mov x0, x20
+    bl _kcc_type_align
+    str x0, [x19, #TY_ALIGN]    // align = element align
+    ldr x0, [x19, #TY_SIZE]
+    b .Ltl_ret
+
+.Ltl_aggregate:
+    ldr x0, [x19, #TY_SIZE]
+    cbnz x0, .Ltl_ret           // memoised: already laid out
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_UNION
+    cset x20, eq                // x20 = is_union
+    ldr x21, [x19, #TY_F0]      // AST_STRUCT_DECL
+    cbz x21, .Ltl_zero
+    ldr x21, [x21, #AST_F1]     // first field
+    cbz x21, .Ltl_zero          // opaque (no body): cannot size
+    mov x22, #0                 // running offset (struct)
+    mov x23, #1                 // max alignment
+    mov x24, #0                 // max member size (union)
+
+.Ltl_loop:
+    cbz x21, .Ltl_finish
+    ldr x0, [x21, #AST_F0]      // field type specifier
+    cbz x0, .Ltl_field_default
+    bl _kcc_sema_resolve_type
+    cbz x0, .Ltl_field_default
+    str x0, [sp, #64]           // stash ftype across the calls
+    bl _kcc_type_layout         // ensure laid out → field size in x0
+    str x0, [sp, #72]           // stash fsize
+    ldr x0, [sp, #64]           // ftype
+    bl _kcc_type_align          // falign in x0
+    mov x3, x0                  // falign
+    ldr x2, [sp, #72]           // fsize
+    b .Ltl_field_have
+.Ltl_field_default:
+    mov x2, #8                  // unresolved: assume one 8-byte slot
+    mov x3, #8
+.Ltl_field_have:
+    cbnz x20, .Ltl_union_field
+    // struct: round running offset up to the field's alignment
+    sub x4, x3, #1
+    add x22, x22, x4
+    bic x22, x22, x4            // aligned offset (falign is a power of two)
+    str x22, [x21, #AST_F3]     // record field byte offset
+    add x22, x22, x2            // advance by field size
+    b .Ltl_field_align
+.Ltl_union_field:
+    str xzr, [x21, #AST_F3]     // union member: offset 0
+    cmp x2, x24
+    csel x24, x2, x24, gt       // track largest member
+.Ltl_field_align:
+    cmp x3, x23
+    csel x23, x3, x23, gt       // track maximum alignment
+    ldr x21, [x21, #AST_F4]     // next field
+    b .Ltl_loop
+
+.Ltl_finish:
+    cbz x20, .Ltl_total
+    mov x22, x24                // union total = largest member
+.Ltl_total:
+    // pad total size up to the aggregate alignment
+    sub x4, x23, #1
+    add x22, x22, x4
+    bic x22, x22, x4
+    str x22, [x19, #TY_SIZE]
+    str x23, [x19, #TY_ALIGN]
+    mov x0, x22
+    b .Ltl_ret
+
+.Ltl_zero:
+    mov x0, #0
+.Ltl_ret:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@| _kcc_type_align _kcc_type_layout
+@}
 
 @d Sema: check declaration @{
 .Lscd_typedef:
@@ -461,28 +619,11 @@ consecutive integer values starting from zero.
     bl _kcc_type_union
 
 .Lscd_tag_register:
-    mov x21, x0                     // type
+    mov x21, x0                     // type descriptor
 
-    // Compute struct size: each field is max(resolved_size, 8) bytes
-    ldr x19, [x19, #AST_F1]        // first field (x19 no longer needed)
-    mov x20, #0                     // total size accumulator
-.Lscd_count_fields:
-    cbz x19, .Lscd_set_size
-    ldr x0, [x19, #AST_F0]         // field type specifier
-    cbz x0, .Lscd_field_default
-    bl _kcc_sema_resolve_type
-    cbz x0, .Lscd_field_default
-    ldr x0, [x0, #TY_SIZE]
-    cmp x0, #8
-    b.ge .Lscd_field_add
-.Lscd_field_default:
-    mov x0, #8
-.Lscd_field_add:
-    add x20, x20, x0
-    ldr x19, [x19, #AST_F4]        // next field
-    b .Lscd_count_fields
-.Lscd_set_size:
-    str x20, [x21, #TY_SIZE]
+    // Lay out the aggregate: byte-accurate size, alignment, field offsets.
+    mov x0, x21
+    bl _kcc_type_layout
 
     mov x0, x22                     // name
     bl _kcc_strlen

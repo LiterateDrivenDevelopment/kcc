@@ -709,10 +709,12 @@ the tooling and diagnostics expected of a production compiler.
 \textbf{Status.}  Stage~9a is under way---\texttt{double} floating point
 is complete (\S\ref{sec:parse-float}); unions, single-precision
 \texttt{float}, \texttt{\_Bool}, and qualifiers remain.  Stage~9b has
-struct pass/return by value working self-consistently
-(\S\ref{sec:struct-args}); more-than-eight-argument stack passing,
-variadic \emph{definitions}, and exact AAPCS64 register/stack packing
-remain.  Stages~9c--9e (register allocation, optimization, tooling) are
+struct pass/return by value working (\S\ref{sec:struct-args}) and now a
+byte-accurate \stdref{6.7.2.1} struct/union layout with standard padding
+and alignment, so \texttt{sizeof} and member offsets are conformant;
+more-than-eight-argument stack passing, variadic \emph{definitions}, and
+AAPCS64 argument \emph{packing} (small structs in registers) remain.
+Stages~9c--9e (register allocation, optimization, tooling) are
 not yet begun.  A precise ledger of what is done and what is left
 appears in the production-readiness assessment
 (\S\ref{sec:production-readiness}).
@@ -820,11 +822,21 @@ the remaining gaps toward full AAPCS64 compliance.
       \texttt{va\_list}/\texttt{va\_start}/\texttt{va\_arg}/\texttt{va\_end}
       as compiler builtins that manage the register save area
       on the stack (AAPCS64~\S{}9.2).
-\item \textbf{Correct struct member alignment.}  Padding bytes
-      between struct members must match the AAPCS64 alignment
-      rules.  The type constructor must compute correct
-      \texttt{TY\_SIZE} with padding, and \texttt{IR\_GEP}
-      offsets must account for alignment gaps.
+\item[\checkmark] \textbf{Correct struct member alignment.}  Done
+      (\S\ref{sec:production-readiness}): \texttt{\_kcc\_type\_layout}
+      places each member at the next offset that satisfies its alignment,
+      sets \texttt{TY\_SIZE} to the size padded up to the aggregate's
+      alignment, and records \texttt{TY\_ALIGN}.  Addressing is now
+      byte-accurate throughout---the \texttt{IR\_GEP} instruction adds a
+      byte offset (arrays pre-scale the index by the real element size,
+      members pass a constant offset), narrow field loads/stores carry a
+      width-and-sign override, and pointer arithmetic steps by the exact
+      pointee size.  \texttt{sizeof(struct \{int x; int y;\})} is now~8, and
+      15 \texttt{struct-layout} differential tests agree with \texttt{clang}
+      on size, padding, odd-sized array strides, and signed narrow fields.
+      Only the AAPCS64 register-\emph{packing} of small structs into
+      argument registers remains (deferred to \texttt{clang}-interop work);
+      the in-memory layout itself now matches the platform.
 \end{itemize}
 
 \subsection{Stage 9c --- Register Allocation}
@@ -984,12 +996,14 @@ honest about the gap matters more than any single headline number.
 \paragraph{What is already solid (and verified).}
 The integer, pointer, and aggregate core of C is complete and, crucially,
 \emph{checked against an oracle}: the differential harness
-(\S\ref{sec:differential-testing}) compiles 118 programs with both
+(\S\ref{sec:differential-testing}) compiles 133 programs with both
 \kcc{} and \texttt{clang} and finds \emph{zero} miscompilations.  That
 core includes all control flow (\texttt{if}/\texttt{while}/\texttt{do}/%
 \texttt{for}/\texttt{switch}/\texttt{goto}), functions and recursion,
 pointers and pointer-to-pointer, arrays (including multi-dimensional),
-structs (field access, nesting, and both pass and return by value),
+structs (field access, nesting, both pass and return by value, and now a
+byte-accurate \stdref{6.7.2.1} layout with correct \texttt{sizeof},
+padding, and alignment),
 enumerations, function pointers, \texttt{typedef}, \texttt{static}
 locals, initializer lists, the object- and function-like preprocessor
 with source-relative \texttt{\#include}, multi-file compilation, and
@@ -1004,6 +1018,7 @@ The remaining language gaps are individually small but collectively keep
 \hline
 Feature & Status & Note \\
 \hline
+standard struct layout           & \checkmark & padding/align, 15 diff. tests \\
 \texttt{double} floating point   & \checkmark & complete, 14 diff. tests \\
 single-precision \texttt{float}  & $\circ$    & widened to \texttt{double} \\
 \texttt{long double}             &            & not lowered \\
@@ -1019,14 +1034,18 @@ variadic \emph{definitions}      &            & \texttt{va\_arg} builtins \\
 \end{tabular}
 \end{center}
 
-One conformance gap deserves special emphasis because it hides behind
-otherwise-correct results: \kcc{}'s \textbf{struct layout gives every
-field its own 8-byte slot}, so \texttt{sizeof(struct \{int x; int y;\})}
-is~16, not~8.  Programs stay self-consistent and the differential tests
-pass, but the layout is \emph{not} the platform ABI---\texttt{sizeof}
-values diverge from the Standard and \kcc{} objects cannot be linked
-against \texttt{clang}-compiled ones.  Correct alignment and packing
-(Stage~9b) is prerequisite to any real interoperability.
+The struct layout gap that used to hide behind otherwise-correct
+results---every field on its own 8-byte slot, so
+\texttt{sizeof(struct \{int x; int y;\})} was~16---is now \textbf{closed}.
+\texttt{\_kcc\_type\_layout} lays aggregates out byte-accurately with
+standard padding and alignment, addressing became byte-granular
+(byte-offset \texttt{IR\_GEP}, real array/pointer strides, width- and
+sign-correct narrow loads and stores), and \texttt{sizeof} now matches the
+Standard.  What remains for \texttt{clang} object-file interoperability is
+narrower: the AAPCS64 rules for \emph{passing} small structs packed into
+\texttt{x0}--\texttt{x1} rather than by hidden pointer, plus the
+\texttt{d0}--\texttt{d7} floating-point argument registers.  The in-memory
+layout itself is now the platform layout.
 
 \paragraph{Production engineering --- what remains.}
 This is the larger axis, and the one where \kcc{} is furthest from an
@@ -1039,7 +1058,7 @@ Concern & Status & Note \\
 \hline
 optimization / reg.\ alloc. &         & all-spill; ${\sim}3\times$ memory traffic \\
 $>8$ arguments on the stack  &         & register cap still~8 \\
-AAPCS64 exact packing        &         & self-consistent only \\
+AAPCS64 argument packing     &         & small structs by hidden ptr \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\
 automatic linking (\texttt{ld}) &      & manual link step \\
 standard library / sys.\ headers &     & no \texttt{<stdio.h>} \\
@@ -1055,15 +1074,19 @@ full \texttt{-O}/\texttt{-I}/\texttt{-D} CLI & $\circ$ & partial \\
 As a \emph{correct compiler for the integer/pointer/aggregate subset of
 C, plus \texttt{double}}, \kcc{} is in good shape and unusually
 well-tested for a hand-written assembly project.  As a \emph{complete
-C17 implementation} it is on the order of two-thirds there: the missing
-pieces are bounded (unions, real \texttt{float}, bit-fields, variadic
-definitions, and---most importantly---standard struct layout).  As a
+C17 implementation} it is roughly two-thirds there: the missing
+pieces are bounded (unions, real \texttt{float}, bit-fields, and variadic
+definitions).  Standard struct layout---previously the most important
+gap---is now done, so \texttt{sizeof} and member offsets are Standard-%
+conformant and the remaining ABI work is the narrower matter of
+register-packing arguments.  As a
 \emph{production-ready} toolchain in the industrial sense it is early:
 no optimizer, a single target, no automatic linking, no standard
 library, and first-error-only diagnostics.  The shortest credible path
-to ``usable in production for real programs'' runs through, in order:
-finishing the ABI (struct alignment, stack arguments, variadic
-definitions), \texttt{union}s and true \texttt{float}, automatic linking
+to ``usable in production for real programs'' now runs through, in order:
+the rest of the ABI (more-than-eight stack arguments, variadic
+definitions, and AAPCS64 argument packing for \texttt{clang} interop),
+\texttt{union}s and true \texttt{float}, automatic linking
 plus a minimal freestanding header set, then register allocation for
 code quality.  Everything after that---a second target, DWARF, an
 optimizer rivalling \texttt{clang -O1}---is refinement rather than

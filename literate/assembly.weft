@@ -332,6 +332,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Sema: check@>
 @<Sema: resolve type@>
 @<Sema: check declaration@>
+@<Sema: struct layout@>
 @<Sema: check statement@>
 @<Sema: check expression@>
 @<Sema: expr ident@>
@@ -373,6 +374,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build expression@>
 @<IR: build int literal@>
 @<IR: build sizeof@>
+@<IR: access width@>
 @<IR: build subscript@>
 @<IR: build member@>
 @<IR: build ident@>
@@ -596,6 +598,7 @@ self-test, and diff against clang:
 @<Difftest: control@>
 @<Difftest: functions@>
 @<Difftest: aggregates@>
+@<Difftest: struct layout@>
 @<Difftest: floating point@>
 @<Difftest: operators@>
 @<Difftest: combinations@>

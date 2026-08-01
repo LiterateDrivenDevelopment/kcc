@@ -684,6 +684,18 @@ _kcc_parse_postfix_tail:
     b .Lpostfix_loop
 
 .Lpostfix_call:
+    // Special form va_arg(ap, type-name): the second operand is a type, not
+    // an expression, so it cannot go through the normal argument list.
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_IDENT_EXPR
+    b.ne .Lpostfix_call_normal
+    ldr x0, [x19, #AST_F0]      // interned callee name
+    adrp x1, _kcc_str_va_arg@@PAGE
+    add  x1, x1, _kcc_str_va_arg@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lpostfix_va_arg
+
+.Lpostfix_call_normal:
     // Consume '('
     bl _kcc_pp_next
     // Parse argument list
@@ -697,6 +709,23 @@ _kcc_parse_postfix_tail:
     bl _kcc_ast_alloc
     str x19, [x0, #AST_F0]      // callee
     str x20, [x0, #AST_F1]      // first arg
+    mov x19, x0
+    b .Lpostfix_loop
+
+.Lpostfix_va_arg:
+    bl _kcc_pp_next              // consume '('
+    bl _kcc_parse_assign_expr    // the va_list expression
+    mov x20, x0
+    mov x0, #TOK_COMMA
+    bl _kcc_parse_expect
+    bl _kcc_parse_type_name      // the target type
+    mov x21, x0
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, #AST_VA_ARG
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]      // va_list expr
+    str x21, [x0, #AST_F1]      // type node
     mov x19, x0
     b .Lpostfix_loop
 @| _kcc_parse_postfix_expr
@@ -1469,6 +1498,9 @@ binary operators at their C17 precedence levels.
 
 _kcc_expr_msg_expected:
     .asciz "expected expression"
+
+_kcc_str_va_arg:
+    .asciz "va_arg"
 
 // -- Precedence table --------------------------------------------------
 // Indexed by (tok_type - 60).  48 entries covering all punctuators.

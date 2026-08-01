@@ -211,6 +211,23 @@ difftest "mutual-rec" \
     "int is_even(int n); int is_odd(int n){ if (n == 0) return 0; return is_even(n - 1); } int is_even(int n){ if (n == 0) return 1; return is_odd(n - 1); } int main(void){ return is_even(10) + is_odd(7); }"
 difftest "many-args" \
     "int sum6(int a, int b, int c, int d, int e, int f){ return a + b + c + d + e + f; } int main(void){ return sum6(1, 2, 3, 4, 5, 6); }"
+difftest "nine-args" \
+    "int s(int a,int b,int c,int d,int e,int f,int g,int h,int i){ return a+b+c+d+e+f+g+h+i; } int main(void){ return s(1,2,3,4,5,6,7,8,9); }"
+difftest "twelve-args" \
+    "int s(int a,int b,int c,int d,int e,int f,int g,int h,int i,int j,int k,int l){ return a+b+c+d+e+f+g+h+i+j+k+l; } int main(void){ return s(1,2,3,4,5,6,7,8,9,10,11,12); }"
+difftest "stack-args-positional" \
+    "int f(int a,int b,int c,int d,int e,int g,int h,int i,int j,int k){ return a*100 + j*10 + k; } int main(void){ return f(1,2,3,4,5,6,7,8,9,10); }"
+difftest "stack-args-recursive" \
+    "int s(int n,int a,int b,int c,int d,int e,int f,int g,int h){ if (n == 0) return a+b+c+d+e+f+g+h; return s(n-1,a,b,c,d,e,f,g,h); } int main(void){ return s(3,1,2,3,4,5,6,7,8); }"
+difftest "vararg-sum" \
+    "#include <stdarg.h>
+int sum(int n, ...){ va_list ap; va_start(ap, n); int s = 0; int i = 0; for (i = 0; i < n; i = i + 1) s = s + va_arg(ap, int); va_end(ap); return s; } int main(void){ return sum(4, 10, 20, 30, 40); }"
+difftest "vararg-max" \
+    "#include <stdarg.h>
+int maxv(int n, ...){ va_list ap; va_start(ap, n); int m = va_arg(ap, int); int i = 1; for (i = 1; i < n; i = i + 1){ int x = va_arg(ap, int); if (x > m) m = x; } va_end(ap); return m; } int main(void){ return maxv(5, 3, 17, 9, 42, 11); }"
+difftest "vararg-two-fixed" \
+    "#include <stdarg.h>
+int f(int a, int b, ...){ va_list ap; va_start(ap, b); int s = a + b; int i = 0; for (i = 0; i < 3; i = i + 1) s = s + va_arg(ap, int); va_end(ap); return s; } int main(void){ return f(1, 2, 10, 20, 30); }"
 difftest "accumulate" \
     "int step(int acc, int x){ return acc + x * x; } int main(void){ int acc = 0; int i = 1; while (i <= 6) { acc = step(acc, i); i = i + 1; } return acc % 250; }"
 @}

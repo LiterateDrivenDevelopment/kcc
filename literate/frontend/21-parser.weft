@@ -126,6 +126,7 @@ Offset & Field & Description \\
 .equ AST_GENERIC,        69   // F0=controlling_expr, F1=first_assoc
 .equ AST_GENERIC_ASSOC,  70   // F0=type (0=default), F1=expr
 .equ AST_FLOAT_LIT,      71   // F0=double bit pattern, F3=type(float/double)
+.equ AST_VA_ARG,         72   // F0=va_list expr, F1=type node, F3=resolved type
 @}
 
 \section{AST Node Allocation}
@@ -550,6 +551,17 @@ _kcc_typedef_lookup:
     mov x19, x0                  // x19 = name
     mov x20, x1                  // x20 = len
 
+    // Built-in typedef: va_list resolves to a pointer (variadic definitions).
+    cmp x20, #7
+    b.ne .Ltypedef_scan
+    adrp x0, _kcc_str_va_list@@PAGE
+    add  x0, x0, _kcc_str_va_list@@PAGEOFF
+    mov x1, x19
+    mov x2, #7
+    bl _kcc_memcmp
+    cbz x0, .Ltypedef_found
+
+.Ltypedef_scan:
     // Load scope stack
     adrp x0, _kcc_typedef_scopes@@PAGE
     add  x0, x0, _kcc_typedef_scopes@@PAGEOFF
@@ -1584,6 +1596,8 @@ _kcc_ast_tag_table:
     .quad _kcc_ast_n_generic_assoc
     .quad AST_FLOAT_LIT
     .quad _kcc_ast_n_float_lit
+    .quad AST_VA_ARG
+    .quad _kcc_ast_n_va_arg
     .quad 0, 0                   // sentinel
 
 // Tag name strings
@@ -1626,6 +1640,8 @@ _kcc_ast_n_null_stmt:     .asciz "NullStmt"
 _kcc_ast_n_ident_expr:    .asciz "IdentExpr"
 _kcc_ast_n_int_lit:       .asciz "IntLit"
 _kcc_ast_n_float_lit:     .asciz "FloatLit"
+_kcc_ast_n_va_arg:        .asciz "VaArg"
+_kcc_str_va_list:         .asciz "va_list"
 _kcc_ast_n_str_lit:       .asciz "StrLit"
 _kcc_ast_n_char_lit:      .asciz "CharLit"
 _kcc_ast_n_binary_expr:   .asciz "BinaryExpr"
@@ -1699,4 +1715,6 @@ _kcc_ast_n_generic_assoc: .asciz "GenericAssoc"
 @| _kcc_ast_n_paren_expr
 @| _kcc_ast_n_generic
 @| _kcc_ast_n_generic_assoc
+@| _kcc_ast_n_va_arg
+@| _kcc_str_va_list
 @}

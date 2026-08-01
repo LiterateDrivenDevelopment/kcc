@@ -1317,7 +1317,12 @@ bare name as a last resort).  A \texttt{\_kcc\_pp\_file\_exists} helper
 wraps the probe, relying on \texttt{\_kcc\_sys\_open} returning $-1$ for
 a file that cannot be opened.  Angle-bracket includes are resolved the
 same way for now; a dedicated system search path (\texttt{-I}
-directories) is left to Phase~9.
+directories) is left to Phase~9.  A quoted include that resolves nowhere
+is a hard error, but a missing \emph{system} header
+(\texttt{\#include <\dots>}) is silently skipped: \kcc{} is freestanding
+and supplies what such headers would declare---for instance the
+\texttt{va\_*} variadic built-ins---directly, so a program that writes
+\texttt{\#include <stdarg.h>} for portability still compiles.
 
 @d PP: resolve include @{
 .text
@@ -1442,6 +1447,7 @@ _kcc_pp_do_include:
     b .Lincl_err
 
 .Lincl_string:
+    mov  x22, #0              // x22 = 0: quoted include (must resolve)
     // Token text includes quotes: "file.h"
     // Strip quotes: start+1, len-2
     adrp x0, _kcc_tok_start@@PAGE
@@ -1455,6 +1461,7 @@ _kcc_pp_do_include:
     b .Lincl_open
 
 .Lincl_angle:
+    mov  x22, #1              // x22 = 1: system <...> include (skippable)
     // Scan from cursor to '>' to get the path
     adrp x0, _kcc_lex_cursor@@PAGE
     add  x0, x0, _kcc_lex_cursor@@PAGEOFF
@@ -1535,7 +1542,10 @@ _kcc_pp_do_include:
     ret
 
 .Lincl_notfound:
-    // File located nowhere on the search path (directive line already skipped)
+    // A missing system header (<...>) is silently skipped: kcc is freestanding
+    // and provides what it needs (e.g. the va_* builtins) without headers.
+    // A missing quoted header ("...") is still a hard error.
+    cbnz x22, .Lincl_skip
     adrp x0, _kcc_pp_dir_line@@PAGE
     add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
     ldr  x0, [x0]
@@ -1543,6 +1553,7 @@ _kcc_pp_do_include:
     adrp x2, _kcc_pp_err_notfound@@PAGE
     add  x2, x2, _kcc_pp_err_notfound@@PAGEOFF
     bl _kcc_diag_error
+.Lincl_skip:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]

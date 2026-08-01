@@ -554,6 +554,18 @@ immediate for the unsigned-offset \textsc{str} is simply
 $k + 2$, reusing the same slot-offset formula as the rest of the
 all-spill backend.
 
+Parameters beyond the eighth do not arrive in registers---the caller
+places them on the stack (see the call lowering below).  Because the
+caller pushes argument~$k$ at offset $(k-1)\times 8$ below its pre-call
+stack pointer, and this callee's prologue subtracts \texttt{frame\_size}
+from that same pointer, incoming parameter~$k$ ($k \ge 8$) is found at
+\texttt{[x29,\;\#frame\_size\;+\;(k-1)\times 8]}.  The spill loop reads
+each such parameter through scratch \texttt{x9} and stores it into its
+own vreg slot, so from that point on a stack parameter is indistinguishable
+from a register one.  This is \kcc{}'s own uniform slot convention rather
+than the exact AAPCS64 stack-slot ordering; it is self-consistent for
+\kcc{}-to-\kcc{} calls, which is what the corpus needs.
+
 @d CodeGen: compile function @{
     // 6. Store arguments (x0-x7) to their vreg stack slots
     ldr x24, [x19, #IRF_PARAMS]   // param count
@@ -563,7 +575,7 @@ all-spill backend.
     cmp x25, x24
     b.ge .Lcgf_walk_bbs
     cmp x25, #8
-    b.ge .Lcgf_walk_bbs           // max 8 register args
+    b.ge .Lcgf_store_stack_args   // params 8+ arrive on the caller's stack
 
     // STR x<param>, [x29, #slot_offset(param)]
     // slot_offset(vreg) = -(16 + vreg*8) but for unsigned offset STR
@@ -594,6 +606,35 @@ all-spill backend.
 
     add x25, x25, #1
     b .Lcgf_store_args
+
+.Lcgf_store_stack_args:
+    // Params 8+ were pushed by the caller at [pre_call_sp + (k-1)*8], which
+    // in this frame is [x29 + frame_size + (k-1)*8].  Copy each through
+    // scratch x9 into its own vreg slot [x29, #(k+2)*8].
+.Lcgf_stack_args_loop:
+    cmp x25, x24
+    b.ge .Lcgf_walk_bbs
+    // LDR x9, [x29, #frame_size + (k-1)*8]
+    adrp x0, _kcc_cg_frame_size@@PAGE
+    add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
+    ldr x0, [x0]                   // frame_size (bytes)
+    lsr x0, x0, #3                // frame_size / 8
+    add x0, x0, x25              // + k
+    sub x2, x0, #1               // imm12_scaled = frame_size/8 + k - 1
+    mov x0, #9                    // rt = x9
+    mov x1, #29                   // rn = x29
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    // STR x9, [x29, #(k+2)*8]  (its vreg slot)
+    mov x0, #9
+    mov x1, #29
+    add x2, x25, #2
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    add x25, x25, #1
+    b .Lcgf_stack_args_loop
 @}
 
 \paragraph{Walking Basic Blocks}
@@ -866,11 +907,16 @@ passes arguments in \texttt{x0}--\texttt{x7}, but Apple diverges:
 the callee's \texttt{va\_list} walks the stack frame, ignoring
 registers beyond the declared parameters.  Because the compiler
 does not know at the call site whether the callee is variadic, we
-adopt a safe strategy: load all arguments into
+adopt a safe strategy: load the first eight arguments into
 \texttt{x0}--\texttt{x7} as usual \emph{and also} push
-\texttt{args[1..N{-}1]} onto the stack.  Non-variadic callees
-simply ignore the stack copies; variadic callees (like
-\texttt{printf}) find them where expected.  The emitted sequence is:
+\texttt{args[1..N{-}1]} onto the stack.  Non-variadic callees with at
+most eight parameters simply ignore the stack copies; variadic callees
+(like \texttt{printf}) find them where expected; and a callee with more
+than eight parameters reads its ninth-and-later parameters from exactly
+this same stack area (\S``Storing Register Arguments'').  Arguments past
+the eighth are not held in any register, so each is loaded from its vreg
+slot into scratch \texttt{x9} before being stored to the stack.  The
+emitted sequence is:
 %
 \begin{enumerate}
 \item \texttt{SUB sp, sp, \#aligned\_size}
@@ -1037,6 +1083,8 @@ _kcc_codegen_instr:
     b.eq .Lcgi_sitofp
     cmp x22, #IR_FPTOSI
     b.eq .Lcgi_fptosi
+    cmp x22, #IR_VA_START
+    b.eq .Lcgi_va_start
 
     // Unknown opcode: skip
     b .Lcgi_done
@@ -2110,6 +2158,48 @@ addressed correctly.
     mov x1, #CG_REG_DST
     bl _kcc_cg_store_vreg
     b .Lcgi_done
+
+.Lcgi_va_start:
+    // va_start: DEST = x29 + frame_size + (F-1)*8, where F = SRC2.  This is
+    // the address of the first stack argument beyond the fixed parameters
+    // (the caller pushed argument k at offset (k-1)*8 below its pre-call sp).
+    ldr x0, [x19, #IR_SRC2]        // F (fixed-param count)
+    sub x0, x0, #1
+    lsl x0, x0, #3                 // (F-1)*8
+    adrp x1, _kcc_cg_frame_size@@PAGE
+    add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
+    ldr x1, [x1]
+    add x25, x0, x1                // x25 = frame_size + (F-1)*8 (byte offset)
+
+    // MOVZ x11, #(offset & 0xffff)
+    mov x0, #CG_REG_DST
+    and x1, x25, #0xffff
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+    // MOVK x11, #((offset>>16)&0xffff), lsl 16   (only if non-zero)
+    lsr x1, x25, #16
+    and x1, x1, #0xffff
+    cbz x1, .Lcgi_vs_add
+    mov x0, #CG_REG_DST
+    mov x2, #1                     // hw = 1 → shift 16
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+.Lcgi_vs_add:
+    // ADD x11, x29, x11
+    mov x0, #CG_REG_DST
+    mov x1, #29
+    mov x2, #CG_REG_DST
+    mov x3, #1
+    bl _kcc_enc_add_reg
+    bl _kcc_code_emit32
+    // Store the address into the DEST vreg slot
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
 @}
 
 \subsection{Control Flow}
@@ -2408,17 +2498,29 @@ described in \S\ref{sec:emit-strings}.
     bl _kcc_enc_sub_imm
     bl _kcc_code_emit32
 
-    // Emit STR x<N>, [sp, #(N-1)*8] for each variadic arg
+    // Emit STR x<k>, [sp, #(k-1)*8] for each arg k in [1, N-1].  Args 1..7
+    // are already in x1..x7; args 8+ are not in any register, so load each
+    // from its vreg slot into scratch x9 first.  This one contiguous layout
+    // serves both the Apple variadic ABI (printf reads args from the stack)
+    // and kcc's own >8-argument passing (the callee reads params 8+ here).
     mov x27, #1
 .Lcgi_call_stack_loop:
     cmp x27, x22
     b.ge .Lcgi_call_no_stack
     cmp x27, #8
-    b.ge .Lcgi_call_no_stack
-
-    mov x0, x27                    // rt = x<arg_index> (already loaded)
+    b.lt .Lcgi_call_stack_reg
+    // arg 8+: load args[k+1] vreg into x9
+    add x0, x27, #1
+    ldr x0, [x26, x0, lsl #3]
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, #9                     // rt = x9
+    b .Lcgi_call_stack_str
+.Lcgi_call_stack_reg:
+    mov x0, x27                    // rt = x<k> (already loaded)
+.Lcgi_call_stack_str:
     mov x1, #31                    // rn = sp
-    sub x2, x27, #1               // imm12_scaled = (arg_index - 1)
+    sub x2, x27, #1               // imm12_scaled = (k - 1)
     mov x3, #1                     // size = 64-bit
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
@@ -2527,9 +2629,17 @@ described in \S\ref{sec:emit-strings}.
     cmp x27, x22
     b.ge .Lcgi_cind_no_stack
     cmp x27, #8
-    b.ge .Lcgi_cind_no_stack
-
+    b.lt .Lcgi_cind_stack_reg
+    // arg 8+: load args[k+1] vreg into x9 (fn-ptr not loaded until after)
+    add x0, x27, #1
+    ldr x0, [x26, x0, lsl #3]
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, #9
+    b .Lcgi_cind_stack_str
+.Lcgi_cind_stack_reg:
     mov x0, x27
+.Lcgi_cind_stack_str:
     mov x1, #31
     sub x2, x27, #1
     mov x3, #1

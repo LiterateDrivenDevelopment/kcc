@@ -214,10 +214,24 @@ _kcc_sema_resolve_type:
     mov x1, x0                     // len
     mov x0, x20                    // name
     bl _kcc_symtab_lookup
-    cbz x0, .Lsrt_fallback
+    cbz x0, .Lsrt_name_builtin
 
     // Found symbol: return its type
     ldr x0, [x0, #SYM_TYPE]
+    b .Lsrt_done
+
+.Lsrt_name_builtin:
+    // Built-in typedef va_list → an 8-byte pointer.  (No <stdarg.h>: the
+    // variadic builtins below treat it as an opaque cursor into the stack.)
+    mov x0, x20
+    adrp x1, _kcc_sema_str_va_list@@PAGE
+    add  x1, x1, _kcc_sema_str_va_list@@PAGEOFF
+    bl _kcc_strcmp
+    cbnz x0, .Lsrt_fallback
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+    bl _kcc_type_ptr
     b .Lsrt_done
 
 .Lsrt_quals:
@@ -1003,9 +1017,22 @@ _kcc_sema_expr:
     b.eq .Lse_comma
     cmp x20, #AST_PAREN_EXPR
     b.eq .Lse_paren
+    cmp x20, #AST_VA_ARG
+    b.eq .Lse_va_arg
 
     // Default: int
     b .Lse_default_int
+
+.Lse_va_arg:
+    // Type the va_list operand; the va_arg node's type is the requested type.
+    ldr x0, [x19, #AST_F0]        // va_list expression
+    cbz x0, .Lse_va_arg_type
+    bl _kcc_sema_expr
+.Lse_va_arg_type:
+    ldr x0, [x19, #AST_F1]        // target type node
+    cbz x0, .Lse_default_int
+    bl _kcc_sema_resolve_type
+    b .Lse_store
 
 .Lse_ident:
     bl _kcc_sema_expr_ident
@@ -1886,6 +1913,7 @@ _kcc_sema_str_typedef:  .asciz "typedef "
 _kcc_sema_str_colon:    .asciz ": "
 _kcc_sema_str_eq:       .asciz " = "
 _kcc_sema_str_nl:       .asciz "\n"
+_kcc_sema_str_va_list:  .asciz "va_list"
 @| _kcc_sema_cur_ret
 @| _kcc_sema_str_var
 @| _kcc_sema_str_func
@@ -1893,4 +1921,5 @@ _kcc_sema_str_nl:       .asciz "\n"
 @| _kcc_sema_str_colon
 @| _kcc_sema_str_eq
 @| _kcc_sema_str_nl
+@| _kcc_sema_str_va_list
 @}

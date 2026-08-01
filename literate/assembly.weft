@@ -377,6 +377,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: access width@>
 @<IR: build subscript@>
 @<IR: build member@>
+@<IR: variadic builtins@>
 @<IR: build ident@>
 @<IR: build binary@>
 @<IR: build unary@>

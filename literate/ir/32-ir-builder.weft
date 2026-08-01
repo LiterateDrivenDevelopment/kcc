@@ -1972,9 +1972,16 @@ _kcc_ir_build_expr:
     b.eq .Libe_subscript
     cmp x0, #AST_MEMBER
     b.eq .Libe_member
+    cmp x0, #AST_VA_ARG
+    b.eq .Libe_va_arg
 
     // Unhandled expression — return 0
     b .Libe_zero
+
+.Libe_va_arg:
+    mov x0, x19
+    bl _kcc_ir_build_va_arg
+    b .Libe_done
 
 .Libe_int_lit:
     mov x0, x19
@@ -5530,6 +5537,19 @@ _kcc_ir_build_call:
 
     ldr x20, [x0, #AST_F0]       // x20 = callee name ptr
 
+    // Variadic builtins: va_start(ap, last) and va_end(ap) are lowered
+    // specially rather than emitted as calls.
+    mov x0, x20
+    adrp x1, _kcc_ir_str_va_start@@PAGE
+    add  x1, x1, _kcc_ir_str_va_start@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_va_start
+    mov x0, x20
+    adrp x1, _kcc_ir_str_va_end@@PAGE
+    add  x1, x1, _kcc_ir_str_va_end@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_va_end
+
     // Direct name, or a local function-pointer variable?
     mov x0, x20
     bl _kcc_strlen
@@ -5688,6 +5708,15 @@ _kcc_ir_build_call:
     mov x0, x20
     b .Libc_done
 
+.Libc_va_start:
+    mov x0, x19                 // call node
+    bl _kcc_ir_build_va_start
+    b .Libc_epilogue
+
+.Libc_va_end:
+    mov x0, #0                  // va_end is a no-op in this ABI
+    b .Libc_epilogue
+
 .Libc_done_zero:
     mov x0, #0
 .Libc_done:
@@ -5703,6 +5732,218 @@ _kcc_ir_build_call:
     ldp x29, x30, [sp], #112
     ret
 @| _kcc_ir_build_call
+@}
+
+\subsection{Variadic Function Definitions}
+\label{sec:variadic-defs}
+
+A function \emph{defined} with a trailing \texttt{...} reads its unnamed
+arguments through the \texttt{<stdarg.h>} interface---\texttt{va\_list},
+\texttt{va\_start}, \texttt{va\_arg}, \texttt{va\_end}.  \kcc{} provides
+these as built-ins rather than a header.  The call lowering already pushes
+\emph{every} argument onto the stack (the Apple variadic ABI push), so a
+variadic callee needs only a cursor into that stack area.  Accordingly
+\texttt{va\_list} is an opaque eight-byte pointer (resolved by sema);
+\texttt{va\_start(ap, last)} points the cursor at the first variadic
+argument; \texttt{va\_arg(ap, T)} reads the eight-byte slot at the cursor
+and advances it; and \texttt{va\_end} is a no-op.
+
+Because the first variadic argument lives at
+\texttt{[x29 + frame\_size + (F-1)\,{\times}\,8]}---where $F$ is the number
+of fixed parameters and \texttt{frame\_size} is known only in the backend---%
+\texttt{va\_start} lowers to a dedicated \texttt{IR\_VA\_START} instruction
+that carries $F$ in \texttt{SRC2}; the code generator materialises the
+address and \texttt{va\_start} stores it into \texttt{ap}.  \texttt{va\_arg}
+needs no new opcode: it loads the cursor, dereferences it, adds eight, and
+writes the cursor back, all with ordinary IR.  Both builtins locate
+\texttt{ap} through \texttt{\_kcc\_ir\_ident\_alloca}, which resolves a
+local identifier to its alloca vreg.
+
+@d IR: variadic builtins @{
+// -- kcc_ir_ident_alloca --------------------------------------------------
+// uint64_t kcc_ir_ident_alloca(node *ident)
+//   x0 = AST_IDENT_EXPR.  Returns the identifier's alloca vreg, or ~0 when
+//   it is not a known local.
+.text
+.globl _kcc_ir_ident_alloca
+.p2align 2
+_kcc_ir_ident_alloca:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    cbz x0, .Lia_none
+    ldr x19, [x0, #AST_F0]       // name ptr
+    cbz x19, .Lia_none
+    mov x0, x19
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19
+    bl _kcc_ht_get
+    cbz x0, .Lia_none
+    bic x0, x0, #0x8000000000000000
+    sub x0, x0, #1
+    b .Lia_done
+.Lia_none:
+    mov x0, #-1
+.Lia_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_build_va_start ------------------------------------------------
+// void kcc_ir_build_va_start(node *call)   — call = va_start(ap, last)
+.text
+.globl _kcc_ir_build_va_start
+.p2align 2
+_kcc_ir_build_va_start:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // call node
+    ldr x0, [x19, #AST_F1]       // first arg = ap ident
+    bl _kcc_ir_ident_alloca
+    mov x20, x0                  // ap alloca vreg
+    // F = current function's fixed-parameter count
+    adrp x0, _kcc_ir_cur_func@@PAGE
+    add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
+    ldr x0, [x0]
+    ldr x21, [x0, #IRF_PARAMS]
+    // IR_VA_START: DEST = base-address vreg, SRC2 = F
+    mov x0, #IR_VA_START
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // base-address vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // *ap = base
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]     // value = base address
+    str x20, [x22, #IR_SRC2]     // pointer = ap's storage
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x21
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_build_va_arg --------------------------------------------------
+// uint64_t kcc_ir_build_va_arg(node *va_arg)
+//   Loads the 8-byte slot at the va_list cursor, advances the cursor by 8,
+//   and returns the loaded value vreg.
+.text
+.globl _kcc_ir_build_va_arg
+.p2align 2
+_kcc_ir_build_va_arg:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // va_arg node
+    ldr x0, [x19, #AST_F0]       // ap ident
+    bl _kcc_ir_ident_alloca
+    mov x20, x0                  // ap alloca vreg
+    // p = *ap  (current cursor)
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // p
+    mov x0, x22
+    bl _kcc_ir_emit
+    // val = *p  (one 8-byte argument slot)
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // val
+    mov x0, x22
+    bl _kcc_ir_emit
+    // c8 = 8
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    mov x1, #8
+    str x1, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x24, x0                  // c8
+    mov x0, x22
+    bl _kcc_ir_emit
+    // p2 = p + 8
+    mov x0, #IR_ADD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    str x24, [x22, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // p2
+    mov x0, x22
+    bl _kcc_ir_emit
+    // *ap = p2
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    str x20, [x22, #IR_SRC2]
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x23                  // return val
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.section __TEXT,__cstring,cstring_literals
+_kcc_ir_str_va_start:    .asciz "va_start"
+_kcc_ir_str_va_end:      .asciz "va_end"
+.text
+@| _kcc_ir_ident_alloca _kcc_ir_build_va_start _kcc_ir_build_va_arg
+@| _kcc_ir_str_va_start _kcc_ir_str_va_end
 @}
 
 \paragraph{End-to-end tests.}

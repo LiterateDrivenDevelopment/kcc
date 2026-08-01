@@ -274,6 +274,10 @@ _kcc_ir_dump_instr:
     b.eq .Lidi_trunc
     cmp x20, #IR_BITCAST
     b.eq .Lidi_bitcast
+    cmp x20, #IR_SITOFP
+    b.eq .Lidi_sitofp
+    cmp x20, #IR_FPTOSI
+    b.eq .Lidi_fptosi
     cmp x20, #IR_CONST
     b.eq .Lidi_const
     cmp x20, #IR_NOP
@@ -451,6 +455,14 @@ the backend can select the correct ARM64 widening instruction
 .Lidi_bitcast:
     adrp x0, _kcc_ir_op_bitcast@@PAGE
     add  x0, x0, _kcc_ir_op_bitcast@@PAGEOFF
+    b .Lidi_unop
+.Lidi_sitofp:
+    adrp x0, _kcc_ir_op_sitofp@@PAGE
+    add  x0, x0, _kcc_ir_op_sitofp@@PAGEOFF
+    b .Lidi_unop
+.Lidi_fptosi:
+    adrp x0, _kcc_ir_op_fptosi@@PAGE
+    add  x0, x0, _kcc_ir_op_fptosi@@PAGEOFF
     b .Lidi_unop
 
 .Lidi_unop:
@@ -1908,6 +1920,8 @@ _kcc_ir_build_expr:
 
     cmp x0, #AST_INT_LIT
     b.eq .Libe_int_lit
+    cmp x0, #AST_FLOAT_LIT
+    b.eq .Libe_float_lit
     cmp x0, #AST_CHAR_LIT
     b.eq .Libe_char_lit
     cmp x0, #AST_IDENT_EXPR
@@ -1943,6 +1957,11 @@ _kcc_ir_build_expr:
 .Libe_int_lit:
     mov x0, x19
     bl _kcc_ir_build_int_lit
+    b .Libe_done
+
+.Libe_float_lit:
+    mov x0, x19
+    bl _kcc_ir_build_float_lit
     b .Libe_done
 
 .Libe_char_lit:
@@ -2080,7 +2099,164 @@ _kcc_ir_build_int_lit:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_ir_build_int_lit
+
+// -- kcc_ir_build_float_lit -----------------------------------------------
+// uint64_t kcc_ir_build_float_lit(node *float_lit)
+//   x0 = AST_FLOAT_LIT (F0 = IEEE-754 double bit pattern)
+// A floating constant lowers to the same IR_CONST as an integer: the
+// 64-bit pattern is materialised into the vreg's slot. Only the type
+// differs (double), which is what makes the backend spill and reload it
+// through the floating-point unit.
+.text
+.globl _kcc_ir_build_float_lit
+.p2align 2
+_kcc_ir_build_float_lit:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // x20 = double bit pattern
+
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x21, #IR_TYPE]     // double
+
+    str x20, [x21, #IR_SRC1]    // bit pattern as the immediate
+
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x20, x0
+
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    mov x0, x20
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_type_is_fp ----------------------------------------------------
+// uint64_t kcc_ir_type_is_fp(type_desc *ty)  → 1 if float/double, else 0.
+.text
+.globl _kcc_ir_type_is_fp
+.p2align 2
+_kcc_ir_type_is_fp:
+    cbz x0, .Litif_no
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_FLOAT
+    b.eq .Litif_yes
+    cmp x1, #TY_DOUBLE
+    b.eq .Litif_yes
+.Litif_no:
+    mov x0, #0
+    ret
+.Litif_yes:
+    mov x0, #1
+    ret
+
+// -- kcc_ir_emit_sitofp ---------------------------------------------------
+// uint64_t kcc_ir_emit_sitofp(uint64_t src_vreg)
+// Emits IR_SITOFP: converts a signed integer vreg to a double vreg.
+.text
+.globl _kcc_ir_emit_sitofp
+.p2align 2
+_kcc_ir_emit_sitofp:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // src vreg
+    mov x0, #IR_SITOFP
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_double@@PAGE
+    add  x1, x1, _kcc_type_double@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    str x0, [sp, #24]            // save dest vreg across the emit call
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [sp, #24]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_emit_fptosi ---------------------------------------------------
+// uint64_t kcc_ir_emit_fptosi(uint64_t src_vreg)
+// Emits IR_FPTOSI: converts a double vreg to a signed integer vreg.
+.text
+.globl _kcc_ir_emit_fptosi
+.p2align 2
+_kcc_ir_emit_fptosi:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    mov x0, #IR_FPTOSI
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    str x0, [sp, #24]            // save dest vreg across the emit call
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [sp, #24]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_convert -------------------------------------------------------
+// uint64_t kcc_ir_convert(uint64_t vreg, type *from, type *to)
+// Inserts an int↔double conversion when the value crosses the boundary
+// between the integer and floating domains; otherwise returns the vreg
+// unchanged. (Integer↔integer resizing is handled by cast lowering.)
+.text
+.globl _kcc_ir_convert
+.p2align 2
+_kcc_ir_convert:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                  // vreg
+    str x1, [sp, #32]            // from type
+    mov x0, x2                   // to type
+    bl _kcc_ir_type_is_fp
+    mov x20, x0                  // to_is_fp
+    ldr x0, [sp, #32]
+    bl _kcc_ir_type_is_fp        // from_is_fp
+    cmp x0, x20
+    b.eq .Licv_none              // same domain → no conversion
+    cbnz x20, .Licv_to_fp
+    mov x0, x19
+    bl _kcc_ir_emit_fptosi       // fp → int
+    b .Licv_ret
+.Licv_to_fp:
+    mov x0, x19
+    bl _kcc_ir_emit_sitofp       // int → fp
+    b .Licv_ret
+.Licv_none:
+    mov x0, x19
+.Licv_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_emit_sitofp _kcc_ir_emit_fptosi _kcc_ir_convert
 @}
 
 \subsection{Sizeof Expression}
@@ -3528,6 +3704,25 @@ _kcc_ir_build_binary:
     b .Libb_emit
 
 .Libb_emit:
+    // Floating-point operation? If the result or either operand is
+    // float/double, take the FP path (promote int operands, emit with
+    // double type so codegen uses the floating-point unit).
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_emit
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_chk_rhs_fp
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_emit
+.Libb_chk_rhs_fp:
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_emit_int
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_emit
+
+.Libb_emit_int:
     // Check left operand type for unsigned — remap signed opcodes
     ldr x0, [x19, #AST_F1]
     cbz x0, .Libb_emit_alloc
@@ -3596,6 +3791,44 @@ _kcc_ir_build_binary:
     bl _kcc_ir_norm32
     mov x23, x0
 
+    mov x0, x23
+    b .Libb_done
+
+.Libb_fp_emit:
+    // Promote any integer operand to double, then emit the operation with
+    // double type — the codegen signal to use floating-point instructions.
+    // No 32-bit normalisation applies. Comparisons still yield an int 0/1
+    // but are computed with fcmp.
+    ldr x0, [x19, #AST_F1]
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_rhs
+    mov x0, x21
+    bl _kcc_ir_emit_sitofp
+    mov x21, x0
+.Libb_fp_rhs:
+    ldr x0, [x19, #AST_F2]
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_do
+    mov x0, x22
+    bl _kcc_ir_emit_sitofp
+    mov x22, x0
+.Libb_fp_do:
+    mov x0, x23                  // opcode (ADD/SUB/MUL/SDIV or CMP_*)
+    bl _kcc_ir_alloc_instr
+    mov x24, x0
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x24, #IR_TYPE]      // double → floating-point codegen
+    str x21, [x24, #IR_SRC1]
+    str x22, [x24, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x24, #IR_DEST]
+    mov x23, x0
+    mov x0, x24
+    bl _kcc_ir_emit
     mov x0, x23
     b .Libb_done
 @| _kcc_ir_build_binary
@@ -4619,9 +4852,22 @@ _kcc_ir_build_assign:
 .Liba_normal_rhs:
     // Build RHS first
     ldr x0, [x19, #AST_F2]
+    ldr x2, [x0, #AST_F3]       // rhs sema type
+    str x2, [sp, #72]
     bl _kcc_ir_build_expr
     mov x21, x0                  // rhs vreg
 
+    // Simple assignment converts the RHS to the LHS type across the
+    // int/float boundary ([sp,#64] holds the assignment's (LHS) type).
+    cmp x20, #TOK_ASSIGN
+    b.ne .Liba_get_lhs
+    mov x0, x21
+    ldr x1, [sp, #72]           // from = rhs type
+    ldr x2, [sp, #64]           // to   = LHS type
+    bl _kcc_ir_convert
+    mov x21, x0
+
+.Liba_get_lhs:
     // Get LHS — identifier, subscript, member, or dereference
     ldr x0, [x19, #AST_F1]
     cbz x0, .Liba_done
@@ -5684,6 +5930,30 @@ _kcc_ir_build_cast:
     ldr x23, [x20, #AST_F3]
     cbz x23, .Lbc_done
 
+    // Floating-point conversions take priority over integer resizing,
+    // since int and double differ in size but are not a mere widening.
+    mov x0, x22
+    bl _kcc_ir_type_is_fp
+    cbz x0, .Lbc_src_fp
+    // Target is float/double.
+    mov x0, x23
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Lbc_done           // fp → fp: no-op (float treated as double)
+    mov x0, x21
+    bl _kcc_ir_emit_sitofp       // int → double
+    mov x21, x0
+    b .Lbc_done
+.Lbc_src_fp:
+    mov x0, x23
+    bl _kcc_ir_type_is_fp
+    cbz x0, .Lbc_int_resize
+    // Source is float/double, target is integer.
+    mov x0, x21
+    bl _kcc_ir_emit_fptosi       // double → int
+    mov x21, x0
+    b .Lbc_done
+
+.Lbc_int_resize:
     // Compare sizes
     ldr x1, [x22, #TY_SIZE]     // target size
     ldr x2, [x23, #TY_SIZE]     // source size
@@ -6321,8 +6591,16 @@ _kcc_ir_build_var_decl:
     b.eq .Libvd_struct_init
 
     // Build initializer expression (scalar/pointer)
+    ldr x24, [x0, #AST_F3]      // init expr's sema type (stash before building)
+    str x24, [sp, #72]
     bl _kcc_ir_build_expr
     mov x24, x0                  // x24 = init value vreg
+
+    // Convert across the int/float boundary if the declared type differs.
+    ldr x1, [sp, #72]           // from = init type
+    mov x2, x21                  // to = declared type
+    bl _kcc_ir_convert
+    mov x24, x0
 
     // Emit store: value -> alloca
     mov x0, #IR_STORE
@@ -8023,6 +8301,8 @@ _kcc_ir_op_sext:        .asciz "sext"
 _kcc_ir_op_zext:        .asciz "zext"
 _kcc_ir_op_trunc:       .asciz "trunc"
 _kcc_ir_op_bitcast:     .asciz "bitcast"
+_kcc_ir_op_sitofp:      .asciz "sitofp"
+_kcc_ir_op_fptosi:      .asciz "fptosi"
 _kcc_ir_op_const:       .asciz "const "
 _kcc_ir_op_nop:         .asciz "nop"
 _kcc_ir_op_global_ref:  .asciz "global_ref "

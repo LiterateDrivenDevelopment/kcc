@@ -283,6 +283,48 @@ difftest "sarg-temp" \
     "struct P { int x; int y; }; struct P mk(int a){ struct P p; p.x = a; p.y = a + 1; return p; } int use(struct P p){ return p.x + p.y; } int main(void){ return use(mk(10)); }"
 @}
 
+The floating-point cases exercise the \texttt{double} pipeline end to
+end (\S\ref{sec:parse-float}): compile-time constant evaluation, the
+four arithmetic operations, ordered comparisons, and conversions in
+both directions, including through variables, globals, arrays, loops,
+and function boundaries.  Every observable value is an \texttt{int}
+(the exit code), so the truncating \texttt{(int)} cast is always the
+final step.
+
+@d Difftest: floating point @{
+echo ""
+echo "--- Floating Point ---"
+
+difftest "fp-const-arith" \
+    "int main(void){ double a = 1.5; double b = 2.25; return (int)((a + b) * 2); }"
+difftest "fp-sub-scale" \
+    "int main(void){ double a = 3.5, b = 1.25; return (int)((a - b) * 100); }"
+difftest "fp-div" \
+    "int main(void){ double a = 10.0, b = 4.0; return (int)(a / b * 10); }"
+difftest "fp-int-to-double" \
+    "int main(void){ int n = 7; double d = n; return (int)(d * 2); }"
+difftest "fp-double-to-int" \
+    "int main(void){ double d = 9.87; return (int)d; }"
+difftest "fp-mixed-promote" \
+    "int main(void){ int n = 3; double r = n + 1.5; return (int)(r * 2); }"
+difftest "fp-compare" \
+    "int main(void){ double a = 1.1; double b = 2.2; return a < b ? 10 : 20; }"
+difftest "fp-assign-convert" \
+    "int main(void){ double d; int n = 5; d = n; int i; double e = 7.9; i = e; return (int)(d * 3) + i; }"
+difftest "fp-global" \
+    "double g = 3.5; int main(void){ g = g + 1.5; return (int)g; }"
+difftest "fp-array" \
+    "int main(void){ double a[3]; a[0] = 1.5; a[1] = 2.5; a[2] = 3.0; return (int)(a[0] + a[1] + a[2]); }"
+difftest "fp-loop-accumulate" \
+    "int main(void){ double s = 0.0; int i; for (i = 0; i < 5; i = i + 1) s = s + 1.5; return (int)s; }"
+difftest "fp-exponent-literal" \
+    "int main(void){ double d = 1.5e3; return (int)(d / 100); }"
+difftest "fp-function" \
+    "int scale(double x){ return (int)(x * 2); } int main(void){ return scale(3.5); }"
+difftest "fp-return" \
+    "double half(double x){ return x / 2.0; } int main(void){ return (int)(half(9.0) * 2); }"
+@}
+
 \section{Operators and Edge Cases}
 
 The remaining operators---ternary, comma, compound assignment,

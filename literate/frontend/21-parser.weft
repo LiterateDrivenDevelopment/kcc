@@ -125,6 +125,7 @@ Offset & Field & Description \\
 .equ AST_PAREN_EXPR,     68   // F0=inner
 .equ AST_GENERIC,        69   // F0=controlling_expr, F1=first_assoc
 .equ AST_GENERIC_ASSOC,  70   // F0=type (0=default), F1=expr
+.equ AST_FLOAT_LIT,      71   // F0=double bit pattern, F3=type(float/double)
 @}
 
 \section{AST Node Allocation}
@@ -752,6 +753,8 @@ _kcc_ast_dump:
     b.eq .Last_dump_name_node
     cmp x20, #AST_INT_LIT
     b.eq .Last_dump_int_lit
+    cmp x20, #AST_FLOAT_LIT
+    b.eq .Last_dump_int_lit       // leaf: prints the raw double bit pattern
     cmp x20, #AST_STR_LIT
     b.eq .Last_dump_str_lit
     cmp x20, #AST_CHAR_LIT
@@ -1579,6 +1582,8 @@ _kcc_ast_tag_table:
     .quad _kcc_ast_n_generic
     .quad AST_GENERIC_ASSOC
     .quad _kcc_ast_n_generic_assoc
+    .quad AST_FLOAT_LIT
+    .quad _kcc_ast_n_float_lit
     .quad 0, 0                   // sentinel
 
 // Tag name strings
@@ -1620,6 +1625,7 @@ _kcc_ast_n_default_stmt:  .asciz "DefaultStmt"
 _kcc_ast_n_null_stmt:     .asciz "NullStmt"
 _kcc_ast_n_ident_expr:    .asciz "IdentExpr"
 _kcc_ast_n_int_lit:       .asciz "IntLit"
+_kcc_ast_n_float_lit:     .asciz "FloatLit"
 _kcc_ast_n_str_lit:       .asciz "StrLit"
 _kcc_ast_n_char_lit:      .asciz "CharLit"
 _kcc_ast_n_binary_expr:   .asciz "BinaryExpr"

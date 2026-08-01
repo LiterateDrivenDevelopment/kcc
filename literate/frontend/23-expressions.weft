@@ -850,7 +850,17 @@ _kcc_parse_primary_expr:
     b .Lprimary_done
 
 .Lprimary_number:
-    // Parse integer value from token text
+    // A pp-number is either an integer or a floating constant.
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_is_float_literal
+    cbnz x0, .Lprimary_float
+
+    // Integer literal: parse the value from token text.
     adrp x0, _kcc_tok_start@@PAGE
     add  x0, x0, _kcc_tok_start@@PAGEOFF
     ldr  x0, [x0]
@@ -866,6 +876,24 @@ _kcc_parse_primary_expr:
     mov x0, #AST_INT_LIT
     bl _kcc_ast_alloc
     str x19, [x0, #AST_F0]      // value
+    b .Lprimary_done
+
+.Lprimary_float:
+    // Floating constant: evaluate to a double bit pattern.
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_parse_atof
+    mov x19, x0                  // x19 = double bit pattern
+
+    bl _kcc_pp_next
+
+    mov x0, #AST_FLOAT_LIT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]      // double bit pattern
     b .Lprimary_done
 
 .Lprimary_string:
@@ -1182,6 +1210,178 @@ _kcc_parse_atoi:
     ldp x29, x30, [sp], #16
     ret
 @| _kcc_parse_atoi
+@}
+
+\section{Floating Constants}
+\label{sec:parse-float}
+
+A preprocessing number is a floating constant---rather than an
+integer---when its decimal spelling contains a radix point, a decimal
+exponent (\texttt{e}/\texttt{E}), or a floating suffix
+(\texttt{f}/\texttt{F}).  Hexadecimal integers (\texttt{0x}\ldots) are
+excluded up front so their \texttt{e}/\texttt{f} \emph{hex digits} are
+not mistaken for an exponent or suffix; hexadecimal floating constants
+(\texttt{0x1p4}) are not yet supported.
+\texttt{kcc\_is\_float\_literal} performs this classification on the raw
+token text.
+
+\texttt{kcc\_parse\_atof} then evaluates the constant to an IEEE-754
+\texttt{double} \emph{at compile time}, using the host's own
+floating-point unit: it accumulates the integer part in a running
+\texttt{double}, adds each fractional digit divided by an advancing
+power of ten, and finally scales by $10^{\pm e}$ through repeated
+multiplication or division.  The 64-bit result is returned as its bit
+pattern (via \texttt{fmov}), ready to be stored verbatim in the
+literal's AST node and, later, materialised as an \texttt{IR\_CONST}.
+Repeated decimal scaling is not correctly-rounded for very large
+exponents, but it is exact for the small constants that dominate real
+code.
+
+@d Expr: parse float @{
+// -- kcc_is_float_literal ---------------------------------------------
+// uint64_t kcc_is_float_literal(const char *str, uint64_t len)
+//   Returns 1 if the pp-number is a floating constant, else 0.
+.text
+.globl _kcc_is_float_literal
+.p2align 2
+_kcc_is_float_literal:
+    cbz x1, .Lisf_no
+    // Hexadecimal integer? 0x / 0X → never a (decimal) float here.
+    cmp x1, #2
+    b.lo .Lisf_scan
+    ldrb w2, [x0]
+    cmp w2, #'0'
+    b.ne .Lisf_scan
+    ldrb w2, [x0, #1]
+    orr w2, w2, #0x20            // tolower
+    cmp w2, #'x'
+    b.eq .Lisf_no
+
+.Lisf_scan:
+    mov x3, #0                   // index
+.Lisf_loop:
+    cmp x3, x1
+    b.hs .Lisf_no
+    ldrb w2, [x0, x3]
+    cmp w2, #'.'
+    b.eq .Lisf_yes
+    cmp w2, #'e'
+    b.eq .Lisf_yes
+    cmp w2, #'E'
+    b.eq .Lisf_yes
+    cmp w2, #'f'
+    b.eq .Lisf_yes
+    cmp w2, #'F'
+    b.eq .Lisf_yes
+    add x3, x3, #1
+    b .Lisf_loop
+.Lisf_yes:
+    mov x0, #1
+    ret
+.Lisf_no:
+    mov x0, #0
+    ret
+
+// -- kcc_parse_atof ---------------------------------------------------
+// uint64_t kcc_parse_atof(const char *str, uint64_t len)
+//   x0 = digit string, x1 = length
+// Returns the IEEE-754 double bit pattern of the decimal constant.
+// Leaf function: uses only caller-saved x2-x10 and d0-d4.
+.text
+.globl _kcc_parse_atof
+.p2align 2
+_kcc_parse_atof:
+    add x3, x0, x1               // x3 = end
+    mov x2, x0                   // x2 = cursor
+    fmov d0, xzr                 // d0 = 0.0 (accumulator)
+    mov x5, #10
+    scvtf d3, x5                 // d3 = 10.0
+
+.Latof_int:
+    cmp x2, x3
+    b.hs .Latof_end
+    ldrb w6, [x2]
+    cmp w6, #'.'
+    b.eq .Latof_frac
+    cmp w6, #'e'
+    b.eq .Latof_exp
+    cmp w6, #'E'
+    b.eq .Latof_exp
+    sub x7, x6, #'0'
+    cmp x7, #9
+    b.hi .Latof_end             // suffix or other → done
+    fmul d0, d0, d3
+    scvtf d1, x7
+    fadd d0, d0, d1
+    add x2, x2, #1
+    b .Latof_int
+
+.Latof_frac:
+    add x2, x2, #1               // skip '.'
+    mov x5, #1
+    scvtf d4, x5                 // d4 = fractional divisor (1.0, ×10 per digit)
+.Latof_frac_loop:
+    cmp x2, x3
+    b.hs .Latof_end
+    ldrb w6, [x2]
+    cmp w6, #'e'
+    b.eq .Latof_exp
+    cmp w6, #'E'
+    b.eq .Latof_exp
+    sub x7, x6, #'0'
+    cmp x7, #9
+    b.hi .Latof_end
+    fmul d4, d4, d3              // divisor *= 10
+    scvtf d1, x7
+    fdiv d1, d1, d4             // digit / 10^k
+    fadd d0, d0, d1
+    add x2, x2, #1
+    b .Latof_frac_loop
+
+.Latof_exp:
+    add x2, x2, #1               // skip e/E
+    mov x8, #0                   // exponent magnitude
+    mov x9, #0                   // sign: 0 = +, 1 = -
+    cmp x2, x3
+    b.hs .Latof_exp_apply
+    ldrb w6, [x2]
+    cmp w6, #'+'
+    b.eq .Latof_exp_skip
+    cmp w6, #'-'
+    b.ne .Latof_exp_digits
+    mov x9, #1
+.Latof_exp_skip:
+    add x2, x2, #1
+.Latof_exp_digits:
+    cmp x2, x3
+    b.hs .Latof_exp_apply
+    ldrb w6, [x2]
+    sub x7, x6, #'0'
+    cmp x7, #9
+    b.hi .Latof_exp_apply
+    mov x10, #10
+    mul x8, x8, x10
+    add x8, x8, x7
+    add x2, x2, #1
+    b .Latof_exp_digits
+
+.Latof_exp_apply:
+    cbz x8, .Latof_end
+    cbnz x9, .Latof_exp_neg
+.Latof_exp_mul:
+    fmul d0, d0, d3
+    subs x8, x8, #1
+    b.ne .Latof_exp_mul
+    b .Latof_end
+.Latof_exp_neg:
+    fdiv d0, d0, d3
+    subs x8, x8, #1
+    b.ne .Latof_exp_neg
+
+.Latof_end:
+    fmov x0, d0                  // return the double's bit pattern
+    ret
+@| _kcc_is_float_literal _kcc_parse_atof
 @}
 
 \section{Argument List}

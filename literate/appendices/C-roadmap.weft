@@ -706,23 +706,47 @@ Stage~9d adds optimization passes that bring generated-code quality
 within striking distance of \texttt{clang -O1}.  Stage~9e delivers
 the tooling and diagnostics expected of a production compiler.
 
+\textbf{Status.}  Stage~9a is under way---\texttt{double} floating point
+is complete (\S\ref{sec:parse-float}); unions, single-precision
+\texttt{float}, \texttt{\_Bool}, and qualifiers remain.  Stage~9b has
+struct pass/return by value working self-consistently
+(\S\ref{sec:struct-args}); more-than-eight-argument stack passing,
+variadic \emph{definitions}, and exact AAPCS64 register/stack packing
+remain.  Stages~9c--9e (register allocation, optimization, tooling) are
+not yet begun.  A precise ledger of what is done and what is left
+appears in the production-readiness assessment
+(\S\ref{sec:production-readiness}).
+
 \subsection{Stage 9a --- Complete Type System}
 
-The current backend handles integer types only.  This stage adds
-every remaining C17 type.
+The backend began with integer types only; \texttt{double} floating
+point is now in place.  This stage adds every remaining C17 type.
 
 \begin{itemize}
-\item \textbf{Floating point.}  The type singletons (\texttt{TY\_FLOAT},
-      \texttt{TY\_DOUBLE}, \texttt{TY\_LDOUBLE}) already exist in the
-      type system but have no IR or codegen support.  Add IR opcodes
-      \texttt{IR\_FADD}, \texttt{IR\_FSUB}, \texttt{IR\_FMUL},
-      \texttt{IR\_FDIV}, \texttt{IR\_FCMP\_*}, \texttt{IR\_SITOFP},
-      \texttt{IR\_FPTOSI}, \texttt{IR\_FPEXT}, \texttt{IR\_FPTRUNC}.
-      Codegen uses NEON/FP registers \texttt{d0}--\texttt{d7} for
-      arguments and \texttt{d8}--\texttt{d15} as callee-saved
-      scratch.  Floating-point literals require a constant pool
-      in the \texttt{\_\_text} section with \texttt{LDR} (literal)
-      instructions.
+\item[\checkmark] \textbf{Floating point (\texttt{double}).}  Implemented
+      end to end.  The lexer classifies a floating constant and
+      \texttt{\_kcc\_parse\_atof} evaluates it to an IEEE-754
+      \texttt{double} at compile time on the host FPU
+      (\S\ref{sec:parse-float}); sema types it \texttt{double} and the
+      usual arithmetic conversions already promote toward it.  The IR
+      gains \texttt{IR\_SITOFP}/\texttt{IR\_FPTOSI} plus a shared
+      \texttt{\_kcc\_ir\_convert}; \texttt{build\_binary} promotes
+      integer operands and tags floating results \texttt{double}, and
+      that type tag is the backend's signal to use the FP unit.  Codegen
+      adds \textsc{fadd}/\textsc{fsub}/\textsc{fmul}/\textsc{fdiv},
+      \textsc{fcmp} (reusing the integer comparison tail, since ordered
+      comparisons leave \texttt{NZCV} exactly as the signed conditions
+      test), \textsc{scvtf}/\textsc{fcvtzs}, and SIMD\&FP
+      \textsc{ldr}/\textsc{str}.  A \texttt{double} occupies the same
+      8-byte spill slot as any value---no constant pool is needed, the
+      64-bit pattern is materialised by the ordinary \texttt{IR\_CONST}
+      path, and because arguments and returns travel through that slot
+      (via \texttt{x0}--\texttt{x7}) they interoperate for
+      \kcc{}-to-\kcc{} calls.  Verified by 14 \texttt{fp-*} differential
+      tests.  Still open: single-precision \texttt{float} arithmetic
+      (currently widened to \texttt{double}), \texttt{long double}, and
+      the AAPCS64 \texttt{d0}--\texttt{d7} register convention for
+      \texttt{clang} interoperation.
 \item \textbf{Unions.}  \texttt{TY\_UNION} is defined but never
       lowered.  The IR builder must treat unions like structs
       whose fields all start at offset~0; \texttt{TY\_SIZE} equals
@@ -756,9 +780,11 @@ every remaining C17 type.
 
 \subsection{Stage 9b --- Full ABI Compliance}
 
-The current calling convention passes at most~8 integer arguments
-in \texttt{x0}--\texttt{x7} and ignores struct-by-value semantics.
-This stage makes \kcc{} fully AAPCS64-compliant.
+The calling convention now handles struct pass and return by value
+(both checked below), but still passes at most eight arguments in
+\texttt{x0}--\texttt{x7} and uses \kcc{}'s own uniform slot convention
+rather than the exact AAPCS64 register/stack rules.  This stage closes
+the remaining gaps toward full AAPCS64 compliance.
 
 \begin{itemize}
 \item \textbf{Stack arguments.}  When a function has more than~8
@@ -933,8 +959,8 @@ Phase & Status & Milestone & Key Output & \texttt{.weft} Files \\
 5 & \checkmark & Type system           & \texttt{--dump-types}         & 25--30 \\
 6 & \checkmark & IR + optimization     & \texttt{--dump-ir}            & 31--36 \\
 7 & \checkmark & Backend               & \texttt{-c file.c -o file.o}  & 37--40, 42 \\
-8 & $\circ$    & Self-hosting          & Differential testing          & --- \\
-9 &            & Production            & \texttt{kcc hello.c -o hello} & 46--50+ \\
+8 & \checkmark & Self-hosting          & Differential testing          & 46--49 \\
+9 & $\circ$    & Production            & \texttt{kcc hello.c -o hello} & 50+ \\
 \hline
 \end{tabular}
 \end{center}
@@ -943,3 +969,102 @@ Total: 45+ \texttt{.weft} source files (growing to ${\sim}55$ by
 Phase~9), approximately 30 tangled assembly files, producing a
 single native \texttt{tmp/kcc} binary that compiles C17 to ARM64
 Mach-O --- with no dependency on any existing C compiler.
+
+\section{Production Readiness}
+\label{sec:production-readiness}
+
+``Is \kcc{} a \emph{100\% functional, production-ready} C compiler?''
+splits into two independent questions.  The first is \textbf{language
+conformance}: does it accept and correctly translate all of C17?  The
+second is \textbf{production engineering}: optimization, portability,
+tooling, and robustness---everything a team depends on \emph{beyond} a
+correct answer.  \kcc{} scores very differently on the two, and being
+honest about the gap matters more than any single headline number.
+
+\paragraph{What is already solid (and verified).}
+The integer, pointer, and aggregate core of C is complete and, crucially,
+\emph{checked against an oracle}: the differential harness
+(\S\ref{sec:differential-testing}) compiles 118 programs with both
+\kcc{} and \texttt{clang} and finds \emph{zero} miscompilations.  That
+core includes all control flow (\texttt{if}/\texttt{while}/\texttt{do}/%
+\texttt{for}/\texttt{switch}/\texttt{goto}), functions and recursion,
+pointers and pointer-to-pointer, arrays (including multi-dimensional),
+structs (field access, nesting, and both pass and return by value),
+enumerations, function pointers, \texttt{typedef}, \texttt{static}
+locals, initializer lists, the object- and function-like preprocessor
+with source-relative \texttt{\#include}, multi-file compilation, and
+now \texttt{double} floating point.
+
+\paragraph{Language conformance --- what remains.}
+The remaining language gaps are individually small but collectively keep
+\kcc{} short of full C17:
+
+\begin{center}
+\begin{tabular}{lcl}
+\hline
+Feature & Status & Note \\
+\hline
+\texttt{double} floating point   & \checkmark & complete, 14 diff. tests \\
+single-precision \texttt{float}  & $\circ$    & widened to \texttt{double} \\
+\texttt{long double}             &            & not lowered \\
+\texttt{union}                   &            & \texttt{TY\_UNION} unlowered \\
+bit-fields                       &            & no real packing \\
+\texttt{\_Bool} 0/1 normalisation & $\circ$   & not verified \\
+\texttt{char s[] = "..."}        &            & string-array init \\
+designated initialisers          &            & \texttt{[i]=}, \texttt{.f=} \\
+\texttt{volatile} semantics      &            & parsed, not honoured \\
+variadic \emph{definitions}      &            & \texttt{va\_arg} builtins \\
+\texttt{\_Generic} lowering      & $\circ$    & parsed, not selected \\
+\hline
+\end{tabular}
+\end{center}
+
+One conformance gap deserves special emphasis because it hides behind
+otherwise-correct results: \kcc{}'s \textbf{struct layout gives every
+field its own 8-byte slot}, so \texttt{sizeof(struct \{int x; int y;\})}
+is~16, not~8.  Programs stay self-consistent and the differential tests
+pass, but the layout is \emph{not} the platform ABI---\texttt{sizeof}
+values diverge from the Standard and \kcc{} objects cannot be linked
+against \texttt{clang}-compiled ones.  Correct alignment and packing
+(Stage~9b) is prerequisite to any real interoperability.
+
+\paragraph{Production engineering --- what remains.}
+This is the larger axis, and the one where \kcc{} is furthest from an
+industrial toolchain:
+
+\begin{center}
+\begin{tabular}{lcl}
+\hline
+Concern & Status & Note \\
+\hline
+optimization / reg.\ alloc. &         & all-spill; ${\sim}3\times$ memory traffic \\
+$>8$ arguments on the stack  &         & register cap still~8 \\
+AAPCS64 exact packing        &         & self-consistent only \\
+second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\
+automatic linking (\texttt{ld}) &      & manual link step \\
+standard library / sys.\ headers &     & no \texttt{<stdio.h>} \\
+multi-error recovery         &         & aborts on first error \\
+warnings (\texttt{-Wall})    &         & none \\
+debug info (DWARF)           &         & no \texttt{lldb} support \\
+full \texttt{-O}/\texttt{-I}/\texttt{-D} CLI & $\circ$ & partial \\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{Bottom line.}
+As a \emph{correct compiler for the integer/pointer/aggregate subset of
+C, plus \texttt{double}}, \kcc{} is in good shape and unusually
+well-tested for a hand-written assembly project.  As a \emph{complete
+C17 implementation} it is on the order of two-thirds there: the missing
+pieces are bounded (unions, real \texttt{float}, bit-fields, variadic
+definitions, and---most importantly---standard struct layout).  As a
+\emph{production-ready} toolchain in the industrial sense it is early:
+no optimizer, a single target, no automatic linking, no standard
+library, and first-error-only diagnostics.  The shortest credible path
+to ``usable in production for real programs'' runs through, in order:
+finishing the ABI (struct alignment, stack arguments, variadic
+definitions), \texttt{union}s and true \texttt{float}, automatic linking
+plus a minimal freestanding header set, then register allocation for
+code quality.  Everything after that---a second target, DWARF, an
+optimizer rivalling \texttt{clang -O1}---is refinement rather than
+feasibility.

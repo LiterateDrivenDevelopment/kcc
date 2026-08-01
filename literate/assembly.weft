@@ -217,6 +217,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Expr: parse cast@>
 @<Expr: parse postfix@>
 @<Expr: parse primary@>
+@<Expr: parse float@>
 @<Expr: parse arg list@>
 @<Expr: data@>
 @}
@@ -426,6 +427,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Backend: encode logical@>
 @<Backend: encode compare@>
 @<Backend: encode memory@>
+@<Backend: encode floating point@>
 @<Backend: encode branch@>
 @<Backend: encode system@>
 @<Backend: encode adrp@>
@@ -462,6 +464,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<CodeGen: compile function@>
 @<CodeGen: vreg slot offset@>
 @<CodeGen: instruction dispatch@>
+@<CodeGen: floating point@>
 @<CodeGen: patch branches@>
 @<CodeGen: emit strings@>
 @<CodeGen: data@>
@@ -593,6 +596,7 @@ self-test, and diff against clang:
 @<Difftest: control@>
 @<Difftest: functions@>
 @<Difftest: aggregates@>
+@<Difftest: floating point@>
 @<Difftest: operators@>
 @<Difftest: combinations@>
 @<Difftest: language@>

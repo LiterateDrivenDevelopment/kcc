@@ -106,6 +106,8 @@ Offset & Field & Description \\
 .equ IR_ZEXT,    51
 .equ IR_TRUNC,   52
 .equ IR_BITCAST, 53
+.equ IR_SITOFP,  54     // signed integer → floating point
+.equ IR_FPTOSI,  55     // floating point → signed integer
 
 // Miscellaneous: 60-63
 .equ IR_CONST,   60

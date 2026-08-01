@@ -627,6 +627,103 @@ _kcc_enc_mov_reg:
 @| _kcc_enc_mov_reg
 @}
 
+\section{Floating-Point Encoding}
+
+Floating-point work uses a small, fixed slice of the SIMD\&FP encoding
+space, all in double precision (\texttt{ptype}\;$=$\;\texttt{01}).  The
+two-source data-processing form (\textsc{fadd}, \textsc{fsub},
+\textsc{fmul}, \textsc{fdiv}) shares a base word and selects the
+operation with a four-bit opcode in bits [15:12].  Conversions between
+the integer and floating files are single-source: \textsc{scvtf}
+signed-int\;$\to$\;double, \textsc{fcvtzs} double\;$\to$\;signed-int
+(round toward zero).  \textsc{fcmp} sets the \texttt{NZCV} flags from a
+double comparison, after which an ordinary \textsc{cset} materialises
+the boolean.  Finally, doubles move to and from stack slots with the
+SIMD\&FP unsigned-offset \textsc{ldr}/\textsc{str} (bit~26, the
+\texttt{V} bit, distinguishes them from the general-register forms).
+
+@d Backend: encode floating point @{
+// -- kcc_enc_fp_dp2 -----------------------------------------------------------
+// Double-precision 2-source op: FADD/FSUB/FMUL/FDIV.
+//   x0=Rd, x1=Rn, x2=Rm, x3=opcode (fmul=0,fdiv=1,fadd=2,fsub=3)
+.text
+.globl _kcc_enc_fp_dp2
+.p2align 2
+_kcc_enc_fp_dp2:
+    movz w4, #0x0800             // base: fp dp2, double (bits[11:10]=10)
+    movk w4, #0x1E60, lsl #16
+    orr w4, w4, w3, lsl #12       // opcode
+    orr w4, w4, w2, lsl #16       // Rm
+    orr w4, w4, w1, lsl #5        // Rn
+    orr w4, w4, w0                // Rd
+    mov w0, w4
+    ret
+
+// -- kcc_enc_scvtf ------------------------------------------------------------
+// SCVTF Dd, Xn — signed 64-bit integer → double.  x0=Rd(fp), x1=Rn(int)
+.text
+.globl _kcc_enc_scvtf
+.p2align 2
+_kcc_enc_scvtf:
+    movz w2, #0x9E62, lsl #16
+    orr w2, w2, w1, lsl #5        // Rn
+    orr w2, w2, w0                // Rd
+    mov w0, w2
+    ret
+
+// -- kcc_enc_fcvtzs -----------------------------------------------------------
+// FCVTZS Xd, Dn — double → signed 64-bit integer (round toward zero).
+//   x0=Rd(int), x1=Rn(fp)
+.text
+.globl _kcc_enc_fcvtzs
+.p2align 2
+_kcc_enc_fcvtzs:
+    movz w2, #0x9E78, lsl #16
+    orr w2, w2, w1, lsl #5        // Rn
+    orr w2, w2, w0                // Rd
+    mov w0, w2
+    ret
+
+// -- kcc_enc_fcmp -------------------------------------------------------------
+// FCMP Dn, Dm — set NZCV from a double comparison.  x0=Rn, x1=Rm
+.text
+.globl _kcc_enc_fcmp
+.p2align 2
+_kcc_enc_fcmp:
+    movz w2, #0x2000
+    movk w2, #0x1E60, lsl #16
+    orr w2, w2, w1, lsl #16       // Rm
+    orr w2, w2, w0, lsl #5        // Rn
+    mov w0, w2
+    ret
+
+// -- kcc_enc_ldr_fp / kcc_enc_str_fp ------------------------------------------
+// LDR/STR Dt, [Xn, #imm12*8] — SIMD&FP unsigned offset (64-bit double).
+//   x0=Rt(fp), x1=Rn, x2=imm12 (already scaled by 8)
+.text
+.globl _kcc_enc_ldr_fp
+.p2align 2
+_kcc_enc_ldr_fp:
+    movz w3, #0xFD40, lsl #16
+    orr w3, w3, w2, lsl #10       // imm12
+    orr w3, w3, w1, lsl #5        // Rn
+    orr w3, w3, w0                // Rt
+    mov w0, w3
+    ret
+
+.text
+.globl _kcc_enc_str_fp
+.p2align 2
+_kcc_enc_str_fp:
+    movz w3, #0xFD00, lsl #16
+    orr w3, w3, w2, lsl #10       // imm12
+    orr w3, w3, w1, lsl #5        // Rn
+    orr w3, w3, w0                // Rt
+    mov w0, w3
+    ret
+@| _kcc_enc_fp_dp2 _kcc_enc_scvtf _kcc_enc_fcvtzs _kcc_enc_fcmp _kcc_enc_ldr_fp _kcc_enc_str_fp
+@}
+
 \section{Branch Encoding}
 
 Unconditional branches (\textsc{b}, \textsc{bl}) encode a 26-bit signed offset in instruction units (divide byte offset by~4). Conditional \textsc{b.cond} uses a 19-bit offset with the condition code in bits [3:0]. \textsc{cbz} and \textsc{cbnz} combine a register test with a 19-bit branch offset. \textsc{ret} is hard-coded to branch to the address in \texttt{x30}.

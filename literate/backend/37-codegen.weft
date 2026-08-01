@@ -825,8 +825,40 @@ _kcc_cg_store_vreg:
 
     ldp x29, x30, [sp], #16
     ret
-@| _kcc_cg_load_vreg
-@| _kcc_cg_store_vreg
+
+// -- kcc_cg_load_vreg_fp / kcc_cg_store_vreg_fp -------------------------------
+// Move a double between a vreg's stack slot and a floating-point register.
+//   x0 = vreg number, x1 = FP register number (0, 1, or 2)
+// The slot layout is identical to the integer helpers (offset vreg+2,
+// scaled by 8), so a double round-trips through the same 8-byte slot.
+.text
+.globl _kcc_cg_load_vreg_fp
+.p2align 2
+_kcc_cg_load_vreg_fp:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    add x2, x0, #2                // imm12 = vreg + 2
+    mov x0, x1                     // Rt = FP reg
+    mov x1, #29                    // Rn = x29
+    bl _kcc_enc_ldr_fp
+    bl _kcc_code_emit32
+    ldp x29, x30, [sp], #16
+    ret
+
+.text
+.globl _kcc_cg_store_vreg_fp
+.p2align 2
+_kcc_cg_store_vreg_fp:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    add x2, x0, #2
+    mov x0, x1                     // Rt = FP reg
+    mov x1, #29
+    bl _kcc_enc_str_fp
+    bl _kcc_code_emit32
+    ldp x29, x30, [sp], #16
+    ret
+@| _kcc_cg_load_vreg _kcc_cg_store_vreg _kcc_cg_load_vreg_fp _kcc_cg_store_vreg_fp
 @}
 
 \section{Instruction Dispatch}
@@ -887,6 +919,41 @@ _kcc_codegen_instr:
 
     ldr x22, [x19, #IR_OP]        // opcode
 
+    // Floating-point arithmetic and comparison route to a parallel set of
+    // handlers.  Only these opcodes use the FP unit; IR_CONST/LOAD/STORE
+    // also carry a double type but move the raw bit pattern, so they stay
+    // on the ordinary path.
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_dispatch
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_FLOAT
+    b.eq .Lcgi_fp_dispatch
+    cmp x0, #TY_DOUBLE
+    b.ne .Lcgi_dispatch
+.Lcgi_fp_dispatch:
+    cmp x22, #IR_ADD
+    b.eq .Lcgi_fadd
+    cmp x22, #IR_SUB
+    b.eq .Lcgi_fsub
+    cmp x22, #IR_MUL
+    b.eq .Lcgi_fmul
+    cmp x22, #IR_SDIV
+    b.eq .Lcgi_fdiv
+    cmp x22, #IR_CMP_EQ
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_NE
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SLT
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SLE
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SGT
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SGE
+    b.eq .Lcgi_fcmp
+    // Other fp-typed opcodes (const/load/store): ordinary path.
+
+.Lcgi_dispatch:
     // Dispatch on opcode
     cmp x22, #IR_NOP
     b.eq .Lcgi_done
@@ -975,6 +1042,10 @@ _kcc_codegen_instr:
     b.eq .Lcgi_sext
     cmp x22, #IR_ZEXT
     b.eq .Lcgi_zext
+    cmp x22, #IR_SITOFP
+    b.eq .Lcgi_sitofp
+    cmp x22, #IR_FPTOSI
+    b.eq .Lcgi_fptosi
 
     // Unknown opcode: skip
     b .Lcgi_done
@@ -1691,6 +1762,122 @@ without changing any bits---a no-op in the all-spill strategy.
     movk w0, #0xD340, lsl #16
     bl _kcc_code_emit32
     b .Lcgi_sext_store
+@}
+
+\subsection{Floating-Point Operations}
+
+The floating-point handlers mirror the integer ones but route their
+operands through the FP register file.  A double lives in the same
+eight-byte spill slot as any other value, so \texttt{\_kcc\_cg\_load\_vreg\_fp}
+reloads it into \texttt{d0}/\texttt{d1}, the two-source op computes into
+\texttt{d2}, and \texttt{\_kcc\_cg\_store\_vreg\_fp} spills it back.
+Comparisons reuse the integer comparison tail: after \textsc{fcmp}
+sets the flags, the very same inverted condition codes drive
+\textsc{cset}, because an \emph{ordered} floating comparison leaves
+\texttt{N}, \texttt{Z}, and \texttt{V} in exactly the arrangement the
+signed integer conditions already test.  The conversions bridge the two
+register files---\textsc{scvtf} reads an integer slot and writes a
+double slot, \textsc{fcvtzs} does the reverse with round-toward-zero,
+matching C's truncating cast.
+
+@d CodeGen: floating point @{
+// ---- Floating-point arithmetic: src1→d0, src2→d1, fOP→d2, store ----
+.Lcgi_fadd:
+    mov x23, #2                    // fp dp2 opcode: fadd
+    b .Lcgi_fp_arith
+.Lcgi_fsub:
+    mov x23, #3                    // fsub
+    b .Lcgi_fp_arith
+.Lcgi_fmul:
+    mov x23, #0                    // fmul
+    b .Lcgi_fp_arith
+.Lcgi_fdiv:
+    mov x23, #1                    // fdiv
+
+.Lcgi_fp_arith:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #1                     // d1
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #2                     // Rd = d2
+    mov x1, #0                     // Rn = d0
+    mov x2, #1                     // Rm = d1
+    mov x3, x23                    // opcode
+    bl _kcc_enc_fp_dp2
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #2                     // d2
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+
+// ---- Floating-point comparison: fcmp d0,d1 then cset x11,<inv_cond> ----
+.Lcgi_fcmp:
+    mov x23, #1                    // EQ  → inv NE (1)
+    cmp x22, #IR_CMP_EQ
+    b.eq .Lcgi_fcmp_do
+    mov x23, #0                    // NE  → inv EQ (0)
+    cmp x22, #IR_CMP_NE
+    b.eq .Lcgi_fcmp_do
+    mov x23, #10                   // SLT → inv GE (10)
+    cmp x22, #IR_CMP_SLT
+    b.eq .Lcgi_fcmp_do
+    mov x23, #12                   // SLE → inv GT (12)
+    cmp x22, #IR_CMP_SLE
+    b.eq .Lcgi_fcmp_do
+    mov x23, #13                   // SGT → inv LE (13)
+    cmp x22, #IR_CMP_SGT
+    b.eq .Lcgi_fcmp_do
+    mov x23, #11                   // SGE → inv LT (11)
+
+.Lcgi_fcmp_do:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0
+    bl _kcc_cg_load_vreg_fp
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #1
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #0                     // Rn = d0
+    mov x1, #1                     // Rm = d1
+    bl _kcc_enc_fcmp
+    bl _kcc_code_emit32
+    mov x0, #CG_REG_DST
+    mov x1, x23                    // inverted condition
+    mov x2, #1
+    bl _kcc_enc_cset
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg          // result is an integer 0/1
+    b .Lcgi_done
+
+// ---- Conversions between the integer and floating register files ----
+.Lcgi_sitofp:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1           // x9
+    bl _kcc_cg_load_vreg
+    mov x0, #0                     // Rd = d0
+    mov x1, #CG_REG_SRC1           // Rn = x9
+    bl _kcc_enc_scvtf
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+
+.Lcgi_fptosi:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #CG_REG_SRC1           // Rd = x9 (integer)
+    mov x1, #0                     // Rn = d0
+    bl _kcc_enc_fcvtzs
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
 @}
 
 \subsection{Memory Operations}

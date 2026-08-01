@@ -834,6 +834,8 @@ _kcc_sema_expr:
     b.eq .Lse_ident
     cmp x20, #AST_INT_LIT
     b.eq .Lse_int_lit
+    cmp x20, #AST_FLOAT_LIT
+    b.eq .Lse_int_lit             // typed by _kcc_sema_expr_literal (→ double)
     cmp x20, #AST_STR_LIT
     b.eq .Lse_str_lit
     cmp x20, #AST_CHAR_LIT
@@ -1065,6 +1067,8 @@ _kcc_sema_expr_literal:
     b.eq .Lsel_int
     cmp x20, #AST_CHAR_LIT
     b.eq .Lsel_int
+    cmp x20, #AST_FLOAT_LIT
+    b.eq .Lsel_double
     cmp x20, #AST_STR_LIT
     b.eq .Lsel_str
 
@@ -1072,6 +1076,14 @@ _kcc_sema_expr_literal:
 .Lsel_int:
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lsel_double:
+    // A floating constant has type double (float suffix not yet distinguished).
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
     ldr  x0, [x0]
     ldp x29, x30, [sp], #16
     ret

@@ -777,11 +777,17 @@ This stage makes \kcc{} fully AAPCS64-compliant.
       later refinement can adopt the exact AAPCS64 register-packing
       and \texttt{x8} rules for interoperation with \texttt{clang}
       object files.
-\item \textbf{Struct pass by value.}  A struct \emph{argument}
-      (as opposed to a return) is still passed as a single slot.
-      Small structs (${\le}16$~bytes) should be packed into
-      \texttt{x0}--\texttt{x1}; larger ones passed by pointer with an
-      implicit copy.
+\item[\checkmark] \textbf{Struct pass by value.}  Implemented
+      (\S\ref{sec:struct-args}) as the mirror image of struct return:
+      the caller passes the \emph{address} of the argument object in a
+      single register (via \texttt{\_kcc\_ir\_build\_struct\_addr}) and
+      the callee's \texttt{build\_param} copies the $N$ slots into its
+      own parameter storage, giving true by-value semantics.  Each
+      struct argument consumes one register, so this composes with the
+      hidden result pointer and with scalar arguments.  As with the
+      return path, this is the uniform all-spill convention rather than
+      AAPCS64's ${\le}16$-byte register packing; adopting the exact
+      register/stack rules is deferred to \texttt{clang}-interop work.
 \item \textbf{Variadic function definitions.}  The current
       compiler can \emph{call} variadic functions (\texttt{printf})
       but cannot \emph{define} them.  Implement

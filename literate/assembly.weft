@@ -384,6 +384,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: build conditional@>
 @<IR: build cast@>
 @<IR: struct copy helper@>
+@<IR: struct address helper@>
 @<IR: aggregate init helpers@>
 @<IR: static local helper@>
 @<IR: build var decl@>

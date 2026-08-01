@@ -1292,6 +1292,24 @@ codegen prologue copies \texttt{x0}--\texttt{x7} into vreg slots
 The alloca vreg is recorded in the \texttt{locals} hash table so
 that later identifier references find the right address.
 
+\paragraph{Passing a struct by value.}
+\label{sec:struct-args}
+A \texttt{struct} does not fit a single register, so it is passed the
+same way it is returned (\S\ref{sec:struct-return}): the caller places
+the \emph{address} of the object in the argument register---
+\texttt{build\_call} uses \texttt{\_kcc\_ir\_build\_struct\_addr}
+instead of loading a value---and the callee makes its own copy.  Here
+in \texttt{build\_param}, a struct parameter therefore allocates its
+full $N$-slot storage and, rather than storing the 8-byte register,
+copies $N$ slots from the incoming pointer into that storage with
+\texttt{\_kcc\_ir\_emit\_struct\_copy}.  The copy is what gives C's
+by-value semantics: mutations to the parameter touch the callee's
+copy, never the caller's object.  Because each struct argument still
+consumes exactly one register (a pointer), this composes cleanly with
+the hidden result pointer of struct return and with ordinary scalar
+arguments.  Passing more than eight registers' worth of arguments on
+the stack remains a separate, still-open ABI item.
+
 @d IR: build param @{
 // -- kcc_ir_build_param ---------------------------------------------------
 // void kcc_ir_build_param(node *param_decl, uint64_t param_index)
@@ -1325,10 +1343,26 @@ _kcc_ir_build_param:
     ldr x21, [x19, #AST_F1]     // x21 = name ptr
     cbz x21, .Libp_done
 
+    // Slot count: a struct parameter occupies N eight-byte slots and is
+    // received as a pointer to the caller's object; a scalar occupies one.
+    ldr x0, [x20, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.ne .Libp_scalar_slots
+    mov x0, x20
+    bl _kcc_ir_type_slots       // x0 = N
+    str x0, [sp, #56]
+    b .Libp_alloca
+.Libp_scalar_slots:
+    mov x0, #1
+    str x0, [sp, #56]
+
+.Libp_alloca:
     // Emit alloca for param storage
     mov x0, #IR_ALLOCA
     bl _kcc_ir_alloc_instr
     str x20, [x0, #IR_TYPE]
+    ldr x1, [sp, #56]
+    str x1, [x0, #IR_SRC1]      // slot count (N for struct, 1 for scalar)
     mov x19, x0                  // save instr
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
@@ -1336,7 +1370,12 @@ _kcc_ir_build_param:
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Emit store: store incoming param value into alloca'd storage
+    // Initialise parameter storage from the incoming register.
+    ldr x0, [x20, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Libp_struct_copy
+
+    // Scalar: store the incoming value into the alloca.
     // IR_STORE: SRC1 = value vreg (param index), SRC2 = pointer vreg (alloca)
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
@@ -1344,7 +1383,17 @@ _kcc_ir_build_param:
     str x23, [x0, #IR_SRC2]     // ptr = alloca vreg
     str x20, [x0, #IR_TYPE]
     bl _kcc_ir_emit
+    b .Libp_record
 
+.Libp_struct_copy:
+    // The incoming register holds a pointer to the caller's struct;
+    // copy its N slots into this parameter's own storage (pass by value).
+    mov x0, x22                  // src base = incoming pointer vreg
+    mov x1, x23                  // dst base = local param storage
+    ldr x2, [sp, #56]           // N slots
+    bl _kcc_ir_emit_struct_copy
+
+.Libp_record:
     // Record in locals: name → alloca vreg
     adrp x0, _kcc_ir_locals@@PAGE
     add  x0, x0, _kcc_ir_locals@@PAGEOFF
@@ -1786,46 +1835,8 @@ _kcc_ir_build_return:
     b .Libret_terminate
 
 .Libret_struct:
-    // x0 = return expression node. Resolve its address (source base vreg).
-    ldr x1, [x0, #AST_TAG]
-    cmp x1, #AST_IDENT_EXPR
-    b.eq .Libret_s_ident
-    cmp x1, #AST_CALL_EXPR
-    b.eq .Libret_s_call
-    cmp x1, #AST_MEMBER
-    b.eq .Libret_s_member
-    cmp x1, #AST_SUBSCRIPT
-    b.eq .Libret_s_subscript
-    bl _kcc_ir_build_expr        // fallback: expression is already an address
-    b .Libret_s_have_src
-
-.Libret_s_ident:
-    ldr x20, [x0, #AST_F0]       // name ptr
-    mov x0, x20
-    bl _kcc_strlen
-    mov x2, x0
-    adrp x0, _kcc_ir_locals@@PAGE
-    add  x0, x0, _kcc_ir_locals@@PAGEOFF
-    ldr x0, [x0]
-    mov x1, x20
-    bl _kcc_ht_get
-    cbz x0, .Libret_s_have_src   // (not a local: leave x0 as 0)
-    bic x0, x0, #0x8000000000000000
-    sub x0, x0, #1               // alloca vreg = struct base address
-    b .Libret_s_have_src
-
-.Libret_s_call:
-    bl _kcc_ir_build_call        // returns result buffer address vreg
-    b .Libret_s_have_src
-
-.Libret_s_member:
-    bl _kcc_ir_build_member_addr
-    b .Libret_s_have_src
-
-.Libret_s_subscript:
-    bl _kcc_ir_build_subscript_addr
-
-.Libret_s_have_src:
+    // x0 = return expression node; resolve its struct address.
+    bl _kcc_ir_build_struct_addr
     mov x20, x0                  // x20 = source base vreg
     // Destination = hidden result pointer at vreg IRF_PARAMS-1.
     adrp x0, _kcc_ir_cur_func@@PAGE
@@ -5243,8 +5254,21 @@ _kcc_ir_build_call:
 .Libc_eval_args:
     cmp x21, x22
     b.ge .Libc_eval_done
+    // A struct argument is passed by value as the address of the object;
+    // the callee copies it into its own parameter storage. Scalars pass
+    // their value.
+    ldr x0, [x24, #AST_F3]        // argument's resolved type
+    cbz x0, .Libc_eval_scalar
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.ne .Libc_eval_scalar
+    mov x0, x24
+    bl _kcc_ir_build_struct_addr  // vreg holding the struct's address
+    b .Libc_eval_store
+.Libc_eval_scalar:
     mov x0, x24
     bl _kcc_ir_build_expr          // returns vreg in x0
+.Libc_eval_store:
     add x1, x21, #1               // offset = (index+1)
     str x0, [x23, x1, lsl #3]     // args[index+1] = vreg
     ldr x24, [x24, #AST_F4]       // next arg
@@ -5870,6 +5894,113 @@ _kcc_ir_emit_struct_copy:
     ldp x29, x30, [sp], #80
     ret
 @| _kcc_ir_emit_struct_copy
+@}
+
+\paragraph{The address of a struct value.}
+Both struct return (\S\ref{sec:struct-return}) and struct
+pass-by-value (\S\ref{sec:struct-args}) need the \emph{address} of a
+struct-valued expression rather than a loaded scalar, because an
+aggregate never fits a single register.
+\texttt{\_kcc\_ir\_build\_struct\_addr} centralises that resolution:
+an identifier yields its alloca vreg (or a \texttt{global\_ref} for a
+file-scope struct), a call yields the address of its own result buffer
+(the struct-return path already returns exactly that), and
+\texttt{.f}/\texttt{[i]} lvalues reuse the member and subscript address
+builders.  A parenthesised expression is unwrapped and re-dispatched.
+Anything else falls back to \texttt{build\_expr}, which for a pointer
+operand already produces an address.
+
+@d IR: struct address helper @{
+// -- kcc_ir_build_struct_addr ---------------------------------------------
+// uint64_t kcc_ir_build_struct_addr(node *expr)
+//   x0 = expression node of struct type
+//   returns x0 = vreg holding the struct's base address (0 if unknown)
+.text
+.globl _kcc_ir_build_struct_addr
+.p2align 2
+_kcc_ir_build_struct_addr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0
+    cbz x19, .Libsad_zero
+    ldr x1, [x19, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Libsad_dispatch
+    ldr x19, [x19, #AST_F0]      // unwrap parentheses
+    cbz x19, .Libsad_zero
+    ldr x1, [x19, #AST_TAG]
+
+.Libsad_dispatch:
+    cmp x1, #AST_IDENT_EXPR
+    b.eq .Libsad_ident
+    cmp x1, #AST_CALL_EXPR
+    b.eq .Libsad_call
+    cmp x1, #AST_MEMBER
+    b.eq .Libsad_member
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Libsad_subscript
+    mov x0, x19
+    bl _kcc_ir_build_expr        // fallback: operand already yields an address
+    b .Libsad_done
+
+.Libsad_ident:
+    ldr x20, [x19, #AST_F0]      // name ptr
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    bl _kcc_ht_get
+    cbz x0, .Libsad_global
+    bic x0, x0, #0x8000000000000000
+    sub x0, x0, #1               // local: alloca vreg is the struct base
+    b .Libsad_done
+
+.Libsad_global:
+    // File-scope struct: its address is a global reference.
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]      // symbol name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0
+    mov x0, x19
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libsad_done
+
+.Libsad_call:
+    mov x0, x19
+    bl _kcc_ir_build_call        // struct-returning call → result buffer address
+    b .Libsad_done
+
+.Libsad_member:
+    mov x0, x19
+    bl _kcc_ir_build_member_addr
+    b .Libsad_done
+
+.Libsad_subscript:
+    mov x0, x19
+    bl _kcc_ir_build_subscript_addr
+    b .Libsad_done
+
+.Libsad_zero:
+    mov x0, #0
+
+.Libsad_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_build_struct_addr
 @}
 
 \paragraph{Aggregate initializer lists.}

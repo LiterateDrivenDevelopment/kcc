@@ -267,6 +267,20 @@ difftest "sret-passthrough" \
     "struct P { int x; int y; }; struct P mk(int a){ struct P p; p.x = a; p.y = a + 1; return p; } struct P wrap(int a){ return mk(a); } int main(void){ struct P q = wrap(20); return q.x + q.y; }"
 difftest "sret-five-args" \
     "struct P { int x; int y; }; struct P make(int a, int b, int c, int d, int e){ struct P p; p.x = a + b + c; p.y = d + e; return p; } int main(void){ struct P q = make(1, 2, 3, 4, 5); return q.x + q.y; }"
+difftest "sarg-basic" \
+    "struct P { int x; int y; }; int sum(struct P p){ return p.x + p.y; } int main(void){ struct P q; q.x = 3; q.y = 4; return sum(q); }"
+difftest "sarg-value-isolation" \
+    "struct P { int x; int y; }; int f(struct P p){ p.x = 99; return p.x + p.y; } int main(void){ struct P q; q.x = 3; q.y = 4; int r = f(q); return r + q.x; }"
+difftest "sarg-three-fields" \
+    "struct P { int a; int b; int c; }; int sum(struct P p){ return p.a + p.b + p.c; } int main(void){ struct P q; q.a = 1; q.b = 2; q.c = 3; return sum(q); }"
+difftest "sarg-two-structs" \
+    "struct P { int x; int y; }; int add(struct P a, struct P b){ return a.x + a.y + b.x + b.y; } int main(void){ struct P p; p.x = 1; p.y = 2; struct P q; q.x = 3; q.y = 4; return add(p, q); }"
+difftest "sarg-mixed" \
+    "struct P { int x; int y; }; int f(int a, struct P p, int b){ return a + p.x + p.y + b; } int main(void){ struct P q; q.x = 5; q.y = 6; return f(10, q, 20); }"
+difftest "sarg-pass-and-return" \
+    "struct P { int x; int y; }; struct P dbl(struct P p){ struct P r; r.x = p.x * 2; r.y = p.y * 2; return r; } int main(void){ struct P q; q.x = 3; q.y = 4; struct P d = dbl(q); return d.x + d.y; }"
+difftest "sarg-temp" \
+    "struct P { int x; int y; }; struct P mk(int a){ struct P p; p.x = a; p.y = a + 1; return p; } int use(struct P p){ return p.x + p.y; } int main(void){ return use(mk(10)); }"
 @}
 
 \section{Operators and Edge Cases}

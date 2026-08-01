@@ -5908,13 +5908,10 @@ _kcc_ir_build_call:
     bl _kcc_arena_alloc
     mov x23, x0                    // x23 = args array
 
-    // Apple variadic ABI: the caller must place the variadic tail at [sp,#0].
-    // A variadic prototype records its fixed-parameter count in the callee
-    // func type's TY_QUALS slot; pack that first-stack index into the high
-    // half of args[0].  The default of 1 preserves the legacy layout for
-    // unprototyped (implicitly declared) callees.
+    // first_stack_idx: a variadic prototype's fixed-param count (in the callee
+    // func type's TY_QUALS), else 1.  Packed into the high half of args[0].
     ldr x1, [sp, #72]            // callee expr node
-    mov x2, #1                   // first_stack_idx default
+    mov x2, #1
     cbz x1, .Libc_fsi_done
     ldr x1, [x1, #AST_F3]        // callee resolved type
     cbz x1, .Libc_fsi_done
@@ -5927,12 +5924,12 @@ _kcc_ir_build_call:
 .Libc_fsi_chk:
     cmp x3, #TY_FUNC
     b.ne .Libc_fsi_done
-    ldr x3, [x1, #TY_QUALS]      // fixed-param count if variadic, else 0
+    ldr x3, [x1, #TY_QUALS]      // nfixed if variadic, else 0
     cbz x3, .Libc_fsi_done
-    mov x2, x3                   // first_stack_idx = nfixed
+    mov x2, x3
 .Libc_fsi_done:
-    ldr x0, [sp, #104]           // total count (low half)
-    orr x0, x0, x2, lsl #32      // pack first_stack_idx into the high half
+    ldr x0, [sp, #104]           // total count
+    orr x0, x0, x2, lsl #32
     str x0, [x23]                // args[0] = count | (first_stack_idx << 32)
 
     // Evaluate each argument expression: store its vreg and AAPCS64 class.
@@ -6079,17 +6076,22 @@ _kcc_ir_build_call:
 A function \emph{defined} with a trailing \texttt{...} reads its unnamed
 arguments through the \texttt{<stdarg.h>} interface---\texttt{va\_list},
 \texttt{va\_start}, \texttt{va\_arg}, \texttt{va\_end}.  \kcc{} provides
-these as built-ins rather than a header.  The call lowering already pushes
-\emph{every} argument onto the stack (the Apple variadic ABI push), so a
-variadic callee needs only a cursor into that stack area.  Accordingly
+these as built-ins rather than a header.  The call lowering pushes the
+variadic tail onto the stack (the Apple variadic ABI push), so a variadic
+callee needs only a cursor into that stack area.  Accordingly
 \texttt{va\_list} is an opaque eight-byte pointer (resolved by sema);
 \texttt{va\_start(ap, last)} points the cursor at the first variadic
 argument; \texttt{va\_arg(ap, T)} reads the eight-byte slot at the cursor
 and advances it; and \texttt{va\_end} is a no-op.
 
-The call lowering places the variadic tail at \texttt{[sp,\,\#0]} of the
-pushed argument area (\texttt{kcc\_cg\_marshal\_args} indexes the stack image
-from the fixed-parameter count), so in the callee the first variadic argument
+Both sides depend on the prototype's fixed-parameter count.  Sema records it
+when it checks a function declaration, storing the count in the otherwise
+unused \texttt{TY\_QUALS} slot of the \texttt{TY\_FUNC} descriptor (zero there
+means non-variadic); \texttt{kcc\_ir\_build\_call} reads it back from the
+callee's type to choose the stack layout, and the caller places the variadic
+tail at \texttt{[sp,\,\#0]} of the pushed argument area
+(\texttt{kcc\_cg\_marshal\_args} indexes the stack image from that count), so
+in the callee the first variadic argument
 lives at \texttt{[x29 + frame\_size]}---independent of how many fixed
 parameters preceded it, and with \texttt{frame\_size} known only in the
 backend.  \texttt{va\_start} therefore lowers to a dedicated

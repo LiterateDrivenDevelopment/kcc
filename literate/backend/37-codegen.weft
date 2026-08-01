@@ -972,13 +972,7 @@ correct bits for floating arguments even though those now travel in
 @d CodeGen: marshal args @{
 // -- kcc_cg_marshal_args ------------------------------------------------------
 // uint64_t kcc_cg_marshal_args(uint64_t *args, uint64_t count, uint64_t fsi)
-//   args = [count, vreg0, class0, vreg1, class1, ...].  Emits the register
-//   placement and the stack image, then returns the stack_adj it subtracted
-//   from sp (0 if none) so the caller can add it back after the call.
-//   fsi = first_stack_idx: the argument index at which the stack image begins.
-//   For a variadic callee this is the number of fixed parameters, so the
-//   variadic tail lands at [sp,#0] where an Apple callee reads it; for an
-//   ordinary call it is 1 (the legacy layout) or 8 for >8-arg overflow.
+//   args = [count, vreg0, class0, ...]; returns the stack_adj subtracted from sp.
 .text
 .globl _kcc_cg_marshal_args
 .p2align 2
@@ -991,9 +985,9 @@ _kcc_cg_marshal_args:
     stp x25, x26, [sp, #64]
     mov x19, x0                  // args array
     mov x20, x1                  // arg count
-    mov x25, x2                  // first_stack_idx (>=1)
+    mov x25, x2                  // first_stack_idx
     cbnz x25, .Lma_fsi_ok
-    mov x25, #1                  // defensive: never index from 0
+    mov x25, #1
 .Lma_fsi_ok:
     mov x24, #0                  // stack_adj (return value)
     cbz x20, .Lma_done
@@ -1075,17 +1069,13 @@ _kcc_cg_marshal_args:
     b .Lma_reg_loop
 
 .Lma_stack:
-    // ---- stack image (Apple variadic tail + >8 overflow) ----
-    // Arguments args[fsi..count-1] are written at [sp,#(k-fsi)*8], so the
-    // first stack argument lands at [sp,#0] regardless of how many fixed
-    // parameters preceded it.
+    // ---- stack image: args[fsi..count-1] at [sp,#(k-fsi)*8] ----
     cmp x20, x25
     b.le .Lma_done
     sub x0, x20, x25
     lsl x0, x0, #3
     add x0, x0, #15
     bic x24, x0, #15            // stack_adj = align16((count-fsi)*8)
-    // SUB sp, sp, #stack_adj
     mov x0, #31
     mov x1, #31
     mov x2, x24
@@ -2411,15 +2401,10 @@ addressed correctly.
     b .Lcgi_done
 
 .Lcgi_va_start:
-    // va_start: DEST = x29 + frame_size.  The caller lays out the variadic
-    // tail starting at [sp,#0] of its pushed area (kcc_cg_marshal_args indexes
-    // from the fixed-parameter count), so the first variadic argument sits at
-    // exactly x29 + frame_size in the callee, independent of how many fixed
-    // parameters preceded it.  SRC2 still records F but no longer shifts the
-    // offset.
+    // va_start: DEST = x29 + frame_size (the variadic tail; see prose).
     adrp x1, _kcc_cg_frame_size@@PAGE
     add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
-    ldr x25, [x1]                 // x25 = frame_size (byte offset)
+    ldr x25, [x1]                 // x25 = frame_size
 
     // MOVZ x11, #(offset & 0xffff)
     mov x0, #CG_REG_DST
@@ -2745,16 +2730,16 @@ described in \S\ref{sec:emit-strings}.
     ldr x26, [x19, #IR_SRC2]      // args array (or 0 if no args)
 
     mov x22, #0
-    mov x2, #1                    // first_stack_idx default (legacy layout)
+    mov x2, #1                    // first_stack_idx default
     cbz x26, .Lcgi_call_load
-    ldr x22, [x26]                // packed: count | (first_stack_idx << 32)
-    lsr x2, x22, #32            // first_stack_idx (>=1 by construction)
-    and x22, x22, #0xffffffff    // arg count (low half)
+    ldr x22, [x26]                // count | (first_stack_idx << 32)
+    lsr x2, x22, #32            // first_stack_idx
+    and x22, x22, #0xffffffff    // count
 .Lcgi_call_load:
     mov x0, x26
     mov x1, x22
-    bl _kcc_cg_marshal_args        // x2 = fsi → x0 = stack_adj (0 if none)
-    str x0, [sp, #88]             // stack_adj (restore sp after the call)
+    bl _kcc_cg_marshal_args        // x0 = stack_adj
+    str x0, [sp, #88]
 
     // Build Mach-O name with underscore prefix: "_" + name
     mov x0, x23
@@ -2855,15 +2840,15 @@ described in \S\ref{sec:emit-strings}.
     ldr x26, [x19, #IR_SRC2]
 
     mov x22, #0
-    mov x2, #1                    // first_stack_idx default (legacy layout)
+    mov x2, #1                    // first_stack_idx default
     cbz x26, .Lcgi_cind_load
-    ldr x22, [x26]                // packed: count | (first_stack_idx << 32)
+    ldr x22, [x26]                // count | (first_stack_idx << 32)
     lsr x2, x22, #32            // first_stack_idx
-    and x22, x22, #0xffffffff    // arg count (low half)
+    and x22, x22, #0xffffffff    // count
 .Lcgi_cind_load:
     mov x0, x26
     mov x1, x22
-    bl _kcc_cg_marshal_args        // x2 = fsi → x0 = stack_adj
+    bl _kcc_cg_marshal_args        // x0 = stack_adj
     str x0, [sp, #88]
 
     // Load fn-ptr vreg into x9 (x29-relative, unaffected by the stack image)

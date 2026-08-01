@@ -1505,14 +1505,13 @@ _kcc_pp_do_include:
     // Skip rest of directive line
     bl _kcc_pp_skip_line
 
-    // A recognised standard header is served from a built-in text instead of
-    // a file, so `#include <stdio.h>` and friends supply real prototypes.
+    // Built-in standard header?  Lex its resident text instead of a file.
     mov  x0, x21
     bl _kcc_pp_builtin_header
     cbz  x0, .Lincl_resolve
-    mov  x22, x0                 // built-in header text
-    bl _kcc_strlen               // x0 = its length (x22 preserved)
-    mov  x23, x0
+    mov  x22, x0                 // header text
+    bl _kcc_strlen
+    mov  x23, x0                 // length
 
     mov  x0, #PP_CTX_INCLUDE
     bl _kcc_pp_ctx_push
@@ -1525,7 +1524,7 @@ _kcc_pp_do_include:
     str  x23, [x0]
     adrp x0, _kcc_src_path@@PAGE
     add  x0, x0, _kcc_src_path@@PAGEOFF
-    str  x21, [x0]               // path = the header name (for diagnostics)
+    str  x21, [x0]               // path = header name
 
     mov  x0, x22
     mov  x1, x23

@@ -359,14 +359,11 @@ _kcc_sema_check_decl:
     bl _kcc_type_func
     mov x21, x0                     // TY_FUNC descriptor
 
-    // Record the fixed-parameter count for a variadic prototype in the func
-    // type's QUALS slot (unused for functions).  A non-zero value both marks
-    // the type variadic and tells the call site where the Apple variadic stack
-    // image begins.  The params pointer carries the variadic flag in bit 0.
+    // Variadic prototype: record the fixed-param count in TY_QUALS (see prose).
     ldr x2, [x19, #AST_F2]         // params pointer (bit 0 = variadic)
     tst x2, #1
-    b.eq .Lscd_func_declared       // not variadic → QUALS stays 0
-    bic x2, x2, #1                 // real params pointer
+    b.eq .Lscd_func_declared
+    bic x2, x2, #1
     mov x3, #0                     // nfixed
 .Lscd_func_nfixed:
     cbz x2, .Lscd_func_setq
@@ -374,7 +371,7 @@ _kcc_sema_check_decl:
     ldr x2, [x2, #AST_F4]
     b .Lscd_func_nfixed
 .Lscd_func_setq:
-    str x3, [x21, #TY_QUALS]       // nfixed (>=1) marks variadic
+    str x3, [x21, #TY_QUALS]
 .Lscd_func_declared:
 
     // Register function in symbol table

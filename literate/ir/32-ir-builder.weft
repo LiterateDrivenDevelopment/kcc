@@ -1196,8 +1196,9 @@ _kcc_ir_build_func:
     mov x0, x24
     bl _kcc_ir_set_bb
 
-    // Count parameters and set IRF_PARAMS
-    ldr x25, [x19, #AST_F2]     // x25 = first param decl
+    // Count parameters and set IRF_PARAMS (mask the variadic tag in bit 0)
+    ldr x25, [x19, #AST_F2]     // x25 = first param decl (bit 0 = variadic)
+    bic x25, x25, #1
     mov x20, #0                   // param count
 .Libf_count_params:
     cbz x25, .Libf_count_done
@@ -1261,7 +1262,8 @@ _kcc_ir_build_func:
 
     // Build alloca + store for each parameter, passing its vreg BASE (which
     // accounts for two-vreg ST2 parameters), not its ordinal index.
-    ldr x25, [x19, #AST_F2]     // first param decl
+    ldr x25, [x19, #AST_F2]     // first param decl (bit 0 = variadic)
+    bic x25, x25, #1
     mov x20, #0                   // param index
     mov x24, #0                   // vreg base (cumulative)
 
@@ -2507,7 +2509,8 @@ _kcc_ir_fill_param_classes:
     add x21, x21, #1
     b .Lfpc_zero
 .Lfpc_walk:
-    ldr x24, [x23, #AST_F2]      // first param decl
+    ldr x24, [x23, #AST_F2]      // first param decl (bit 0 = variadic)
+    bic x24, x24, #1
     mov x21, #0                  // named-param index
 .Lfpc_loop:
     cbz x24, .Lfpc_sret
@@ -5904,8 +5907,33 @@ _kcc_ir_build_call:
     lsl x0, x0, #3               // in bytes
     bl _kcc_arena_alloc
     mov x23, x0                    // x23 = args array
-    ldr x0, [sp, #104]
-    str x0, [x23]                 // args[0] = total count
+
+    // Apple variadic ABI: the caller must place the variadic tail at [sp,#0].
+    // A variadic prototype records its fixed-parameter count in the callee
+    // func type's TY_QUALS slot; pack that first-stack index into the high
+    // half of args[0].  The default of 1 preserves the legacy layout for
+    // unprototyped (implicitly declared) callees.
+    ldr x1, [sp, #72]            // callee expr node
+    mov x2, #1                   // first_stack_idx default
+    cbz x1, .Libc_fsi_done
+    ldr x1, [x1, #AST_F3]        // callee resolved type
+    cbz x1, .Libc_fsi_done
+    ldr x3, [x1, #TY_KIND]
+    cmp x3, #TY_PTR
+    b.ne .Libc_fsi_chk
+    ldr x1, [x1, #TY_F0]         // pointer-to-function → the function type
+    cbz x1, .Libc_fsi_done
+    ldr x3, [x1, #TY_KIND]
+.Libc_fsi_chk:
+    cmp x3, #TY_FUNC
+    b.ne .Libc_fsi_done
+    ldr x3, [x1, #TY_QUALS]      // fixed-param count if variadic, else 0
+    cbz x3, .Libc_fsi_done
+    mov x2, x3                   // first_stack_idx = nfixed
+.Libc_fsi_done:
+    ldr x0, [sp, #104]           // total count (low half)
+    orr x0, x0, x2, lsl #32      // pack first_stack_idx into the high half
+    str x0, [x23]                // args[0] = count | (first_stack_idx << 32)
 
     // Evaluate each argument expression: store its vreg and AAPCS64 class.
     mov x24, x21                   // x24 = current arg node
@@ -6059,12 +6087,16 @@ variadic callee needs only a cursor into that stack area.  Accordingly
 argument; \texttt{va\_arg(ap, T)} reads the eight-byte slot at the cursor
 and advances it; and \texttt{va\_end} is a no-op.
 
-Because the first variadic argument lives at
-\texttt{[x29 + frame\_size + (F-1)\,{\times}\,8]}---where $F$ is the number
-of fixed parameters and \texttt{frame\_size} is known only in the backend---%
-\texttt{va\_start} lowers to a dedicated \texttt{IR\_VA\_START} instruction
-that carries $F$ in \texttt{SRC2}; the code generator materialises the
-address and \texttt{va\_start} stores it into \texttt{ap}.  \texttt{va\_arg}
+The call lowering places the variadic tail at \texttt{[sp,\,\#0]} of the
+pushed argument area (\texttt{kcc\_cg\_marshal\_args} indexes the stack image
+from the fixed-parameter count), so in the callee the first variadic argument
+lives at \texttt{[x29 + frame\_size]}---independent of how many fixed
+parameters preceded it, and with \texttt{frame\_size} known only in the
+backend.  \texttt{va\_start} therefore lowers to a dedicated
+\texttt{IR\_VA\_START} instruction; the code generator materialises that
+address and \texttt{va\_start} stores it into \texttt{ap}.  (The instruction
+still records the fixed count $F$ in \texttt{SRC2} for diagnostics, though the
+offset no longer depends on it.)  \texttt{va\_arg}
 needs no new opcode: it loads the cursor, dereferences it, adds eight, and
 writes the cursor back, all with ordinary IR.  Both builtins locate
 \texttt{ap} through \texttt{\_kcc\_ir\_ident\_alloca}, which resolves a

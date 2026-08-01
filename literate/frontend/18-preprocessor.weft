@@ -1505,6 +1505,42 @@ _kcc_pp_do_include:
     // Skip rest of directive line
     bl _kcc_pp_skip_line
 
+    // A recognised standard header is served from a built-in text instead of
+    // a file, so `#include <stdio.h>` and friends supply real prototypes.
+    mov  x0, x21
+    bl _kcc_pp_builtin_header
+    cbz  x0, .Lincl_resolve
+    mov  x22, x0                 // built-in header text
+    bl _kcc_strlen               // x0 = its length (x22 preserved)
+    mov  x23, x0
+
+    mov  x0, #PP_CTX_INCLUDE
+    bl _kcc_pp_ctx_push
+
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    str  x22, [x0]
+    adrp x0, _kcc_src_size@@PAGE
+    add  x0, x0, _kcc_src_size@@PAGEOFF
+    str  x23, [x0]
+    adrp x0, _kcc_src_path@@PAGE
+    add  x0, x0, _kcc_src_path@@PAGEOFF
+    str  x21, [x0]               // path = the header name (for diagnostics)
+
+    mov  x0, x22
+    mov  x1, x23
+    bl _kcc_lex_init
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  xzr, [x0]
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lincl_resolve:
     // Resolve against the including file's directory, then the name as given
     mov  x0, x21
     bl _kcc_pp_resolve_include
@@ -1574,6 +1610,119 @@ _kcc_pp_do_include:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@}
+
+\subsection{Built-in standard headers}
+\label{sec:builtin-headers}
+
+A freestanding compiler that simply skips \verb|#include <stdio.h>| forces
+every program to hand-declare \texttt{printf}, \texttt{malloc}, and friends.
+That is tolerable for the compiler's own bootstrap sources but hostile to
+ordinary C.  Rather than ship header \emph{files} and a search path, kcc
+embeds a small set of standard headers directly in the compiler: when the
+include machinery is asked for a recognised name it hands back a
+compiler-resident C snippet and lexes it in place of a file (the hook in
+\texttt{.Lincl\_open} above).  The snippets carry real prototypes, so the
+front end learns each function's arity and argument classes---enough to
+marshal a call correctly---and the linker resolves the symbols against
+\texttt{libSystem}.
+
+The prototypes are deliberately spare: parameters are named (kcc's declarator
+parser wants a name), qualifiers are dropped (they do not affect the calling
+convention), and \texttt{size\_t}-shaped arguments are written as
+\texttt{unsigned long} so no cross-header \texttt{typedef} collides.  Each
+header carries an \verb|#ifndef| guard so double inclusion is a no-op.  The
+lookup is a linear scan of a name/text table---ten entries, so nothing
+fancier is warranted.
+
+One deliberate omission: \texttt{stdin}, \texttt{stdout}, and \texttt{stderr}
+are absent from \texttt{stdio.h}.  They are not functions but \emph{data}
+objects imported from \texttt{libSystem} (\verb|__stdinp| and friends), and a
+dylib-imported datum must be reached through the GOT rather than a direct
+\verb|adrp|/\verb|add| pair---which is what kcc's back end currently emits for
+any global reference.  Function symbols are unaffected: they route through
+the lazy-binding stubs, so \texttt{printf}, \texttt{fopen}, and even
+\texttt{fprintf} to a \texttt{FILE*} returned by \texttt{fopen} all link
+cleanly.  GOT-indirect addressing for imported data is a back-end task left
+for later; until then a program wanting the standard streams must obtain a
+\texttt{FILE*} some other way.
+
+@d Preprocessor: builtin headers @{
+// char *_kcc_pp_builtin_header(const char *name)
+//   x0 = include name → compiler-resident header text, or 0 if unknown.
+.p2align 2
+_kcc_pp_builtin_header:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // requested include name
+    adrp x20, _kcc_pp_builtin_table@@PAGE
+    add  x20, x20, _kcc_pp_builtin_table@@PAGEOFF
+.Lbh_loop:
+    ldr x0, [x20]                   // candidate name (0 terminates table)
+    cbz x0, .Lbh_none
+    mov x1, x19
+    bl _kcc_strcmp
+    cbz x0, .Lbh_found
+    add x20, x20, #16
+    b .Lbh_loop
+.Lbh_found:
+    ldr x0, [x20, #8]               // matching header text
+    b .Lbh_ret
+.Lbh_none:
+    mov x0, #0
+.Lbh_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.section __TEXT,__cstring
+_kcc_hdr_n_stdio:   .asciz "stdio.h"
+_kcc_hdr_n_stdlib:  .asciz "stdlib.h"
+_kcc_hdr_n_string:  .asciz "string.h"
+_kcc_hdr_n_stddef:  .asciz "stddef.h"
+_kcc_hdr_n_stdbool: .asciz "stdbool.h"
+_kcc_hdr_n_stdarg:  .asciz "stdarg.h"
+_kcc_hdr_n_stdint:  .asciz "stdint.h"
+_kcc_hdr_n_ctype:   .asciz "ctype.h"
+_kcc_hdr_n_math:    .asciz "math.h"
+_kcc_hdr_n_assert:  .asciz "assert.h"
+
+_kcc_hdr_stddef: .asciz "#ifndef _STDDEF_H\n#define _STDDEF_H\ntypedef unsigned long size_t;\ntypedef long ptrdiff_t;\n#define NULL ((void*)0)\n#endif\n"
+
+_kcc_hdr_stdbool: .asciz "#ifndef _STDBOOL_H\n#define _STDBOOL_H\n#define bool int\n#define true 1\n#define false 0\n#endif\n"
+
+_kcc_hdr_stdarg: .asciz "#ifndef _STDARG_H\n#define _STDARG_H\n#endif\n"
+
+_kcc_hdr_stdint: .asciz "#ifndef _STDINT_H\n#define _STDINT_H\ntypedef signed char int8_t;\ntypedef unsigned char uint8_t;\ntypedef short int16_t;\ntypedef unsigned short uint16_t;\ntypedef int int32_t;\ntypedef unsigned int uint32_t;\ntypedef long int64_t;\ntypedef unsigned long uint64_t;\ntypedef long intptr_t;\ntypedef unsigned long uintptr_t;\n#endif\n"
+
+_kcc_hdr_assert: .asciz "#ifndef _ASSERT_H\n#define _ASSERT_H\n#define assert(x) ((void)0)\n#endif\n"
+
+_kcc_hdr_ctype: .asciz "#ifndef _CTYPE_H\n#define _CTYPE_H\nint isalpha(int c);\nint isdigit(int c);\nint isalnum(int c);\nint isspace(int c);\nint isupper(int c);\nint islower(int c);\nint ispunct(int c);\nint toupper(int c);\nint tolower(int c);\n#endif\n"
+
+_kcc_hdr_math: .asciz "#ifndef _MATH_H\n#define _MATH_H\ndouble sqrt(double x);\ndouble pow(double x, double y);\ndouble sin(double x);\ndouble cos(double x);\ndouble tan(double x);\ndouble exp(double x);\ndouble log(double x);\ndouble fabs(double x);\ndouble floor(double x);\ndouble ceil(double x);\ndouble fmod(double x, double y);\n#endif\n"
+
+_kcc_hdr_string: .asciz "#ifndef _STRING_H\n#define _STRING_H\nunsigned long strlen(char *s);\nint strcmp(char *a, char *b);\nint strncmp(char *a, char *b, unsigned long n);\nchar *strcpy(char *d, char *s);\nchar *strncpy(char *d, char *s, unsigned long n);\nchar *strcat(char *d, char *s);\nchar *strncat(char *d, char *s, unsigned long n);\nchar *strchr(char *s, int c);\nchar *strrchr(char *s, int c);\nchar *strstr(char *h, char *n);\nvoid *memcpy(void *d, void *s, unsigned long n);\nvoid *memmove(void *d, void *s, unsigned long n);\nvoid *memset(void *d, int c, unsigned long n);\nint memcmp(void *a, void *b, unsigned long n);\n#endif\n"
+
+_kcc_hdr_stdlib: .asciz "#ifndef _STDLIB_H\n#define _STDLIB_H\nvoid *malloc(unsigned long size);\nvoid *calloc(unsigned long n, unsigned long size);\nvoid *realloc(void *ptr, unsigned long size);\nvoid free(void *ptr);\nvoid exit(int status);\nvoid abort(void);\nint atoi(char *s);\nlong atol(char *s);\nint abs(int x);\nlong labs(long x);\nint rand(void);\nvoid srand(unsigned int seed);\n#endif\n"
+
+_kcc_hdr_stdio: .asciz "#ifndef _STDIO_H\n#define _STDIO_H\ntypedef void FILE;\nint printf(char *fmt, ...);\nint fprintf(FILE *stream, char *fmt, ...);\nint sprintf(char *str, char *fmt, ...);\nint snprintf(char *str, unsigned long size, char *fmt, ...);\nint puts(char *s);\nint putchar(int c);\nint fputs(char *s, FILE *stream);\nint fputc(int c, FILE *stream);\nint getchar(void);\nint scanf(char *fmt, ...);\nint sscanf(char *str, char *fmt, ...);\nFILE *fopen(char *path, char *mode);\nint fclose(FILE *stream);\nunsigned long fread(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nunsigned long fwrite(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nint fflush(FILE *stream);\nint fgetc(FILE *stream);\nchar *fgets(char *s, int n, FILE *stream);\nint remove(char *path);\n#endif\n"
+
+.data
+.align 3
+_kcc_pp_builtin_table:
+    .quad _kcc_hdr_n_stdio,   _kcc_hdr_stdio
+    .quad _kcc_hdr_n_stdlib,  _kcc_hdr_stdlib
+    .quad _kcc_hdr_n_string,  _kcc_hdr_string
+    .quad _kcc_hdr_n_stddef,  _kcc_hdr_stddef
+    .quad _kcc_hdr_n_stdbool, _kcc_hdr_stdbool
+    .quad _kcc_hdr_n_stdarg,  _kcc_hdr_stdarg
+    .quad _kcc_hdr_n_stdint,  _kcc_hdr_stdint
+    .quad _kcc_hdr_n_ctype,   _kcc_hdr_ctype
+    .quad _kcc_hdr_n_math,    _kcc_hdr_math
+    .quad _kcc_hdr_n_assert,  _kcc_hdr_assert
+    .quad 0, 0
+.text
 @}
 
 \paragraph{End-to-end tests.}

@@ -958,31 +958,43 @@ next SIMD/floating register---and loads each argument into \texttt{x[ngrn]} or
 \texttt{d[nsrn]} accordingly; an integer, pointer, or (for now)
 by-reference/by-address aggregate takes one general register, a
 \texttt{double} takes one floating register.  After the register phase it also
-writes a full stack image---every argument at \texttt{[sp,\,\#(k-1)*8]}---so
-that a variadic Apple callee, which reads its arguments from the stack
-regardless of registers, still finds them; the caller restores \texttt{sp}
-with the returned \texttt{stack\_adj} once the call returns.  Because the
-stack image loads each value from its vreg slot (not from a register), it
-carries the correct bits for floating arguments even though those now travel
-in \texttt{d} registers.
+writes a stack image---the arguments from the first-stack index \texttt{fsi}
+onward, argument $k$ at \texttt{[sp,\,\#(k-fsi)*8]}---so that a variadic Apple
+callee, which reads its variadic tail from \texttt{[sp,\,\#0]} regardless of
+registers, finds it in place; the caller restores \texttt{sp} with the
+returned \texttt{stack\_adj} once the call returns.  \texttt{fsi} is the
+callee's fixed-parameter count for a variadic prototype and one otherwise
+(which also covers the $>$eight-argument overflow).  Because the stack image
+loads each value from its vreg slot (not from a register), it carries the
+correct bits for floating arguments even though those now travel in
+\texttt{d} registers.
 
 @d CodeGen: marshal args @{
 // -- kcc_cg_marshal_args ------------------------------------------------------
-// uint64_t kcc_cg_marshal_args(uint64_t *args, uint64_t count)
+// uint64_t kcc_cg_marshal_args(uint64_t *args, uint64_t count, uint64_t fsi)
 //   args = [count, vreg0, class0, vreg1, class1, ...].  Emits the register
-//   placement and the stack image.  Returns the stack_adj it subtracted from
-//   sp (0 if none), so the caller can add it back after the call.
+//   placement and the stack image, then returns the stack_adj it subtracted
+//   from sp (0 if none) so the caller can add it back after the call.
+//   fsi = first_stack_idx: the argument index at which the stack image begins.
+//   For a variadic callee this is the number of fixed parameters, so the
+//   variadic tail lands at [sp,#0] where an Apple callee reads it; for an
+//   ordinary call it is 1 (the legacy layout) or 8 for >8-arg overflow.
 .text
 .globl _kcc_cg_marshal_args
 .p2align 2
 _kcc_cg_marshal_args:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
     mov x19, x0                  // args array
     mov x20, x1                  // arg count
+    mov x25, x2                  // first_stack_idx (>=1)
+    cbnz x25, .Lma_fsi_ok
+    mov x25, #1                  // defensive: never index from 0
+.Lma_fsi_ok:
     mov x24, #0                  // stack_adj (return value)
     cbz x20, .Lma_done
 
@@ -1063,13 +1075,16 @@ _kcc_cg_marshal_args:
     b .Lma_reg_loop
 
 .Lma_stack:
-    // ---- stack image (Apple variadic + >8 overflow) ----
-    cmp x20, #2
-    b.lt .Lma_done
-    sub x0, x20, #1
+    // ---- stack image (Apple variadic tail + >8 overflow) ----
+    // Arguments args[fsi..count-1] are written at [sp,#(k-fsi)*8], so the
+    // first stack argument lands at [sp,#0] regardless of how many fixed
+    // parameters preceded it.
+    cmp x20, x25
+    b.le .Lma_done
+    sub x0, x20, x25
     lsl x0, x0, #3
     add x0, x0, #15
-    bic x24, x0, #15            // stack_adj = align16((count-1)*8)
+    bic x24, x0, #15            // stack_adj = align16((count-fsi)*8)
     // SUB sp, sp, #stack_adj
     mov x0, #31
     mov x1, #31
@@ -1077,7 +1092,7 @@ _kcc_cg_marshal_args:
     mov x3, #1
     bl _kcc_enc_sub_imm
     bl _kcc_code_emit32
-    mov x21, #1                  // k
+    mov x21, x25                 // k = fsi
 .Lma_stack_loop:
     cmp x21, x20
     b.ge .Lma_done
@@ -1088,7 +1103,7 @@ _kcc_cg_marshal_args:
     bl _kcc_cg_load_vreg
     mov x0, #9
     mov x1, #31
-    sub x2, x21, #1
+    sub x2, x21, x25            // slot = k - fsi
     mov x3, #1
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
@@ -1097,10 +1112,11 @@ _kcc_cg_marshal_args:
 
 .Lma_done:
     mov x0, x24                  // return stack_adj
+    ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
 @| _kcc_cg_marshal_args
 @}
@@ -1116,24 +1132,27 @@ attention.
 On Apple ARM64, variadic functions read their non-fixed arguments
 from the \emph{stack}, not from registers.  The standard AAPCS64
 passes arguments in \texttt{x0}--\texttt{x7}, but Apple diverges:
-the callee's \texttt{va\_list} walks the stack frame, ignoring
-registers beyond the declared parameters.  Because the compiler
-does not know at the call site whether the callee is variadic, we
-adopt a safe strategy: load the first eight arguments into
-\texttt{x0}--\texttt{x7} as usual \emph{and also} push
-\texttt{args[1..N{-}1]} onto the stack.  Non-variadic callees with at
-most eight parameters simply ignore the stack copies; variadic callees
-(like \texttt{printf}) find them where expected; and a callee with more
-than eight parameters reads its ninth-and-later parameters from exactly
-this same stack area (\S``Storing Register Arguments'').  Arguments past
-the eighth are not held in any register, so each is loaded from its vreg
-slot into scratch \texttt{x9} before being stored to the stack.  The
-emitted sequence is:
+the callee's \texttt{va\_list} walks the stack frame, and---crucially---%
+the variadic tail begins at \texttt{[sp,\,\#0]}, immediately past the
+fixed parameters, wherever those landed.  A correct caller must therefore
+know how many fixed parameters precede the ellipsis.  \kcc{} recovers this
+count from the prototype: sema records it in the callee function type
+(\S\ref{sec:variadic-defs}), and \texttt{kcc\_ir\_build\_call} threads it to
+the code generator as a \emph{first-stack-index} $F$ packed into the high
+half of the argument-array header.  The marshaller then loads the first eight
+arguments into \texttt{x0}--\texttt{x7} as usual \emph{and} writes the
+variadic tail---\texttt{args[F..N{-}1]}---to the stack starting at
+\texttt{[sp,\,\#0]}.  For an ordinary (non-variadic) call $F$ defaults to
+one, reproducing the legacy layout; the same stack image also feeds a callee
+with more than eight parameters, whose ninth-and-later arguments are read
+from this area (\S``Storing Register Arguments'').  Arguments in the tail are
+loaded from their vreg slots into scratch \texttt{x9} before being stored.
+The emitted sequence is:
 %
 \begin{enumerate}
 \item \texttt{SUB sp, sp, \#aligned\_size}
-\item \texttt{STR x\textit{k}, [sp, \#(\textit{k}{-}1)*8]}
-      for each $k \in [1, N{-}1]$
+\item \texttt{STR x\textit{k}, [sp, \#(\textit{k}{-}F)*8]}
+      for each $k \in [F, N{-}1]$
 \item \texttt{BL \_callee}
 \item \texttt{ADD sp, sp, \#aligned\_size}
 \end{enumerate}
@@ -2392,16 +2411,15 @@ addressed correctly.
     b .Lcgi_done
 
 .Lcgi_va_start:
-    // va_start: DEST = x29 + frame_size + (F-1)*8, where F = SRC2.  This is
-    // the address of the first stack argument beyond the fixed parameters
-    // (the caller pushed argument k at offset (k-1)*8 below its pre-call sp).
-    ldr x0, [x19, #IR_SRC2]        // F (fixed-param count)
-    sub x0, x0, #1
-    lsl x0, x0, #3                 // (F-1)*8
+    // va_start: DEST = x29 + frame_size.  The caller lays out the variadic
+    // tail starting at [sp,#0] of its pushed area (kcc_cg_marshal_args indexes
+    // from the fixed-parameter count), so the first variadic argument sits at
+    // exactly x29 + frame_size in the callee, independent of how many fixed
+    // parameters preceded it.  SRC2 still records F but no longer shifts the
+    // offset.
     adrp x1, _kcc_cg_frame_size@@PAGE
     add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
-    ldr x1, [x1]
-    add x25, x0, x1                // x25 = frame_size + (F-1)*8 (byte offset)
+    ldr x25, [x1]                 // x25 = frame_size (byte offset)
 
     // MOVZ x11, #(offset & 0xffff)
     mov x0, #CG_REG_DST
@@ -2727,12 +2745,15 @@ described in \S\ref{sec:emit-strings}.
     ldr x26, [x19, #IR_SRC2]      // args array (or 0 if no args)
 
     mov x22, #0
+    mov x2, #1                    // first_stack_idx default (legacy layout)
     cbz x26, .Lcgi_call_load
-    ldr x22, [x26]                // arg count
+    ldr x22, [x26]                // packed: count | (first_stack_idx << 32)
+    lsr x2, x22, #32            // first_stack_idx (>=1 by construction)
+    and x22, x22, #0xffffffff    // arg count (low half)
 .Lcgi_call_load:
     mov x0, x26
     mov x1, x22
-    bl _kcc_cg_marshal_args        // → x0 = stack_adj emitted (0 if none)
+    bl _kcc_cg_marshal_args        // x2 = fsi → x0 = stack_adj (0 if none)
     str x0, [sp, #88]             // stack_adj (restore sp after the call)
 
     // Build Mach-O name with underscore prefix: "_" + name
@@ -2834,12 +2855,15 @@ described in \S\ref{sec:emit-strings}.
     ldr x26, [x19, #IR_SRC2]
 
     mov x22, #0
+    mov x2, #1                    // first_stack_idx default (legacy layout)
     cbz x26, .Lcgi_cind_load
-    ldr x22, [x26]
+    ldr x22, [x26]                // packed: count | (first_stack_idx << 32)
+    lsr x2, x22, #32            // first_stack_idx
+    and x22, x22, #0xffffffff    // arg count (low half)
 .Lcgi_cind_load:
     mov x0, x26
     mov x1, x22
-    bl _kcc_cg_marshal_args        // registers + stack image; x0 = stack_adj
+    bl _kcc_cg_marshal_args        // x2 = fsi → x0 = stack_adj
     str x0, [sp, #88]
 
     // Load fn-ptr vreg into x9 (x29-relative, unaffected by the stack image)

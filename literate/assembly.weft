@@ -174,6 +174,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<PP: conditional@>
 @<PP: resolve include@>
 @<PP: include@>
+@<Preprocessor: builtin headers@>
 @<PP: error directive@>
 @<PP: directive dispatch@>
 @<PP: next token@>

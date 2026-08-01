@@ -972,12 +972,23 @@ A production compiler needs more than correct code generation.
       the linker's status.  The SDK root comes from \texttt{\$SDKROOT} or the
       standard locations.  \texttt{kcc hello.c -o hello} now produces a
       runnable executable---including one that calls \texttt{libSystem}'s
-      \texttt{printf}---in one step; five end-to-end driver tests
-      (\S\ref{sec:e2e-tests}, \texttt{just e2e}) exercise it.
-\item \textbf{System header compatibility.}  Handle
-      \texttt{\#include <stdio.h>} by providing a minimal
-      freestanding header set or by parsing Apple SDK headers
-      (requires attribute and extension tolerance).
+      \texttt{printf}---in one step; eight end-to-end driver tests
+      (\S\ref{sec:e2e-tests}, \texttt{just e2e}), three of them driving the
+      built-in headers (\S\ref{sec:builtin-headers}), exercise it.
+\item[\checkmark] \textbf{System header compatibility.}
+      \texttt{\#include <stdio.h>} (and \texttt{stdlib}, \texttt{string},
+      \texttt{math}, \texttt{ctype}, \texttt{stddef}, \texttt{stdbool},
+      \texttt{stdint}, \texttt{stdarg}, \texttt{assert}) are served from a
+      compiler-embedded freestanding header set rather than a file: the
+      include machinery hands back a resident C snippet of prototypes,
+      typedefs, and macros (\S\ref{sec:builtin-headers}) and \texttt{libSystem}
+      resolves the symbols.  This exposed---and forced the fix of---a
+      pre-existing variadic-ABI limitation: multi-fixed-argument variadic
+      calls (\texttt{fprintf}, \texttt{sprintf}, \texttt{snprintf}) now lay
+      out the Apple variadic stack from the prototype's fixed-parameter count
+      instead of assuming one.  The remaining gap is the standard streams
+      \texttt{stdin}/\texttt{stdout}/\texttt{stderr}, which are dylib-imported
+      \emph{data} and need GOT-indirect addressing (a back-end task).
 \item \textbf{Source-level profiling.}  Instrument function
       entry/exit for \texttt{-pg}-style profiling or basic
       timing output.
@@ -1045,7 +1056,7 @@ honest about the gap matters more than any single headline number.
 \paragraph{What is already solid (and verified).}
 The integer, pointer, and aggregate core of C is complete and, crucially,
 \emph{checked against an oracle}: the differential harness
-(\S\ref{sec:differential-testing}) compiles 154 programs with both
+(\S\ref{sec:differential-testing}) compiles 155 programs with both
 \kcc{} and \texttt{clang} and finds \emph{zero} miscompilations.  That
 core includes all control flow (\texttt{if}/\texttt{while}/\texttt{do}/%
 \texttt{for}/\texttt{switch}/\texttt{goto}), functions and recursion,

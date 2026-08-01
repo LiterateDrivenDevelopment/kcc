@@ -740,6 +740,14 @@ run_e2e "arithmetic"  30 "int sq(int x){ return x*x; } int main(void){ return sq
 run_e2e "two-units"   42 "int add(int a,int b){ return a+b; }" \
                          "int add(int,int); int main(void){ return add(20,22); }"
 run_e2e "libsystem-printf" 7 "int printf(const char*,...); int main(void){ printf(\"kcc e2e ok\n\"); return 7; }"
+run_e2e "header-stdlib-string" 5 "#include <stdlib.h>
+#include <string.h>
+int main(void){ char *p = malloc(16); strcpy(p, \"hello\"); int n = strlen(p); free(p); return n; }"
+run_e2e "header-math" 7 "#include <math.h>
+int main(void){ return (int) sqrt(49.0); }"
+run_e2e "header-vararg-sprintf" 23 "#include <stdio.h>
+#include <stdlib.h>
+int main(void){ char buf[16]; sprintf(buf, \"%d\", 123); return atoi(buf) - 100; }"
 
 # A missing symbol must make the driver fail (no executable, nonzero status).
 printf 'int gone(void); int main(void){ return gone(); }\n' > "$TMP/bad.c"

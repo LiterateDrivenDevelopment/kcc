@@ -891,7 +891,11 @@ type---implementing C's inside-out declarator semantics.  For instance,
     str x1, [x0, #AST_F0]       // type (return type)
     str x20, [x0, #AST_F1]      // name
     ldr x1, [x21, #AST_F1]      // params
-    str x1, [x0, #AST_F2]       // params
+    // Tag bit 0 of the params pointer with the variadic flag (params are node
+    // pointers, 8-byte aligned, so bit 0 is free).  Consumers mask it off.
+    ldr x2, [x21, #AST_F2]      // variadic (0/1) from the func-type node
+    orr x1, x1, x2
+    str x1, [x0, #AST_F2]       // params | variadic
 
     b .Lddecl_done
 

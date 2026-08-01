@@ -34,6 +34,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Syscall: close@>
 @<Syscall: mmap@>
 @<Syscall: lseek@>
+@<Syscall: process@>
 @}
 
 \noindent\textbf{arena.s} --- arena memory allocator:
@@ -491,6 +492,7 @@ physical assembly files under \texttt{tmp/src/}.
 @o tmp/src/driver.s @{
 @<ARM64: common macros@>
 @<Driver: compile@>
+@<Driver: link@>
 @<Driver: data@>
 @}
 
@@ -618,4 +620,11 @@ oracle (Chapter~\ref{ch:interop-testing}):
 @<Interop: runner@>
 @<Interop: cases@>
 @<Interop: results@>
+@}
+
+\noindent\textbf{e2e.sh} --- drive the whole toolchain like a user:
+\texttt{kcc src.c -o out} then run \texttt{out} (Section~\ref{sec:e2e-tests}):
+
+@o tmp/tests/e2e.sh @{
+@<E2E: runner@>
 @}

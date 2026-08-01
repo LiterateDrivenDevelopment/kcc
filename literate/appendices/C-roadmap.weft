@@ -948,10 +948,18 @@ A production compiler needs more than correct code generation.
       \texttt{-D name=val} (command-line defines),
       \texttt{-S} (emit assembly text), \texttt{-E} (preprocess
       only, already implemented), \texttt{-o output}.
-\item \textbf{Automatic linking.}  When invoked without
-      \texttt{-c}, the driver should compile to a temporary
-      \texttt{.o} and invoke \texttt{ld} to produce an
-      executable, eliminating the manual link step.
+\item[\checkmark] \textbf{Automatic linking.}  Done
+      (\S\ref{sec:auto-linking}): invoked without \texttt{-c}, the driver
+      compiles each source to an object, then \texttt{fork}s and
+      \texttt{execve}s \texttt{/usr/bin/ld} (new process syscalls in
+      Chapter~\ref{ch:syscalls}) with
+      \texttt{-lSystem -syslibroot \meta{sdk} -arch arm64 -e \_main},
+      \texttt{wait4}s for it, removes the intermediate objects, and exits with
+      the linker's status.  The SDK root comes from \texttt{\$SDKROOT} or the
+      standard locations.  \texttt{kcc hello.c -o hello} now produces a
+      runnable executable---including one that calls \texttt{libSystem}'s
+      \texttt{printf}---in one step; five end-to-end driver tests
+      (\S\ref{sec:e2e-tests}, \texttt{just e2e}) exercise it.
 \item \textbf{System header compatibility.}  Handle
       \texttt{\#include <stdio.h>} by providing a minimal
       freestanding header set or by parsing Apple SDK headers
@@ -1087,7 +1095,7 @@ optimization / reg.\ alloc. &         & all-spill; ${\sim}3\times$ memory traffi
 $>8$ arguments on the stack  & \checkmark & self-consistent, 5 diff. tests \\
 AAPCS64 register convention  & \checkmark & FP/small+large struct/x8; interop 16/16 \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\
-automatic linking (\texttt{ld}) &      & manual link step \\
+automatic linking (\texttt{ld}) & \checkmark & \texttt{kcc x.c -o x}; \texttt{just e2e} \\
 standard library / sys.\ headers &     & no \texttt{<stdio.h>} \\
 multi-error recovery         &         & aborts on first error \\
 warnings (\texttt{-Wall})    &         & none \\
@@ -1110,14 +1118,15 @@ function definitions, and a fully AAPCS64-compliant calling convention
 struct returns via \texttt{x8})---all previously open---are now done and
 cross-checked in both directions against \texttt{clang} with a mixed-object
 interoperability suite (16/16), so \kcc{} objects link and run correctly with
-\texttt{clang} ones.  The Stage~9b ABI is complete.  As a
-\emph{production-ready} toolchain in the industrial sense it is early:
-no optimizer, a single target, no automatic linking, no standard
+\texttt{clang} ones.  The Stage~9b ABI is complete, and the driver now links
+automatically: \texttt{kcc hello.c -o hello} produces a runnable executable in
+one step (\S\ref{sec:auto-linking}).  As a
+\emph{production-ready} toolchain in the industrial sense it is still early:
+no optimizer, a single target, no standard
 library, and first-error-only diagnostics.  The shortest credible path
 to ``usable in production for real programs'' now runs through, in order:
-\texttt{union}s and true \texttt{float}, automatic linking
-plus a minimal freestanding header set, AAPCS64 argument packing for
-\texttt{clang} interop, then register allocation for
-code quality.  Everything after that---a second target, DWARF, an
+\texttt{union}s and true \texttt{float}, a minimal freestanding header set (so
+\texttt{\#include <stdio.h>} yields real prototypes), then register allocation
+for code quality.  Everything after that---a second target, DWARF, an
 optimizer rivalling \texttt{clang -O1}---is refinement rather than
 feasibility.

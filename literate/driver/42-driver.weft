@@ -321,6 +321,314 @@ _kcc_driver_compile_all:
 @| _kcc_driver_compile_all
 @}
 
+\section{Automatic Linking}
+\label{sec:auto-linking}
+
+Invoked without \texttt{-c}, \kcc{} behaves like a normal compiler driver: it
+compiles every source argument to a temporary object file and then links those
+objects into an executable, so \texttt{kcc hello.c -o hello} produces a runnable
+program in one step.  Linking is delegated to the system linker
+\texttt{/usr/bin/ld}, run as a child process (Chapter~\ref{ch:syscalls}
+supplies \texttt{fork}/\texttt{execve}/\texttt{wait4}).  Because \kcc{}-compiled
+programs are freestanding---their entry point is \texttt{\_main}, with no C
+runtime start-up---the link line is
+\texttt{ld \meta{objects} -o \meta{out} -lSystem -syslibroot \meta{sdk}
+-arch arm64 -e \_main}.  The SDK root needed by \texttt{-syslibroot} is found
+from \texttt{\$SDKROOT} or, failing that, the two standard SDK locations.  After
+a successful link the intermediate object files are removed.
+
+@d Driver: link @{
+// -- kcc_getenv ---------------------------------------------------------------
+// char *kcc_getenv(const char *name, uint64_t namelen)
+//   Returns the value (text after '=') of environment variable name, or 0.
+.text
+.globl _kcc_getenv
+.p2align 2
+_kcc_getenv:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // name
+    mov x20, x1                  // namelen
+    adrp x0, _kcc_envp@@PAGE
+    add  x0, x0, _kcc_envp@@PAGEOFF
+    ldr x21, [x0]                // envp
+    cbz x21, .Lge_none
+.Lge_loop:
+    ldr x22, [x21]               // entry
+    cbz x22, .Lge_none
+    mov x0, x22
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_memcmp
+    cbnz x0, .Lge_next
+    ldrb w0, [x22, x20]          // entry[namelen] == '=' ?
+    cmp w0, #'='
+    b.ne .Lge_next
+    add x0, x22, x20
+    add x0, x0, #1               // value = entry + namelen + 1
+    b .Lge_ret
+.Lge_next:
+    add x21, x21, #8
+    b .Lge_loop
+.Lge_none:
+    mov x0, #0
+.Lge_ret:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_dir_exists -----------------------------------------------------------
+// int kcc_dir_exists(const char *path) — 1 if it can be opened, else 0.
+.text
+.globl _kcc_dir_exists
+.p2align 2
+_kcc_dir_exists:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    mov x1, #0                   // O_RDONLY
+    mov x2, #0
+    bl _kcc_sys_open
+    cmp x0, #0
+    b.lt .Lde_no
+    bl _kcc_sys_close
+    mov x0, #1
+    b .Lde_ret
+.Lde_no:
+    mov x0, #0
+.Lde_ret:
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_driver_sdkroot -------------------------------------------------------
+// char *kcc_driver_sdkroot(void) — SDK path for `ld -syslibroot`.
+.text
+.globl _kcc_driver_sdkroot
+.p2align 2
+_kcc_driver_sdkroot:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    // 1. $SDKROOT if set and openable
+    adrp x0, _kcc_str_sdkroot_env@@PAGE
+    add  x0, x0, _kcc_str_sdkroot_env@@PAGEOFF
+    mov x1, #7
+    bl _kcc_getenv
+    cbz x0, .Lsr_clt
+    mov x19, x0
+    bl _kcc_dir_exists
+    cbnz x0, .Lsr_use
+    // 2. Command Line Tools SDK
+.Lsr_clt:
+    adrp x19, _kcc_str_sdk_clt@@PAGE
+    add  x19, x19, _kcc_str_sdk_clt@@PAGEOFF
+    mov x0, x19
+    bl _kcc_dir_exists
+    cbnz x0, .Lsr_use
+    // 3. Xcode SDK
+    adrp x19, _kcc_str_sdk_xcode@@PAGE
+    add  x19, x19, _kcc_str_sdk_xcode@@PAGEOFF
+    mov x0, x19
+    bl _kcc_dir_exists
+    cbnz x0, .Lsr_use
+    // 4. fall back to the CLT path unconditionally
+    adrp x19, _kcc_str_sdk_clt@@PAGE
+    add  x19, x19, _kcc_str_sdk_clt@@PAGEOFF
+.Lsr_use:
+    mov x0, x19
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_driver_spawn ---------------------------------------------------------
+// int kcc_driver_spawn(const char *path, char *const argv[])
+//   fork+execve+wait4; returns the child's exit status (or -1 on fork error).
+.text
+.globl _kcc_driver_spawn
+.p2align 2
+_kcc_driver_spawn:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // path
+    mov x20, x1                  // argv
+    bl _kcc_sys_fork
+    cbz x0, .Lsp_child
+    cmp x0, #0
+    b.lt .Lsp_err
+    mov x21, x0                  // child pid
+    add x1, sp, #40             // &status
+    mov x0, x21
+    mov x2, #0
+    mov x3, #0
+    bl _kcc_sys_wait4
+    ldr w0, [sp, #40]           // status
+    lsr w0, w0, #8              // WEXITSTATUS
+    and w0, w0, #0xff
+    b .Lsp_ret
+.Lsp_child:
+    mov x0, x19                  // path
+    mov x1, x20                  // argv
+    adrp x2, _kcc_envp@@PAGE
+    add  x2, x2, _kcc_envp@@PAGEOFF
+    ldr x2, [x2]                 // envp
+    bl _kcc_sys_execve
+    mov x0, #127                 // exec failed
+    bl _kcc_sys_exit
+.Lsp_err:
+    mov x0, #-1
+.Lsp_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_driver_link_all ------------------------------------------------------
+// void kcc_driver_link_all(int argc, char **argv)
+//   Compile every source argument to a .o, link them into an executable
+//   (output from "-o" or "a.out"), remove the objects, and exit with the
+//   linker's status.
+.text
+.globl _kcc_driver_link_all
+.p2align 2
+_kcc_driver_link_all:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+    mov x19, x0                  // argc
+    mov x20, x1                  // argv
+
+    // Linker argv: at most argc + 12 pointers.
+    add x0, x19, #12
+    lsl x0, x0, #3
+    bl _kcc_arena_alloc
+    mov x21, x0                  // larg
+
+    adrp x0, _kcc_str_ld_argv0@@PAGE
+    add  x0, x0, _kcc_str_ld_argv0@@PAGEOFF
+    str x0, [x21]                // larg[0] = "ld"
+    mov x22, #1                  // k (next larg slot)
+    mov x23, #0                  // output (0 = default)
+    mov x24, #1                  // scan index (from argv[1])
+    mov x25, #0                  // compile-error accumulator
+    mov x26, #0                  // source count
+
+.Lla_loop:
+    cmp x24, x19
+    b.ge .Lla_link
+    ldr x27, [x20, x24, lsl #3]  // argv[i]
+    mov x0, x27
+    adrp x1, _kcc_opt_o@@PAGE
+    add  x1, x1, _kcc_opt_o@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_o
+    // A source file: derive its object name, record it, compile it.
+    mov x0, x27
+    bl _kcc_driver_obj_name
+    str x0, [x21, x22, lsl #3]   // larg[k] = obj name
+    mov x1, x0                    // out
+    mov x0, x27                   // src
+    bl _kcc_driver_compile
+    orr x25, x25, x0
+    add x22, x22, #1
+    add x26, x26, #1
+    add x24, x24, #1
+    b .Lla_loop
+.Lla_o:
+    add x24, x24, #1
+    cmp x24, x19
+    b.ge .Lla_link
+    ldr x23, [x20, x24, lsl #3]   // output name
+    add x24, x24, #1
+    b .Lla_loop
+
+.Lla_link:
+    cbnz x25, .Lla_fail          // a compile failed → do not link
+    cbz x26, .Lla_noinput
+
+    cbnz x23, .Lla_out_ok
+    adrp x23, _kcc_str_aout@@PAGE
+    add  x23, x23, _kcc_str_aout@@PAGEOFF
+.Lla_out_ok:
+    // Append: -o <out> -lSystem -syslibroot <sdk> -arch arm64 -e _main NULL
+    adrp x0, _kcc_opt_o@@PAGE
+    add  x0, x0, _kcc_opt_o@@PAGEOFF
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    str x23, [x21, x22, lsl #3]
+    add x22, x22, #1
+    adrp x0, _kcc_str_lsystem@@PAGE
+    add  x0, x0, _kcc_str_lsystem@@PAGEOFF
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    adrp x0, _kcc_str_syslibroot@@PAGE
+    add  x0, x0, _kcc_str_syslibroot@@PAGEOFF
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    bl _kcc_driver_sdkroot
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    adrp x0, _kcc_str_arch@@PAGE
+    add  x0, x0, _kcc_str_arch@@PAGEOFF
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    adrp x0, _kcc_str_arm64@@PAGE
+    add  x0, x0, _kcc_str_arm64@@PAGEOFF
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    adrp x0, _kcc_str_dash_e@@PAGE
+    add  x0, x0, _kcc_str_dash_e@@PAGEOFF
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    adrp x0, _kcc_str_umain@@PAGE
+    add  x0, x0, _kcc_str_umain@@PAGEOFF
+    str x0, [x21, x22, lsl #3]
+    add x22, x22, #1
+    str xzr, [x21, x22, lsl #3]   // NULL terminator
+
+    bl _kcc_io_flush              // flush before fork
+
+    adrp x0, _kcc_str_ld_path@@PAGE
+    add  x0, x0, _kcc_str_ld_path@@PAGEOFF
+    mov x1, x21
+    bl _kcc_driver_spawn
+    mov x25, x0                    // link status
+
+    // Remove the intermediate objects (larg[1 .. source count]).
+    mov x24, #1
+.Lla_unlink:
+    cmp x24, x26
+    b.gt .Lla_done
+    ldr x0, [x21, x24, lsl #3]
+    bl _kcc_sys_unlink
+    add x24, x24, #1
+    b .Lla_unlink
+.Lla_done:
+    bl _kcc_io_flush
+    mov x0, x25
+    bl _kcc_sys_exit
+
+.Lla_fail:
+    bl _kcc_io_flush
+    mov x0, #1
+    bl _kcc_sys_exit
+
+.Lla_noinput:
+    adrp x0, _kcc_driver_err_noinput@@PAGE
+    add  x0, x0, _kcc_driver_err_noinput@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
+@| _kcc_getenv _kcc_dir_exists _kcc_driver_sdkroot _kcc_driver_spawn _kcc_driver_link_all
+@}
+
 @d Driver: data @{
 // -- Driver string constants --------------------------------------------------
 .section __TEXT,__cstring,cstring_literals
@@ -328,6 +636,37 @@ _kcc_opt_o:
     .asciz "-o"
 _kcc_driver_err_noinput:
     .asciz "kcc: error: no input files\n"
+_kcc_str_ld_argv0:
+    .asciz "ld"
+_kcc_str_ld_path:
+    .asciz "/usr/bin/ld"
+_kcc_str_lsystem:
+    .asciz "-lSystem"
+_kcc_str_syslibroot:
+    .asciz "-syslibroot"
+_kcc_str_arch:
+    .asciz "-arch"
+_kcc_str_arm64:
+    .asciz "arm64"
+_kcc_str_dash_e:
+    .asciz "-e"
+_kcc_str_umain:
+    .asciz "_main"
+_kcc_str_aout:
+    .asciz "a.out"
+_kcc_str_sdkroot_env:
+    .asciz "SDKROOT"
+_kcc_str_sdk_clt:
+    .asciz "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+_kcc_str_sdk_xcode:
+    .asciz "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+
+.data
+.p2align 3
+.globl _kcc_envp
+_kcc_envp:
+    .quad 0
+@| _kcc_envp
 @}
 
 \section{Multi-file Tests}
@@ -353,4 +692,65 @@ run_test_multi "multi-extern-global" \
 run_test_multi "multi-mutual-call" \
     "int dbl(int x); int quad(int x){ return dbl(dbl(x)); }" \
     "int quad(int x); int dbl(int x){ return x + x; } int main(void){ return quad(6); }" 24
+@}
+
+\section{End-to-End Driver Tests}
+\label{sec:e2e-tests}
+
+Automatic linking (\S\ref{sec:auto-linking}) lets \kcc{} produce runnable
+executables directly.  These tests drive the whole toolchain the way a user
+would---\texttt{kcc src.c -o out} then run \texttt{out}---covering a single
+file, the default \texttt{a.out} name, a multi-file link, a call into
+\texttt{libSystem} (\texttt{printf}), and the propagation of a linker error.
+
+@d E2E: runner @{
+#!/bin/bash
+# kcc end-to-end driver tests (compile + auto-link + run) — generated by weft
+set -u
+PASS=0
+FAIL=0
+KCC="tmp/kcc"
+TMP="/tmp/kcc_e2e_$$"
+mkdir -p "$TMP"
+trap 'rm -rf "$TMP"' EXIT
+
+# e2e name expected src...   (last-but-one is expected exit, rest are sources)
+run_e2e() {
+    local name="$1"; shift
+    local expected="$1"; shift
+    local srcs=() i=0
+    for s in "$@@"; do printf '%s\n' "$s" > "$TMP/f$i.c"; srcs+=("$TMP/f$i.c"); i=$((i+1)); done
+    "$KCC" "${srcs[@@]}" -o "$TMP/prog" >/dev/null 2>&1
+    if [ ! -x "$TMP/prog" ]; then
+        printf "  %-24s FAIL (no executable)\n" "$name"; FAIL=$((FAIL+1)); return
+    fi
+    "$TMP/prog" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$TMP/prog"
+    if [ "$rc" = "$expected" ]; then
+        printf "  %-24s ok (%s)\n" "$name" "$rc"; PASS=$((PASS+1))
+    else
+        printf "  %-24s FAIL got=%s exp=%s\n" "$name" "$rc" "$expected"; FAIL=$((FAIL+1))
+    fi
+}
+
+echo "=== end-to-end driver (compile + link + run) ==="
+run_e2e "single-file" 42 "int main(void){ return 42; }"
+run_e2e "arithmetic"  30 "int sq(int x){ return x*x; } int main(void){ return sq(5)+sq(2)+1; }"
+run_e2e "two-units"   42 "int add(int a,int b){ return a+b; }" \
+                         "int add(int,int); int main(void){ return add(20,22); }"
+run_e2e "libsystem-printf" 7 "int printf(const char*,...); int main(void){ printf(\"kcc e2e ok\n\"); return 7; }"
+
+# A missing symbol must make the driver fail (no executable, nonzero status).
+printf 'int gone(void); int main(void){ return gone(); }\n' > "$TMP/bad.c"
+$KCC "$TMP/bad.c" -o "$TMP/bad" >/dev/null 2>&1
+if [ $? -ne 0 ] && [ ! -x "$TMP/bad" ]; then
+    printf "  %-24s ok (rejected)\n" "link-error"; PASS=$((PASS+1))
+else
+    printf "  %-24s FAIL (should reject)\n" "link-error"; FAIL=$((FAIL+1))
+fi
+
+echo ""
+echo "=== e2e: $PASS ok, $FAIL fail ==="
+[ "$FAIL" -eq 0 ]
 @}

@@ -86,6 +86,11 @@ interop: build
     chmod +x tmp/tests/interop.sh
     tmp/tests/interop.sh
 
+# End-to-end: kcc compiles AND links to an executable, then runs it
+e2e: build
+    chmod +x tmp/tests/e2e.sh
+    tmp/tests/e2e.sh
+
 # Code generation tests: compile C programs with kcc, link, run, check exit codes
 test-codegen: build
     chmod +x tmp/tests/test_codegen.sh

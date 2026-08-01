@@ -24,10 +24,14 @@ in \reg{x16} before the \texttt{svc} instruction.
 // -- macOS ARM64 syscall numbers ------------------------------------
 // Source: XNU bsd/kern/syscalls.master
 .equ SYS_exit,     1
+.equ SYS_fork,     2
 .equ SYS_read,     3
 .equ SYS_write,    4
 .equ SYS_open,     5
 .equ SYS_close,    6
+.equ SYS_wait4,    7
+.equ SYS_unlink,  10
+.equ SYS_execve,  59
 .equ SYS_mmap,   197          // 0xC5
 .equ SYS_munmap,  73          // 0x49
 .equ SYS_lseek,  199          // 0xC7
@@ -186,5 +190,61 @@ returns the file length.
 // Returns new file offset in x0, or -1 on error.
 FUNC kcc_sys_lseek
     SYSCALL SYS_lseek
+ENDFUNC
+@}
+
+\section{Process Creation}
+
+Automatic linking (Chapter~\ref{ch:driver}) requires \kcc{} to run the system
+linker as a child process.  Three syscalls suffice: \texttt{fork} duplicates
+the process, \texttt{execve} replaces the child's image with \texttt{/usr/bin/ld},
+and \texttt{wait4} lets the parent collect the linker's exit status.
+\texttt{unlink} removes the temporary object files afterwards.
+
+On Darwin ARM64 the \texttt{fork} syscall has an unusual convention: it returns
+in \emph{both} processes at the instruction after \texttt{svc}, with \reg{x1}
+set to~1 in the child and~0 in the parent (and \reg{x0} holding the child's PID
+in the parent).  The wrapper normalises this to the POSIX contract---the child
+sees a return value of~0, the parent sees the child PID, and $-1$ signals an
+error (carry set).
+
+@d Syscall: process @{
+// -- SYS_fork ---------------------------------------------------
+// pid_t kcc_sys_fork(void)
+// Returns 0 in the child, the child PID in the parent, or -1 on error.
+FUNC kcc_sys_fork
+    SYSCALL SYS_fork
+    b.cs .Lfork_err
+    cmp x1, #1                 // Darwin: x1 == 1 in the child
+    b.ne .Lfork_ret
+    mov x0, #0                 // child → 0
+    b .Lfork_ret
+.Lfork_err:
+    mov x0, #-1
+.Lfork_ret:
+ENDFUNC
+
+// -- SYS_execve -------------------------------------------------
+// int kcc_sys_execve(const char *path, char *const argv[], char *const envp[])
+//   x0 = path, x1 = argv, x2 = envp
+// Only returns on failure; then returns -1.
+FUNC kcc_sys_execve
+    SYSCALL SYS_execve
+    mov x0, #-1
+ENDFUNC
+
+// -- SYS_wait4 --------------------------------------------------
+// pid_t kcc_sys_wait4(pid_t pid, int *status, int options, void *rusage)
+//   x0 = pid, x1 = status ptr, x2 = options, x3 = rusage ptr
+// Returns the reaped PID in x0.
+FUNC kcc_sys_wait4
+    SYSCALL SYS_wait4
+ENDFUNC
+
+// -- SYS_unlink -------------------------------------------------
+// int kcc_sys_unlink(const char *path)
+//   x0 = path
+FUNC kcc_sys_unlink
+    SYSCALL SYS_unlink
 ENDFUNC
 @}

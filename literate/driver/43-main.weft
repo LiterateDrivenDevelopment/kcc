@@ -40,6 +40,14 @@ _main:
     mov x19, x0                   // x19 = argc
     mov x20, x1                   // x20 = argv
 
+    // Capture envp (= argv + (argc+1)*8, past the NULL that ends argv) so the
+    // driver can pass the environment on to the linker via execve.
+    add x2, x19, #1
+    add x2, x20, x2, lsl #3
+    adrp x3, _kcc_envp@@PAGE
+    add  x3, x3, _kcc_envp@@PAGEOFF
+    str x2, [x3]
+
     // Initialize subsystems
     bl _kcc_arena_init
     bl _kcc_lex_kw_init
@@ -102,15 +110,11 @@ _main:
     bl _kcc_strcmp
     cbz x0, .Lmain_compile
 
-    // Not a flag: treat as source file (legacy Phase 0 behavior)
-    adrp x0, _kcc_msg_source@@PAGE
-    add  x0, x0, _kcc_msg_source@@PAGEOFF
-    bl _kcc_io_puts
-    ldr x0, [x20, #8]            // argv[1]
-    bl _kcc_io_puts
-    adrp x0, _kcc_msg_newline@@PAGE
-    add  x0, x0, _kcc_msg_newline@@PAGEOFF
-    bl _kcc_io_puts
+    // Not a flag: the argument is a source file.  Compile every source and
+    // link the resulting objects into an executable (the default mode).
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_driver_link_all
     b .Lmain_exit
 @| _main
 @}

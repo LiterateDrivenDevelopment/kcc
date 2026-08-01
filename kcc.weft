@@ -10,10 +10,19 @@
 @W tex
 
 \documentclass[11pt,a4paper,twoside,openright,DIV=15]{scrbook}
+\usepackage{multicol}
 
 % Page layout: DIV=15 gives a wider/taller type area suited to
 % code-heavy literate programs.  KOMA-Script computes margins from
 % DIV; 15 keeps readable margins while accommodating long code scraps.
+
+\usepackage[
+  top=2cm,
+  bottom=1.0cm,
+  left=1.0cm,
+  right=1.0cm
+]{geometry}
+\linespread{0.9}
 
 % Engine-agnostic encoding and fonts
 \usepackage{iftex}
@@ -43,8 +52,20 @@
   pdfauthor={kcc project},
 }
 
+\usepackage[utf8]{inputenc}
+\renewcommand{\familydefault}{\sfdefault}
+
+
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\leftmark}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
 % Section styling
-\usepackage{kcc-sections}
+% \usepackage{kcc-sections}
 
 % weft weave emits old font commands that KOMA-Script disables by default:
 \DeclareOldFontCommand{\tt}{\normalfont\ttfamily}{\mathtt}
@@ -74,25 +95,46 @@
   morecomment=[l]{//},
   morestring=[b]",
 }
+
+%\lstset{
+%  language=aarch64,
+%  basicstyle=\ttfamily\small,
+%  keywordstyle=\color{blue!70!black}\bfseries,
+%  keywordstyle=[2]\color{red!60!black},
+%  keywordstyle=[3]\color{green!40!black}\bfseries,
+%  commentstyle=\color{gray}\itshape,
+%  stringstyle=\color{orange!80!black},
+%  numbers=left,
+%  numberstyle=\tiny\color{gray},
+%  numbersep=8pt,
+%  tabsize=4,
+%  showstringspaces=false,
+%  breaklines=true,
+%  frame=single,
+%  rulecolor=\color{gray!30},
+%  xleftmargin=1.5em,
+%  framexleftmargin=1.5em,
+%}
+
 \lstset{
   language=aarch64,
-  basicstyle=\ttfamily\small,
+  basicstyle=\ttfamily\footnotesize\linespread{0.85}\selectfont,
+  columns=flexible,
+  keepspaces=true,
   keywordstyle=\color{blue!70!black}\bfseries,
   keywordstyle=[2]\color{red!60!black},
   keywordstyle=[3]\color{green!40!black}\bfseries,
   commentstyle=\color{gray}\itshape,
   stringstyle=\color{orange!80!black},
-  numbers=left,
-  numberstyle=\tiny\color{gray},
-  numbersep=8pt,
-  tabsize=4,
+  numbers=none,
+  frame=none,
   showstringspaces=false,
   breaklines=true,
-  frame=single,
-  rulecolor=\color{gray!30},
-  xleftmargin=1.5em,
-  framexleftmargin=1.5em,
+  breakatwhitespace=false,
+  breakindent=1.5em,
+  texcl=false,
 }
+
 
 % Theorem environments for formal semantics
 \theoremstyle{definition}
@@ -119,9 +161,14 @@
 \author{The \kcc{} Project}
 \date{\today}
 
+
+%\WEFTlstsetup
 \begin{document}
 \maketitle
+
+\begin{multicols}{2}
 \tableofcontents
+\end{multicols}
 
 % Tolerate uneven page fills — weft scraps are unbreakable blocks
 % that frequently leave partial pages. Without this, LaTeX forces
@@ -149,8 +196,15 @@ implementation-defined choices.  No code appears here; the chapters that
 follow lay the contractual ground on which every subsequent line of
 assembly rests.
 
+\begin{multicols}{2}
 @i literate/foundations/01-normative-corpus.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/foundations/02-conformance-model.weft
+\end{multicols}
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part II: Machine
@@ -174,14 +228,45 @@ operations (Chapter~\ref{ch:strings}), buffered I/O
 (Chapter~\ref{ch:source}).  None of these modules depend on any C
 library; every byte of output reaches the kernel through \texttt{svc}.
 
+\begin{multicols}{2}
 @i literate/machine/07-arm64-conventions.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/machine/08-syscalls.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/machine/09-memory-management.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/machine/10-data-structures.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/machine/11-string-operations.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/machine/12-io.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/machine/13-diagnostics.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/machine/14-source-manager.weft
+\end{multicols}
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part III: The Frontend
@@ -203,16 +288,55 @@ parser is hand-written --- no generator tools --- so every production
 rule is visible in the assembly, and error recovery follows a simple
 synchronisation-point strategy.
 
+\begin{multicols}{2}
 @i literate/frontend/15-source-encoding.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/16-line-splicing.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/17-lexer.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/18-preprocessor.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/19-string-literals.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/20-concatenation.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/21-parser.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/22-declarations.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/23-expressions.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/frontend/24-statements.weft
+\end{multicols}
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part IV: Semantics
@@ -235,9 +359,23 @@ expression node carries its resolved type, and any constraint
 violation has been reported as a diagnostic.
 
 @i literate/semantics/25-types.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/semantics/26-symtab.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/semantics/27-sema.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/semantics/28-conversions.weft
+\end{multicols}
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part V: Intermediate Representation
@@ -258,8 +396,18 @@ integrity check that verifies every basic block is properly terminated
 before the IR is handed to later phases.
 
 @i literate/ir/31-ir-design.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/ir/32-ir-builder.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/ir/33-ir-validation.weft
+\end{multicols}
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part VI: Optimization
@@ -281,9 +429,20 @@ never consumed.  Together these passes eliminate the most obvious
 waste without introducing the complexity of a full register allocator
 or loop optimiser.
 
+\begin{multicols}{2}
 @i literate/optimization/34-ir-passes.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/optimization/35-peephole.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/optimization/36-dce.weft
+\end{multicols}
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part VII: The Backend
@@ -307,11 +466,30 @@ generation, and the compilation driver
 (Chapter~\ref{ch:compile-driver}) orchestrates the full pipeline from
 source file to \texttt{.o}.
 
+\begin{multicols}{2}
 @i literate/backend/37-codegen.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/backend/38-emit-arm64.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/backend/39-emit-macho.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/backend/40-linker-info.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/driver/42-driver.weft
+\end{multicols}
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part VIII: Driver
@@ -329,7 +507,12 @@ the appropriate pipeline stage.  Because the compiler has no C runtime,
 \texttt{\_main} is the true process entry point: it receives
 \texttt{argc} and \texttt{argv} directly from the kernel's stack frame.
 
+
+\begin{multicols}{2}
 @i literate/driver/43-main.weft
+\end{multicols}
+\newpage
+
 
 % ═══════════════════════════════════════════════════════════════════
 % Part V: Verification
@@ -351,30 +534,64 @@ asserts the expected token type and spelling.  The code generation tests
 complete C programs with \kcc{}, link the resulting object files, execute
 the binaries, and verify that the exit code matches the expected value.
 
+\begin{multicols}{2}
 @i literate/verification/44-test-harness.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/verification/45-conformance-tests.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/verification/46-codegen-tests.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/verification/47-self-hosting.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/verification/48-self-hosting-lexer.weft
+\end{multicols}
+\newpage
+
+\begin{multicols}{2}
 @i literate/verification/49-differential-testing.weft
+\end{multicols}
+\newpage
 
 % ═══════════════════════════════════════════════════════════════════
 % Output Routing
 % ═══════════════════════════════════════════════════════════════════
 @i literate/assembly.weft
+\end{multicols}
+\newpage
 
+\begin{multicols}{2}
 % ═══════════════════════════════════════════════════════════════════
 % Appendices
 % ═══════════════════════════════════════════════════════════════════
 \appendix
+\end{multicols}
+\newpage
 
+\begin{multicols}{2}
 @i literate/appendices/C-roadmap.weft
+\end{multicols}
+\newpage
 
+\begin{multicols}{2}
 % ═══════════════════════════════════════════════════════════════════
 % Indexes
 % ═══════════════════════════════════════════════════════════════════
 @f
 @m
 @u
+\end{multicols}
+
 
 \end{document}

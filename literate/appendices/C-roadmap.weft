@@ -706,9 +706,10 @@ Stage~9d adds optimization passes that bring generated-code quality
 within striking distance of \texttt{clang -O1}.  Stage~9e delivers
 the tooling and diagnostics expected of a production compiler.
 
-\textbf{Status.}  Stage~9a is under way---\texttt{double} floating point
-is complete (\S\ref{sec:parse-float}); unions, single-precision
-\texttt{float}, \texttt{\_Bool}, and qualifiers remain.  Stage~9b has
+\textbf{Status.}  Stage~9a is well advanced---\texttt{double} floating point
+(\S\ref{sec:parse-float}), \texttt{union}s, and single-precision
+\texttt{float} (rounded at its boundaries) are done; \texttt{\_Bool},
+qualifiers, \texttt{long double}, and \texttt{\_Generic} remain.  Stage~9b has
 struct pass/return by value working (\S\ref{sec:struct-args}), a
 byte-accurate \stdref{6.7.2.1} struct/union layout with standard padding
 and alignment (so \texttt{sizeof} and member offsets are conformant),
@@ -753,16 +754,29 @@ point is now in place.  This stage adds every remaining C17 type.
       path, and because arguments and returns travel through that slot
       (via \texttt{x0}--\texttt{x7}) they interoperate for
       \kcc{}-to-\kcc{} calls.  Verified by 14 \texttt{fp-*} differential
-      tests.  Still open: single-precision \texttt{float} arithmetic
-      (currently widened to \texttt{double}), \texttt{long double}, and
-      the AAPCS64 \texttt{d0}--\texttt{d7} register convention for
-      \texttt{clang} interoperation.
-\item \textbf{Unions.}  \texttt{TY\_UNION} is defined but never
-      lowered.  The IR builder must treat unions like structs
-      whose fields all start at offset~0; \texttt{TY\_SIZE} equals
-      the largest member.  Codegen is identical to structs
-      except that \texttt{IR\_GEP} stride is always~0 for member
-      access.
+      tests.
+\item[\checkmark] \textbf{Single-precision \texttt{float}.}  A floating
+      constant with an \texttt{f}/\texttt{F} suffix is rounded to single
+      precision at compile time (on the host FPU) and typed \texttt{float};
+      a run-time conversion \emph{to} \texttt{float}---an assignment, a cast,
+      or an \texttt{int}${\to}$\texttt{float}---emits \texttt{IR\_FPROUND},
+      which the backend lowers to \texttt{FCVT\;s,d} followed by
+      \texttt{FCVT\;d,s} to truncate the value to single precision.  So
+      \texttt{16777217.0f == 16777216.0f} and \texttt{(float)d} agree with
+      \texttt{clang} (six \texttt{float-*} differential tests).  Arithmetic
+      is still performed at \texttt{double} precision and rounded at the
+      \texttt{float} boundaries (permitted excess intermediate precision);
+      exact per-operation single-precision rounding and the
+      \texttt{s0}--\texttt{s7} argument convention for \texttt{clang}
+      float-argument interop remain.  \texttt{long double} is unlowered.
+\item[\checkmark] \textbf{Unions.}  Done: \texttt{\_kcc\_type\_layout} lays a
+      union out with every member at offset~0 and \texttt{TY\_SIZE} equal to
+      the largest member (rounded to its alignment), and member access,
+      classification, and pass/return share the struct paths.  Fixing a
+      subscript on an aggregate \emph{member} array (\texttt{u.arr[i]} /
+      \texttt{s.arr[i]}) along the way---it had been (mis)loaded as a
+      pointer---closed the last union gap.  Six \texttt{union-*}/aggregate
+      differential tests pass.
 \item \textbf{\_Bool.}  \texttt{TY\_BOOL} exists as a singleton.
       The IR builder must insert \texttt{IR\_TRUNC} to 1~bit on
       assignment (any non-zero value becomes~1) and
@@ -1031,7 +1045,7 @@ honest about the gap matters more than any single headline number.
 \paragraph{What is already solid (and verified).}
 The integer, pointer, and aggregate core of C is complete and, crucially,
 \emph{checked against an oracle}: the differential harness
-(\S\ref{sec:differential-testing}) compiles 140 programs with both
+(\S\ref{sec:differential-testing}) compiles 154 programs with both
 \kcc{} and \texttt{clang} and finds \emph{zero} miscompilations.  That
 core includes all control flow (\texttt{if}/\texttt{while}/\texttt{do}/%
 \texttt{for}/\texttt{switch}/\texttt{goto}), functions and recursion,
@@ -1055,9 +1069,9 @@ Feature & Status & Note \\
 \hline
 standard struct layout           & \checkmark & padding/align, 15 diff. tests \\
 \texttt{double} floating point   & \checkmark & complete, 14 diff. tests \\
-single-precision \texttt{float}  & $\circ$    & widened to \texttt{double} \\
+single-precision \texttt{float}  & \checkmark & rounded at boundaries; 6 diff. tests \\
 \texttt{long double}             &            & not lowered \\
-\texttt{union}                   &            & \texttt{TY\_UNION} unlowered \\
+\texttt{union}                   & \checkmark & offset-0 layout; 6 diff. tests \\
 bit-fields                       &            & no real packing \\
 \texttt{\_Bool} 0/1 normalisation & $\circ$   & not verified \\
 \texttt{char s[] = "..."}        &            & string-array init \\
@@ -1109,8 +1123,11 @@ full \texttt{-O}/\texttt{-I}/\texttt{-D} CLI & $\circ$ & partial \\
 As a \emph{correct compiler for the integer/pointer/aggregate subset of
 C, plus \texttt{double}}, \kcc{} is in good shape and unusually
 well-tested for a hand-written assembly project.  As a \emph{complete
-C17 implementation} it is roughly two-thirds there: the missing
-pieces are bounded (unions, real \texttt{float}, and bit-fields).
+C17 implementation} it is roughly three-quarters there: with
+\texttt{union}s and single-precision \texttt{float} now done, the bounded
+pieces still missing are bit-fields, \texttt{long double}, designated
+initializers, \texttt{\_Generic}, \texttt{volatile} semantics, and
+\texttt{char s[] = "..."} string-array initialization.
 Standard struct layout, more-than-eight stack arguments, variadic
 function definitions, and a fully AAPCS64-compliant calling convention
 (floating values in \texttt{d} registers, small structs in
@@ -1125,8 +1142,9 @@ one step (\S\ref{sec:auto-linking}).  As a
 no optimizer, a single target, no standard
 library, and first-error-only diagnostics.  The shortest credible path
 to ``usable in production for real programs'' now runs through, in order:
-\texttt{union}s and true \texttt{float}, a minimal freestanding header set (so
-\texttt{\#include <stdio.h>} yields real prototypes), then register allocation
-for code quality.  Everything after that---a second target, DWARF, an
+a minimal freestanding header set (so \texttt{\#include <stdio.h>} yields
+real prototypes), then register allocation for code quality, then
+multi-error recovery and \texttt{-Wall} warnings.  Everything after that---a
+second target, DWARF, an
 optimizer rivalling \texttt{clang -O1}---is refinement rather than
 feasibility.

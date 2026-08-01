@@ -701,6 +701,32 @@ _kcc_enc_fcvtzs:
     mov w0, w2
     ret
 
+// -- kcc_enc_fcvt_s_d / kcc_enc_fcvt_d_s --------------------------------------
+// FCVT Sd, Dn (double → single, rounds) and FCVT Dd, Sn (single → double).
+// Rounding a double through single and back is how a value is truncated to
+// single precision at a conversion to float.  x0=Rd, x1=Rn.
+.text
+.globl _kcc_enc_fcvt_s_d
+.p2align 2
+_kcc_enc_fcvt_s_d:
+    movz w2, #0x4000
+    movk w2, #0x1E62, lsl #16     // FCVT Sd, Dn = 0x1E624000
+    orr w2, w2, w1, lsl #5        // Rn
+    orr w2, w2, w0                // Rd
+    mov w0, w2
+    ret
+
+.text
+.globl _kcc_enc_fcvt_d_s
+.p2align 2
+_kcc_enc_fcvt_d_s:
+    movz w2, #0xC000
+    movk w2, #0x1E22, lsl #16     // FCVT Dd, Sn = 0x1E22C000
+    orr w2, w2, w1, lsl #5        // Rn
+    orr w2, w2, w0                // Rd
+    mov w0, w2
+    ret
+
 // -- kcc_enc_fcmp -------------------------------------------------------------
 // FCMP Dn, Dm — set NZCV from a double comparison.  x0=Rn, x1=Rm
 .text
@@ -738,7 +764,7 @@ _kcc_enc_str_fp:
     orr w3, w3, w0                // Rt
     mov w0, w3
     ret
-@| _kcc_enc_fp_dp2 _kcc_enc_scvtf _kcc_enc_fcvtzs _kcc_enc_fcmp _kcc_enc_ldr_fp _kcc_enc_str_fp
+@| _kcc_enc_fp_dp2 _kcc_enc_scvtf _kcc_enc_fcvtzs _kcc_enc_fcvt_s_d _kcc_enc_fcvt_d_s _kcc_enc_fcmp _kcc_enc_ldr_fp _kcc_enc_str_fp
 @}
 
 \section{Branch Encoding}

@@ -110,6 +110,7 @@ Offset & Field & Description \\
 .equ IR_SITOFP,  54     // signed integer → floating point
 .equ IR_FPTOSI,  55     // floating point → signed integer
 .equ IR_VA_START, 56    // SRC2 = fixed-param count; DEST = &first variadic arg
+.equ IR_FPROUND,  57    // round a double vreg to single precision (double format)
 
 // Miscellaneous: 60-63
 .equ IR_CONST,   60

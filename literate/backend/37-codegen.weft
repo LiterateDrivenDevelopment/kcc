@@ -1297,6 +1297,8 @@ _kcc_codegen_instr:
     b.eq .Lcgi_fptosi
     cmp x22, #IR_VA_START
     b.eq .Lcgi_va_start
+    cmp x22, #IR_FPROUND
+    b.eq .Lcgi_fpround
 
     // Unknown opcode: skip
     b .Lcgi_done
@@ -2128,6 +2130,24 @@ matching C's truncating cast.
     ldr x0, [x19, #IR_DEST]
     mov x1, #CG_REG_SRC1
     bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_fpround:
+    // Round a double to single precision: FCVT s0,d0 then FCVT d0,s0.
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #0                     // Rd = s0
+    mov x1, #0                     // Rn = d0
+    bl _kcc_enc_fcvt_s_d
+    bl _kcc_code_emit32
+    mov x0, #0                     // Rd = d0
+    mov x1, #0                     // Rn = s0
+    bl _kcc_enc_fcvt_d_s
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
     b .Lcgi_done
 @}
 

@@ -2370,6 +2370,35 @@ _kcc_ir_emit_sitofp:
     ldp x29, x30, [sp], #32
     ret
 
+// -- kcc_ir_emit_fpround --------------------------------------------------
+// uint64_t kcc_ir_emit_fpround(uint64_t src_vreg)
+// Emits IR_FPROUND: rounds a double vreg to single precision (float type).
+.text
+.globl _kcc_ir_emit_fpround
+.p2align 2
+_kcc_ir_emit_fpround:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // src vreg
+    mov x0, #IR_FPROUND
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_float@@PAGE
+    add  x1, x1, _kcc_type_float@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    str x0, [sp, #24]
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [sp, #24]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
 // -- kcc_ir_emit_fptosi ---------------------------------------------------
 // uint64_t kcc_ir_emit_fptosi(uint64_t src_vreg)
 // Emits IR_FPTOSI: converts a double vreg to a signed integer vreg.
@@ -2411,26 +2440,37 @@ _kcc_ir_convert:
     stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
-    mov x19, x0                  // vreg
+    mov x19, x0                  // vreg (result accumulator)
     str x1, [sp, #32]            // from type
-    mov x0, x2                   // to type
+    str x2, [sp, #40]            // to type
+    mov x0, x2
     bl _kcc_ir_type_is_fp
     mov x20, x0                  // to_is_fp
     ldr x0, [sp, #32]
     bl _kcc_ir_type_is_fp        // from_is_fp
     cmp x0, x20
-    b.eq .Licv_none              // same domain → no conversion
+    b.eq .Licv_maybe_round       // same domain → maybe just round
     cbnz x20, .Licv_to_fp
     mov x0, x19
     bl _kcc_ir_emit_fptosi       // fp → int
-    b .Licv_ret
+    mov x19, x0
+    b .Licv_maybe_round
 .Licv_to_fp:
     mov x0, x19
-    bl _kcc_ir_emit_sitofp       // int → fp
-    b .Licv_ret
-.Licv_none:
+    bl _kcc_ir_emit_sitofp       // int → double
+    mov x19, x0
+.Licv_maybe_round:
+    // Converting to float truncates the value to single precision.
+    ldr x0, [sp, #40]
+    cbz x0, .Licv_done
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_FLOAT
+    b.ne .Licv_done
     mov x0, x19
-.Licv_ret:
+    bl _kcc_ir_emit_fpround
+    mov x19, x0
+.Licv_done:
+    mov x0, x19
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
@@ -2500,7 +2540,7 @@ _kcc_ir_fill_param_classes:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
-@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_classify_type _kcc_ir_emit_sitofp _kcc_ir_emit_fptosi _kcc_ir_convert _kcc_ir_fill_param_classes
+@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_classify_type _kcc_ir_emit_sitofp _kcc_ir_emit_fptosi _kcc_ir_emit_fpround _kcc_ir_convert _kcc_ir_fill_param_classes
 @}
 
 \subsection{Sizeof Expression}
@@ -2855,6 +2895,8 @@ _kcc_ir_build_subscript_addr:
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_SUBSCRIPT
     b.eq .Libsa_nested_base
+    cmp x1, #AST_MEMBER
+    b.eq .Libsa_member_base
     cmp x1, #AST_IDENT_EXPR
     b.ne .Libsa_expr
 
@@ -2885,6 +2927,18 @@ _kcc_ir_build_subscript_addr:
     // base (contiguous), so recurse for the address rather than loading it.
     ldr x0, [x19, #AST_F0]
     bl _kcc_ir_build_subscript_addr
+    mov x20, x0
+    b .Libsa_index
+
+.Libsa_member_base:
+    // base is s.arr / s->arr.  When the member is itself an array, its
+    // ADDRESS is the array base; a pointer member is loaded like any pointer.
+    ldr x1, [x0, #AST_F3]       // member's resolved type
+    cbz x1, .Libsa_ptr
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.ne .Libsa_ptr
+    bl _kcc_ir_build_member_addr // x0 = base member node → member address
     mov x20, x0
     b .Libsa_index
 
@@ -3595,7 +3649,13 @@ _kcc_ir_build_ident:
     sub x22, x0, #1              // x22 = alloca vreg
 
 .Libi_local_load:
-    // Emit load from alloca (always 64-bit — vreg slots are 8 bytes)
+    // Load from the alloca with a width+sign override matching the variable's
+    // declared type: a narrow variable was stored with its own width (e.g. a
+    // char as one byte), so it must be reloaded and sign/zero-extended the same
+    // way, not read as a raw 8-byte slot (which would pick up stale bytes).
+    ldr x0, [x19, #AST_F3]      // variable type
+    bl _kcc_ir_load_width
+    mov x21, x0                 // width+sign override
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
     adrp x1, _kcc_type_int_s@@PAGE
@@ -3603,6 +3663,7 @@ _kcc_ir_build_ident:
     ldr x1, [x1]
     str x1, [x0, #IR_TYPE]
     str x22, [x0, #IR_SRC1]     // src = alloca vreg
+    str x21, [x0, #IR_SRC2]     // access-size override
 
     mov x19, x0
     bl _kcc_ir_next_vreg
@@ -3648,7 +3709,12 @@ _kcc_ir_build_ident:
     b.eq .Libi_global_array
 
 .Libi_global_scalar:
-    // Scalar/pointer global: emit global_ref + load
+    // Scalar/pointer global: emit global_ref + load.  Capture the variable's
+    // load width+sign first (x19 still points at the ident node here).
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_load_width
+    mov x21, x0                 // width+sign override
+
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
     str x20, [x0, #IR_SRC1]     // name ptr
@@ -3665,7 +3731,7 @@ _kcc_ir_build_ident:
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Emit load from the global address
+    // Emit load from the global address (width+sign-aware, like locals)
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
     adrp x1, _kcc_type_int_s@@PAGE
@@ -3673,6 +3739,7 @@ _kcc_ir_build_ident:
     ldr x1, [x1]
     str x1, [x0, #IR_TYPE]
     str x22, [x0, #IR_SRC1]     // src = address vreg
+    str x21, [x0, #IR_SRC2]     // access-size override
 
     mov x19, x0
     bl _kcc_ir_next_vreg
@@ -6523,26 +6590,21 @@ _kcc_ir_build_cast:
     ldr x23, [x20, #AST_F3]
     cbz x23, .Lbc_done
 
-    // Floating-point conversions take priority over integer resizing,
-    // since int and double differ in size but are not a mere widening.
+    // Any conversion touching a floating type is delegated to
+    // _kcc_ir_convert, which inserts sitofp / fptosi as needed and rounds to
+    // single precision when the target is float.  Integer-only casts fall
+    // through to the width-resize path below.
     mov x0, x22
     bl _kcc_ir_type_is_fp
-    cbz x0, .Lbc_src_fp
-    // Target is float/double.
+    mov x1, x0                   // target_is_fp
     mov x0, x23
-    bl _kcc_ir_type_is_fp
-    cbnz x0, .Lbc_done           // fp → fp: no-op (float treated as double)
-    mov x0, x21
-    bl _kcc_ir_emit_sitofp       // int → double
-    mov x21, x0
-    b .Lbc_done
-.Lbc_src_fp:
-    mov x0, x23
-    bl _kcc_ir_type_is_fp
+    bl _kcc_ir_type_is_fp        // source_is_fp
+    orr x0, x0, x1
     cbz x0, .Lbc_int_resize
-    // Source is float/double, target is integer.
-    mov x0, x21
-    bl _kcc_ir_emit_fptosi       // double → int
+    mov x0, x21                  // src vreg
+    mov x1, x23                  // from type
+    mov x2, x22                  // to type
+    bl _kcc_ir_convert
     mov x21, x0
     b .Lbc_done
 

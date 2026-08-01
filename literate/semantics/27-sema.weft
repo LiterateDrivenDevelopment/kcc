@@ -1249,7 +1249,16 @@ _kcc_sema_expr_literal:
     ret
 
 .Lsel_double:
-    // A floating constant has type double (float suffix not yet distinguished).
+    // A floating constant is double, or float when it carried an f/F suffix
+    // (recorded in AST_F2 by the parser; the value was rounded to single there).
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Lsel_double_d
+    adrp x0, _kcc_type_float@@PAGE
+    add  x0, x0, _kcc_type_float@@PAGEOFF
+    ldr  x0, [x0]
+    ldp x29, x30, [sp], #16
+    ret
+.Lsel_double_d:
     adrp x0, _kcc_type_double@@PAGE
     add  x0, x0, _kcc_type_double@@PAGEOFF
     ldr  x0, [x0]

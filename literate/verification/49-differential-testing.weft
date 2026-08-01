@@ -354,6 +354,22 @@ difftest "char-array-packing" \
     "int main(void){ char s[4]; s[0] = 65; s[1] = 66; s[2] = 67; s[3] = 0; return s[0] + s[1] + s[2] + sizeof(s); }"
 difftest "int-ptr-stride" \
     "int main(void){ int a[5]; int *p = a; int i = 0; for (i = 0; i < 5; i = i + 1) *(p + i) = i * 2; return a[4] + (int)(&a[4] - a); }"
+difftest "union-alias" \
+    "union U { int i; int j; }; int main(void){ union U u; u.i = 42; return u.j; }"
+difftest "union-overlap" \
+    "union U { int a; char b; }; int main(void){ union U u; u.a = 300; return u.b; }"
+difftest "union-array-member" \
+    "union U { int i; int arr[2]; }; int main(void){ union U u; u.arr[0] = 5; u.arr[1] = 9; return u.i; }"
+difftest "struct-array-member" \
+    "struct S { int n; int a[3]; }; int main(void){ struct S s; s.a[0]=1; s.a[1]=2; s.a[2]=3; return s.a[0]+s.a[1]+s.a[2]; }"
+difftest "union-in-struct" \
+    "struct S { int tag; union { int i; char c; } u; }; int main(void){ struct S s; s.tag = 1; s.u.i = 7; return s.tag + s.u.i; }"
+difftest "char-sign-extend" \
+    "int main(void){ char c = (char)200; int x = (int)c; return x < 0 ? 1 : 0; }"
+difftest "signed-char-neg" \
+    "int main(void){ signed char c = -5; int i = c; return i + 10; }"
+difftest "short-narrow" \
+    "int main(void){ short s = 1000; s = s + 100; return s; }"
 @}
 
 @d Difftest: floating point @{
@@ -388,6 +404,18 @@ difftest "fp-function" \
     "int scale(double x){ return (int)(x * 2); } int main(void){ return scale(3.5); }"
 difftest "fp-return" \
     "double half(double x){ return x / 2.0; } int main(void){ return (int)(half(9.0) * 2); }"
+difftest "float-precision-literal" \
+    "int main(void){ float f = 16777217.0f; return f == 16777216.0f ? 1 : 0; }"
+difftest "float-precision-convert" \
+    "int main(void){ double d = 16777217.0; float f = d; return f == 16777216.0f ? 1 : 0; }"
+difftest "float-precision-cast" \
+    "int main(void){ return (float)16777217.0 == 16777216.0f ? 1 : 0; }"
+difftest "float-sizeof" \
+    "int main(void){ return (int)(sizeof(float) + sizeof(1.5f)); }"
+difftest "float-arith" \
+    "int main(void){ float f = 1.5f, g = 2.25f; return (int)((f + g) * 8); }"
+difftest "float-func" \
+    "float sq(float x){ return x * x; } int main(void){ return (int)sq(7.0f); }"
 @}
 
 \section{Operators and Edge Cases}

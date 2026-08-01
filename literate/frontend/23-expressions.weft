@@ -908,21 +908,38 @@ _kcc_parse_primary_expr:
     b .Lprimary_done
 
 .Lprimary_float:
-    // Floating constant: evaluate to a double bit pattern.
+    // Floating constant: evaluate to a double bit pattern.  An `f`/`F` suffix
+    // makes it a single-precision float: round the value to single precision
+    // and mark the node so sema types it as float.
     adrp x0, _kcc_tok_start@@PAGE
     add  x0, x0, _kcc_tok_start@@PAGEOFF
     ldr  x0, [x0]
     adrp x1, _kcc_tok_len@@PAGE
     add  x1, x1, _kcc_tok_len@@PAGEOFF
     ldr  x1, [x1]
+    add  x2, x0, x1
+    ldrb w2, [x2, #-1]           // last character = suffix
+    mov  x20, #0                  // is_float flag
+    cmp  w2, #'f'
+    b.eq .Lpf_isfloat
+    cmp  w2, #'F'
+    b.ne .Lpf_atof
+.Lpf_isfloat:
+    mov  x20, #1
+.Lpf_atof:
     bl _kcc_parse_atof
     mov x19, x0                  // x19 = double bit pattern
-
+    cbz x20, .Lpf_build
+    mov x0, x19
+    bl _kcc_round_to_float       // round to single precision
+    mov x19, x0
+.Lpf_build:
     bl _kcc_pp_next
 
     mov x0, #AST_FLOAT_LIT
     bl _kcc_ast_alloc
-    str x19, [x0, #AST_F0]      // double bit pattern
+    str x19, [x0, #AST_F0]      // double bit pattern (single-rounded if float)
+    str x20, [x0, #AST_F2]      // is_float suffix flag
     b .Lprimary_done
 
 .Lprimary_string:
@@ -1410,7 +1427,22 @@ _kcc_parse_atof:
 .Latof_end:
     fmov x0, d0                  // return the double's bit pattern
     ret
-@| _kcc_is_float_literal _kcc_parse_atof
+
+// -- kcc_round_to_float -------------------------------------------------------
+// uint64_t kcc_round_to_float(uint64_t double_bits)
+//   Rounds a double to single precision and returns it back in double format,
+//   so an `f`-suffixed literal such as 16777217.0f holds exactly the value a
+//   single-precision float would.  Uses the compiler host's own FPU.
+.text
+.globl _kcc_round_to_float
+.p2align 2
+_kcc_round_to_float:
+    fmov d0, x0
+    fcvt s0, d0                  // double → single (rounds to nearest)
+    fcvt d0, s0                  // single → double (exact widening)
+    fmov x0, d0
+    ret
+@| _kcc_is_float_literal _kcc_parse_atof _kcc_round_to_float
 @}
 
 \section{Argument List}

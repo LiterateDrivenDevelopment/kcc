@@ -712,9 +712,16 @@ is complete (\S\ref{sec:parse-float}); unions, single-precision
 struct pass/return by value working (\S\ref{sec:struct-args}), a
 byte-accurate \stdref{6.7.2.1} struct/union layout with standard padding
 and alignment (so \texttt{sizeof} and member offsets are conformant),
-more-than-eight-argument stack passing, and variadic function definitions
-(\S\ref{sec:variadic-defs}); only AAPCS64 argument \emph{packing} (small
-structs in registers, for \texttt{clang} interop) remains.
+more-than-eight-argument stack passing, variadic function definitions
+(\S\ref{sec:variadic-defs}), and now a fully AAPCS64-compliant calling
+convention---floating arguments and returns in \texttt{d0}--\texttt{d7},
+small structs passed and returned in \texttt{x0}--\texttt{x1} (a 9--16-byte
+struct argument arrives in two registers and is rebuilt by the callee), large
+struct arguments by reference, and large struct returns through the \texttt{x8}
+indirect-result pointer---validated in both directions against \texttt{clang}
+by a mixed-object interoperability suite (Chapter~\ref{ch:interop-testing}),
+which passes on all sixteen checks.  \kcc{}'s Stage~9b ABI work is therefore
+complete: its objects link and run correctly with \texttt{clang}'s.
 Stages~9c--9e (register allocation, optimization, tooling) are
 not yet begun.  A precise ledger of what is done and what is left
 appears in the production-readiness assessment
@@ -1078,7 +1085,7 @@ Concern & Status & Note \\
 \hline
 optimization / reg.\ alloc. &         & all-spill; ${\sim}3\times$ memory traffic \\
 $>8$ arguments on the stack  & \checkmark & self-consistent, 5 diff. tests \\
-AAPCS64 argument packing     &         & small structs by hidden ptr \\
+AAPCS64 register convention  & \checkmark & FP/small+large struct/x8; interop 16/16 \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\
 automatic linking (\texttt{ld}) &      & manual link step \\
 standard library / sys.\ headers &     & no \texttt{<stdio.h>} \\
@@ -1096,11 +1103,14 @@ C, plus \texttt{double}}, \kcc{} is in good shape and unusually
 well-tested for a hand-written assembly project.  As a \emph{complete
 C17 implementation} it is roughly two-thirds there: the missing
 pieces are bounded (unions, real \texttt{float}, and bit-fields).
-Standard struct layout, more-than-eight stack arguments, and variadic
-function definitions---all previously open---are now done, so \texttt{sizeof}
-and member offsets are Standard-conformant and the only remaining ABI item
-is register-packing small structs into argument registers (needed solely
-for \texttt{clang} object-file interop).  As a
+Standard struct layout, more-than-eight stack arguments, variadic
+function definitions, and a fully AAPCS64-compliant calling convention
+(floating values in \texttt{d} registers, small structs in
+\texttt{x0}--\texttt{x1}, 9--16-byte struct arguments in two registers, large
+struct returns via \texttt{x8})---all previously open---are now done and
+cross-checked in both directions against \texttt{clang} with a mixed-object
+interoperability suite (16/16), so \kcc{} objects link and run correctly with
+\texttt{clang} ones.  The Stage~9b ABI is complete.  As a
 \emph{production-ready} toolchain in the industrial sense it is early:
 no optimizer, a single target, no automatic linking, no standard
 library, and first-error-only diagnostics.  The shortest credible path

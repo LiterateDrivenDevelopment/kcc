@@ -567,74 +567,127 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
 \kcc{}-to-\kcc{} calls, which is what the corpus needs.
 
 @d CodeGen: compile function @{
-    // 6. Store arguments (x0-x7) to their vreg stack slots
+    // 6. Spill incoming parameters (AAPCS64) to their vreg stack slots.
+    // Walk the parameters keeping NGRN (x26), NSRN (x27), and a running vreg
+    // base ([sp,#96]) that advances by two for a 9..16-byte struct (which
+    // occupies two vregs) and by one otherwise.  Each parameter is spilled
+    // from x<ngrn>, d<nsrn>, or (a 9..16B struct) two general registers, per
+    // its class in IRF_PARAM_CLS; a parameter that exhausts its register file
+    // is read from the caller's stack image at [x29 + frame_size + (base-1)*8].
     ldr x24, [x19, #IRF_PARAMS]   // param count
+    ldr x28, [x19, #IRF_PARAM_CLS] // per-param class array (may be 0)
     mov x25, #0                    // param index
+    mov x26, #0                    // NGRN
+    mov x27, #0                    // NSRN
+    str xzr, [sp, #96]            // vreg base
 
 .Lcgf_store_args:
     cmp x25, x24
     b.ge .Lcgf_walk_bbs
-    cmp x25, #8
-    b.ge .Lcgf_store_stack_args   // params 8+ arrive on the caller's stack
+    mov x0, #0                     // class (default GP)
+    cbz x28, .Lcgf_sa_have_cls
+    ldr x0, [x28, x25, lsl #3]
+.Lcgf_sa_have_cls:
+    cmp x0, #1                     // FP?
+    b.eq .Lcgf_sa_fp
+    cmp x0, #5                     // hidden sret pointer (x8)?
+    b.eq .Lcgf_sa_x8
+    cmp x0, #3                     // ST2 (9..16B struct)?
+    b.eq .Lcgf_sa_st2
 
-    // STR x<param>, [x29, #slot_offset(param)]
-    // slot_offset(vreg) = -(16 + vreg*8) but for unsigned offset STR
-    // we need positive offset from sp. Actually with frame pointer:
-    // sp = x29 - frame_size + 16? No.
-    // After prologue: x29 = sp, and sp was decremented by frame_size.
-    // So x29 points to the OLD sp - frame_size.
-    // Stored fp/lr are at [x29, #0] and [x29, #8].
-    // vreg N is at [x29, #16 + N*8] ... wait no.
-    //
-    // Let's use: vreg N at [sp, #16 + N*8]
-    // Since x29 == sp after prologue, this is [x29, #16 + N*8]
-    // Frame layout:
-    //   [x29+0]: saved x29 (old fp)
-    //   [x29+8]: saved x30 (lr)
-    //   [x29+16]: vreg 0
-    //   [x29+24]: vreg 1
-    //   ...
-    //   [x29+16+N*8]: vreg N
-
-    // Encode STR: rt=param_reg, rn=29(x29), imm12_scaled=(16+param*8)/8
-    mov x0, x25                    // rt = x<param_index>
-    mov x1, #29                    // rn = x29
-    add x2, x25, #2               // imm12_scaled = (16 + param*8)/8 = param + 2
-    mov x3, #1                     // size = 64-bit
+    // GP / ST1 / REF: spill x<ngrn> into slot(base); base += 1
+    cmp x26, #8
+    b.ge .Lcgf_sa_stack
+    mov x0, x26                    // rt = x<ngrn>
+    mov x1, #29
+    ldr x2, [sp, #96]
+    add x2, x2, #2               // imm12_scaled = base + 2
+    mov x3, #1
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
+    add x26, x26, #1
+    ldr x2, [sp, #96]
+    add x2, x2, #1
+    str x2, [sp, #96]
+    b .Lcgf_sa_next
 
-    add x25, x25, #1
-    b .Lcgf_store_args
+.Lcgf_sa_fp:
+    cmp x27, #8
+    b.ge .Lcgf_sa_stack
+    ldr x0, [sp, #96]            // vreg = base
+    mov x1, x27                    // fp reg = nsrn
+    bl _kcc_cg_store_vreg_fp
+    add x27, x27, #1
+    ldr x2, [sp, #96]
+    add x2, x2, #1
+    str x2, [sp, #96]
+    b .Lcgf_sa_next
 
-.Lcgf_store_stack_args:
-    // Params 8+ were pushed by the caller at [pre_call_sp + (k-1)*8], which
-    // in this frame is [x29 + frame_size + (k-1)*8].  Copy each through
-    // scratch x9 into its own vreg slot [x29, #(k+2)*8].
-.Lcgf_stack_args_loop:
-    cmp x25, x24
-    b.ge .Lcgf_walk_bbs
-    // LDR x9, [x29, #frame_size + (k-1)*8]
-    adrp x0, _kcc_cg_frame_size@@PAGE
-    add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
-    ldr x0, [x0]                   // frame_size (bytes)
-    lsr x0, x0, #3                // frame_size / 8
-    add x0, x0, x25              // + k
-    sub x2, x0, #1               // imm12_scaled = frame_size/8 + k - 1
-    mov x0, #9                    // rt = x9
-    mov x1, #29                   // rn = x29
+.Lcgf_sa_x8:
+    // Hidden result pointer: spill x8 into the sret vreg slot (no NGRN/NSRN).
+    mov x0, #8
+    mov x1, #29
+    ldr x2, [sp, #96]
+    add x2, x2, #2
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    ldr x2, [sp, #96]
+    add x2, x2, #1
+    str x2, [sp, #96]
+    b .Lcgf_sa_next
+
+.Lcgf_sa_st2:
+    // 9..16B struct in two registers: spill x<ngrn>→slot(base),
+    // x<ngrn+1>→slot(base+1); base += 2.
+    cmp x26, #6
+    b.gt .Lcgf_sa_stack
+    ldr x2, [sp, #96]
+    add x2, x2, #2               // slot(base)
+    mov x0, x26
+    mov x1, #29
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    ldr x2, [sp, #96]
+    add x2, x2, #3               // slot(base+1) = (base+1)+2
+    add x0, x26, #1
+    mov x1, #29
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    add x26, x26, #2
+    ldr x2, [sp, #96]
+    add x2, x2, #2
+    str x2, [sp, #96]
+    b .Lcgf_sa_next
+
+.Lcgf_sa_stack:
+    // Overflow: read from [x29 + frame_size + (base-1)*8] into x9, store to
+    // slot(base); base += 1.
+    ldr x1, [sp, #96]           // base
+    lsr x0, x20, #3               // frame_size / 8  (x20 = frame_size)
+    add x0, x0, x1
+    sub x2, x0, #1               // imm12_scaled = frame_size/8 + base - 1
+    mov x0, #9
+    mov x1, #29
     mov x3, #1
     bl _kcc_enc_ldr_imm
     bl _kcc_code_emit32
-    // STR x9, [x29, #(k+2)*8]  (its vreg slot)
     mov x0, #9
     mov x1, #29
-    add x2, x25, #2
+    ldr x2, [sp, #96]
+    add x2, x2, #2
     mov x3, #1
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
+    ldr x2, [sp, #96]
+    add x2, x2, #1
+    str x2, [sp, #96]
+
+.Lcgf_sa_next:
     add x25, x25, #1
-    b .Lcgf_stack_args_loop
+    b .Lcgf_store_args
 @}
 
 \paragraph{Walking Basic Blocks}
@@ -891,6 +944,165 @@ _kcc_cg_store_vreg_fp:
     ldp x29, x30, [sp], #16
     ret
 @| _kcc_cg_load_vreg _kcc_cg_store_vreg _kcc_cg_load_vreg_fp _kcc_cg_store_vreg_fp
+@}
+
+\section{AAPCS64 Argument Marshaling}
+\label{sec:aapcs64-marshal}
+
+Both the direct and indirect call paths share \texttt{\_kcc\_cg\_marshal\_args},
+which realises the AAPCS64 argument-passing rules.  The argument array carries,
+per argument, a vreg and a class (Section~\ref{sec:variadic-defs} lists the
+class codes: GP, FP, ST1, ST2, REF).  The routine walks the arguments keeping
+two counters---\textsc{ngrn}, the next general register, and \textsc{nsrn}, the
+next SIMD/floating register---and loads each argument into \texttt{x[ngrn]} or
+\texttt{d[nsrn]} accordingly; an integer, pointer, or (for now)
+by-reference/by-address aggregate takes one general register, a
+\texttt{double} takes one floating register.  After the register phase it also
+writes a full stack image---every argument at \texttt{[sp,\,\#(k-1)*8]}---so
+that a variadic Apple callee, which reads its arguments from the stack
+regardless of registers, still finds them; the caller restores \texttt{sp}
+with the returned \texttt{stack\_adj} once the call returns.  Because the
+stack image loads each value from its vreg slot (not from a register), it
+carries the correct bits for floating arguments even though those now travel
+in \texttt{d} registers.
+
+@d CodeGen: marshal args @{
+// -- kcc_cg_marshal_args ------------------------------------------------------
+// uint64_t kcc_cg_marshal_args(uint64_t *args, uint64_t count)
+//   args = [count, vreg0, class0, vreg1, class1, ...].  Emits the register
+//   placement and the stack image.  Returns the stack_adj it subtracted from
+//   sp (0 if none), so the caller can add it back after the call.
+.text
+.globl _kcc_cg_marshal_args
+.p2align 2
+_kcc_cg_marshal_args:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // args array
+    mov x20, x1                  // arg count
+    mov x24, #0                  // stack_adj (return value)
+    cbz x20, .Lma_done
+
+    // ---- register phase: NGRN (x22) / NSRN (x23) ----
+    mov x21, #0                  // arg index
+    mov x22, #0                  // NGRN
+    mov x23, #0                  // NSRN
+.Lma_reg_loop:
+    cmp x21, x20
+    b.ge .Lma_stack
+    lsl x0, x21, #1
+    add x1, x0, #2
+    ldr x1, [x19, x1, lsl #3]    // class
+    add x0, x0, #1
+    ldr x0, [x19, x0, lsl #3]    // vreg
+    cmp x1, #1                   // FP?
+    b.eq .Lma_fp
+    cmp x1, #5                   // X8 (indirect result pointer)?
+    b.eq .Lma_x8
+    cmp x1, #2                   // ST1: struct <=8B, one register
+    b.eq .Lma_st1
+    cmp x1, #3                   // ST2: struct 9..16B, two registers
+    b.eq .Lma_st2
+    // GP / REF: load vreg (value or address) into x[ngrn]
+    cmp x22, #8
+    b.ge .Lma_reg_next
+    mov x1, x22
+    bl _kcc_cg_load_vreg
+    add x22, x22, #1
+    b .Lma_reg_next
+.Lma_st1:
+    cmp x22, #8
+    b.ge .Lma_reg_next
+    // x0 = struct address vreg → x9 = address, then x[ngrn] = [x9]
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, x22
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    add x22, x22, #1
+    b .Lma_reg_next
+.Lma_st2:
+    // Two consecutive general registers; if fewer than two remain, overflow.
+    cmp x22, #6
+    b.gt .Lma_reg_next
+    mov x1, #9
+    bl _kcc_cg_load_vreg          // x9 = struct address
+    mov x0, x22                    // x[ngrn] = [x9]
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    add x0, x22, #1               // x[ngrn+1] = [x9, #8]
+    mov x1, #9
+    mov x2, #1
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    add x22, x22, #2
+    b .Lma_reg_next
+.Lma_fp:
+    cmp x23, #8
+    b.ge .Lma_reg_next
+    mov x1, x23
+    bl _kcc_cg_load_vreg_fp
+    add x23, x23, #1
+    b .Lma_reg_next
+.Lma_x8:
+    // The indirect result pointer travels in x8 and consumes no NGRN/NSRN.
+    mov x1, #8
+    bl _kcc_cg_load_vreg
+.Lma_reg_next:
+    add x21, x21, #1
+    b .Lma_reg_loop
+
+.Lma_stack:
+    // ---- stack image (Apple variadic + >8 overflow) ----
+    cmp x20, #2
+    b.lt .Lma_done
+    sub x0, x20, #1
+    lsl x0, x0, #3
+    add x0, x0, #15
+    bic x24, x0, #15            // stack_adj = align16((count-1)*8)
+    // SUB sp, sp, #stack_adj
+    mov x0, #31
+    mov x1, #31
+    mov x2, x24
+    mov x3, #1
+    bl _kcc_enc_sub_imm
+    bl _kcc_code_emit32
+    mov x21, #1                  // k
+.Lma_stack_loop:
+    cmp x21, x20
+    b.ge .Lma_done
+    lsl x0, x21, #1
+    add x0, x0, #1
+    ldr x0, [x19, x0, lsl #3]    // vreg
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, #9
+    mov x1, #31
+    sub x2, x21, #1
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    add x21, x21, #1
+    b .Lma_stack_loop
+
+.Lma_done:
+    mov x0, x24                  // return stack_adj
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_cg_marshal_args
 @}
 
 \section{Instruction Dispatch}
@@ -2366,20 +2578,58 @@ range is $0$--$63$.
 
 @d CodeGen: instruction dispatch @{
 .Lcgi_ret:
-    // Return: load return value to x0, emit epilogue
+    // Return: load the value to x0 (scalar), d0 (floating), or x0(-x1) for a
+    // small struct, then emit the epilogue.
     ldr x23, [x19, #IR_SRC1]      // return value vreg (0 if void)
 
-    // Check if this is a void return (no src1)
-    ldr x24, [x19, #IR_TYPE]
-    cbz x24, .Lcgi_ret_epilogue
-    ldr x24, [x24]                 // type kind
-    cmp x24, #1                    // TY_VOID = 1
+    ldr x25, [x19, #IR_TYPE]      // return type (kept in x25)
+    cbz x25, .Lcgi_ret_epilogue
+    ldr x24, [x25]                 // type kind
+    cmp x24, #1                    // TY_VOID
     b.eq .Lcgi_ret_epilogue
+    cmp x24, #8                    // TY_FLOAT
+    b.eq .Lcgi_ret_fp
+    cmp x24, #9                    // TY_DOUBLE
+    b.eq .Lcgi_ret_fp
+    cmp x24, #14                   // TY_STRUCT
+    b.eq .Lcgi_ret_struct
+    cmp x24, #15                   // TY_UNION
+    b.eq .Lcgi_ret_struct
 
     // Load return value to x0
     mov x0, x23
     mov x1, #0                     // target reg = x0
     bl _kcc_cg_load_vreg
+    b .Lcgi_ret_epilogue
+
+.Lcgi_ret_fp:
+    // A floating return goes in d0 (AAPCS64)
+    mov x0, x23
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    b .Lcgi_ret_epilogue
+
+.Lcgi_ret_struct:
+    // Small struct (<=16 bytes): x23 = struct address vreg, x25 = struct type.
+    // Load [addr] into x0, and [addr+8] into x1 when the struct exceeds 8 bytes.
+    mov x0, x23
+    mov x1, #9                     // x9 = struct address
+    bl _kcc_cg_load_vreg
+    mov x0, #0                     // x0 = [x9]
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    ldr x0, [x25, #TY_SIZE]
+    cmp x0, #8
+    b.le .Lcgi_ret_epilogue
+    mov x0, #1                     // x1 = [x9, #8]
+    mov x1, #9
+    mov x2, #1                     // imm12_scaled = 1 → byte offset 8
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
 
 .Lcgi_ret_epilogue:
     // Emit epilogue
@@ -2449,85 +2699,21 @@ described in \S\ref{sec:emit-strings}.
 
 @d CodeGen: instruction dispatch @{
 .Lcgi_call:
-    // Call: SRC1 = callee name, SRC2 = args array [count, vreg0, ...], DEST = result vreg
-    // Apple ARM64 ABI: variadic args go on the stack, not in registers.
-    // We pass all args in registers AND also push args[1..N-1] on the stack
-    // so both variadic and non-variadic calls work correctly.
+    // Call: SRC1 = callee name, SRC2 = args array, DEST = result vreg.
+    // The args array is [count, vreg0, class0, vreg1, class1, ...]; the class
+    // drives AAPCS64 register selection (see kcc_cg_marshal_args).
     ldr x23, [x19, #IR_SRC1]      // callee name
     ldr x24, [x19, #IR_DEST]      // result vreg
     ldr x26, [x19, #IR_SRC2]      // args array (or 0 if no args)
 
-    // Get arg count into x22 (free after dispatch)
     mov x22, #0
     cbz x26, .Lcgi_call_load
-    ldr x22, [x26]
+    ldr x22, [x26]                // arg count
 .Lcgi_call_load:
-
-    // Marshal arguments: load each arg vreg into x0-x7
-    cbz x22, .Lcgi_call_args_done
-    mov x27, #0
-.Lcgi_call_arg_loop:
-    cmp x27, x22
-    b.ge .Lcgi_call_args_done
-    cmp x27, #8
-    b.ge .Lcgi_call_args_done
-    add x0, x27, #1
-    ldr x0, [x26, x0, lsl #3]     // vreg = args[index+1]
-    mov x1, x27                    // target reg = x0-x7
-    bl _kcc_cg_load_vreg
-    add x27, x27, #1
-    b .Lcgi_call_arg_loop
-.Lcgi_call_args_done:
-
-    // Push variadic args onto stack (args[1..N-1])
-    cmp x22, #2
-    b.lt .Lcgi_call_no_stack
-
-    // stack_adj = align16((arg_count - 1) * 8)
-    sub x0, x22, #1
-    lsl x0, x0, #3
-    add x0, x0, #15
-    and x0, x0, #~15
-    str x0, [sp, #88]             // save stack_adj
-
-    // Emit: SUB sp, sp, #stack_adj
-    mov x0, #31                    // rd = sp
-    mov x1, #31                    // rn = sp
-    ldr x2, [sp, #88]
-    mov x3, #1
-    bl _kcc_enc_sub_imm
-    bl _kcc_code_emit32
-
-    // Emit STR x<k>, [sp, #(k-1)*8] for each arg k in [1, N-1].  Args 1..7
-    // are already in x1..x7; args 8+ are not in any register, so load each
-    // from its vreg slot into scratch x9 first.  This one contiguous layout
-    // serves both the Apple variadic ABI (printf reads args from the stack)
-    // and kcc's own >8-argument passing (the callee reads params 8+ here).
-    mov x27, #1
-.Lcgi_call_stack_loop:
-    cmp x27, x22
-    b.ge .Lcgi_call_no_stack
-    cmp x27, #8
-    b.lt .Lcgi_call_stack_reg
-    // arg 8+: load args[k+1] vreg into x9
-    add x0, x27, #1
-    ldr x0, [x26, x0, lsl #3]
-    mov x1, #9
-    bl _kcc_cg_load_vreg
-    mov x0, #9                     // rt = x9
-    b .Lcgi_call_stack_str
-.Lcgi_call_stack_reg:
-    mov x0, x27                    // rt = x<k> (already loaded)
-.Lcgi_call_stack_str:
-    mov x1, #31                    // rn = sp
-    sub x2, x27, #1               // imm12_scaled = (k - 1)
-    mov x3, #1                     // size = 64-bit
-    bl _kcc_enc_str_imm
-    bl _kcc_code_emit32
-
-    add x27, x27, #1
-    b .Lcgi_call_stack_loop
-.Lcgi_call_no_stack:
+    mov x0, x26
+    mov x1, x22
+    bl _kcc_cg_marshal_args        // → x0 = stack_adj emitted (0 if none)
+    str x0, [sp, #88]             // stack_adj (restore sp after the call)
 
     // Build Mach-O name with underscore prefix: "_" + name
     mov x0, x23
@@ -2560,23 +2746,65 @@ described in \S\ref{sec:emit-strings}.
     bl _kcc_enc_bl
     bl _kcc_code_emit32
 
-    // Store return value (x0) to dest vreg slot
-    mov x0, x24                    // dest vreg
-    mov x1, #0                     // source reg = x0
+    // Store the return value: d0 (floating), x0(-x1) unpacked into the sret
+    // buffer (small struct), or x0 (scalar).
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_call_ret_gp
+    ldr x0, [x0]
+    cmp x0, #8                     // TY_FLOAT
+    b.eq .Lcgi_call_ret_fp
+    cmp x0, #9                     // TY_DOUBLE
+    b.eq .Lcgi_call_ret_fp
+    cmp x0, #14                    // TY_STRUCT
+    b.eq .Lcgi_call_ret_struct
+    cmp x0, #15                    // TY_UNION
+    b.eq .Lcgi_call_ret_struct
+.Lcgi_call_ret_gp:
+    mov x0, x24
+    mov x1, #0                     // x0
     bl _kcc_cg_store_vreg
+    b .Lcgi_call_ret_done
+.Lcgi_call_ret_fp:
+    mov x0, x24
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_call_ret_done
+.Lcgi_call_ret_struct:
+    // >16B (REF): the callee already wrote the buffer through x8. <=16B:
+    // unpack x0(-x1) into the buffer whose address is in DEST (x24).
+    ldr x1, [x19, #IR_TYPE]
+    ldr x1, [x1, #TY_SIZE]
+    cmp x1, #16
+    b.gt .Lcgi_call_ret_done
+    mov x0, x24                    // buffer vreg → x9 = its address
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, #0                     // STR x0, [x9]
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_TYPE]
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.le .Lcgi_call_ret_done
+    mov x0, #1                     // STR x1, [x9, #8]
+    mov x1, #9
+    mov x2, #1
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+.Lcgi_call_ret_done:
 
-    // Restore stack if we pushed variadic args
-    cmp x22, #2
-    b.lt .Lcgi_done
-
-    // Emit: ADD sp, sp, #stack_adj
+    // Restore stack if the marshal pushed a stack image: ADD sp, sp, #stack_adj
+    ldr x2, [sp, #88]
+    cbz x2, .Lcgi_done
     mov x0, #31
     mov x1, #31
-    ldr x2, [sp, #88]
     mov x3, #1
     bl _kcc_enc_add_imm
     bl _kcc_code_emit32
-
     b .Lcgi_done
 
 .Lcgi_call_ind:
@@ -2585,72 +2813,16 @@ described in \S\ref{sec:emit-strings}.
     ldr x24, [x19, #IR_DEST]
     ldr x26, [x19, #IR_SRC2]
 
-    // Get arg count
     mov x22, #0
     cbz x26, .Lcgi_cind_load
     ldr x22, [x26]
 .Lcgi_cind_load:
-
-    // Marshal arguments into x0-x7
-    cbz x22, .Lcgi_cind_args_done
-    mov x27, #0
-.Lcgi_cind_arg_loop:
-    cmp x27, x22
-    b.ge .Lcgi_cind_args_done
-    cmp x27, #8
-    b.ge .Lcgi_cind_args_done
-    add x0, x27, #1
-    ldr x0, [x26, x0, lsl #3]
-    mov x1, x27
-    bl _kcc_cg_load_vreg
-    add x27, x27, #1
-    b .Lcgi_cind_arg_loop
-.Lcgi_cind_args_done:
-
-    // Push variadic args onto stack (same as direct call)
-    cmp x22, #2
-    b.lt .Lcgi_cind_no_stack
-
-    sub x0, x22, #1
-    lsl x0, x0, #3
-    add x0, x0, #15
-    and x0, x0, #~15
+    mov x0, x26
+    mov x1, x22
+    bl _kcc_cg_marshal_args        // registers + stack image; x0 = stack_adj
     str x0, [sp, #88]
 
-    mov x0, #31
-    mov x1, #31
-    ldr x2, [sp, #88]
-    mov x3, #1
-    bl _kcc_enc_sub_imm
-    bl _kcc_code_emit32
-
-    mov x27, #1
-.Lcgi_cind_stack_loop:
-    cmp x27, x22
-    b.ge .Lcgi_cind_no_stack
-    cmp x27, #8
-    b.lt .Lcgi_cind_stack_reg
-    // arg 8+: load args[k+1] vreg into x9 (fn-ptr not loaded until after)
-    add x0, x27, #1
-    ldr x0, [x26, x0, lsl #3]
-    mov x1, #9
-    bl _kcc_cg_load_vreg
-    mov x0, #9
-    b .Lcgi_cind_stack_str
-.Lcgi_cind_stack_reg:
-    mov x0, x27
-.Lcgi_cind_stack_str:
-    mov x1, #31
-    sub x2, x27, #1
-    mov x3, #1
-    bl _kcc_enc_str_imm
-    bl _kcc_code_emit32
-
-    add x27, x27, #1
-    b .Lcgi_cind_stack_loop
-.Lcgi_cind_no_stack:
-
-    // Load fn-ptr vreg into x9 (scratch)
+    // Load fn-ptr vreg into x9 (x29-relative, unaffected by the stack image)
     mov x0, x23
     mov x1, #9
     bl _kcc_cg_load_vreg
@@ -2660,18 +2832,60 @@ described in \S\ref{sec:emit-strings}.
     bl _kcc_enc_blr
     bl _kcc_code_emit32
 
-    // Store return value (x0) to dest vreg slot
+    // Store the return value: d0 (floating), x0(-x1) into the sret buffer
+    // (small struct), or x0 (scalar).
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_cind_ret_gp
+    ldr x0, [x0]
+    cmp x0, #8                     // TY_FLOAT
+    b.eq .Lcgi_cind_ret_fp
+    cmp x0, #9                     // TY_DOUBLE
+    b.eq .Lcgi_cind_ret_fp
+    cmp x0, #14                    // TY_STRUCT
+    b.eq .Lcgi_cind_ret_struct
+    cmp x0, #15                    // TY_UNION
+    b.eq .Lcgi_cind_ret_struct
+.Lcgi_cind_ret_gp:
     mov x0, x24
     mov x1, #0
     bl _kcc_cg_store_vreg
+    b .Lcgi_cind_ret_done
+.Lcgi_cind_ret_fp:
+    mov x0, x24
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_cind_ret_done
+.Lcgi_cind_ret_struct:
+    ldr x1, [x19, #IR_TYPE]
+    ldr x1, [x1, #TY_SIZE]
+    cmp x1, #16
+    b.gt .Lcgi_cind_ret_done
+    mov x0, x24
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, #0
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_TYPE]
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.le .Lcgi_cind_ret_done
+    mov x0, #1
+    mov x1, #9
+    mov x2, #1
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+.Lcgi_cind_ret_done:
 
-    // Restore stack if we pushed variadic args
-    cmp x22, #2
-    b.lt .Lcgi_done
-
+    // Restore stack if a stack image was pushed
+    ldr x2, [sp, #88]
+    cbz x2, .Lcgi_done
     mov x0, #31
     mov x1, #31
-    ldr x2, [sp, #88]
     mov x3, #1
     bl _kcc_enc_add_imm
     bl _kcc_code_emit32

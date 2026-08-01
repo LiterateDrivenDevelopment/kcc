@@ -466,6 +466,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<CodeGen: compile all@>
 @<CodeGen: compile function@>
 @<CodeGen: vreg slot offset@>
+@<CodeGen: marshal args@>
 @<CodeGen: instruction dispatch@>
 @<CodeGen: floating point@>
 @<CodeGen: patch branches@>
@@ -607,4 +608,14 @@ self-test, and diff against clang:
 @<Difftest: divergences@>
 @<Difftest: gaps@>
 @<Difftest: results@>
+@}
+
+\noindent\textbf{interop.sh} --- compile one translation unit with \kcc{} and
+the other with \texttt{clang}, link, run, compare to the all-\texttt{clang}
+oracle (Chapter~\ref{ch:interop-testing}):
+
+@o tmp/tests/interop.sh @{
+@<Interop: runner@>
+@<Interop: cases@>
+@<Interop: results@>
 @}

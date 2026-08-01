@@ -1211,37 +1211,63 @@ _kcc_ir_build_func:
     ldr x25, [x25, #AST_F4]
     b .Libf_count_params
 .Libf_count_done:
-    // Struct return-by-value: the caller passes the address of a result
-    // buffer as a hidden trailing argument, so reserve one extra incoming
-    // vreg. The prologue spills it from register x<param count>.
+    // AAPCS64 struct return: a struct larger than 16 bytes (class REF) is
+    // returned through a hidden result pointer the caller supplies in x8, so
+    // reserve one extra incoming vreg for it.  A struct of 16 bytes or less
+    // (ST1/ST2) is returned in x0(-x1) and needs no hidden parameter.
     ldr x0, [x23, #IRF_RETTYPE]
-    cbz x0, .Libf_params_set
-    ldr x0, [x0, #TY_KIND]
-    cmp x0, #TY_STRUCT
+    bl _kcc_ir_classify_type
+    cmp x0, #4                    // REF (>16B aggregate)
     b.ne .Libf_params_set
     add x20, x20, #1
 .Libf_params_set:
     str x20, [x23, #IRF_PARAMS]  // set param count (incl. hidden sret)
 
-    // Reserve vregs 0..n-1 for incoming parameter values
-    // These slots will be filled by the codegen prologue (stores x0-x7)
+    // Record each incoming parameter's AAPCS64 class for the prologue.
+    mov x0, x23                   // ir_func
+    mov x1, x19                   // func_decl
+    bl _kcc_ir_fill_param_classes
+
+    // Reserve incoming-parameter vregs.  A 9..16-byte struct parameter
+    // (class ST2) arrives in two registers and occupies two vregs; every
+    // other parameter occupies one.  Sum the widths, then reserve that many.
+    mov x24, #0                   // total vreg width
+    mov x25, #0                   // param index
+.Libf_reserve_count:
+    cmp x25, x20
+    b.ge .Libf_reserve_do
+    ldr x0, [x23, #IRF_PARAM_CLS]
+    cbz x0, .Libf_rc_one
+    ldr x0, [x0, x25, lsl #3]     // class
+    cmp x0, #3                    // ST2 → width 2
+    b.eq .Libf_rc_two
+.Libf_rc_one:
+    add x24, x24, #1
+    b .Libf_rc_next
+.Libf_rc_two:
+    add x24, x24, #2
+.Libf_rc_next:
+    add x25, x25, #1
+    b .Libf_reserve_count
+.Libf_reserve_do:
     mov x25, #0
 .Libf_reserve_vregs:
-    cmp x25, x20
+    cmp x25, x24
     b.ge .Libf_build_params
-    bl _kcc_ir_next_vreg          // reserves vreg for param
+    bl _kcc_ir_next_vreg
     add x25, x25, #1
     b .Libf_reserve_vregs
 .Libf_build_params:
 
-    // Build alloca + store for each parameter
-    ldr x25, [x19, #AST_F2]     // x25 = first param decl
-    mov x20, #0                   // param index (0-based)
+    // Build alloca + store for each parameter, passing its vreg BASE (which
+    // accounts for two-vreg ST2 parameters), not its ordinal index.
+    ldr x25, [x19, #AST_F2]     // first param decl
+    mov x20, #0                   // param index
+    mov x24, #0                   // vreg base (cumulative)
 
 .Libf_param_loop:
     cbz x25, .Libf_body
 
-    // Each param: F0=type, F1=name
     ldr x0, [x25, #AST_TAG]
     cmp x0, #AST_PARAM_DECL
     b.ne .Libf_param_next
@@ -1249,8 +1275,17 @@ _kcc_ir_build_func:
     cbz x0, .Libf_param_next
 
     mov x0, x25
-    mov x1, x20                   // pass param index
+    mov x1, x24                   // vreg base for this parameter
     bl _kcc_ir_build_param
+    ldr x1, [x23, #IRF_PARAM_CLS]
+    ldr x1, [x1, x20, lsl #3]     // class
+    cmp x1, #3
+    b.ne .Libf_pl_one
+    add x24, x24, #2              // ST2 consumed two vregs
+    b .Libf_pl_adv
+.Libf_pl_one:
+    add x24, x24, #1
+.Libf_pl_adv:
     add x20, x20, #1
 
 .Libf_param_next:
@@ -1404,12 +1439,41 @@ _kcc_ir_build_param:
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Initialise parameter storage from the incoming register.
+    // Initialise parameter storage from the incoming register(s).
     ldr x0, [x20, #TY_KIND]
     cmp x0, #TY_STRUCT
-    b.eq .Libp_struct_copy
+    b.eq .Libp_agg
+    cmp x0, #TY_UNION
+    b.eq .Libp_agg
+    b .Libp_scalar_store
 
-    // Scalar: store the incoming value into the alloca.
+.Libp_agg:
+    // <=8B (ST1): arrives as a value in one register → store like a scalar.
+    // 9..16B (ST2): arrives in two registers (vregs base, base+1) → store both
+    //   words into the alloca.
+    // >16B (REF): arrives as a pointer → copy slot by slot.
+    mov x0, x20
+    bl _kcc_type_layout
+    cmp x0, #8
+    b.le .Libp_scalar_store
+    cmp x0, #16
+    b.gt .Libp_struct_copy
+
+    // ST2: reconstruct the 16-byte aggregate from the two incoming vregs.
+    mov x0, x23                  // base = alloca vreg
+    mov x1, #0                   // byte offset 0
+    mov x2, x22                  // value = incoming word 0 (vreg base)
+    mov x3, #0
+    bl _kcc_ir_emit_indexed_store
+    mov x0, x23
+    mov x1, #8                   // byte offset 8
+    add x2, x22, #1              // value = incoming word 1 (vreg base + 1)
+    mov x3, #0
+    bl _kcc_ir_emit_indexed_store
+    b .Libp_record
+
+.Libp_scalar_store:
+    // Scalar / ST1: store the incoming value into the alloca.
     // IR_STORE: SRC1 = value vreg (param index), SRC2 = pointer vreg (alloca)
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
@@ -1869,23 +1933,58 @@ _kcc_ir_build_return:
     b .Libret_terminate
 
 .Libret_struct:
-    // x0 = return expression node; resolve its struct address.
+    // x0 = return expression node; resolve its struct address (x20).
     bl _kcc_ir_build_struct_addr
-    mov x20, x0                  // x20 = source base vreg
-    // Destination = hidden result pointer at vreg IRF_PARAMS-1.
+    mov x20, x0
     adrp x0, _kcc_ir_cur_func@@PAGE
     add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
     ldr x0, [x0]
-    ldr x19, [x0, #IRF_PARAMS]
-    sub x19, x19, #1             // x19 = sret destination vreg
-    ldr x0, [x0, #IRF_RETTYPE]
-    bl _kcc_ir_type_slots        // x0 = slot count
-    mov x2, x0                   // field count
+    ldr x19, [x0, #IRF_RETTYPE]   // x19 = return type
+    mov x0, x19
+    bl _kcc_ir_classify_type
+    cmp x0, #4                    // REF (>16B) → hidden result pointer
+    b.eq .Libret_struct_ref
+
+    // ST1/ST2: return the aggregate in x0(-x1).  IR_RET carries the struct
+    // address in SRC1 and the struct type; codegen loads the words.
+    mov x0, #IR_RET
+    bl _kcc_ir_alloc_instr
+    str x19, [x0, #IR_TYPE]
+    str x20, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    b .Libret_terminate
+
+.Libret_struct_ref:
+    // >16B: copy through the hidden result pointer (received in x8), void ret.
+    mov x0, x19
+    bl _kcc_ir_type_slots        // slot count (kept in x2, untouched below)
+    mov x2, x0
+    // The hidden sret pointer is the last reserved parameter vreg, i.e. the
+    // sum of every parameter's vreg width minus one (an ST2 param takes two).
+    adrp x0, _kcc_ir_cur_func@@PAGE
+    add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
+    ldr x0, [x0]
+    ldr x3, [x0, #IRF_PARAMS]
+    ldr x4, [x0, #IRF_PARAM_CLS]
+    mov x1, #0                    // width sum
+    mov x5, #0                    // index
+.Libret_sret_loop:
+    cmp x5, x3
+    b.ge .Libret_sret_done
+    add x1, x1, #1
+    cbz x4, .Libret_sret_next
+    ldr x6, [x4, x5, lsl #3]
+    cmp x6, #3
+    b.ne .Libret_sret_next
+    add x1, x1, #1
+.Libret_sret_next:
+    add x5, x5, #1
+    b .Libret_sret_loop
+.Libret_sret_done:
+    sub x1, x1, #1               // dst = hidden sret vreg
     mov x0, x20                  // src base
-    mov x1, x19                  // dst base
     bl _kcc_ir_emit_struct_copy
 
-    // Void ret: the callee wrote the result through the hidden pointer.
     mov x0, #IR_RET
     bl _kcc_ir_alloc_instr
     adrp x1, _kcc_type_void@@PAGE
@@ -2192,6 +2291,56 @@ _kcc_ir_type_is_fp:
     mov x0, #1
     ret
 
+// -- kcc_ir_classify_type -------------------------------------------------
+// uint64_t kcc_ir_classify_type(type_desc *ty)
+//   AAPCS64 argument class:
+//     0 = GP    (integer/pointer, one general register)
+//     1 = FP    (float/double, one SIMD register)
+//     2 = ST1   (aggregate <=8 bytes, one general register, by value)
+//     3 = ST2   (aggregate 9..16 bytes, two general registers, by value)
+//     4 = REF   (aggregate >16 bytes, passed by reference in one register)
+.text
+.globl _kcc_ir_classify_type
+.p2align 2
+_kcc_ir_classify_type:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    cbz x0, .Lct_gp
+    mov x19, x0
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Lct_fp
+    ldr x0, [x19, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Lct_struct
+    cmp x0, #TY_UNION
+    b.eq .Lct_struct
+    b .Lct_gp
+.Lct_struct:
+    mov x0, x19
+    bl _kcc_type_layout          // x0 = byte size
+    cmp x0, #8
+    b.le .Lct_st1
+    cmp x0, #16
+    b.le .Lct_st2
+    mov x0, #4
+    b .Lct_ret
+.Lct_st1:
+    mov x0, #2
+    b .Lct_ret
+.Lct_st2:
+    mov x0, #3
+    b .Lct_ret
+.Lct_fp:
+    mov x0, #1
+    b .Lct_ret
+.Lct_gp:
+    mov x0, #0
+.Lct_ret:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
 // -- kcc_ir_emit_sitofp ---------------------------------------------------
 // uint64_t kcc_ir_emit_sitofp(uint64_t src_vreg)
 // Emits IR_SITOFP: converts a signed integer vreg to a double vreg.
@@ -2285,7 +2434,73 @@ _kcc_ir_convert:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_emit_sitofp _kcc_ir_emit_fptosi _kcc_ir_convert
+
+// -- kcc_ir_fill_param_classes --------------------------------------------
+// void kcc_ir_fill_param_classes(ir_func *fn, node *func_decl)
+//   Allocates IRF_PARAM_CLS: one AAPCS64 class per incoming parameter, in
+//   order, so the codegen prologue can spill each from the right register.
+//   Named source parameters are classified from their type; a trailing
+//   hidden sret pointer (when the return type is a struct) stays GP.
+.text
+.globl _kcc_ir_fill_param_classes
+.p2align 2
+_kcc_ir_fill_param_classes:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // ir_func
+    mov x23, x1                  // func_decl
+    ldr x20, [x19, #IRF_PARAMS]
+    cbz x20, .Lfpc_done
+    lsl x0, x20, #3
+    bl _kcc_arena_alloc
+    str x0, [x19, #IRF_PARAM_CLS]
+    mov x22, x0                  // class array
+    // Default every slot to GP (arena is not zero-initialised).
+    mov x21, #0
+.Lfpc_zero:
+    cmp x21, x20
+    b.ge .Lfpc_walk
+    str xzr, [x22, x21, lsl #3]
+    add x21, x21, #1
+    b .Lfpc_zero
+.Lfpc_walk:
+    ldr x24, [x23, #AST_F2]      // first param decl
+    mov x21, #0                  // named-param index
+.Lfpc_loop:
+    cbz x24, .Lfpc_sret
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_PARAM_DECL
+    b.ne .Lfpc_next
+    ldr x0, [x24, #AST_F1]       // name (skip the (void) marker)
+    cbz x0, .Lfpc_next
+    ldr x0, [x24, #AST_F0]       // param type spec
+    bl _kcc_sema_resolve_type
+    bl _kcc_ir_classify_type
+    str x0, [x22, x21, lsl #3]
+    add x21, x21, #1
+.Lfpc_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lfpc_loop
+.Lfpc_sret:
+    // A >16B struct return adds a trailing hidden parameter received in x8
+    // (class 5), not in a general argument register.
+    ldr x0, [x19, #IRF_RETTYPE]
+    bl _kcc_ir_classify_type
+    cmp x0, #4
+    b.ne .Lfpc_done
+    sub x0, x20, #1              // last param index
+    mov x1, #5                   // class X8
+    str x1, [x22, x0, lsl #3]
+.Lfpc_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_classify_type _kcc_ir_emit_sitofp _kcc_ir_emit_fptosi _kcc_ir_convert _kcc_ir_fill_param_classes
 @}
 
 \subsection{Sizeof Expression}
@@ -5609,33 +5824,35 @@ _kcc_ir_build_call:
     bl _kcc_ir_emit
 
 .Libc_alloc_args:
-    // Allocate args array: (1 + count + has_sret) * 8 bytes
+    // Allocate args array.  Layout: args[0] = total arg count, then two words
+    // per argument: args[1+i*2] = vreg, args[2+i*2] = AAPCS64 class.  Size is
+    // therefore (1 + total*2) * 8 bytes.
     ldr x0, [sp, #80]            // biased sret buffer vreg (0 = none)
     cmp x0, #0
     cset x1, ne                  // has_sret ∈ {0,1}
     add x1, x22, x1              // total argument count
     str x1, [sp, #104]          // total count (args[0])
-    add x0, x1, #1
-    lsl x0, x0, #3               // (total+1) * 8
+    lsl x0, x1, #1              // total*2
+    add x0, x0, #1             // 1 + total*2
+    lsl x0, x0, #3               // in bytes
     bl _kcc_arena_alloc
     mov x23, x0                    // x23 = args array
     ldr x0, [sp, #104]
     str x0, [x23]                 // args[0] = total count
 
-    // Evaluate each argument expression and store vreg in array
+    // Evaluate each argument expression: store its vreg and AAPCS64 class.
     mov x24, x21                   // x24 = current arg node
     mov x21, #0                    // x21 = arg index
 .Libc_eval_args:
     cmp x21, x22
     b.ge .Libc_eval_done
-    // A struct argument is passed by value as the address of the object;
-    // the callee copies it into its own parameter storage. Scalars pass
-    // their value.
+    // Classify the argument; a struct/union (class >= ST1) is passed as the
+    // address of the object, scalars/doubles by value.
     ldr x0, [x24, #AST_F3]        // argument's resolved type
-    cbz x0, .Libc_eval_scalar
-    ldr x1, [x0, #TY_KIND]
-    cmp x1, #TY_STRUCT
-    b.ne .Libc_eval_scalar
+    bl _kcc_ir_classify_type
+    str x0, [sp, #104]           // stash class (total count no longer needed)
+    cmp x0, #2
+    b.lt .Libc_eval_scalar
     mov x0, x24
     bl _kcc_ir_build_struct_addr  // vreg holding the struct's address
     b .Libc_eval_store
@@ -5643,43 +5860,63 @@ _kcc_ir_build_call:
     mov x0, x24
     bl _kcc_ir_build_expr          // returns vreg in x0
 .Libc_eval_store:
-    add x1, x21, #1               // offset = (index+1)
-    str x0, [x23, x1, lsl #3]     // args[index+1] = vreg
+    lsl x1, x21, #1              // index*2
+    add x1, x1, #1             // 1 + index*2
+    str x0, [x23, x1, lsl #3]     // vreg
+    add x1, x1, #1
+    ldr x2, [sp, #104]           // class
+    str x2, [x23, x1, lsl #3]     // class
     ldr x24, [x24, #AST_F4]       // next arg
     add x21, x21, #1
     b .Libc_eval_args
 .Libc_eval_done:
 
-    // Append the hidden result pointer as the trailing argument.
+    // Append the hidden result pointer with class X8 (5): the marshal loads
+    // it into x8 (AAPCS64 indirect-result register).  A >16B callee reads it;
+    // a <=16B callee ignores x8 and returns the aggregate in x0(-x1) instead.
     ldr x0, [sp, #80]            // biased sret buffer vreg
     cbz x0, .Libc_dispatch
     sub x0, x0, #1              // recover real buffer vreg
-    add x1, x22, #1              // index = arg_count + 1
-    str x0, [x23, x1, lsl #3]    // args[arg_count+1] = buffer vreg
+    lsl x1, x22, #1             // arg_count*2
+    add x1, x1, #1             // 1 + arg_count*2
+    str x0, [x23, x1, lsl #3]    // vreg = buffer address
+    add x1, x1, #1
+    mov x2, #5
+    str x2, [x23, x1, lsl #3]   // class = X8
 
 .Libc_dispatch:
     // Check if indirect call (callee is a local variable)
     ldr x0, [sp, #64]            // locals_result
     cbnz x0, .Libc_indirect
 
-    // Direct call: emit IR_CALL
+    // Direct call: emit IR_CALL.  IR_TYPE = the call's result type, so the
+    // backend knows whether the result comes back in x0 or d0.
     mov x0, #IR_CALL
     bl _kcc_ir_alloc_instr
     str x20, [x0, #IR_SRC1]       // callee name
     str x23, [x0, #IR_SRC2]       // args array ptr
+    ldr x1, [x19, #AST_F3]       // call result type (x19 = call node)
+    cbnz x1, .Libc_dtype
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
+.Libc_dtype:
     str x1, [x0, #IR_TYPE]
     mov x19, x0
+    // DEST is the sret buffer vreg for a struct return (so the backend can
+    // unpack x0/x1 into it), otherwise a fresh result vreg.
+    ldr x1, [sp, #80]
+    cbz x1, .Libc_dfresh
+    sub x1, x1, #1
+    str x1, [x19, #IR_DEST]
+    b .Libc_demit
+.Libc_dfresh:
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
-    mov x20, x0                    // result vreg
-
+.Libc_demit:
     mov x0, x19
     bl _kcc_ir_emit
-
-    mov x0, x20
+    ldr x0, [x19, #IR_DEST]        // result vreg (.Libc_done overrides for struct)
     b .Libc_done
 
 .Libc_indirect:
@@ -5688,24 +5925,31 @@ _kcc_ir_build_call:
     bl _kcc_ir_build_expr          // returns fn-ptr vreg in x0
     mov x24, x0                    // x24 = fn-ptr vreg
 
-    // Emit IR_CALL_IND
+    // Emit IR_CALL_IND (result type in IR_TYPE, as for the direct call)
     mov x0, #IR_CALL_IND
     bl _kcc_ir_alloc_instr
     str x24, [x0, #IR_SRC1]       // fn-ptr vreg
     str x23, [x0, #IR_SRC2]       // args array ptr
+    ldr x1, [x19, #AST_F3]       // call result type (x19 = call node)
+    cbnz x1, .Libc_itype
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
+.Libc_itype:
     str x1, [x0, #IR_TYPE]
     mov x19, x0
+    ldr x1, [sp, #80]
+    cbz x1, .Libc_ifresh
+    sub x1, x1, #1
+    str x1, [x19, #IR_DEST]
+    b .Libc_iemit
+.Libc_ifresh:
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
-    mov x20, x0
-
+.Libc_iemit:
     mov x0, x19
     bl _kcc_ir_emit
-
-    mov x0, x20
+    ldr x0, [x19, #IR_DEST]
     b .Libc_done
 
 .Libc_va_start:

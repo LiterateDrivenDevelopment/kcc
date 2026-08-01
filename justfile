@@ -81,6 +81,11 @@ difftest: build
     chmod +x tmp/tests/difftest.sh
     tmp/tests/difftest.sh
 
+# ABI interop: compile one TU with kcc and the other with clang, link, run
+interop: build
+    chmod +x tmp/tests/interop.sh
+    tmp/tests/interop.sh
+
 # Code generation tests: compile C programs with kcc, link, run, check exit codes
 test-codegen: build
     chmod +x tmp/tests/test_codegen.sh

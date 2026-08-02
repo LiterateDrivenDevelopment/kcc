@@ -792,7 +792,7 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 \textbf{\#} & \textbf{Open item} & \textbf{Impact} & \textbf{Effort} & \textbf{Home}\\
 \hline
 1  & Multi-error recovery \& diagnostics \stDone & \meterA & \meterB & 9e\\
-2  & \texttt{-Wall} warnings \stPart            & \meterB & \meterC & 9e\\
+2  & \texttt{-Wall} warnings \stDone            & \meterB & \meterC & 9e\\
 3  & Designated initializers                    & \meterA & \meterB & 9a\\
 4  & Bit-fields                                 & \meterA & \meterB & 9a\\
 5  & \_Bool normalize, \texttt{char\,s[]="\dots"} & \meterB & \meterC & 9a\\
@@ -851,8 +851,8 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       itself treats as \texttt{-Wall} warnings rather than errors, and whose
       false-positive risk against pointer-heavy systems C argues for the
       warning machinery, not the error path.
-\item \textbf{\texttt{-Wall}-equivalent warnings} (Stage~9e).  \emph{In
-      progress.}  The whole family sits behind a single default-off
+\item \textbf{\texttt{-Wall}-equivalent warnings} (Stage~9e).  \emph{Core
+      complete.}  The whole family sits behind a single default-off
       \texttt{-Wall} flag (\texttt{\_kcc\_warn\_all}, set while the driver
       scans arguments), and warnings go through the warning path of the
       diagnostic engine, which counts but does not abort---so a compile
@@ -884,8 +884,17 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       relational or equality comparison that mixes a signed and an unsigned
       integer---the \texttt{u < -1} surprise---while staying quiet when an
       operand is a known non-negative constant, so the ubiquitous
-      \texttt{i < 10} loop test draws nothing.  \emph{Still open:} the
-      pointer/integer conversion warnings deferred from item~1.
+      \texttt{i < 10} loop test draws nothing.  The fifth,
+      \texttt{-Wint-conversion}, completes the canonical set: mixing an
+      integer and a pointer across an assignment, initialiser, or
+      \texttt{return} without a cast (\texttt{int *p = 5}) is flagged, with
+      the integer constant zero exempted as the null pointer constant and
+      compound assignment left to pointer arithmetic.  All five warnings are
+      false-positive-free, carry the same source-line caret as the errors,
+      and are guarded by \texttt{just warntest}.  \emph{Optional later:}
+      \texttt{-Wparentheses}, \texttt{-Wuninitialized}, and argument-position
+      conversion checks once the function type descriptor carries its
+      parameter types.
 \item \textbf{Designated initializers} (Stage~9a).  Pervasive in real systems
       C (\texttt{\{.field = v\}}, \texttt{[i] = v}); without them a great deal
       of ordinary code simply will not compile, which caps conformance no

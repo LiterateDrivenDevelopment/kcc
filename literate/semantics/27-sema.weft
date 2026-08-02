@@ -360,7 +360,14 @@ _kcc_sema_check_decl:
     // Check initializer if present
     ldr x0, [x19, #AST_F2]
     cbz x0, .Lscd_done
-    bl _kcc_sema_expr
+    bl _kcc_sema_expr               // x0 = initializer type
+
+    // -Wall -Wint-conversion: declared type (x21) vs initializer type
+    mov x2, x0                      // src type
+    mov x1, x21                     // dst = declared type
+    mov x0, x19                     // location node
+    ldr x3, [x19, #AST_F2]         // src node
+    bl _kcc_sema_check_int_ptr
     b .Lscd_done
 
 .Lscd_func:
@@ -967,7 +974,17 @@ statement is forwarded to \texttt{kcc\_sema\_check\_decl}.
 
     // return <expr>; — type-check the expression, then enforce that a
     // value is not returned from a void function (\stdref{6.8.6.4}).
-    bl _kcc_sema_expr
+    bl _kcc_sema_expr               // x0 = returned expression type
+
+    // -Wall -Wint-conversion: return type vs expression type
+    adrp x1, _kcc_sema_cur_ret@@PAGE
+    add  x1, x1, _kcc_sema_cur_ret@@PAGEOFF
+    ldr  x1, [x1]                   // dst = current return type
+    mov  x2, x0                     // src type
+    mov  x0, x19                    // location (return node)
+    ldr  x3, [x19, #AST_F0]        // src node
+    bl _kcc_sema_check_int_ptr
+
     adrp x0, _kcc_sema_cur_ret@@PAGE
     add  x0, x0, _kcc_sema_cur_ret@@PAGEOFF
     ldr  x0, [x0]
@@ -2226,6 +2243,24 @@ of the left operand.  Both sides are type-checked, but the result
 type is always the LHS type.  Compound assignments (\texttt{+=},
 \texttt{-=}, etc.) are treated identically for type purposes.
 
+A simple assignment additionally runs the \texttt{-Wint-conversion}
+check (\texttt{kcc\_sema\_check\_int\_ptr}), the same check reused for
+initialisation and \texttt{return}: mixing an integer and a pointer
+across the assignment---\texttt{int *p = 5}, or \texttt{int n =
+p}---without a cast is almost always a mistake, and the resulting value
+is meaningless on this target where pointers are wider than
+\texttt{int}.  \texttt{kcc\_sema\_ptr\_int\_class} sorts each type into
+pointer, integer, or neither, and a warning is issued only for the two
+genuine mismatches (integer into pointer, pointer into integer).  Two
+suppressions keep it honest: the check is limited to the simple
+\texttt{=} operator, since \texttt{p += n} is legitimate pointer
+arithmetic rather than a conversion; and the integer constant zero is
+recognised as the null pointer constant
+(\texttt{kcc\_sema\_is\_null\_const}), so \texttt{int *p = 0} stays
+silent while \texttt{int *p = 5} does not.  Function arguments are not
+covered, because the function type descriptor does not yet carry its
+parameter types.
+
 @d Sema: expr assign @{
 // -- kcc_sema_expr_assign -------------------------------------------------
 // type_desc *kcc_sema_expr_assign(node *expr)
@@ -2245,13 +2280,132 @@ _kcc_sema_expr_assign:
 
     // Type-check RHS
     ldr x0, [x19, #AST_F2]
-    bl _kcc_sema_expr
+    bl _kcc_sema_expr               // x0 = RHS type
 
+    // -Wall -Wint-conversion: only for a simple '=' (compound assignment on a
+    // pointer is legal arithmetic, not a conversion).
+    ldr x1, [x19, #AST_F0]         // operator
+    cmp x1, #TOK_ASSIGN
+    b.ne .Lsea_result
+    mov x2, x0                      // src type (RHS)
+    mov x1, x20                     // dst type (LHS)
+    mov x0, x19                     // location node
+    ldr x3, [x19, #AST_F2]         // src node
+    bl _kcc_sema_check_int_ptr
+
+.Lsea_result:
     // Result type is LHS type
     mov x0, x20
 
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_ptr_int_class -----------------------------------------------
+// int kcc_sema_ptr_int_class(type_desc *t)
+// 1 = pointer, 2 = integer (bool..long long, enum), 0 = anything else.
+.p2align 2
+_kcc_sema_ptr_int_class:
+    cbz x0, .Lpic_other
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.eq .Lpic_ptr
+    cmp x1, #TY_ENUM
+    b.eq .Lpic_int
+    cmp x1, #TY_BOOL               // 2
+    b.lt .Lpic_other
+    cmp x1, #TY_LLONG              // 7
+    b.gt .Lpic_other
+    mov x0, #2
+    ret
+.Lpic_ptr:
+    mov x0, #1
+    ret
+.Lpic_int:
+    mov x0, #2
+    ret
+.Lpic_other:
+    mov x0, #0
+    ret
+
+// -- kcc_sema_is_null_const -----------------------------------------------
+// int kcc_sema_is_null_const(node *e)
+// 1 iff e is a (parenthesised) integer literal equal to zero -- the null
+// pointer constant, which converts to any pointer without complaint.
+.p2align 2
+_kcc_sema_is_null_const:
+    cbz x0, .Lnc_no
+.Lnc_unwrap:
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Lnc_check
+    ldr x0, [x0, #AST_F0]
+    cbz x0, .Lnc_no
+    b .Lnc_unwrap
+.Lnc_check:
+    cmp x1, #AST_INT_LIT
+    b.ne .Lnc_no
+    ldr x0, [x0, #AST_F0]          // value
+    cmp x0, #0
+    cset x0, eq
+    ret
+.Lnc_no:
+    mov x0, #0
+    ret
+
+// -- kcc_sema_check_int_ptr -----------------------------------------------
+// void kcc_sema_check_int_ptr(node *loc, type *dst, type *src, node *srcexpr)
+// Under -Wall, warn when an integer is converted to a pointer or vice versa
+// without a cast (assignment, initialisation, return).  A null pointer
+// constant (integer 0) assigned to a pointer is exempt.
+.globl _kcc_sema_check_int_ptr
+.p2align 2
+_kcc_sema_check_int_ptr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                    // loc node
+    mov x20, x1                    // dst type
+    mov x21, x2                    // src type
+    mov x22, x3                    // src node
+    adrp x0, _kcc_warn_all@@PAGE
+    add  x0, x0, _kcc_warn_all@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lcip_done
+    mov x0, x20
+    bl _kcc_sema_ptr_int_class
+    mov x20, x0                    // dst class (leaf call: x19/x21/x22 intact)
+    mov x0, x21
+    bl _kcc_sema_ptr_int_class
+    mov x21, x0                    // src class
+    cmp x20, #1                    // dst pointer?
+    b.ne .Lcip_int_dst
+    cmp x21, #2                    // src integer?
+    b.ne .Lcip_done
+    mov x0, x22
+    bl _kcc_sema_is_null_const
+    cbnz x0, .Lcip_done            // int 0 → null pointer constant, fine
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_int2ptr@@PAGE
+    add  x2, x2, _kcc_sema_int2ptr@@PAGEOFF
+    bl _kcc_diag_warning
+    b .Lcip_done
+.Lcip_int_dst:
+    cmp x20, #2                    // dst integer?
+    b.ne .Lcip_done
+    cmp x21, #1                    // src pointer?
+    b.ne .Lcip_done
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_ptr2int@@PAGE
+    add  x2, x2, _kcc_sema_ptr2int@@PAGEOFF
+    bl _kcc_diag_warning
+.Lcip_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 @}
 
@@ -2757,6 +2911,10 @@ _kcc_sema_reach_end:
     .asciz "control reaches end of non-void function"
 _kcc_sema_sign_cmp:
     .asciz "comparison of integers of different signedness"
+_kcc_sema_int2ptr:
+    .asciz "incompatible integer to pointer conversion"
+_kcc_sema_ptr2int:
+    .asciz "incompatible pointer to integer conversion"
 _kcc_sema_main_name:
     .asciz "main"
 // Known _Noreturn library functions: a trailing call to one of these means

@@ -888,22 +888,24 @@ register allocation to eliminate redundant memory traffic.
 
 \begin{itemize}
 \item[\checkmark] \textbf{Local linear-scan allocator}
-      (\S\ref{sec:regalloc}).  A conservative first pass allocates
-      block-local, call-free, integer-scalar temporaries to the four
-      caller-saved scratch registers \texttt{x12}--\texttt{x15}, so no
-      prologue save and no frame-layout change is needed.  Two walks over
-      the IR compute per-vreg live information (mirroring the DCE
-      use-classification, and detecting call-crossing with a monotonic call
-      counter) and then run the scan; \texttt{load\_vreg}/\texttt{store\_vreg}
-      consult the resulting map, with the FP helpers bridging a
-      register-resident value to a \texttt{d} register via \textsc{fmov}.  An
-      unallocated vreg falls back to the exact all-spill behaviour, so the
-      change is transparent.  Measured frame-memory traffic on
-      arithmetic-heavy functions drops by roughly one third to two thirds.
-\item \textbf{Global allocation over callee-saved registers.}  Extend beyond
-      block-local ranges to \texttt{x19}--\texttt{x28}, which survive calls;
-      this needs prologue/epilogue save-restore and a frame-layout shift for
-      the save area.
+      (\S\ref{sec:regalloc}).  A conservative pass allocates block-local,
+      integer-scalar temporaries to two banks: the caller-saved scratch
+      registers \texttt{x12}--\texttt{x15} for call-free values, and the
+      callee-saved registers \texttt{x19}--\texttt{x27} for values whose live
+      range crosses a call.  Two walks over the IR compute per-vreg live
+      information (mirroring the DCE use-classification, and detecting
+      call-crossing with a monotonic call counter) and then run the scan;
+      \texttt{load\_vreg}/\texttt{store\_vreg} consult the resulting map, with
+      the FP helpers bridging a register-resident value to a \texttt{d}
+      register via \textsc{fmov}.  Each claimed callee-saved register is
+      spilled in the prologue to a save area \emph{above} the vreg slots (so
+      no other offset moves) and restored at every return.  An unallocated
+      vreg falls back to exact all-spill behaviour, so the change is
+      transparent.  Measured frame-memory traffic on arithmetic-heavy
+      functions drops by roughly one third to two thirds.
+\item \textbf{Global (cross-block) ranges.}  Extend beyond block-local
+      liveness with real live-in/live-out dataflow, so a temporary spanning
+      several blocks (or a loop) can stay in a register.
 \item \textbf{Spill heuristics.}  When registers are exhausted, spill the
       vreg with the longest remaining interval rather than declining to
       allocate; coalesce adjacent load/store pairs.

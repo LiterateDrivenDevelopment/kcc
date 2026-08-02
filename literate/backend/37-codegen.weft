@@ -360,14 +360,14 @@ those slots and stores its result back.  That is simple and always correct,
 but it pays a memory round-trip for every value.  Register allocation removes
 the traffic for the values that can safely live in a physical register.
 
-The allocator here is deliberately conservative---a \emph{local} linear scan
-over the caller-saved scratch registers \texttt{x12}--\texttt{x15}.  The
-generated code otherwise touches only \texttt{x0}--\texttt{x11} and
-\texttt{x29}, so these four are always free; being caller-saved, they need no
-prologue save, which keeps the frame layout (and the delicate \texttt{va\_arg}
-and stack-argument offsets) untouched.  A virtual register is a candidate only
-when it is safe beyond any doubt, so the pass allocates a vreg to a physical
-register precisely when \emph{all} of these hold:
+The allocator here is a deliberately conservative \emph{local} linear scan
+over two register banks: the four caller-saved scratch registers
+\texttt{x12}--\texttt{x15} and the nine callee-saved registers
+\texttt{x19}--\texttt{x27}.  The generated code otherwise touches only
+\texttt{x0}--\texttt{x11} and \texttt{x29}, so all thirteen are free for
+allocation.  A virtual register is a candidate only when it is safe beyond any
+doubt, so the pass allocates a vreg to a physical register precisely when
+\emph{both} of these hold:
 
 \begin{itemize}
 \item Its defining instruction produces an integer or pointer scalar
@@ -375,11 +375,20 @@ register precisely when \emph{all} of these hold:
       the FP helpers or by address).
 \item Its definition and every use lie in a single basic block.  A block is
       straight-line, so within it textual order \emph{is} execution order;
-      this is what makes the call-crossing test below exact even inside loops.
-\item No function call lies between its definition and its last use.  A call
-      clobbers the caller-saved registers, so a value spanning one must stay
-      in memory.
+      this keeps the call-crossing analysis exact even inside loops (a loop
+      body re-enters at its top, redefining the value before reusing it).
 \end{itemize}
+
+Whether the value's live range \emph{crosses a function call} then decides the
+bank.  A call clobbers the caller-saved registers but preserves the
+callee-saved ones, so a call-free value may take any register (preferring
+\texttt{x12}--\texttt{x15}, which cost no frame save), whereas a call-crossing
+value is restricted to \texttt{x19}--\texttt{x27}.  Each callee-saved register
+the function actually claims is recorded in a mask; the prologue spills exactly
+those to a save area placed \emph{above} the vreg slots and alloca storage
+(so their offsets, and the frame-relative \texttt{va\_arg}/stack-argument
+reads, are unchanged---only \texttt{frame\_size} grows), and each
+\texttt{IR\_RET} restores them before tearing the frame down.
 
 The pass makes two walks over the instruction stream.  The first computes, per
 vreg, its defining block, its last-use position, whether any use escapes the
@@ -389,12 +398,12 @@ with its value at each use.  Determining which operand fields are vreg
 \emph{uses} mirrors the dead-code eliminator's classification
 (\S\ref{sec:dce}); over-counting a use is harmless here (it only lengthens a
 live range), so mirroring that liberal rule stays safe.  The second walk is
-the linear scan itself: at each candidate's definition it frees any of the
-four registers whose occupant's last use has passed, then claims a free one
-(or leaves the vreg spilled).  The result is a map that \texttt{load\_vreg}
-and \texttt{store\_vreg} consult---an unallocated vreg (map entry~0) behaves
-exactly as in the all-spill model, so the change is transparent wherever the
-allocator declines to act.
+the linear scan itself: at each candidate's definition it frees any register
+whose occupant's last use has passed, then claims a free one from the
+permitted bank (or leaves the vreg spilled).  The result is a map that the
+\texttt{load\_vreg}/\texttt{store\_vreg} family consults---an unallocated vreg
+(map entry~0) behaves exactly as in the all-spill model, so the change is
+transparent wherever the allocator declines to act.
 
 The use-marking helper reads the pass's array bases from the stable
 callee-saved registers the scan keeps live (\texttt{x20}--\texttt{x24}) and
@@ -437,7 +446,7 @@ _kcc_ra_use:
 .globl _kcc_cg_regalloc
 .p2align 2
 _kcc_cg_regalloc:
-    stp x29, x30, [sp, #-192]!
+    stp x29, x30, [sp, #-256]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -451,6 +460,12 @@ _kcc_cg_regalloc:
     // Default to the all-spill map (no allocation) until we build a real one.
     adrp x0, _kcc_cg_regmap@@PAGE
     add  x0, x0, _kcc_cg_regmap@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_cg_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_callee_mask@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_cg_save_count@@PAGE
+    add  x0, x0, _kcc_cg_save_count@@PAGEOFF
     str xzr, [x0]
     cbz x20, .Lra_done             // no vregs
 
@@ -610,12 +625,18 @@ _kcc_cg_regalloc:
     b .Lp1_bb
 .Lp1_done:
 
-    // ---- Pass 2: linear scan over x12..x15 ----
+    // ---- Pass 2: linear scan over x12..x15 (caller-saved) and x19..x27
+    //      (callee-saved).  reg_end[i] lives at [sp,#152 + i*8]; -1 = free.
+    add x1, sp, #152
     mov x9, #-1
-    str x9, [sp, #152]           // reg_end[0] = free
-    str x9, [sp, #160]           // reg_end[1]
-    str x9, [sp, #168]           // reg_end[2]
-    str x9, [sp, #176]           // reg_end[3]
+    mov x10, #0
+.Lp2_rinit:
+    cmp x10, #13
+    b.ge .Lp2_rinit_done
+    str x9, [x1, x10, lsl #3]
+    add x10, x10, #1
+    b .Lp2_rinit
+.Lp2_rinit_done:
     ldr x0, [x19, #IRF_BLOCKS]
     ldr x1, [x0, #VEC_COUNT]
     str x1, [sp, #112]
@@ -646,45 +667,52 @@ _kcc_cg_regalloc:
     cmp x0, x20
     b.hs .Lp2_next
     ldr x1, [x24, x0, lsl #3]     // flags[dest]
-    and x1, x1, #7
-    cmp x1, #1                    // candidate, no escape, no call-cross
+    and x2, x1, #3
+    cmp x2, #1                    // candidate def that does not escape its block
     b.ne .Lp2_next
+    and x4, x1, #4               // x4 = crossed-a-call bit
     ldr x3, [x21, x0, lsl #3]     // lastuse[dest]
     cmp x3, x27
     b.ls .Lp2_next                // no later use
-    // find a free register (reg_end < pos, signed)
-    ldr x4, [sp, #152]
-    cmp x4, x27
-    b.lt .Lp2_a0
-    ldr x4, [sp, #160]
-    cmp x4, x27
-    b.lt .Lp2_a1
-    ldr x4, [sp, #168]
-    cmp x4, x27
-    b.lt .Lp2_a2
-    ldr x4, [sp, #176]
-    cmp x4, x27
-    b.lt .Lp2_a3
-    b .Lp2_next                    // all busy → spill
-.Lp2_a0:
-    mov x5, #12
-    str x5, [x25, x0, lsl #3]
-    str x3, [sp, #152]
+    // Scan for a free register (reg_end < pos, signed).  A call-crossing
+    // value may take only a callee-saved register (index >= 4); a call-free
+    // value prefers the caller-saved registers (index 0..3) to spare a frame
+    // save, falling through to callee-saved as overflow.
+    mov x5, #0
+    cbz x4, .Lp2_scan
+    mov x5, #4
+.Lp2_scan:
+    cmp x5, #13
+    b.ge .Lp2_next                // no free register → spill
+    add x6, sp, #152
+    ldr x7, [x6, x5, lsl #3]      // reg_end[i]
+    cmp x7, x27
+    b.ge .Lp2_scan_next
+    // free: physical register = i<4 ? 12+i : 15+i
+    cmp x5, #4
+    b.lo .Lp2_caller
+    add x8, x5, #15
+    b .Lp2_assign
+.Lp2_caller:
+    add x8, x5, #12
+.Lp2_assign:
+    str x8, [x25, x0, lsl #3]     // map[dest] = physreg
+    add x6, sp, #152
+    str x3, [x6, x5, lsl #3]      // reg_end[i] = lastuse[dest]
+    cmp x5, #4
+    b.lo .Lp2_next                // caller-saved: no save needed
+    sub x9, x8, #19              // callee-saved: record it in the save mask
+    mov x10, #1
+    lsl x10, x10, x9
+    adrp x6, _kcc_cg_callee_mask@@PAGE
+    add  x6, x6, _kcc_cg_callee_mask@@PAGEOFF
+    ldr x7, [x6]
+    orr x7, x7, x10
+    str x7, [x6]
     b .Lp2_next
-.Lp2_a1:
-    mov x5, #13
-    str x5, [x25, x0, lsl #3]
-    str x3, [sp, #160]
-    b .Lp2_next
-.Lp2_a2:
-    mov x5, #14
-    str x5, [x25, x0, lsl #3]
-    str x3, [sp, #168]
-    b .Lp2_next
-.Lp2_a3:
-    mov x5, #15
-    str x5, [x25, x0, lsl #3]
-    str x3, [sp, #176]
+.Lp2_scan_next:
+    add x5, x5, #1
+    b .Lp2_scan
 .Lp2_next:
     add x27, x27, #1
     ldr x26, [x26, #IR_NEXT]
@@ -701,13 +729,29 @@ _kcc_cg_regalloc:
     add  x0, x0, _kcc_cg_regmap@@PAGEOFF
     str x25, [x0]
 
+    // save_count = popcount(callee_mask) — how many regs the prologue spills.
+    adrp x0, _kcc_cg_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_callee_mask@@PAGEOFF
+    ldr x1, [x0]
+    mov x2, #0
+.Lra_popcnt:
+    cbz x1, .Lra_popcnt_done
+    and x3, x1, #1
+    add x2, x2, x3
+    lsr x1, x1, #1
+    b .Lra_popcnt
+.Lra_popcnt_done:
+    adrp x0, _kcc_cg_save_count@@PAGE
+    add  x0, x0, _kcc_cg_save_count@@PAGEOFF
+    str x2, [x0]
+
 .Lra_done:
     ldp x27, x28, [sp, #80]
     ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #192
+    ldp x29, x30, [sp], #256
     ret
 @| _kcc_cg_regalloc _kcc_ra_use
 @}
@@ -824,18 +868,8 @@ _kcc_codegen_func:
     b .Lcgf_alloca_scan_bb
 .Lcgf_alloca_scan_done:
     // x0 = total alloca slots, x20 = vreg_count
-    // frame_size = align16(16 + vreg_count*8 + total_alloca*8)
-    lsl x1, x20, #3               // vreg_count * 8
-    lsl x0, x0, #3                // total_alloca_slots * 8
-    add x0, x0, x1                 // + vreg value slots
-    add x0, x0, #16                // + fp/lr
-    add x0, x0, #15
-    and x0, x0, #~15              // align to 16
-    mov x20, x0                    // x20 = frame_size
-
-    adrp x1, _kcc_cg_frame_size@@PAGE
-    add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
-    str x20, [x1]
+    mov x24, x0                    // preserve total_alloca_slots across RA
+    mov x25, x20                   // preserve vreg_count across RA
 
     // Store vreg_count for alloca address computation
     ldr x0, [x19, #IRF_VREG_N]
@@ -843,10 +877,35 @@ _kcc_codegen_func:
     add  x1, x1, _kcc_cg_vreg_count@@PAGEOFF
     str x0, [x1]
 
-    // 1b. Register allocation: assign eligible temporaries to physical
-    //     registers, publishing the map that load/store_vreg consult.
+    // 1b. Register allocation runs before frame sizing: it decides how many
+    //     callee-saved registers must be spilled, which enlarges the frame.
     mov x0, x19
     bl _kcc_cg_regalloc
+
+    // save_base = 16 + vreg_count*8 + total_alloca*8 — the callee-save area
+    // sits above the vreg slots and alloca storage, so those offsets (and the
+    // frame-relative va_arg/stack-argument reads) are unaffected.
+    lsl x1, x25, #3               // vreg_count * 8
+    lsl x0, x24, #3               // total_alloca_slots * 8
+    add x0, x0, x1
+    add x0, x0, #16                // + fp/lr
+    adrp x1, _kcc_cg_save_base@@PAGE
+    add  x1, x1, _kcc_cg_save_base@@PAGEOFF
+    str x0, [x1]
+    mov x2, x0                     // save_base
+
+    // frame_size = align16(save_base + save_count*8)
+    adrp x1, _kcc_cg_save_count@@PAGE
+    add  x1, x1, _kcc_cg_save_count@@PAGEOFF
+    ldr x1, [x1]
+    add x0, x2, x1, lsl #3
+    add x0, x0, #15
+    and x0, x0, #~15              // align to 16
+    mov x20, x0                    // x20 = frame_size
+
+    adrp x1, _kcc_cg_frame_size@@PAGE
+    add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
+    str x20, [x1]
 
     // 2. Record function start offset
     bl _kcc_code_current_pos
@@ -921,6 +980,10 @@ _kcc_codegen_func:
     mov x3, #1
     bl _kcc_enc_add_imm
     bl _kcc_code_emit32
+
+    // Save the callee-saved registers the allocator claimed.
+    mov x0, #0
+    bl _kcc_cg_callee_transfer
 @| _kcc_codegen_func
 @}
 
@@ -1398,7 +1461,62 @@ _kcc_cg_store_vreg_fp:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
-@| _kcc_cg_load_vreg _kcc_cg_store_vreg _kcc_cg_load_vreg_fp _kcc_cg_store_vreg_fp
+
+// -- kcc_cg_callee_transfer ---------------------------------------------------
+// void kcc_cg_callee_transfer(uint64_t restore)
+//   x0 = 0 → save (STR), non-zero → restore (LDR).  Walks _kcc_cg_callee_mask
+//   and emits one transfer per used callee-saved register (x19..x28) at
+//   [x29, #save_base + k*8]; k counts the registers actually saved.
+.text
+.globl _kcc_cg_callee_transfer
+.p2align 2
+_kcc_cg_callee_transfer:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                    // restore flag
+
+    adrp x0, _kcc_cg_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_callee_mask@@PAGEOFF
+    ldr x20, [x0]                  // mask
+    cbz x20, .Lct_done
+    adrp x0, _kcc_cg_save_base@@PAGE
+    add  x0, x0, _kcc_cg_save_base@@PAGEOFF
+    ldr x0, [x0]
+    lsr x21, x0, #3               // save_base as an imm12 (scaled by 8)
+    mov x22, #19                   // current register number
+    mov x23, #0                    // k = save-slot index
+.Lct_loop:
+    cmp x22, #29
+    b.ge .Lct_done
+    sub x0, x22, #19
+    lsr x1, x20, x0
+    tst x1, #1
+    b.eq .Lct_next
+    add x2, x21, x23              // imm12 = save_base_scaled + k
+    mov x0, x22                    // rt = register
+    mov x1, #29                    // rn = x29
+    mov x3, #1                     // size = 64-bit
+    cbz x19, .Lct_save
+    bl _kcc_enc_ldr_imm
+    b .Lct_emit
+.Lct_save:
+    bl _kcc_enc_str_imm
+.Lct_emit:
+    bl _kcc_code_emit32
+    add x23, x23, #1
+.Lct_next:
+    add x22, x22, #1
+    b .Lct_loop
+.Lct_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_cg_load_vreg _kcc_cg_store_vreg _kcc_cg_load_vreg_fp _kcc_cg_store_vreg_fp _kcc_cg_callee_transfer
 @}
 
 \section{AAPCS64 Argument Marshaling}
@@ -3110,6 +3228,11 @@ range is $0$--$63$.
     bl _kcc_code_emit32
 
 .Lcgi_ret_epilogue:
+    // Restore the callee-saved registers (the return value already sits in
+    // x0/d0), then tear the frame down.
+    mov x0, #1
+    bl _kcc_cg_callee_transfer
+
     // Emit epilogue
     adrp x0, _kcc_cg_frame_size@@PAGE
     add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
@@ -4072,6 +4195,12 @@ _kcc_cstr_fixups:    .quad 0     // vec of {sym_index, cstr_offset} fixups
 _kcc_cg_defined_globals: .quad 0 // hash set: globals defined in this TU
 .globl _kcc_cg_regmap
 _kcc_cg_regmap:      .quad 0     // per-function vreg→physreg map (0 = all-spill)
+.globl _kcc_cg_callee_mask
+_kcc_cg_callee_mask: .quad 0     // bitmask of callee-saved regs used (bit r-19)
+.globl _kcc_cg_save_count
+_kcc_cg_save_count:  .quad 0     // number of callee-saved regs to save
+.globl _kcc_cg_save_base
+_kcc_cg_save_base:   .quad 0     // byte offset of the callee-save area from x29
 @| _kcc_cg_frame_size
 @| _kcc_cg_vreg_count
 @| _kcc_cstr_buf
@@ -4080,4 +4209,7 @@ _kcc_cg_regmap:      .quad 0     // per-function vreg→physreg map (0 = all-spi
 @| _kcc_cstr_fixups
 @| _kcc_cg_defined_globals
 @| _kcc_cg_regmap
+@| _kcc_cg_callee_mask
+@| _kcc_cg_save_count
+@| _kcc_cg_save_base
 @}

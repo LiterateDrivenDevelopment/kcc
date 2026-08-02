@@ -233,6 +233,8 @@ difftest "vararg-three-fixed" \
 int g(int a, int b, int c, ...){ va_list ap; va_start(ap, c); int s = a + b + c; int i = 0; for (i = 0; i < 4; i = i + 1) s = s + va_arg(ap, int); va_end(ap); return s; } int main(void){ return g(1, 2, 3, 4, 5, 6, 7); }"
 difftest "accumulate" \
     "int step(int acc, int x){ return acc + x * x; } int main(void){ int acc = 0; int i = 1; while (i <= 6) { acc = step(acc, i); i = i + 1; } return acc % 250; }"
+difftest "regalloc-call-crossing" \
+    "int g(int x){ return x * 2 + 1; } int main(void){ int a = 17, b = 23; int t = a * b + 5; int u = g(a) + g(b); int v = t - u + a * b; return (t + u + v) % 250; }"
 @}
 
 \section{Pointers, Arrays, and Structs}

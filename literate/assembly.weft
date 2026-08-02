@@ -395,6 +395,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<IR: struct copy helper@>
 @<IR: struct address helper@>
 @<IR: aggregate init helpers@>
+@<IR: bitfield access@>
 @<IR: static local helper@>
 @<IR: build var decl@>
 @<IR: build if@>

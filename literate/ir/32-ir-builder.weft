@@ -1028,7 +1028,7 @@ _kcc_ir_emit_global_inits:
     mov x1, x0                   // byte offset
     mov x0, x22                  // base = global address vreg
     mov x2, x24                  // value
-    bl _kcc_ir_emit_indexed_store
+    bl _kcc_ir_store_elem        // bit-field aware
     add x21, x21, #1
     ldr x20, [x20, #AST_F4]      // next element
     b .Legi_il_loop
@@ -3462,10 +3462,16 @@ _kcc_ir_build_member_addr:
 
 .Libma_found:
     ldr x21, [x23, #AST_F3]      // field byte offset (set by _kcc_type_layout)
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str x23, [x0]                // expose the field decl for bit-field access
     b .Libma_emit_const
 
 .Libma_index_zero:
     mov x21, #0
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str xzr, [x0]                // not a resolved field → no bit-field metadata
 
 .Libma_emit_const:
     // Emit IR_CONST for the field's byte offset
@@ -3529,6 +3535,21 @@ _kcc_ir_build_member:
     bl _kcc_ir_build_member_addr
     mov x20, x0                  // GEP vreg (field address)
 
+    // Bit-field?  _kcc_ir_build_member_addr published the matched field decl;
+    // a non-zero packed AST_F2 means a bit-field, read by shift-and-mask.
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x1, [x0]
+    cbz x1, .Libm_scalar
+    ldr x2, [x1, #AST_F2]
+    cbz x2, .Libm_scalar
+    mov x0, x20                  // container address
+    bl _kcc_ir_bitfield_load     // x1 = field decl
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Libm_scalar:
     // Field access width + signedness from the member's resolved type.
     ldr x0, [x19, #AST_F3]      // field type
     bl _kcc_ir_load_width
@@ -3557,6 +3578,413 @@ _kcc_ir_build_member:
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_ir_build_member
+@}
+
+\subsection{Bit-field Access}
+\label{sec:ir-bitfield}
+
+A bit-field is stored inside a wider container, so it cannot be read
+with a plain load or written with a plain store.  Rather than teach the
+backend new instructions, \kcc{} \emph{synthesises} the access out of IR
+operations it already lowers: shifts, masks, and---for the write---an
+or.  A read loads the whole container, shifts the field down to bit
+zero, masks it to its width, and, for a signed bit-field,
+sign-extends by shifting left then arithmetic-right by
+\texttt{64\,$-$\,width}.  A write is a read-modify-write: load the
+container, clear the field's bits with \texttt{AND\,\texttilde
+(mask\,$\ll$\,offset)}, splice in \texttt{(value\,\&\,mask)\,$\ll$\,%
+offset} with an \texttt{OR}, and store the container back.  All the
+intermediate values are 64-bit so masks up to a full \texttt{long}
+container materialise correctly; only the final store narrows to the
+container's width.
+
+Two tiny emitters keep the synthesis readable:
+\texttt{kcc\_ir\_emit\_const} materialises an integer, and
+\texttt{kcc\_ir\_emit\_binop} emits one two-operand instruction and
+returns its result vreg.  The field to act on is the one
+\texttt{\_kcc\_ir\_build\_member\_addr} just matched, published through
+\texttt{\_kcc\_ir\_member\_field}; its packed \texttt{AST\_F2} gives the
+bit offset and width, and its declared type gives the container size and
+signedness.
+
+@d IR: bitfield access @{
+// -- kcc_ir_emit_const ----------------------------------------------------
+// uint64_t kcc_ir_emit_const(uint64_t value) → result vreg
+.text
+.p2align 2
+_kcc_ir_emit_const:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    str x19, [x20, #IR_SRC1]
+    adrp x1, _kcc_type_long_u@@PAGE
+    add  x1, x1, _kcc_type_long_u@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    mov x0, x19
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_emit_binop ----------------------------------------------------
+// uint64_t kcc_ir_emit_binop(int op, uint64_t a_vreg, uint64_t b_vreg) → vreg
+.p2align 2
+_kcc_ir_emit_binop:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x1                  // a
+    mov x20, x2                  // b
+    bl _kcc_ir_alloc_instr       // x0 = op passed through
+    mov x21, x0
+    adrp x1, _kcc_type_long_u@@PAGE
+    add  x1, x1, _kcc_type_long_u@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x21, #IR_TYPE]
+    str x19, [x21, #IR_SRC1]
+    str x20, [x21, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x22, x0
+    mov x0, x21
+    bl _kcc_ir_emit
+    mov x0, x22
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_bf_code -------------------------------------------------------
+// int kcc_ir_bf_code(uint64_t container_bytes) → access-size override
+// (unsigned): 8→0 (full 64-bit), 4→4, 2→2, 1→1.
+.p2align 2
+_kcc_ir_bf_code:
+    cmp x0, #4
+    b.eq .Lbfc_4
+    cmp x0, #2
+    b.eq .Lbfc_2
+    cmp x0, #1
+    b.eq .Lbfc_1
+    mov x0, #0
+    ret
+.Lbfc_4:
+    mov x0, #4
+    ret
+.Lbfc_2:
+    mov x0, #2
+    ret
+.Lbfc_1:
+    mov x0, #1
+    ret
+
+// -- kcc_ir_bf_mask -------------------------------------------------------
+// uint64_t kcc_ir_bf_mask(uint64_t width) → (1<<width)-1, saturating at ~0.
+.p2align 2
+_kcc_ir_bf_mask:
+    cmp x0, #64
+    b.hs .Lbfm_all
+    mov x1, #1
+    lsl x1, x1, x0
+    sub x0, x1, #1
+    ret
+.Lbfm_all:
+    mov x0, #-1
+    ret
+
+// -- kcc_ir_bitfield_load -------------------------------------------------
+// uint64_t kcc_ir_bitfield_load(uint64_t addr_vreg, node *field) → value vreg
+//   addr_vreg = container address, field = the bit-field decl node.
+.globl _kcc_ir_bitfield_load
+.p2align 2
+_kcc_ir_bitfield_load:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // addr
+    ldr x0, [x1, #AST_F2]        // packed (bit_offset<<16)|width
+    and x22, x0, #0xffff         // width
+    lsr x23, x0, #16             // bit offset (lsb)
+    ldr x0, [x1, #AST_F0]        // field type spec
+    bl _kcc_sema_resolve_type
+    mov x24, x0                  // field type
+    bl _kcc_ir_type_layout_size  // x0 = container bytes
+    bl _kcc_ir_bf_code
+    mov x20, x0                  // unsigned load code
+    // container LOAD
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_ir_emit_load
+    mov x21, x0                  // loaded value vreg
+    // shift right by lsb
+    cbz x23, .Lbfl_mask
+    mov x0, x23
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_LSHR
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+.Lbfl_mask:
+    mov x0, x22
+    bl _kcc_ir_bf_mask
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_AND
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+    // signed? sign-extend from `width` bits
+    mov x0, x24
+    bl _kcc_sema_int_signedness
+    cmp x0, #1
+    b.ne .Lbfl_done
+    mov x0, #64
+    sub x0, x0, x22              // s = 64 - width
+    mov x24, x0                  // reuse x24 = shift amount
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_SHL
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+    mov x0, x24
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_ASHR
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+.Lbfl_done:
+    mov x0, x21
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_ir_bitfield_store ------------------------------------------------
+// uint64_t kcc_ir_bitfield_store(uint64_t addr, uint64_t value, node *field)
+//   → the stored value vreg.  Read-modify-write of the container.
+.globl _kcc_ir_bitfield_store
+.p2align 2
+_kcc_ir_bitfield_store:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x19, x0                  // addr
+    mov x20, x1                  // value
+    ldr x0, [x2, #AST_F2]        // packed
+    and x22, x0, #0xffff         // width
+    lsr x23, x0, #16             // lsb
+    ldr x0, [x2, #AST_F0]        // field type
+    bl _kcc_sema_resolve_type
+    bl _kcc_ir_type_layout_size  // container bytes
+    bl _kcc_ir_bf_code
+    mov x24, x0                  // access-size code
+    // old = LOAD(addr)  (intermediates live in x21/x22/x26; the emitters only
+    // clobber x0-x2 and their own x19-x22, so x23-x26 survive across calls)
+    mov x0, x19
+    mov x1, x24
+    bl _kcc_ir_emit_load
+    mov x26, x0                  // old container vreg
+    mov x0, x22
+    bl _kcc_ir_bf_mask
+    mov x22, x0                  // mask (integer)
+    // vbits = value & mask
+    bl _kcc_ir_emit_const        // x0 already = mask
+    mov x1, x20
+    mov x2, x0
+    mov x0, #IR_AND
+    bl _kcc_ir_emit_binop
+    mov x21, x0                  // vbits vreg
+    cbz x23, .Lbfs_cleared
+    mov x0, x23
+    bl _kcc_ir_emit_const        // lsb const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_SHL
+    bl _kcc_ir_emit_binop        // vbits <<= lsb
+    mov x21, x0
+.Lbfs_cleared:
+    // cleared = old & ~(mask << lsb)
+    lsl x0, x22, x23
+    mvn x0, x0
+    bl _kcc_ir_emit_const
+    mov x1, x26
+    mov x2, x0
+    mov x0, #IR_AND
+    bl _kcc_ir_emit_binop
+    mov x1, x0                   // cleared
+    mov x2, x21                  // vbits
+    mov x0, #IR_OR
+    bl _kcc_ir_emit_binop
+    mov x21, x0                  // newval
+    // STORE newval → addr (container width)
+    mov x0, x21
+    mov x1, x19
+    mov x2, x24
+    bl _kcc_ir_emit_store
+    mov x0, x20                  // assignment result = the value
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+// -- kcc_ir_emit_load / kcc_ir_emit_store ---------------------------------
+// vreg kcc_ir_emit_load(addr_vreg, size_code); void kcc_ir_emit_store(value,
+// addr, size_code).  Thin wrappers around IR_LOAD / IR_STORE with an
+// access-size override, used by the bit-field synthesis.
+.p2align 2
+_kcc_ir_emit_load:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x1                  // size code
+    mov x20, x0                  // addr
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x1, x0
+    adrp x2, _kcc_type_long_u@@PAGE
+    add  x2, x2, _kcc_type_long_u@@PAGEOFF
+    ldr x2, [x2]
+    str x2, [x1, #IR_TYPE]
+    str x20, [x1, #IR_SRC1]
+    str x19, [x1, #IR_SRC2]
+    mov x20, x1
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    mov x0, x19
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.p2align 2
+_kcc_ir_emit_store:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // value
+    mov x20, x1                  // addr
+    mov x21, x2                  // size code
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x2, _kcc_type_long_u@@PAGE
+    add  x2, x2, _kcc_type_long_u@@PAGEOFF
+    ldr x2, [x2]
+    str x2, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]      // value
+    str x20, [x0, #IR_SRC2]      // addr
+    str x21, [x0, #IR_DEST]      // access-size override
+    bl _kcc_ir_emit
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_type_layout_size ----------------------------------------------
+// uint64_t kcc_ir_type_layout_size(type *t) → size in bytes (forces layout).
+.p2align 2
+_kcc_ir_type_layout_size:
+    cbz x0, .Ltls_zero
+    b _kcc_type_layout           // tail call: returns TY_SIZE in x0
+.Ltls_zero:
+    mov x0, #0
+    ret
+
+// -- kcc_ir_emit_gep_const ------------------------------------------------
+// uint64_t kcc_ir_emit_gep_const(base_vreg, byte_offset) → address vreg
+.p2align 2
+_kcc_ir_emit_gep_const:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // base
+    mov x0, x1                   // offset
+    bl _kcc_ir_emit_const
+    mov x20, x0                  // offset vreg
+    mov x0, #IR_GEP
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+    adrp x1, _kcc_type_long_u@@PAGE
+    add  x1, x1, _kcc_type_long_u@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x21, #IR_TYPE]
+    str x19, [x21, #IR_SRC1]
+    str x20, [x21, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x19, x0
+    mov x0, x21
+    bl _kcc_ir_emit
+    mov x0, x19
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_store_elem ----------------------------------------------------
+// void kcc_ir_store_elem(base_vreg, byte_offset, value_vreg, width)
+// Writes one initializer element.  If the field just resolved by
+// _kcc_ir_elem_off_width (published in _kcc_ir_member_field) is a bit-field,
+// read-modify-write its container; otherwise a plain sized store.
+.globl _kcc_ir_store_elem
+.p2align 2
+_kcc_ir_store_elem:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // base
+    mov x20, x1                  // offset
+    mov x21, x2                  // value
+    mov x22, x3                  // width
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lse_plain
+    ldr x1, [x0, #AST_F2]
+    cbz x1, .Lse_plain
+    mov x22, x0                  // field decl (survives emit_gep_const)
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_ir_emit_gep_const    // x0 = container address
+    mov x1, x21                  // value
+    mov x2, x22                  // field
+    bl _kcc_ir_bitfield_store
+    b .Lse_done
+.Lse_plain:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x21
+    mov x3, x22
+    bl _kcc_ir_emit_indexed_store
+.Lse_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
 @}
 
 Struct tests verify field write, field read, multiple fields, and
@@ -5567,6 +5995,20 @@ _kcc_ir_build_assign:
     bl _kcc_ir_build_member_addr
     mov x22, x0                  // x22 = field address vreg
 
+    // Bit-field?  Read-modify-write the container instead of a plain store.
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x9, [x0]
+    cbz x9, .Liba_member_scalar
+    ldr x10, [x9, #AST_F2]
+    cbz x10, .Liba_member_scalar
+    mov x0, x22                  // container address
+    mov x1, x21                  // value
+    mov x2, x9                   // field decl
+    bl _kcc_ir_bitfield_store
+    b .Liba_done
+
+.Liba_member_scalar:
     // Store width from the field type (so a narrow field is not clobbered)
     ldr x0, [x23, #AST_F3]
     bl _kcc_ir_store_width
@@ -7151,6 +7593,10 @@ _kcc_ir_elem_off_width:
     stp x21, x22, [sp, #32]
     mov x19, x0                  // type
     mov x20, x1                  // index
+    // Clear any previously published field; an array element has none.
+    adrp x2, _kcc_ir_member_field@@PAGE
+    add  x2, x2, _kcc_ir_member_field@@PAGEOFF
+    str xzr, [x2]
     cbz x19, .Leow_scalar
     ldr x2, [x19, #TY_KIND]
     cmp x2, #TY_STRUCT
@@ -7186,6 +7632,9 @@ _kcc_ir_elem_off_width:
     sub x20, x20, #1
     b .Leow_walk
 .Leow_found:
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str x21, [x0]                // publish the field for a possible bit-field store
     ldr x20, [x21, #AST_F3]      // field byte offset
     ldr x1, [x21, #AST_F0]       // field type spec
     cbz x1, .Leow_found_w0
@@ -7624,7 +8073,7 @@ _kcc_ir_build_var_decl:
     mov x1, x0                   // byte offset
     mov x0, x23                  // base
     ldr x2, [sp, #72]           // value vreg
-    bl _kcc_ir_emit_indexed_store
+    bl _kcc_ir_store_elem        // bit-field aware
     add x22, x22, #1
     ldr x20, [x20, #AST_F4]      // next element
     b .Libvd_il_loop
@@ -9207,6 +9656,10 @@ _kcc_loop_depth: .quad 0
 _kcc_loop_stack: .space 256   // 16 levels * 16 bytes (break_bb, continue_bb)
 .globl _kcc_ir_trans_unit
 _kcc_ir_trans_unit: .quad 0
+// Field decl matched by the most recent _kcc_ir_build_member_addr, so the
+// member load/store can see its bit-field metadata (0 if none).
+.globl _kcc_ir_member_field
+_kcc_ir_member_field: .quad 0
 
 // Short type names
 .section __TEXT,__cstring,cstring_literals

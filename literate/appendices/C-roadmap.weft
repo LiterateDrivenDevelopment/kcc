@@ -794,7 +794,7 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 1  & Multi-error recovery \& diagnostics \stDone & \meterA & \meterB & 9e\\
 2  & \texttt{-Wall} warnings \stDone            & \meterB & \meterC & 9e\\
 3  & Designated initializers \stDone            & \meterA & \meterB & 9a\\
-4  & Bit-fields                                 & \meterA & \meterB & 9a\\
+4  & Bit-fields \stDone                         & \meterA & \meterB & 9a\\
 5  & \_Bool normalize, \texttt{char\,s[]="\dots"} & \meterB & \meterC & 9a\\
 6  & DWARF debug info                           & \meterB & \meterA & 9e\\
 7  & Harden vs.\ malformed input                & \meterB & \meterB & new\\
@@ -907,9 +907,17 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       lists, and mixed positional/designated forms all agree with
       \texttt{clang} in the differential suite.  \emph{Remaining:} nested
       designator chains (\texttt{.a.b}, \texttt{[i].f}).
-\item \textbf{Bit-fields} (Stage~9a).  Equally pervasive in systems and
-      device-register headers; needs sub-byte layout in
-      \texttt{\_kcc\_type\_layout} and masked load/store codegen.
+\item \textbf{Bit-fields} (Stage~9a).  \emph{Landed.}  Equally pervasive in
+      systems and device-register headers.  \texttt{\_kcc\_type\_layout} now
+      packs consecutive same-type bit-fields into one container
+      least-significant-bit first, recording each field's container offset and
+      packed \texttt{(bit\_offset, width)} on its node; reads and writes are
+      \emph{synthesised} from ordinary shifts, masks, and an or---no new
+      backend instructions---and the read-modify-write is reused by the
+      initializer path so positional, designated, local, and file-scope
+      bit-field initialisation all agree with \texttt{clang} (packing, signed
+      sign-extension, container crossing, and truncation included).
+      \emph{Not modelled:} mixed-type packing and zero-width separators.
 \item \textbf{\_Bool normalization and \texttt{char s[] = "..."}}
       (Stage~9a).  Cheap, high-frequency gaps: truncate any non-zero value to
       1 on a \texttt{\_Bool} store, and initialize a \texttt{char} array from

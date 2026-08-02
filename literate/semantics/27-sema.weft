@@ -533,7 +533,7 @@ _kcc_type_align:
 .globl _kcc_type_layout
 .p2align 2
 _kcc_type_layout:
-    stp x29, x30, [sp, #-80]!
+    stp x29, x30, [sp, #-112]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -577,6 +577,10 @@ _kcc_type_layout:
     mov x22, #0                 // running offset (struct)
     mov x23, #1                 // max alignment
     mov x24, #0                 // max member size (union)
+    // Bit-field container state (slots survive the calls in the loop body):
+    // [sp,#80] container byte offset, [sp,#88] next free bit, [sp,#96] container
+    // size in bytes (0 = no active container).
+    str xzr, [sp, #96]
 
 .Ltl_loop:
     cbz x21, .Ltl_finish
@@ -596,6 +600,13 @@ _kcc_type_layout:
     mov x2, #8                  // unresolved: assume one 8-byte slot
     mov x3, #8
 .Ltl_field_have:
+    // A bit-field is marked by a non-null width in AST_F2 (an expression node).
+    // Everything else is a whole-byte member.
+    ldr x5, [x21, #AST_F2]
+    cbz x5, .Ltl_not_bitfield
+    @<Sema: layout bit-field@>
+.Ltl_not_bitfield:
+    str xzr, [sp, #96]         // a plain member ends any bit-field container run
     cbnz x20, .Ltl_union_field
     // struct: round running offset up to the field's alignment
     sub x4, x3, #1
@@ -633,9 +644,89 @@ _kcc_type_layout:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #80
+    ldp x29, x30, [sp], #112
     ret
 @| _kcc_type_align _kcc_type_layout
+@}
+
+\paragraph{Bit-field packing}
+
+A bit-field member (\stdref{6.7.2.1}) declares a width in bits rather
+than occupying a whole storage unit.  \kcc{} lays consecutive bit-fields
+of the \emph{same declared type} into one \emph{container}---an aligned
+unit the size of that type---filling it from the least-significant bit
+upward, which is the little-endian AArch64 convention.  A bit-field that
+would not fit in the remaining space of the current container (or whose
+declared type differs from it) starts a fresh, type-aligned container;
+its own container is reserved whole, so a lone \texttt{unsigned x : 3}
+still makes the struct four bytes.  The layout records two numbers on the
+field node: \texttt{AST\_F3} becomes the container's byte offset (the
+address the member access will load), and \texttt{AST\_F2}---which held
+the width expression---is overwritten with the packed pair
+\texttt{(bit\_offset~$\ll$~16)~$\vert$~width}.  A zero there afterwards
+means ``not a bit-field,'' so ordinary members are untouched.  This is a
+deliberately conservative model: same-type runs, which is what real
+bit-field structs overwhelmingly use, match \texttt{clang} exactly;
+mixed-type packing and zero-width separators are not yet modelled.
+
+@d Sema: layout bit-field @{
+// x2 = fsize (container bytes), x3 = falign, x5 = width expr, x20 = is_union,
+// x21 = field, x22 = struct byte cursor.  Falls through to .Ltl_field_align.
+    ldr x7, [x5, #AST_TAG]
+.Ltl_bf_unwrap:
+    cmp x7, #AST_PAREN_EXPR
+    b.ne .Ltl_bf_folded
+    ldr x5, [x5, #AST_F0]
+    cbz x5, .Ltl_bf_w0
+    ldr x7, [x5, #AST_TAG]
+    b .Ltl_bf_unwrap
+.Ltl_bf_folded:
+    cmp x7, #AST_INT_LIT
+    b.eq .Ltl_bf_getval
+    cmp x7, #AST_CHAR_LIT
+    b.eq .Ltl_bf_getval
+.Ltl_bf_w0:
+    mov x6, #0                 // non-constant width → 0 (degrades to plain)
+    b .Ltl_bf_wdone
+.Ltl_bf_getval:
+    ldr x6, [x5, #AST_F0]      // width value
+.Ltl_bf_wdone:
+    cbnz x20, .Ltl_bf_union
+    lsl x7, x2, #3             // container bits
+    ldr x8, [sp, #96]          // active container size (0 = none)
+    cmp x8, x2
+    b.ne .Ltl_bf_newcont
+    ldr x9, [sp, #88]          // next free bit
+    add x10, x9, x6
+    cmp x10, x7
+    b.gt .Ltl_bf_newcont
+    ldr x11, [sp, #80]         // reuse the active container
+    b .Ltl_bf_store
+.Ltl_bf_newcont:
+    sub x4, x3, #1
+    add x22, x22, x4
+    bic x22, x22, x4           // align the cursor to the container type
+    mov x11, x22
+    str x11, [sp, #80]
+    str x2, [sp, #96]          // container size
+    mov x9, #0                 // bit offset 0 in the fresh unit
+    add x22, x22, x2           // reserve the whole container
+.Ltl_bf_store:
+    str x11, [x21, #AST_F3]     // container byte offset
+    lsl x12, x9, #16
+    orr x12, x12, x6
+    str x12, [x21, #AST_F2]     // (bit_offset << 16) | width
+    add x9, x9, x6
+    str x9, [sp, #88]           // advance the bit cursor
+    b .Ltl_field_align
+.Ltl_bf_union:
+    str xzr, [x21, #AST_F3]     // union bit-field shares offset 0
+    and x12, x6, #0xffff
+    str x12, [x21, #AST_F2]     // bit_offset 0, width
+    cmp x2, x24
+    csel x24, x2, x24, gt
+    b .Ltl_field_align
+@| _kcc_type_layout
 @}
 
 @d Sema: check declaration @{
@@ -2061,6 +2152,7 @@ _kcc_sema_expr_binary:
 // int kcc_sema_int_signedness(type_desc *t)
 // 1 = signed integer, 0 = unsigned integer, -1 = not an integer we rank.
 // Integer kinds CHAR..LLONG carry signedness in TY_F0; an enum is signed int.
+.globl _kcc_sema_int_signedness
 .p2align 2
 _kcc_sema_int_signedness:
     cbz x0, .Lsg_na

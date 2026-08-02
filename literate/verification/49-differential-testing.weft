@@ -618,6 +618,20 @@ difftest "desig-mixed" \
     "int main(void){ int m[5] = { 1, 2, [4] = 5 }; struct { int a, b, c; } s = { 100, .c = 30 }; return m[0]+m[1]+m[4]+s.a+s.c; }"
 difftest "desig-array-inferred" \
     "int main(void){ int a[] = { [3] = 7, [1] = 2 }; return a[0] + a[1] + a[3]; }"
+difftest "bitfield-pack" \
+    "struct F { unsigned a:3; unsigned b:5; unsigned c:1; }; int main(void){ struct F f; f.a=5; f.b=20; f.c=1; return f.a + f.b + f.c + (int)sizeof(struct F); }"
+difftest "bitfield-signed" \
+    "struct M { int x:5; unsigned y:10; }; int main(void){ struct M m; m.x=-3; m.y=1000; return m.x + (int)m.y; }"
+difftest "bitfield-cross" \
+    "struct C { unsigned p:30; unsigned q:6; }; int main(void){ struct C c; c.p=1000000; c.q=40; return (int)(c.p % 1000) + c.q + (int)sizeof(struct C); }"
+difftest "bitfield-truncate" \
+    "struct T { unsigned a:3; unsigned c:8; }; int main(void){ struct T t; t.a=100; t.c=300; return t.a + t.c; }"
+difftest "bitfield-init" \
+    "struct F { unsigned a:3; unsigned b:5; unsigned c:1; }; int main(void){ struct F f = { 5, 20, 1 }; return f.a + f.b + f.c; }"
+difftest "bitfield-desig" \
+    "struct F { unsigned a:3; unsigned b:5; unsigned c:4; }; int main(void){ struct F f = { .c = 7, .a = 2 }; return f.a*100 + f.b*10 + f.c; }"
+difftest "bitfield-global" \
+    "struct F { unsigned a:3; unsigned b:5; }; struct F g = { 6, 25 }; int main(void){ return g.a + g.b; }"
 @}
 
 \section{Known Divergences}

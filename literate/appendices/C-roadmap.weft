@@ -793,7 +793,7 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 \hline
 1  & Multi-error recovery \& diagnostics \stDone & \meterA & \meterB & 9e\\
 2  & \texttt{-Wall} warnings \stDone            & \meterB & \meterC & 9e\\
-3  & Designated initializers                    & \meterA & \meterB & 9a\\
+3  & Designated initializers \stDone            & \meterA & \meterB & 9a\\
 4  & Bit-fields                                 & \meterA & \meterB & 9a\\
 5  & \_Bool normalize, \texttt{char\,s[]="\dots"} & \meterB & \meterC & 9a\\
 6  & DWARF debug info                           & \meterB & \meterA & 9e\\
@@ -895,10 +895,18 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       \texttt{-Wparentheses}, \texttt{-Wuninitialized}, and argument-position
       conversion checks once the function type descriptor carries its
       parameter types.
-\item \textbf{Designated initializers} (Stage~9a).  Pervasive in real systems
-      C (\texttt{\{.field = v\}}, \texttt{[i] = v}); without them a great deal
-      of ordinary code simply will not compile, which caps conformance no
-      matter what else is done.
+\item \textbf{Designated initializers} (Stage~9a).  \emph{Landed.}  Pervasive
+      in real systems C (\texttt{\{.field = v\}}, \texttt{[i] = v}); without
+      them a great deal of ordinary code simply will not compile.  A
+      single-level designator now reuses the positional lowering unchanged:
+      the write loop keeps a running position and a designator merely resets
+      it (an array index directly, a member name through
+      \texttt{kcc\_ir\_field\_index}), after which plain elements resume from
+      the new position exactly as \stdref{6.7.9} prescribes.  Local and
+      file-scope aggregates, structs, unions, arrays, sparse and out-of-order
+      lists, and mixed positional/designated forms all agree with
+      \texttt{clang} in the differential suite.  \emph{Remaining:} nested
+      designator chains (\texttt{.a.b}, \texttt{[i].f}).
 \item \textbf{Bit-fields} (Stage~9a).  Equally pervasive in systems and
       device-register headers; needs sub-byte layout in
       \texttt{\_kcc\_type\_layout} and masked load/store codegen.

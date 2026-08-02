@@ -1764,7 +1764,16 @@ _kcc_parse_is_type_token:
 \section{Initializer}
 
 An initializer (\stdref{6.7.9}) is either an assignment expression or
-a brace-enclosed initializer list.
+a brace-enclosed initializer list.  Within a list, an element may be
+preceded by a \emph{designator} (\stdref{6.7.9p6}): \texttt{.member} to
+name a struct or union member, or \texttt{[constant]} to name an array
+element.  A designator makes an initializer list sparse and
+order-independent---\texttt{\{ [2] = 5, [0] = 1 \}} or
+\texttt{\{ .y = 2, .x = 1 \}}---and it resets the ``current object'' so
+that any plain elements that follow continue from the designated
+position.  \kcc{} supports a single top-level designator per element
+(\texttt{.member} or \texttt{[index]}); nested designator chains
+(\texttt{.a.b}, \texttt{[i][j]}) are not yet handled.
 
 @d Decl: parse init @{
 // -- kcc_parse_initializer ---------------------------------------------
@@ -1801,8 +1810,8 @@ _kcc_parse_initializer:
     cmp  x0, #TOK_RBRACE
     b.eq .Linit_list_close
 
-    // Parse one initializer (possibly with designator)
-    bl _kcc_parse_initializer
+    // Parse one initializer element, honouring a leading designator
+    bl _kcc_parse_designated_element
     mov x0, x0                   // new init
 
     cbz x20, .Linit_list_first
@@ -1847,7 +1856,108 @@ _kcc_parse_initializer:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+
+// -- kcc_parse_designated_element --------------------------------------
+// node *kcc_parse_designated_element(void)
+// One initializer-list element.  If it starts with `.member` or
+// `[index]`, parse "<designator> = <initializer>" into an AST_DESIGNATOR
+// (F0 = interned member name or integer index, F1 = 1 for a field / 0 for
+// an index, F3 = the value initializer).  Otherwise fall through to a
+// plain positional initializer.
+.p2align 2
+_kcc_parse_designated_element:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_DOT
+    b.eq .Lde_field
+    cmp  x0, #TOK_LBRACKET
+    b.eq .Lde_index
+    bl _kcc_parse_initializer
+    b .Lde_ret
+
+.Lde_field:
+    bl _kcc_pp_next               // consume '.'
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x19, x0                   // interned member name
+    bl _kcc_pp_next               // consume member identifier
+    mov x0, #AST_DESIGNATOR
+    bl _kcc_ast_alloc
+    mov x20, x0                   // designator node
+    str x19, [x20, #AST_F0]      // name
+    mov x0, #1
+    str x0, [x20, #AST_F1]      // is_field
+    mov x0, #TOK_ASSIGN
+    bl _kcc_parse_expect
+    bl _kcc_parse_initializer
+    str x0, [x20, #AST_F3]      // value
+    mov x0, x20
+    b .Lde_ret
+
+.Lde_index:
+    bl _kcc_pp_next               // consume '['
+    bl _kcc_parse_assign_expr     // index expression
+    bl _kcc_parse_const_index     // fold to an integer
+    mov x19, x0                   // index value
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect          // consume ']'
+    mov x0, #AST_DESIGNATOR
+    bl _kcc_ast_alloc
+    mov x20, x0
+    str x19, [x20, #AST_F0]      // index value
+    str xzr, [x20, #AST_F1]      // is_field = 0
+    mov x0, #TOK_ASSIGN
+    bl _kcc_parse_expect
+    bl _kcc_parse_initializer
+    str x0, [x20, #AST_F3]      // value
+    mov x0, x20
+
+.Lde_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_parse_const_index ---------------------------------------------
+// uint64_t kcc_parse_const_index(node *e)
+// Extracts the integer value of a constant array-index designator.  A
+// literal (after unwrapping parentheses) is used directly; anything else
+// folds to 0 (non-constant designator indices are not yet supported).
+.p2align 2
+_kcc_parse_const_index:
+    cbz x0, .Lpci_zero
+.Lpci_unwrap:
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Lpci_check
+    ldr x0, [x0, #AST_F0]
+    cbz x0, .Lpci_zero
+    b .Lpci_unwrap
+.Lpci_check:
+    cmp x1, #AST_INT_LIT
+    b.eq .Lpci_val
+    cmp x1, #AST_CHAR_LIT
+    b.eq .Lpci_val
+    mov x0, #0
+    ret
+.Lpci_val:
+    ldr x0, [x0, #AST_F0]
+    ret
+.Lpci_zero:
+    mov x0, #0
+    ret
 @| _kcc_parse_initializer
+@| _kcc_parse_designated_element
+@| _kcc_parse_const_index
 @}
 
 \section{Static Assert}

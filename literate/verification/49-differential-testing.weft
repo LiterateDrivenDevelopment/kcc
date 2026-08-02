@@ -606,6 +606,18 @@ difftest "long-stays-64" \
     "int main(void){ long a = 4000000000; long b = 1000000000; return (int)((a + b) % 1000); }"
 difftest "ptr-arith-untouched" \
     "int main(void){ int a[10]; int i = 0; while (i < 10) { a[i] = i; i = i + 1; } int *p = a; return *(p + 7); }"
+difftest "desig-array-local" \
+    "int main(void){ int a[6] = { [4] = 44, [0] = 1, 2 }; return a[0]+a[1]+a[4]; }"
+difftest "desig-struct-local" \
+    "struct P { int x; int y; int z; }; int main(void){ struct P p = { .y = 20, .x = 10 }; return p.x + p.y + p.z; }"
+difftest "desig-array-global" \
+    "int g[6] = { [5] = 9, [1] = 11 }; int main(void){ return g[1] + g[5] + g[0]; }"
+difftest "desig-struct-global" \
+    "struct P { int a; int b; int c; }; struct P g = { .c = 3, .a = 1 }; int main(void){ return g.a*100 + g.b*10 + g.c; }"
+difftest "desig-mixed" \
+    "int main(void){ int m[5] = { 1, 2, [4] = 5 }; struct { int a, b, c; } s = { 100, .c = 30 }; return m[0]+m[1]+m[4]+s.a+s.c; }"
+difftest "desig-array-inferred" \
+    "int main(void){ int a[] = { [3] = 7, [1] = 2 }; return a[0] + a[1] + a[3]; }"
 @}
 
 \section{Known Divergences}

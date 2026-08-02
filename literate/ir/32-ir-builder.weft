@@ -995,10 +995,30 @@ _kcc_ir_emit_global_inits:
 
     ldr x20, [x19, #AST_F2]     // init list node
     ldr x20, [x20, #AST_F0]     // first element
-    mov x21, #0                  // element index
+    mov x21, #0                  // element index (current object position)
 .Legi_il_loop:
     cbz x20, .Legi_next
-    mov x0, x20
+    // Honour a designator, exactly as the local-variable path does.
+    ldr x9, [x20, #AST_TAG]
+    cmp x9, #AST_DESIGNATOR
+    b.ne .Legi_il_pos
+    ldr x9, [x20, #AST_F1]       // is_field?
+    cbz x9, .Legi_il_arr
+    mov x0, x23                  // aggregate type
+    ldr x1, [x20, #AST_F0]      // member name
+    bl _kcc_ir_field_index
+    tbnz x0, #63, .Legi_il_desval
+    mov x21, x0
+.Legi_il_desval:
+    ldr x0, [x20, #AST_F3]      // value node
+    b .Legi_il_build
+.Legi_il_arr:
+    ldr x21, [x20, #AST_F0]      // [i] = : position becomes i
+    ldr x0, [x20, #AST_F3]      // value node
+    b .Legi_il_build
+.Legi_il_pos:
+    mov x0, x20                  // value node = element itself
+.Legi_il_build:
     bl _kcc_ir_build_expr
     mov x24, x0                  // value
     mov x0, x23                  // element/aggregate type
@@ -6991,30 +7011,58 @@ When a list is shorter than the aggregate (\texttt{int a[4] = \{5,
 initialised as if they had static storage duration---that is, to
 zero.  The builder therefore records the total slot count when it
 sizes the alloca and, after the provided values are placed, stores a
-single reused zero constant into every remaining slot.  Nested
-aggregates and designated initializers (\texttt{[i] =}, \texttt{.f =})
-are not yet handled; the elements are taken positionally.  String
+single reused zero constant into every remaining slot.
+
+\emph{Designated initializers} (\texttt{[i] =}, \texttt{.member =}) fit
+this machinery with almost no new mechanism.  Each list element is
+either a plain value or an \texttt{AST\_DESIGNATOR} carrying its value
+in \texttt{AST\_F3}; the write loop keeps a running ``current object''
+position, and when it meets a designator it \emph{resets} that position
+--- an array index goes straight in, a member name is turned into a
+field position by \texttt{kcc\_ir\_field\_index} --- then continues
+positionally from there, exactly as \stdref{6.7.9p17--18} prescribes.
+Because the whole region is zero-filled first, a sparse list such as
+\texttt{int a[6] = \{ [5] = 9 \}} leaves the gaps correctly at zero.
+The offset helper is untouched: it still maps a position to a byte
+offset, and the designator only changes \emph{which} position that is.
+Nested designator chains (\texttt{.a.b}, \texttt{[i][j]}) and string
 initialisers for character arrays (\texttt{char s[] = "abc"}) remain
-pending.  File-scope aggregates take the same positional shape but are
-seeded by \texttt{\_kcc\_ir\_emit\_global\_inits} rather than here.
+pending.  File-scope aggregates take the same shape but are seeded by
+\texttt{\_kcc\_ir\_emit\_global\_inits} rather than here, relying on
+BSS zero instead of an explicit zero-fill.
 
 @d IR: aggregate init helpers @{
 // -- kcc_ir_initlist_count ------------------------------------------------
 // uint64_t kcc_ir_initlist_count(node *init_list)
-//   x0 = AST_INIT_LIST node → count of top-level elements (F0 chained via F4)
+//   x0 = AST_INIT_LIST node → number of array slots the list spans.  Plain
+//   elements advance a running index; an `[i] =` designator resets it, so a
+//   sparse list like { [9] = 1 } reports a length of 10.  The result is the
+//   highest index reached plus one (used only for `int a[]` sizing).
 .text
 .globl _kcc_ir_initlist_count
 .p2align 2
 _kcc_ir_initlist_count:
     ldr x0, [x0, #AST_F0]       // first element
-    mov x1, #0
+    mov x1, #0                  // running index
+    mov x2, #0                  // max slots
 .Lilc_loop:
     cbz x0, .Lilc_done
-    add x1, x1, #1
+    ldr x3, [x0, #AST_TAG]
+    cmp x3, #AST_DESIGNATOR
+    b.ne .Lilc_step
+    ldr x3, [x0, #AST_F1]       // is_field?
+    cbnz x3, .Lilc_step         // a member designator does not move the index
+    ldr x1, [x0, #AST_F0]       // [i] = : running index becomes i
+.Lilc_step:
+    add x1, x1, #1              // this element consumes slot (running-1)
+    cmp x1, x2
+    b.le .Lilc_nomax
+    mov x2, x1
+.Lilc_nomax:
     ldr x0, [x0, #AST_F4]
     b .Lilc_loop
 .Lilc_done:
-    mov x0, x1
+    mov x0, x2
     ret
 
 // -- kcc_ir_emit_indexed_store --------------------------------------------
@@ -7159,9 +7207,47 @@ _kcc_ir_elem_off_width:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+
+// -- kcc_ir_field_index ---------------------------------------------------
+// int64_t kcc_ir_field_index(type *aggregate, char *name)
+//   x0 = struct/union type, x1 = interned member name
+// Returns the zero-based position of the named member (so the positional
+// offset machinery can be reused), or -1 if there is no such member.
+.globl _kcc_ir_field_index
+.p2align 2
+_kcc_ir_field_index:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x1                  // name
+    ldr x2, [x0, #TY_F0]         // struct decl
+    cbz x2, .Lfi_notfound
+    ldr x20, [x2, #AST_F1]       // first field
+    mov x21, #0                  // index (callee-saved across strcmp)
+.Lfi_loop:
+    cbz x20, .Lfi_notfound
+    ldr x0, [x20, #AST_F1]       // field name
+    mov x1, x19
+    bl _kcc_strcmp
+    cbz x0, .Lfi_found
+    ldr x20, [x20, #AST_F4]      // next field
+    add x21, x21, #1
+    b .Lfi_loop
+.Lfi_found:
+    mov x0, x21
+    b .Lfi_ret
+.Lfi_notfound:
+    mov x0, #-1
+.Lfi_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
 @| _kcc_ir_initlist_count
 @| _kcc_ir_emit_indexed_store
 @| _kcc_ir_elem_off_width
+@| _kcc_ir_field_index
 @}
 
 \subsection{Static Locals}
@@ -7505,10 +7591,30 @@ _kcc_ir_build_var_decl:
     b .Libvd_il_zf_loop
 
 .Libvd_il_write:
-    mov x22, #0                  // element index
+    mov x22, #0                  // element index (current object position)
 .Libvd_il_loop:
     cbz x20, .Libvd_done
-    mov x0, x20
+    // A designator resets the current position; a plain element keeps it.
+    ldr x9, [x20, #AST_TAG]
+    cmp x9, #AST_DESIGNATOR
+    b.ne .Libvd_il_pos
+    ldr x9, [x20, #AST_F1]       // is_field?
+    cbz x9, .Libvd_il_arr
+    mov x0, x21                  // aggregate type
+    ldr x1, [x20, #AST_F0]      // member name
+    bl _kcc_ir_field_index       // x0 = position, or -1
+    tbnz x0, #63, .Libvd_il_desval
+    mov x22, x0
+.Libvd_il_desval:
+    ldr x0, [x20, #AST_F3]      // value node
+    b .Libvd_il_build
+.Libvd_il_arr:
+    ldr x22, [x20, #AST_F0]      // [i] = : position becomes i
+    ldr x0, [x20, #AST_F3]      // value node
+    b .Libvd_il_build
+.Libvd_il_pos:
+    mov x0, x20                  // value node = element itself
+.Libvd_il_build:
     bl _kcc_ir_build_expr        // element value vreg
     str x0, [sp, #72]           // stash value vreg
     mov x0, x21                  // element/aggregate type
@@ -8895,11 +9001,13 @@ run_test "charpp-argv-like" \
 \subsection{Initializer Lists}
 
 Brace-enclosed initializers seed an aggregate positionally, one value
-per eight-byte slot.  The tests below cover explicit and implicit
-array bounds, a short list whose tail must zero-fill
-(\S\ref{sec:ir-subscript} reads the same slots back), flat struct
-initialization, and a file-scope lookup table---the shape a
-self-hosted lexer's character-class tables take.
+per eight-byte slot, or---with a designator---at a named position.  The
+tests below cover explicit and implicit array bounds, a short list whose
+tail must zero-fill (\S\ref{sec:ir-subscript} reads the same slots
+back), flat struct initialization, and a file-scope lookup table---the
+shape a self-hosted lexer's character-class tables take.  Designated
+forms (\texttt{[i] =}, \texttt{.member =}) are exercised against
+\texttt{clang} in the differential suite.
 
 @d Test: codegen init lists @{
 echo ""

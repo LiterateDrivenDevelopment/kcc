@@ -8313,7 +8313,7 @@ _kcc_ir_build_switch:
 
     mov x22, #0                  // x22 = default_bb (null)
 
-    // ── Pass 1: create BBs for each case/default ──
+    // -- Pass 1: create BBs for each case/default --
     mov x24, x23
 .Lsw_scan:
     cbz x24, .Lsw_scan_done
@@ -8334,7 +8334,7 @@ _kcc_ir_build_switch:
     b .Lsw_scan
 .Lsw_scan_done:
 
-    // ── Pass 2: dispatch chain ──
+    // -- Pass 2: dispatch chain --
     // For each case: emit const + cmp_eq + br_cond in current BB,
     // then create a fresh dispatch BB for the next comparison.
     mov x24, x23
@@ -8433,7 +8433,7 @@ _kcc_ir_build_switch:
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
 
-    // ── Pass 3: emit case/default bodies ──
+    // -- Pass 3: emit case/default bodies --
     // Push break target (continue=0, not valid in switch)
     ldr x0, [x21, #BB_ID]       // break → exit_bb
     mov x1, #0                  // no continue target

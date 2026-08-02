@@ -13,7 +13,7 @@ the \texttt{.weft} files to be created or extended, the new tangled
 output files, and the acceptance criteria that must hold before the
 phase is considered complete.
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 0 --- Project Skeleton}
 \label{sec:phase0}
 
@@ -59,7 +59,7 @@ prints a banner, and exits cleanly.  No C source is compiled yet.
 
 \textbf{Status.} Complete.
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 1 --- Data Structures and Lexer Foundation}
 \label{sec:phase1}
 
@@ -97,7 +97,7 @@ a stream of C17 preprocessing tokens (\stdref{6.4}).
 
 \textbf{Status.} Complete.
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 2 --- Complete Lexer and Diagnostics}
 \label{sec:phase2}
 
@@ -137,7 +137,7 @@ build the diagnostic engine required by \stdref{5.1.1.3}.
 
 \textbf{Status.} Complete.
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 3 --- Preprocessor}
 \label{sec:phase3}
 
@@ -187,7 +187,7 @@ including file, \texttt{\#if}/\texttt{\#ifdef}/\texttt{\#endif},
 \texttt{\#error}; predefined macros).  A \texttt{-I} system search path
 remains for Phase~9.
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 4 --- Parser}
 \label{sec:phase4}
 
@@ -239,7 +239,7 @@ tree (AST) for every C17 construct.
 
 \textbf{Status.} Complete.
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 5 --- Type System and Semantic Analysis}
 \label{sec:phase5}
 
@@ -302,7 +302,7 @@ checks all constraints.
 \textbf{Status.} Complete (core type checking for integer types,
 pointers, functions; \texttt{--dump-types} and \texttt{--check} flags).
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 6 --- Intermediate Representation and Optimization}
 \label{sec:phase6}
 
@@ -354,7 +354,7 @@ essential optimization passes.
 \textbf{Status.} Complete (constant folding, DCE, pass manager;
 \texttt{--dump-ir} flag).
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 7 --- ARM64 Backend}
 \label{sec:phase7}
 
@@ -475,7 +475,7 @@ correctly.  Valid Mach-O with \texttt{LC\_BUILD\_VERSION}.
       the left operand's type has \texttt{TY\_F0}=0.
 \end{itemize}
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 8 --- Self-Hosting}
 \label{sec:phase8}
 
@@ -687,9 +687,20 @@ milestones above).
 \item Appendix~B: undefined-behavior policy matrix.
 \end{itemize}
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Phase 9 --- Production Compiler}
 \label{sec:phase9}
+
+% Status and rating markers used throughout the Phase 9 tables.
+\newcommand{\stDone}{\textcolor{green!55!black}{\checkmark\,\textsc{done}}}
+\newcommand{\stPart}{\textcolor{orange!90!black}{$\odot$\,\textsc{partial}}}
+\newcommand{\stOpen}{\textcolor{black!45}{$\circ$\,\textsc{open}}}
+\newcommand{\meterA}{$\bullet\bullet\bullet$}   % high
+\newcommand{\meterB}{$\bullet\bullet\circ$}     % medium
+\newcommand{\meterC}{$\bullet\circ\circ$}       % low
+\newcommand{\mkDone}{\textcolor{green!55!black}{\checkmark}}
+\newcommand{\mkPart}{\textcolor{orange!90!black}{$\odot$}}
+\newcommand{\mkOpen}{\textcolor{black!45}{$\circ$}}
 
 \textbf{Goal.}  Elevate \kcc{} from a working subset compiler to a
 conforming, efficient, and usable C17 implementation suitable for
@@ -697,14 +708,50 @@ compiling real-world programs.  Phase~8 proves correctness on a
 significant codebase; Phase~9 fills every remaining gap in the
 language, the ABI, the optimizer, and the tooling.
 
-\textbf{Strategy.}  Phase~9 is divided into five stages, ordered by
-impact.  Stage~9a completes the C17 type system (floating point,
-unions, qualifiers).  Stage~9b makes the calling convention fully
-ABI-compliant (struct-by-value, stack arguments, variadic definitions).
-Stage~9c replaces the all-spill model with a real register allocator.
-Stage~9d adds optimization passes that bring generated-code quality
-within striking distance of \texttt{clang -O1}.  Stage~9e delivers
-the tooling and diagnostics expected of a production compiler.
+\begin{center}
+\fcolorbox{black!55}{black!4}{%
+\parbox{0.9\linewidth}{\centering\smallskip
+\textbf{North Star}\\[2pt]
+A conforming C17 compiler a developer can actually use: it compiles real-world
+code, reports \emph{every} error clearly, produces debuggable executables, and
+generates efficient code---while remaining a single, self-hosting literate
+program.\smallskip}}
+\end{center}
+
+\noindent Phase~9 is where the compiler crosses from ``proven correct on a
+large codebase'' to ``pleasant to use.''  The five thematic stages and their
+current standing:
+
+\begin{center}
+\small
+\begin{tabular}{@@{}cllc@@{}}
+\hline
+\textbf{Stage} & \textbf{Theme} & \textbf{Where it stands} & \textbf{Status}\\
+\hline
+9a & Complete type system   & \texttt{double}/\texttt{float}/unions done; \_Bool, bit-fields, \dots{} left & \stPart\\
+9b & Full ABI compliance    & AAPCS64, struct-by-value, variadic; \texttt{clang}-validated & \stDone\\
+9c & Register allocation    & local linear-scan, caller \& callee-saved & \stDone\\
+9d & Optimization           & CSE, copy-prop, strength reduction, global RA & \stOpen\\
+9e & Tooling \& diagnostics & auto-link \& headers done; errors, DWARF left & \stPart\\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent\emph{Legend:}\quad \stDone{}\,shipped and tested \quad
+\stPart{}\,partially landed \quad \stOpen{}\,not begun.
+
+\textbf{Strategy.}  Phase~9 is organized into five \emph{thematic} stages.
+Stage~9a completes the C17 type system (floating point, unions, qualifiers).
+Stage~9b makes the calling convention fully ABI-compliant (struct-by-value,
+stack arguments, variadic definitions).  Stage~9c replaces the all-spill model
+with a real register allocator.  Stage~9d adds optimization passes that bring
+generated-code quality within striking distance of \texttt{clang -O1}.
+Stage~9e delivers the tooling and diagnostics expected of a production
+compiler.  These groupings organize the \emph{material}; they are no longer
+the order of work.  With 9a--9c largely landed, the remaining open items are
+re-prioritized by impact toward a genuinely \emph{usable} compiler in the
+go-forward plan below (\S\ref{sec:goforward})---diagnostics and
+high-frequency language features first, optimization and breadth later.
 
 \textbf{Status.}  Stage~9a is well advanced---\texttt{double} floating point
 (\S\ref{sec:parse-float}), \texttt{union}s, and single-precision
@@ -723,10 +770,84 @@ indirect-result pointer---validated in both directions against \texttt{clang}
 by a mixed-object interoperability suite (Chapter~\ref{ch:interop-testing}),
 which passes on all sixteen checks.  \kcc{}'s Stage~9b ABI work is therefore
 complete: its objects link and run correctly with \texttt{clang}'s.
-Stages~9c--9e (register allocation, optimization, tooling) are
-not yet begun.  A precise ledger of what is done and what is left
-appears in the production-readiness assessment
+Stage~9c's local register allocator has landed (\S\ref{sec:regalloc});
+Stages~9d--9e (optimization, tooling) are largely open.  A precise ledger of
+what is done and what is left appears in the production-readiness assessment
 (\S\ref{sec:production-readiness}).
+
+\subsection{Reprioritized Go-Forward Plan}
+\label{sec:goforward}
+
+The thematic stages above group the material; this list is the authoritative
+\emph{order} in which the remaining open items should be tackled.  It is
+re-ordered by impact toward a usable production compiler rather than by stage
+number, on one principle: \emph{remove what stops a user from using \kcc{} in
+practice before adding polish or breadth}.  Correctness and self-hosting are
+already in hand, so the leverage now is in usability and coverage, not speed.
+
+\begin{center}
+\small
+\begin{tabular}{@@{}clccl@@{}}
+\hline
+\textbf{\#} & \textbf{Open item} & \textbf{Impact} & \textbf{Effort} & \textbf{Home}\\
+\hline
+1  & Multi-error recovery \& diagnostics        & \meterA & \meterB & 9e\\
+2  & \texttt{-Wall} warnings                    & \meterB & \meterC & 9e\\
+3  & Designated initializers                    & \meterA & \meterB & 9a\\
+4  & Bit-fields                                 & \meterA & \meterB & 9a\\
+5  & \_Bool normalize, \texttt{char\,s[]="\dots"} & \meterB & \meterC & 9a\\
+6  & DWARF debug info                           & \meterB & \meterA & 9e\\
+7  & Harden vs.\ malformed input                & \meterB & \meterB & new\\
+8  & Optimizer \& global/FP reg-alloc           & \meterB & \meterA & 9c--9d\\
+9  & Tail C17 (\_Generic, \texttt{long double}) & \meterC & \meterB & 9a\\
+10 & Second target (x86-64 / ELF)               & \meterC & \meterA & new\\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent\emph{Impact / effort:}\quad \meterA{}\,high \quad \meterB{}\,medium
+\quad \meterC{}\,low.\quad The table is the scan; the notes below are the
+\emph{why}.
+
+\begin{enumerate}
+\item \textbf{Multi-error recovery and precise diagnostics} (Stage~9e).  The
+      single biggest usability jump.  The front end aborts on the first error
+      today; add synchronization-point recovery (skip to the next \texttt{;}
+      or \texttt{\}}) so one compile reports \emph{every} error, each with an
+      accurate line and column.  It depends on nothing else, and its recovery
+      machinery hardens the whole front end for everything that follows.
+\item \textbf{\texttt{-Wall}-equivalent warnings} (Stage~9e).  Nearly free
+      once error recovery exists: unused variables, missing returns, implicit
+      conversions, shadowed declarations, signed/unsigned comparisons.
+\item \textbf{Designated initializers} (Stage~9a).  Pervasive in real systems
+      C (\texttt{\{.field = v\}}, \texttt{[i] = v}); without them a great deal
+      of ordinary code simply will not compile, which caps conformance no
+      matter what else is done.
+\item \textbf{Bit-fields} (Stage~9a).  Equally pervasive in systems and
+      device-register headers; needs sub-byte layout in
+      \texttt{\_kcc\_type\_layout} and masked load/store codegen.
+\item \textbf{\_Bool normalization and \texttt{char s[] = "..."}}
+      (Stage~9a).  Cheap, high-frequency gaps: truncate any non-zero value to
+      1 on a \texttt{\_Bool} store, and initialize a \texttt{char} array from
+      a string literal.
+\item \textbf{DWARF debug information} (Stage~9e).  The line table first
+      (source-level stepping and breakpoints), then variable DIEs.  Large but
+      additive---it emits \texttt{\_\_debug\_*} sections without changing code
+      generation---and it is what lets \texttt{lldb}/\texttt{gdb} work.
+\item \textbf{Hardening against malformed input} (new).  A production
+      compiler must reject adversarial or truncated source cleanly rather than
+      crash; fuzz the front end and close the holes.
+\item \textbf{Optimization and global register allocation} (Stages~9c--9d).
+      Deliberately deferred behind usability: \kcc{} already emits
+      \emph{correct} code, so cross-block (global) allocation, CSE, copy
+      propagation, and strength reduction are quality, not enablement.
+\item \textbf{Tail C17 features---\_Generic, \texttt{long double},
+      \texttt{volatile}} (Stage~9a).  Low frequency; they close the last of
+      conformance but rarely block real code.
+\item \textbf{A second target} (new).  Retargeting to x86-64 or Linux/ELF is
+      a strategic multiplier but an entire new backend or object writer;
+      undertake it only if cross-platform support becomes an explicit goal.
+\end{enumerate}
 
 \subsection{Stage 9a --- Complete Type System}
 
@@ -790,6 +911,15 @@ point is now in place.  This stage adds every remaining C17 type.
       to \texttt{IR\_CONST} with the type's alignment.
       \texttt{\_Alignas} adjusts alloca padding and
       \texttt{\_\_data}-section alignment.
+\item \textbf{Bit-fields.}  Struct members declared with a
+      \texttt{: width} need sub-byte layout in
+      \texttt{\_kcc\_type\_layout} (packing consecutive fields into
+      storage units) and masked load/store codegen to read and write
+      the field within its unit.
+\item \textbf{\texttt{char} array from a string literal.}
+      \texttt{char s[] = "abc"} (and a sized \texttt{char s[8] =
+      "abc"}) must copy the literal's bytes into the array's storage,
+      not store a pointer to it.
 \item \textbf{Designated initializers.}  Struct and array
       initializers with \texttt{.field = val} and
       \texttt{[index] = val} syntax, including nested
@@ -916,6 +1046,10 @@ register allocation to eliminate redundant memory traffic.
 
 \subsection{Stage 9d --- Optimization}
 
+\emph{Go-forward priority: deferred} (\S\ref{sec:goforward}, item~8).  \kcc{}
+already emits correct code, so these passes are quality, not enablement, and
+come after diagnostics and the high-frequency language gaps.
+
 Phase~6 provides constant folding and dead code elimination.
 This stage adds passes that substantially improve code quality.
 
@@ -945,6 +1079,11 @@ This stage adds passes that substantially improve code quality.
 \end{itemize}
 
 \subsection{Stage 9e --- Tooling and Diagnostics}
+
+\emph{Go-forward priority: highest} (\S\ref{sec:goforward}, items~1--2, 6--7).
+Error recovery and warnings are the top of the reprioritized plan---the
+biggest usability jump---followed by DWARF and input hardening; only automatic
+linking and freestanding headers here are already done.
 
 A production compiler needs more than correct code generation.
 
@@ -1006,27 +1145,29 @@ A production compiler needs more than correct code generation.
       timing output.
 \end{itemize}
 
-\textbf{Acceptance.}
-\begin{enumerate}
-\item The full C17 type system is implemented: floating point,
-      unions, \_Bool, qualifiers, \_Generic.
-\item The calling convention matches AAPCS64: struct-by-value,
-      stack arguments, variadic definitions all work.
-\item Register allocation reduces code size by at least
-      $2\times$ compared to the all-spill baseline.
-\item \texttt{lldb} can debug \kcc{}-compiled programs with
+\textbf{Acceptance milestones.}\quad(\mkDone\,met \quad \mkPart\,partial \quad
+\mkOpen\,open)
+\begin{itemize}
+\item[\mkPart] The full C17 type system: floating point and unions are in;
+      \_Bool, qualifiers, bit-fields, designated initializers, and \_Generic
+      remain.
+\item[\mkDone] The calling convention matches AAPCS64: struct-by-value, stack
+      arguments, and variadic definitions all work, \texttt{clang}-validated.
+\item[\mkPart] Register allocation beats the all-spill baseline: a local
+      linear-scan has landed (memory traffic down a third to two thirds); the
+      $2\times$ code-size target awaits global allocation.
+\item[\mkOpen] \texttt{lldb} can debug \kcc{}-compiled programs with
       source-level breakpoints and variable inspection.
-\item The compiler accepts at least two \texttt{-O} levels and
-      produces measurably better code at \texttt{-O1} vs
-      \texttt{-O0}.
-\item \texttt{tmp/kcc hello.c -o hello} compiles, links, and
-      runs without a manual \texttt{ld} invocation.
-\item \kcc{} compiles a subset of its own source or an
-      equivalent-complexity program ($>5000$ lines of C)
-      and produces a correct, debuggable executable.
-\end{enumerate}
+\item[\mkOpen] The compiler accepts at least two \texttt{-O} levels and
+      produces measurably better code at \texttt{-O1} than \texttt{-O0}.
+\item[\mkDone] \texttt{tmp/kcc hello.c -o hello} compiles, links, and runs
+      without a manual \texttt{ld} invocation.
+\item[\mkPart] \kcc{} compiles a $>5000$-line program (its own source) to a
+      correct executable; the remaining ``\emph{debuggable}'' clause is gated
+      on the DWARF milestone above.
+\end{itemize}
 
-% ────────────────────────────────────────────────────────────────
+% ----------------------------------------------------------------
 \section{Summary}
 \label{sec:roadmap-summary}
 
@@ -1035,19 +1176,24 @@ A production compiler needs more than correct code generation.
 \hline
 Phase & Status & Milestone & Key Output & \texttt{.weft} Files \\
 \hline
-0 & \checkmark & Skeleton boots        & \texttt{tmp/kcc} runs        & 01, 02, 07--09, 11, 12, 43 \\
-1 & \checkmark & Lexer                 & \texttt{--dump-tokens}        & 10, 14, 17 \\
-2 & \checkmark & Diagnostics + tests   & \texttt{just test}            & 13, 15, 16, 44, 45 \\
-3 & \checkmark & Preprocessor          & \texttt{-E}                   & 18, 19, 20 \\
-4 & \checkmark & Parser                & \texttt{--dump-ast}           & 21--24 \\
-5 & \checkmark & Type system           & \texttt{--dump-types}         & 25--30 \\
-6 & \checkmark & IR + optimization     & \texttt{--dump-ir}            & 31--36 \\
-7 & \checkmark & Backend               & \texttt{-c file.c -o file.o}  & 37--40, 42 \\
-8 & \checkmark & Self-hosting          & Differential testing          & 46--49 \\
-9 & $\circ$    & Production            & \texttt{kcc hello.c -o hello} & 50+ \\
+0 & \mkDone & Skeleton boots        & \texttt{tmp/kcc} runs         & 01, 02, 07--09, 11, 12, 43 \\
+1 & \mkDone & Lexer                 & \texttt{--dump-tokens}        & 10, 14, 17 \\
+2 & \mkDone & Diagnostics + tests   & \texttt{just test}            & 13, 15, 16, 44, 45 \\
+3 & \mkDone & Preprocessor          & \texttt{-E}                   & 18, 19, 20 \\
+4 & \mkDone & Parser                & \texttt{--dump-ast}           & 21--24 \\
+5 & \mkDone & Type system           & \texttt{--dump-types}         & 25--30 \\
+6 & \mkDone & IR + optimization     & \texttt{--dump-ir}            & 31--36 \\
+7 & \mkDone & Backend               & \texttt{-c file.c -o file.o}  & 37--40, 42 \\
+8 & \mkDone & Self-hosting          & Differential testing          & 46--49 \\
+9 & \mkPart & Production            & \texttt{kcc hello.c -o hello} & 50+ \\
 \hline
 \end{tabular}
 \end{center}
+
+\noindent Phase~9 is under way: its ABI and register-allocation stages have
+landed and the compiler self-hosts and auto-links; diagnostics, DWARF, and the
+remaining language and optimization work are what stand between it and
+``production-ready'' (\S\ref{sec:goforward}).
 
 Total: 45+ \texttt{.weft} source files (growing to ${\sim}55$ by
 Phase~9), approximately 30 tangled assembly files, producing a

@@ -34,7 +34,7 @@ We assign a unique integer code to each.  Codes 0--9 are structural,
 .equ TOK_STRING_LIT,   4      // string literal
 .equ TOK_UNKNOWN,      5      // unrecognized character
 
-// C17 keywords (section 6.4.1) — 44 keywords, codes 10–53
+// C17 keywords (section 6.4.1) — 44 keywords, codes 10-53
 .equ TOK_AUTO,        10
 .equ TOK_BREAK,       11
 .equ TOK_CASE,        12

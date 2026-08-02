@@ -563,7 +563,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Test: codegen results@>
 @}
 
-% ── Self-hosting (Stage 8b): the arena in C, compiled by kcc ──────────
+% -- Self-hosting (Stage 8b): the arena in C, compiled by kcc ----------
 
 \noindent\textbf{arena.c} --- \kcc{}'s arena allocator, ported to C
 (Chapter~\ref{ch:self-hosting-arena}):
@@ -593,7 +593,7 @@ self-test, and diff against clang:
 @<Selfhost: lexer verify@>
 @}
 
-% ── Differential testing against clang ───────────────────────────────
+% -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and
 \texttt{clang}, run both, compare (Chapter~\ref{ch:differential-testing}):

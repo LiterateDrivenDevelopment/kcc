@@ -95,7 +95,7 @@ _\name:
 
 // SYSCALL num — invoke macOS syscall
 // Places the syscall number in x16 and traps to kernel.
-// Arguments must already be in x0–x5 per convention.
+// Arguments must already be in x0-x5 per convention.
 // Returns result in x0; carry flag set on error.
 .macro SYSCALL num
     mov x16, #\num

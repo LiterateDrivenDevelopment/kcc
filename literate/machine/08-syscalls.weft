@@ -2,7 +2,7 @@
 %
 % kcc uses no C library.  Every interaction with the operating system
 % goes through the macOS ARM64 syscall interface: place the syscall
-% number in x16, arguments in x0–x5, and execute svc #0x80.
+% number in x16, arguments in x0-x5, and execute svc #0x80.
 %
 % This chapter provides thin wrappers that establish proper frame
 % records and present a clean calling convention to the rest of kcc.

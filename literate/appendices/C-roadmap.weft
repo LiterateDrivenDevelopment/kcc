@@ -880,9 +880,12 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       so an exhaustive \texttt{if}/\texttt{else}, an infinite loop, an
       exhaustive returning \texttt{switch}, and a tail call to a
       \texttt{\_Noreturn} function are all correctly left quiet, and
-      \texttt{main} is exempt.  \emph{Still open:} the pointer/integer
-      conversion warnings deferred from item~1, signed/unsigned comparison,
-      and shadowed declarations.
+      \texttt{main} is exempt.  A fourth, \texttt{-Wsign-compare}, flags a
+      relational or equality comparison that mixes a signed and an unsigned
+      integer---the \texttt{u < -1} surprise---while staying quiet when an
+      operand is a known non-negative constant, so the ubiquitous
+      \texttt{i < 10} loop test draws nothing.  \emph{Still open:} the
+      pointer/integer conversion warnings deferred from item~1.
 \item \textbf{Designated initializers} (Stage~9a).  Pervasive in real systems
       C (\texttt{\{.field = v\}}, \texttt{[i] = v}); without them a great deal
       of ordinary code simply will not compile, which caps conformance no

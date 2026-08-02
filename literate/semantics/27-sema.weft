@@ -1941,6 +1941,25 @@ result is a pointer type (pointer arithmetic).  Otherwise, the usual
 arithmetic conversions (\texttt{\_kcc\_conv\_usual}) determine the
 common type.
 
+The six relational and equality operators additionally run the
+\texttt{-Wsign-compare} check (\texttt{kcc\_sema\_check\_sign\_compare}).
+When one operand is a signed integer and the other unsigned, the usual
+conversions turn the signed value unsigned, which flips the meaning of a
+negative value---the classic \texttt{u < -1} surprise.  The check warns
+on exactly that mismatch, with one deliberate suppression that keeps it
+quiet on ordinary code: if either operand is a \emph{known non-negative
+constant}, there is nothing to be surprised by, so \texttt{u < 10} and
+\texttt{i == 0} stay silent.  Identifying that constant is easy here
+because the AST has no negative literals---a negative value is a
+unary-minus expression---so an integer or character literal operand is
+necessarily non-negative.  An enumeration constant, already folded to
+such a literal by the time the operands are checked, is covered by the
+same test.  Signedness itself comes from
+\texttt{kcc\_sema\_int\_signedness}, which reads \texttt{TY\_F0} for the
+ranked integer kinds and treats an enum as signed \texttt{int}; anything
+that is not one of those integers (a pointer, a float) is unranked and
+the check is skipped.
+
 @d Sema: expr binary @{
 // -- kcc_sema_expr_binary -------------------------------------------------
 // type_desc *kcc_sema_expr_binary(node *expr)
@@ -1966,19 +1985,19 @@ _kcc_sema_expr_binary:
     // Get operator
     ldr x20, [x19, #AST_F0]
 
-    // Comparison operators return int
+    // Comparison operators return int (and get the -Wsign-compare check)
     cmp x20, #TOK_EQ
-    b.eq .Lseb_int
+    b.eq .Lseb_cmp
     cmp x20, #TOK_NE
-    b.eq .Lseb_int
+    b.eq .Lseb_cmp
     cmp x20, #TOK_LT
-    b.eq .Lseb_int
+    b.eq .Lseb_cmp
     cmp x20, #TOK_GT
-    b.eq .Lseb_int
+    b.eq .Lseb_cmp
     cmp x20, #TOK_LE
-    b.eq .Lseb_int
+    b.eq .Lseb_cmp
     cmp x20, #TOK_GE
-    b.eq .Lseb_int
+    b.eq .Lseb_cmp
 
     // Logical operators return int
     cmp x20, #TOK_AND
@@ -2002,12 +2021,120 @@ _kcc_sema_expr_binary:
     mov x0, x21
     b .Lseb_done
 
+.Lseb_cmp:
+    // -Wall -Wsign-compare: a signed-vs-unsigned comparison, then int result.
+    mov x0, x19                    // expr node (for location + operand nodes)
+    mov x1, x21                    // LHS type
+    mov x2, x22                    // RHS type
+    bl _kcc_sema_check_sign_compare
+    // fall through to the int result
+
 .Lseb_int:
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
 
 .Lseb_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_sema_int_signedness ----------------------------------------------
+// int kcc_sema_int_signedness(type_desc *t)
+// 1 = signed integer, 0 = unsigned integer, -1 = not an integer we rank.
+// Integer kinds CHAR..LLONG carry signedness in TY_F0; an enum is signed int.
+.p2align 2
+_kcc_sema_int_signedness:
+    cbz x0, .Lsg_na
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ENUM
+    b.eq .Lsg_signed
+    cmp x1, #TY_CHAR
+    b.lt .Lsg_na                   // below CHAR (void/bool) → skip
+    cmp x1, #TY_LLONG
+    b.gt .Lsg_na                   // above LLONG (float/ptr/...) → skip
+    ldr x0, [x0, #TY_F0]           // 1=signed, 0=unsigned
+    ret
+.Lsg_signed:
+    mov x0, #1
+    ret
+.Lsg_na:
+    mov x0, #-1
+    ret
+
+// -- kcc_sema_is_nonneg_const ---------------------------------------------
+// int kcc_sema_is_nonneg_const(node *e)
+// 1 iff e is a (parenthesised) integer/char literal.  In this AST such a
+// literal is always non-negative -- a negative value is a unary-minus
+// expression -- so this exactly identifies a known non-negative constant.
+.p2align 2
+_kcc_sema_is_nonneg_const:
+    cbz x0, .Lnn_no
+.Lnn_unwrap:
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Lnn_check
+    ldr x0, [x0, #AST_F0]
+    cbz x0, .Lnn_no
+    b .Lnn_unwrap
+.Lnn_check:
+    cmp x1, #AST_INT_LIT
+    b.eq .Lnn_yes
+    cmp x1, #AST_CHAR_LIT
+    b.eq .Lnn_yes
+    mov x0, #0
+    ret
+.Lnn_yes:
+    mov x0, #1
+    ret
+.Lnn_no:
+    mov x0, #0
+    ret
+
+// -- kcc_sema_check_sign_compare ------------------------------------------
+// void kcc_sema_check_sign_compare(node *expr, type_desc *lt, type_desc *rt)
+// Under -Wall, warn when a comparison mixes a signed and an unsigned integer
+// operand, unless one operand is a known non-negative constant (the common,
+// safe case such as `u < 10`).
+.globl _kcc_sema_check_sign_compare
+.p2align 2
+_kcc_sema_check_sign_compare:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                    // expr node
+    mov x21, x1                    // LHS type
+    mov x22, x2                    // RHS type
+    adrp x0, _kcc_warn_all@@PAGE
+    add  x0, x0, _kcc_warn_all@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lcsc_done
+    mov x0, x21
+    bl _kcc_sema_int_signedness
+    cmn x0, #1                     // == -1 ?
+    b.eq .Lcsc_done                // LHS not an integer we rank
+    mov x20, x0                    // LHS signedness
+    mov x0, x22
+    bl _kcc_sema_int_signedness
+    cmn x0, #1
+    b.eq .Lcsc_done                // RHS not an integer
+    cmp x0, x20
+    b.eq .Lcsc_done                // same signedness → fine
+    // Signedness differs: suppress if either operand is a non-negative const.
+    ldr x0, [x19, #AST_F1]         // LHS node
+    bl _kcc_sema_is_nonneg_const
+    cbnz x0, .Lcsc_done
+    ldr x0, [x19, #AST_F2]         // RHS node
+    bl _kcc_sema_is_nonneg_const
+    cbnz x0, .Lcsc_done
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_sign_cmp@@PAGE
+    add  x2, x2, _kcc_sema_sign_cmp@@PAGEOFF
+    bl _kcc_diag_warning
+.Lcsc_done:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
@@ -2628,6 +2755,8 @@ _kcc_sema_ret_nonvoid:
     .asciz "non-void function should return a value"
 _kcc_sema_reach_end:
     .asciz "control reaches end of non-void function"
+_kcc_sema_sign_cmp:
+    .asciz "comparison of integers of different signedness"
 _kcc_sema_main_name:
     .asciz "main"
 // Known _Noreturn library functions: a trailing call to one of these means

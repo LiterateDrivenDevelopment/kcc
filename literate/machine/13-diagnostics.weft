@@ -747,6 +747,24 @@ run_warn "main-fallthrough-clean" clean "" \
 run_warn "reach-end-gated"     gated "" \
     "int f(void){ int x = 1; }
 int main(void){ return f(); }"
+run_warn "sign-compare-var"    warn "comparison of integers of different signedness" \
+    "int f(int a, unsigned b){ return a < b; }
+int main(void){ return f(1, 2); }"
+run_warn "sign-compare-neg"    warn "comparison of integers of different signedness" \
+    "int f(unsigned u){ return u < -1; }
+int main(void){ return f(1); }"
+run_warn "sign-const-clean"    clean "" \
+    "int f(unsigned u){ return u < 10; }
+int main(void){ return f(1); }"
+run_warn "sign-samesign-clean" clean "" \
+    "int f(unsigned a, unsigned b){ return a < b; }
+int main(void){ return f(1, 2); }"
+run_warn "sign-ptr-clean"      clean "" \
+    "int f(int *p, int *q){ return p < q; }
+int main(void){ int x; return f(&x, &x); }"
+run_warn "sign-compare-gated"  gated "" \
+    "int f(int a, unsigned b){ return a < b; }
+int main(void){ return f(1, 2); }"
 
 echo ""
 echo "=== warntest: $PASS ok, $FAIL fail ==="

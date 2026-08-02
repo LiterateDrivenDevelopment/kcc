@@ -202,6 +202,11 @@ _kcc_diag_emit:
     add  x0, x0, _kcc_diag_newline@@PAGEOFF
     bl _kcc_io_err
 
+    // Print the offending source line and a caret under the column
+    mov x0, x20                  // line
+    mov x1, x21                  // column
+    bl _kcc_diag_caret
+
     // Update counters based on severity
     cmp x19, #DIAG_ERROR
     b.ne .Ldiag_check_warn
@@ -242,6 +247,146 @@ _kcc_diag_emit:
     ldp x29, x30, [sp], #64
     ret
 @| _kcc_diag_emit
+@}
+
+\section{Source Snippet and Caret}
+
+A location alone (\texttt{file:line:col}) tells the reader \emph{where}
+the problem is; a caret shows it.  Immediately after the message line,
+\kcc{} reproduces the offending source line verbatim and, on the line
+below, a single \texttt{\char`\^} positioned under the reported column ---
+exactly the presentation \texttt{clang} and \texttt{gcc} use.  This turns
+an abstract coordinate into something the eye lands on directly.
+
+The routine reads straight from the live source buffer
+(\texttt{\_kcc\_src\_base}/\texttt{\_kcc\_src\_size}), which the driver
+leaves pointing at the current translation unit and the preprocessor
+restores to the includer on every \texttt{\#include} pop.  It is written
+to be \emph{unfailing}: a null buffer, a zero line, or a line number
+past the end of the file simply suppresses the snippet rather than
+risking a bad read --- diagnostics must never themselves crash.  Because
+carets only render on the error path, and every valid program never
+reaches it, they add nothing to the output of correct code.
+
+Two details make the caret land in the right place.  First, the column
+is 1-based, so the indent is \texttt{col\,$-$\,1} characters.  Second,
+to stay aligned when the line contains tabs, the indent is copied
+\emph{from the source line itself} --- a tab in the source yields a tab
+in the caret line, a non-tab yields a space --- so the terminal's own
+tab stops keep the \texttt{\char`\^} under the right glyph.  The whole
+caret line is assembled in a stack buffer and written in one syscall;
+an over-long indent is clamped to the buffer, which at worst nudges the
+caret left on a pathologically wide line.
+
+@d Diag: caret @{
+// -- _kcc_diag_caret ----------------------------------------------------
+// void _kcc_diag_caret(uint64_t line, uint64_t col)
+//   x0 = line (1-based), x1 = column (1-based)
+// Prints the source line for `line`, then a caret under `col`.
+// No-op if the source buffer is absent or the line is out of range.
+.equ CARET_MAX, 500
+.p2align 2
+_kcc_diag_caret:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    sub sp, sp, #512             // scratch buffer for the caret line
+
+    mov x24, x0                  // x24 = line
+    mov x19, x1                  // x19 = col
+
+    adrp x2, _kcc_src_base@@PAGE
+    add  x2, x2, _kcc_src_base@@PAGEOFF
+    ldr  x2, [x2]                // x2 = base
+    cbz  x2, .Lcaret_done
+    cbz  x24, .Lcaret_done       // line 0 → nothing to show
+    adrp x3, _kcc_src_size@@PAGE
+    add  x3, x3, _kcc_src_size@@PAGEOFF
+    ldr  x3, [x3]
+    add  x22, x2, x3             // x22 = end pointer
+
+    // Walk to the start of the target line
+    mov  x4, x2                  // p = base
+    mov  x5, #1                  // curline
+.Lcaret_findline:
+    cmp  x5, x24
+    b.ge .Lcaret_found
+.Lcaret_scan:
+    cmp  x4, x22
+    b.hs .Lcaret_done           // ran off the end before reaching line
+    ldrb w6, [x4], #1
+    cmp  w6, #10                // '\n'
+    b.ne .Lcaret_scan
+    add  x5, x5, #1
+    b    .Lcaret_findline
+.Lcaret_found:
+    mov  x20, x4                 // x20 = line start
+    mov  x21, x4                 // x21 = line end (scan forward)
+.Lcaret_endscan:
+    cmp  x21, x22
+    b.hs .Lcaret_printline
+    ldrb w6, [x21]
+    cmp  w6, #10
+    b.eq .Lcaret_printline
+    add  x21, x21, #1
+    b    .Lcaret_endscan
+
+.Lcaret_printline:
+    // Write the source line [x20, x21) to stderr, then a newline
+    mov  x0, #2
+    mov  x1, x20
+    sub  x2, x21, x20
+    bl   _kcc_sys_write
+    adrp x0, _kcc_diag_newline@@PAGE
+    add  x0, x0, _kcc_diag_newline@@PAGEOFF
+    bl   _kcc_io_err
+
+    // Build the caret line: (col-1) indent chars, then '^', then '\n'
+    mov  x23, sp                 // x23 = stack buffer
+    mov  x9, #0                  // x9 = bytes in buffer
+    subs x10, x19, #1            // x10 = indent count = col-1
+    b.le .Lcaret_put             // col <= 1 → no indent
+    mov  x11, x20                // x11 = source cursor (for tab copy)
+.Lcaret_indent:
+    cmp  x10, #0
+    b.eq .Lcaret_put
+    cmp  x9, #CARET_MAX
+    b.hs .Lcaret_put            // clamp pathologically wide lines
+    mov  w12, #32               // default: space
+    cmp  x11, x21
+    b.hs .Lcaret_store
+    ldrb w13, [x11]
+    cmp  w13, #9                // tab → copy tab for alignment
+    b.ne .Lcaret_store
+    mov  w12, #9
+.Lcaret_store:
+    strb w12, [x23, x9]
+    add  x9, x9, #1
+    add  x11, x11, #1
+    sub  x10, x10, #1
+    b    .Lcaret_indent
+.Lcaret_put:
+    mov  w12, #0x5E             // '^'
+    strb w12, [x23, x9]
+    add  x9, x9, #1
+    mov  w12, #10              // '\n'
+    strb w12, [x23, x9]
+    add  x9, x9, #1
+    mov  x0, #2
+    mov  x1, x23
+    mov  x2, x9
+    bl   _kcc_sys_write
+
+.Lcaret_done:
+    add sp, sp, #512
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_diag_caret
 @}
 
 \section{Convenience Wrappers}
@@ -388,4 +533,103 @@ _kcc_diag_too_many:      .asciz "kcc: fatal: too many errors emitted, stopping\n
 @| _kcc_diag_str_note
 @| _kcc_diag_unknown_file
 @| _kcc_diag_too_many
+@}
+
+\section{Diagnostic Tests}
+\label{sec:diag-tests}
+
+Correct diagnostics are as much a feature as correct code generation, and
+they need their own kind of test: not a program that compiles and runs, but
+one that \emph{must not}.  The harness below feeds \kcc{} a series of invalid
+translation units and checks that the compiler (a)~exits non-zero,
+(b)~prints the expected error text, and (c)~does not hang---each run is wrapped
+in an \texttt{alarm} so a runaway recovery loop fails loudly instead of
+stalling the suite.  A final ``clean'' case guards the other direction: an
+implicit \texttt{printf} call must still compile without an
+undeclared-identifier error, so the leniency the call path depends on is not
+lost.  \texttt{just diagtest} runs it.
+
+@d Diag: tests @{
+#!/bin/bash
+# kcc diagnostic tests (invalid inputs must be rejected clearly) — generated by weft
+set -u
+PASS=0
+FAIL=0
+KCC="tmp/kcc"
+TMP="/tmp/kcc_diag_$$"
+mkdir -p "$TMP"
+trap 'rm -rf "$TMP"' EXIT
+
+# run_diag name mode pattern src
+#   mode=err   : expect a non-zero exit whose output contains <pattern>
+#   mode=clean : expect a zero exit (no diagnostics)
+run_diag() {
+    local name="$1"; local mode="$2"; local pattern="$3"; local src="$4"
+    printf '%s\n' "$src" > "$TMP/d.c"
+    local out rc
+    out=$(perl -e 'alarm 8; exec @@ARGV' "$KCC" -c "$TMP/d.c" -o "$TMP/d.o" 2>&1)
+    rc=$?
+    if [ "$rc" = "142" ] || [ "$rc" = "137" ]; then
+        printf "  %-26s FAIL (hang/timeout)\n" "$name"; FAIL=$((FAIL+1)); return
+    fi
+    if [ "$mode" = "clean" ]; then
+        if [ "$rc" -eq 0 ]; then printf "  %-26s ok (clean)\n" "$name"; PASS=$((PASS+1))
+        else printf "  %-26s FAIL (wanted clean, rc=%s)\n" "$name" "$rc"; FAIL=$((FAIL+1)); fi
+        return
+    fi
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$pattern"; then
+        printf "  %-26s ok\n" "$name"; PASS=$((PASS+1))
+    else
+        printf "  %-26s FAIL (rc=%s, wanted '%s')\n" "$name" "$rc" "$pattern"; FAIL=$((FAIL+1))
+    fi
+}
+
+echo "=== diagnostics (invalid inputs must be rejected) ==="
+run_diag "undeclared-var"    err "use of undeclared identifier 'nope'" \
+    "int main(void){ return nope; }"
+run_diag "undeclared-two"    err "use of undeclared identifier 'b'" \
+    "int main(void){ return a + b; }"
+run_diag "missing-semicolon" err "expected ';'" \
+    "int main(void){ return 0 }"
+run_diag "missing-expression" err "expected expression" \
+    "int x = ;"
+run_diag "missing-rparen"    err "expected ')'" \
+    "int f(void){ return (1 + 2; }"
+run_diag "recover-past-syntax" err "use of undeclared identifier" \
+    "int a = ;
+int main(void){ return undeclared_name; }"
+run_diag "implicit-printf-ok" clean "" \
+    "int main(void){ printf(\"hi\"); return 0; }"
+run_diag "call-non-function"  err "called object is not a function" \
+    "int main(void){ int x = 5; return x(); }"
+run_diag "member-non-struct"  err "member access on non-struct/union type" \
+    "int main(void){ int x = 5; return x.f; }"
+run_diag "no-such-member"     err "no member named 'zzz'" \
+    "struct P { int a; }; int main(void){ struct P p; return p.zzz; }"
+run_diag "redefinition-local" err "redefinition of 'x'" \
+    "int main(void){ int x; int x; return 0; }"
+run_diag "redefinition-param" err "redefinition of 'x'" \
+    "int f(int x, int x){ return x; }"
+run_diag "tentative-ok"       clean "" \
+    "int x;
+int x;
+int main(void){ return x; }"
+run_diag "shadow-ok"          clean "" \
+    "int main(void){ int x = 1; { int x = 2; return x; } }"
+run_diag "void-returns-value" err "void function should not return a value" \
+    "void f(void){ return 5; }
+int main(void){ f(); return 0; }"
+run_diag "nonvoid-bare-return" err "non-void function should return a value" \
+    "int f(void){ return; }
+int main(void){ return f(); }"
+run_diag "void-bare-return-ok" clean "" \
+    "void f(void){ return; }
+int main(void){ f(); return 0; }"
+run_diag "int-returns-value-ok" clean "" \
+    "int f(void){ return 5; }
+int main(void){ return f(); }"
+
+echo ""
+echo "=== diagtest: $PASS ok, $FAIL fail ==="
+[ "$FAIL" -eq 0 ]
 @}

@@ -335,7 +335,14 @@ _kcc_sema_check_decl:
     // Register in symbol table
     ldr x0, [x19, #AST_F1]         // name_ptr
     cbz x0, .Lscd_var_init
-    mov x22, x0
+    mov x22, x0                     // name
+
+    // Reject a same-scope redefinition (block scope only; see the helper).
+    mov x0, x19                    // decl node
+    mov x1, x22                    // name
+    bl _kcc_sema_check_redef
+
+    mov x0, x22                    // name
     bl _kcc_strlen
     mov x1, x0                     // len
     mov x0, x22                    // name
@@ -415,6 +422,12 @@ _kcc_sema_check_decl:
     ldr x0, [x22, #AST_F1]         // param name
     cbz x0, .Lscd_param_next
     mov x20, x0
+    // A duplicate parameter name is a redefinition (params live in the body
+    // scope, depth >= 2).
+    mov x0, x22                    // param node
+    mov x1, x20                    // name
+    bl _kcc_sema_check_redef
+    mov x0, x20
     bl _kcc_strlen
     mov x1, x0
     mov x0, x20
@@ -905,8 +918,17 @@ variable declaration.
 
 \paragraph{Return, Switch, Labels, and Declarations}
 
-\texttt{return} type-checks its expression (if present) against the
-function's declared return type.  \texttt{switch} checks the controlling
+\texttt{return} type-checks its expression (if present) and enforces the
+two constraints of \stdref{6.8.6.4}: a \texttt{return} with a value may
+not appear in a \texttt{void} function, and a bare \texttt{return} may
+appear \emph{only} in a \texttt{void} function.  Both are constraint
+violations the standard requires a diagnostic for, and no valid program
+triggers either, so \kcc{} reports them as errors against the return
+statement's own location.  The comparison reads
+\texttt{\_kcc\_sema\_cur\_ret}, the return-type descriptor the
+function-definition handler stashed before walking the body; when it is
+absent (a stray \texttt{return} outside any function) the check is
+skipped.  \texttt{switch} checks the controlling
 expression and recurses into the body.  Label, case, and default
 statements register or validate their labels and recurse into their
 associated statement.  Any declaration node encountered inside a compound
@@ -915,9 +937,39 @@ statement is forwarded to \texttt{kcc\_sema\_check\_decl}.
 @d Sema: check statement @{
 .Lscs_return:
     ldr x0, [x19, #AST_F0]         // return expression
-    cbz x0, .Lscs_done
+    cbz x0, .Lscs_ret_novalue
+
+    // return <expr>; — type-check the expression, then enforce that a
+    // value is not returned from a void function (\stdref{6.8.6.4}).
     bl _kcc_sema_expr
-    // TODO: check against function return type
+    adrp x0, _kcc_sema_cur_ret@@PAGE
+    add  x0, x0, _kcc_sema_cur_ret@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lscs_done            // no current return type: nothing to check
+    ldr  x1, [x0, #TY_KIND]
+    cmp  x1, #TY_VOID
+    b.ne .Lscs_done
+    ldr  x0, [x19, #AST_LINE]
+    ldr  x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_ret_void@@PAGE
+    add  x2, x2, _kcc_sema_ret_void@@PAGEOFF
+    bl   _kcc_diag_error
+    b .Lscs_done
+
+.Lscs_ret_novalue:
+    // bare return; — a value is required unless the function returns void.
+    adrp x0, _kcc_sema_cur_ret@@PAGE
+    add  x0, x0, _kcc_sema_cur_ret@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lscs_done
+    ldr  x1, [x0, #TY_KIND]
+    cmp  x1, #TY_VOID
+    b.eq .Lscs_done
+    ldr  x0, [x19, #AST_LINE]
+    ldr  x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_ret_nonvoid@@PAGE
+    add  x2, x2, _kcc_sema_ret_nonvoid@@PAGEOFF
+    bl   _kcc_diag_error
     b .Lscs_done
 
 .Lscs_switch:
@@ -1154,9 +1206,12 @@ An identifier expression looks up the name in the symbol table.  If
 found, the symbol's type is returned after applying function and
 array decay (per \stdref{6.3.2.1}): a function designator decays to
 a pointer-to-function, and an array decays to a pointer to its first
-element.  Undeclared identifiers fall back to \texttt{int}; a
-diagnostic is deferred to avoid crashing on implicit function
-declarations common in legacy C code.
+element.  An undeclared identifier used as a \emph{value} is a hard error
+(\texttt{use of undeclared identifier '\\meta{name}'}); the one exception is a
+bare name in call position, which is taken as an implicit function declaration
+(legacy C) rather than an error---the call handler signals that case through
+\texttt{\_kcc\_sema\_callee\_ctx}.  Either way the node's type falls back to
+\texttt{int} so the pass keeps running and reports any further errors.
 
 Enumeration constants receive special treatment.  When the lookup
 returns a symbol whose kind is \texttt{SYM\_ENUM\_CONST}, the AST
@@ -1216,8 +1271,29 @@ _kcc_sema_expr_ident:
     ret
 
 .Lsei_undeclared:
-    // Undeclared identifier — return int as fallback
-    // (diagnostic omitted for now to avoid crash on implicit declarations)
+    // A bare identifier used as a value must be declared.  When it is the
+    // direct target of a call we defer to implicit-function-declaration
+    // leniency (legacy C: \texttt{printf()} without a prototype); otherwise it
+    // is a hard error.  Either way we fall through to the int fallback so the
+    // rest of the pass keeps running and reports further errors.
+    adrp x0, _kcc_sema_callee_ctx@@PAGE
+    add  x0, x0, _kcc_sema_callee_ctx@@PAGEOFF
+    ldr  x0, [x0]
+    cbz x0, .Lsei_emit_undecl
+    // Implicit function declaration: remember it so the call handler does not
+    // then complain that the callee is not a function.
+    adrp x1, _kcc_sema_callee_implicit@@PAGE
+    add  x1, x1, _kcc_sema_callee_implicit@@PAGEOFF
+    mov  x2, #1
+    str  x2, [x1]
+    b .Lsei_int_type
+.Lsei_emit_undecl:
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    mov x2, x20                    // name
+    adrp x3, _kcc_sema_undecl_pre@@PAGE
+    add  x3, x3, _kcc_sema_undecl_pre@@PAGEOFF
+    bl _kcc_sema_err_named
 
 .Lsei_unknown:
 .Lsei_int_type:
@@ -1225,6 +1301,96 @@ _kcc_sema_expr_ident:
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_err_named ---------------------------------------------------
+// void kcc_sema_err_named(uint64_t line, uint64_t col,
+//                         const char *name, const char *prefix)
+// Emits "<prefix>name'" at line:col, building the quoted message in an arena
+// buffer (the prefix supplies its own opening quote).  Shared by the
+// undeclared-identifier, no-member, and redefinition diagnostics.
+.text
+.globl _kcc_sema_err_named
+.p2align 2
+_kcc_sema_err_named:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x19, x0                    // line
+    mov x20, x1                    // col
+    mov x21, x2                    // name
+    mov x22, x3                    // prefix
+    mov x0, x22
+    bl _kcc_strlen
+    mov x24, x0                    // prefix_len
+    mov x0, x21
+    bl _kcc_strlen
+    mov x25, x0                    // name_len
+    add x0, x24, x25
+    add x0, x0, #2                 // + closing quote + NUL
+    bl _kcc_arena_alloc
+    mov x23, x0                    // buffer
+    mov x0, x23
+    mov x1, x22
+    mov x2, x24
+    bl _kcc_memcpy                 // prefix
+    add x0, x23, x24
+    mov x1, x21
+    mov x2, x25
+    bl _kcc_memcpy                 // name
+    add x9, x23, x24
+    add x9, x9, x25
+    mov w10, #0x27                 // '\''
+    strb w10, [x9]
+    strb wzr, [x9, #1]
+    mov x0, x19                    // line
+    mov x1, x20                    // col
+    mov x2, x23
+    bl _kcc_diag_error
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+// -- kcc_sema_check_redef -------------------------------------------------
+// void kcc_sema_check_redef(node *decl, const char *name)
+// At block scope (depth >= 2; file scope is depth 1) a name already present
+// in the current scope is a redefinition, since a block has no tentative
+// definitions.  Emits "redefinition of 'name'" at the decl node's location.
+.text
+.globl _kcc_sema_check_redef
+.p2align 2
+_kcc_sema_check_redef:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                    // node
+    mov x20, x1                    // name
+    adrp x0, _kcc_sym_depth@@PAGE
+    add  x0, x0, _kcc_sym_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #2
+    b.lt .Lscr_done
+    mov x0, x20
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    bl _kcc_symtab_lookup_current
+    cbz x0, .Lscr_done
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    mov x2, x20                    // name
+    adrp x3, _kcc_sema_redef_pre@@PAGE
+    add  x3, x3, _kcc_sema_redef_pre@@PAGEOFF
+    bl _kcc_sema_err_named
+.Lscr_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
@@ -1510,10 +1676,24 @@ _kcc_sema_expr_call:
     stp x19, x20, [sp, #16]
     str x21, [sp, #32]
 
-    // Type-check callee
-    ldr x0, [x19, #AST_F0]
+    // Type-check callee.  When it is a bare identifier, enter "callee
+    // context" so an undeclared name is taken as an implicit function
+    // declaration rather than an undeclared-identifier error.
+    adrp x3, _kcc_sema_callee_implicit@@PAGE
+    add  x3, x3, _kcc_sema_callee_implicit@@PAGEOFF
+    str xzr, [x3]                   // clear implicit-function marker
+    ldr x0, [x19, #AST_F0]         // callee node
+    ldr x1, [x0]                   // AST_TAG
+    cmp x1, #AST_IDENT_EXPR
+    cset x2, eq
+    adrp x3, _kcc_sema_callee_ctx@@PAGE
+    add  x3, x3, _kcc_sema_callee_ctx@@PAGEOFF
+    str x2, [x3]
     bl _kcc_sema_expr
     mov x20, x0                     // callee type
+    adrp x3, _kcc_sema_callee_ctx@@PAGE
+    add  x3, x3, _kcc_sema_callee_ctx@@PAGEOFF
+    str xzr, [x3]
 
     // Type-check arguments
     ldr x21, [x19, #AST_F1]        // first arg
@@ -1532,7 +1712,18 @@ _kcc_sema_expr_call:
     cmp x1, #TY_PTR
     b.eq .Lsec_ptr_func
 
-    // Not a function type: assume int return
+    // Not a function type.  Unless the callee was an implicit function
+    // declaration (an undeclared bare name in call position), this is an
+    // error: something that is not a function is being called.
+    adrp x0, _kcc_sema_callee_implicit@@PAGE
+    add  x0, x0, _kcc_sema_callee_implicit@@PAGEOFF
+    ldr  x0, [x0]
+    cbnz x0, .Lsec_default_int
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_err_not_func@@PAGE
+    add  x2, x2, _kcc_sema_err_not_func@@PAGEOFF
+    bl _kcc_diag_error
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
@@ -1614,6 +1805,11 @@ _kcc_sema_expr_member:
     b.eq .Lsem_lookup
 
 .Lsem_fallback:
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_err_not_struct@@PAGE
+    add  x2, x2, _kcc_sema_err_not_struct@@PAGEOFF
+    bl _kcc_diag_error
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
@@ -1642,6 +1838,12 @@ _kcc_sema_expr_member:
     b .Lsem_field_loop
 
 .Lsem_not_found:
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    ldr x2, [x19, #AST_F1]         // member name
+    adrp x3, _kcc_sema_nomember_pre@@PAGE
+    add  x3, x3, _kcc_sema_nomember_pre@@PAGEOFF
+    bl _kcc_sema_err_named
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
@@ -1919,9 +2121,21 @@ the type dumper.
 .data
 .globl _kcc_sema_cur_ret
 _kcc_sema_cur_ret:    .quad 0       // current function return type
+.globl _kcc_sema_callee_ctx
+_kcc_sema_callee_ctx: .quad 0       // 1 while checking a call's direct callee
+.globl _kcc_sema_callee_implicit
+_kcc_sema_callee_implicit: .quad 0  // 1 if the callee was an implicit function
 
 // -- Sema error messages --------------------------------------------------
 .section __TEXT,__cstring,cstring_literals
+.globl _kcc_sema_undecl_pre
+_kcc_sema_undecl_pre:
+    .asciz "use of undeclared identifier '"
+_kcc_sema_nomember_pre:
+    .asciz "no member named '"
+.globl _kcc_sema_redef_pre
+_kcc_sema_redef_pre:
+    .asciz "redefinition of '"
 _kcc_sema_err_undecl:
     .asciz "use of undeclared identifier"
 _kcc_sema_err_not_func:
@@ -1930,6 +2144,10 @@ _kcc_sema_err_not_struct:
     .asciz "member access on non-struct/union type"
 _kcc_sema_err_void_val:
     .asciz "void value not ignored as it ought to be"
+_kcc_sema_ret_void:
+    .asciz "void function should not return a value"
+_kcc_sema_ret_nonvoid:
+    .asciz "non-void function should return a value"
 
 // -- Dump type strings ----------------------------------------------------
 _kcc_sema_str_var:      .asciz "var "
@@ -1940,6 +2158,9 @@ _kcc_sema_str_eq:       .asciz " = "
 _kcc_sema_str_nl:       .asciz "\n"
 _kcc_sema_str_va_list:  .asciz "va_list"
 @| _kcc_sema_cur_ret
+@| _kcc_sema_callee_ctx
+@| _kcc_sema_callee_implicit
+@| _kcc_sema_redef_pre
 @| _kcc_sema_str_var
 @| _kcc_sema_str_func
 @| _kcc_sema_str_typedef

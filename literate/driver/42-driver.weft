@@ -332,7 +332,7 @@ program in one step.  Linking is delegated to the system linker
 supplies \texttt{fork}/\texttt{execve}/\texttt{wait4}).  Because \kcc{}-compiled
 programs are freestanding---their entry point is \texttt{\_main}, with no C
 runtime start-up---the link line is
-\texttt{ld \meta{objects} -o \meta{out} -lSystem -syslibroot \meta{sdk}
+\texttt{ld \\meta{objects} -o \\meta{out} -lSystem -syslibroot \\meta{sdk}
 -arch arm64 -e \_main}.  The SDK root needed by \texttt{-syslibroot} is found
 from \texttt{\$SDKROOT} or, failing that, the two standard SDK locations.  After
 a successful link the intermediate object files are removed.

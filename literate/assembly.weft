@@ -110,6 +110,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Diag: constants@>
 @<Diag: putu stderr@>
 @<Diag: emit@>
+@<Diag: caret@>
 @<Diag: error@>
 @<Diag: warning@>
 @<Diag: note@>
@@ -629,4 +630,11 @@ oracle (Chapter~\ref{ch:interop-testing}):
 
 @o tmp/tests/e2e.sh @{
 @<E2E: runner@>
+@}
+
+\noindent\textbf{diagtest.sh} --- feed the compiler invalid programs and
+check the diagnostics (Section~\ref{sec:diag-tests}):
+
+@o tmp/tests/diagtest.sh @{
+@<Diag: tests@>
 @}

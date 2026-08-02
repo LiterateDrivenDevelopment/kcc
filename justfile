@@ -91,6 +91,11 @@ e2e: build
     chmod +x tmp/tests/e2e.sh
     tmp/tests/e2e.sh
 
+# Diagnostics: invalid programs must be rejected with clear errors (no hang)
+diagtest: build
+    chmod +x tmp/tests/diagtest.sh
+    tmp/tests/diagtest.sh
+
 # Code generation tests: compile C programs with kcc, link, run, check exit codes
 test-codegen: build
     chmod +x tmp/tests/test_codegen.sh

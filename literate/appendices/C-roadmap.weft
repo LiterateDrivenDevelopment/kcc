@@ -565,7 +565,7 @@ two codegen bugs now fixed.
       the zero image).  String initializers for char arrays and
       designated initializers remain for Phase~9.
 \item[\checkmark] Static locals: hoisted to a per-declaration global
-      named \texttt{sl\_}\meta{node address} by
+      named \texttt{sl\_}\\meta{node address} by
       \texttt{\_kcc\_ir\_static\_name}, so no stack alloca is emitted.
       A per-function \texttt{statics} table redirects identifier and
       assignment references onto the mangled symbol (shadowing any
@@ -791,7 +791,7 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 \hline
 \textbf{\#} & \textbf{Open item} & \textbf{Impact} & \textbf{Effort} & \textbf{Home}\\
 \hline
-1  & Multi-error recovery \& diagnostics        & \meterA & \meterB & 9e\\
+1  & Multi-error recovery \& diagnostics \stDone & \meterA & \meterB & 9e\\
 2  & \texttt{-Wall} warnings                    & \meterB & \meterC & 9e\\
 3  & Designated initializers                    & \meterA & \meterB & 9a\\
 4  & Bit-fields                                 & \meterA & \meterB & 9a\\
@@ -810,12 +810,47 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 \emph{why}.
 
 \begin{enumerate}
-\item \textbf{Multi-error recovery and precise diagnostics} (Stage~9e).  The
-      single biggest usability jump.  The front end aborts on the first error
-      today; add synchronization-point recovery (skip to the next \texttt{;}
-      or \texttt{\}}) so one compile reports \emph{every} error, each with an
-      accurate line and column.  It depends on nothing else, and its recovery
-      machinery hardens the whole front end for everything that follows.
+\item \textbf{Multi-error recovery and precise diagnostics} (Stage~9e).
+      \emph{Essentially complete.}  The single biggest usability jump.  Parser recovery
+      turned out to be already working---\texttt{kcc\_parse\_sync} skips to the
+      next \texttt{;}/\texttt{\}}/EOF, the driver defers its error check until
+      after parse \emph{and} sema, and one compile already reports several
+      syntax errors with line and column.  The real gap was that semantic
+      analysis emitted \emph{no} diagnostics at all (it silently accepted
+      undeclared names, so the failure surfaced only at link time).  Now landed:
+      an ``\texttt{use of undeclared identifier '\\meta{name}'}'' error for any
+      bare identifier used as a value---kept lenient only in call position, for
+      implicit function declarations---and specific ``\texttt{expected 'X'}''
+      messages for the common punctuators (was a bare ``expected token'').  A
+      negative-test harness (\texttt{just diagtest}, \S\ref{sec:diag-tests})
+      guards it.  A second round added the semantic checks that share the same
+      quoted-message helper: calling a non-function, member access on a
+      non-aggregate, a nonexistent member (``\texttt{no member named 'X'}''),
+      and redefinition of a block-scope identifier or parameter (file-scope
+      tentative definitions, prototype-then-definition, and inner-scope
+      shadowing are all correctly left alone).  A third round added the two
+      pieces named here as the remaining work.  \emph{Richer messages:} every
+      diagnostic now prints the offending source line followed by a
+      \texttt{\char`\^} caret under the reported column---the
+      \texttt{clang}/\texttt{gcc} presentation---rendered straight from the
+      live source buffer and written so that a missing buffer or an
+      out-of-range line simply omits the snippet rather than faulting.
+      Adding the caret immediately exposed a latent one-token location error
+      (an identifier node was stamped with the \emph{following} token's
+      column because it was allocated after the token was consumed); fixing
+      the allocation order put the caret exactly under the name.
+      \emph{Type-mismatch on return:} the two constraints of
+      \stdref{6.8.6.4}---no value returned from a \texttt{void} function, and
+      no bare \texttt{return} in a non-\texttt{void} function---are now
+      enforced as errors, which is standard-conformant (both are \emph{shall}
+      constraints) and, because no valid program violates them, costs nothing
+      in self-hosting or the differential corpus.  \texttt{diagtest} now runs
+      eighteen cases, and \kcc{} matches \texttt{clang}'s error \emph{count}
+      on mixed syntax/semantic inputs.  \emph{Deliberately deferred to
+      item~2:} pointer/integer conversion mismatches, which \texttt{clang}
+      itself treats as \texttt{-Wall} warnings rather than errors, and whose
+      false-positive risk against pointer-heavy systems C argues for the
+      warning machinery, not the error path.
 \item \textbf{\texttt{-Wall}-equivalent warnings} (Stage~9e).  Nearly free
       once error recovery exists: unused variables, missing returns, implicit
       conversions, shadowed declarations, signed/unsigned comparisons.
@@ -1114,7 +1149,7 @@ A production compiler needs more than correct code generation.
       compiles each source to an object, then \texttt{fork}s and
       \texttt{execve}s \texttt{/usr/bin/ld} (new process syscalls in
       Chapter~\ref{ch:syscalls}) with
-      \texttt{-lSystem -syslibroot \meta{sdk} -arch arm64 -e \_main},
+      \texttt{-lSystem -syslibroot \\meta{sdk} -arch arm64 -e \_main},
       \texttt{wait4}s for it, removes the intermediate objects, and exits with
       the linker's status.  The SDK root comes from \texttt{\$SDKROOT} or the
       standard locations.  \texttt{kcc hello.c -o hello} now produces a

@@ -806,6 +806,12 @@ and builds an \texttt{AST\_MEMBER} node.
 Primary expressions (\stdref{6.5.1}): identifiers, integer constants,
 string literals, character constants, and parenthesized expressions.
 
+Because \texttt{kcc\_ast\_alloc} stamps a node with the \emph{current}
+token's location, the identifier case allocates its node \emph{before}
+consuming the token.  Otherwise the node would record the position of
+the following token, and a diagnostic caret on, say, an undeclared
+identifier would point one token too far to the right.
+
 For string literals, the lexer delivers the raw token including the
 surrounding double quotes.  We strip the quotes, then call
 \texttt{kcc\_strlit\_process} (Chapter~\ref{ch:string-literals}) to translate
@@ -869,13 +875,16 @@ _kcc_parse_primary_expr:
     bl _kcc_strtab_intern
     mov x19, x0                  // x19 = interned name
 
-    // Consume identifier
-    bl _kcc_pp_next
-
-    // Build ident node
+    // Build ident node BEFORE consuming, so it records the identifier's
+    // own column rather than that of the following token.
     mov x0, #AST_IDENT_EXPR
     bl _kcc_ast_alloc
-    str x19, [x0, #AST_F0]      // name_ptr
+    mov x20, x0
+    str x19, [x20, #AST_F0]      // name_ptr
+
+    // Consume identifier
+    bl _kcc_pp_next
+    mov x0, x20
     b .Lprimary_done
 
 .Lprimary_number:

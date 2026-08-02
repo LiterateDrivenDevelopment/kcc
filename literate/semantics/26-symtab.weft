@@ -337,7 +337,35 @@ _kcc_symtab_lookup:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+
+// -- kcc_symtab_lookup_current --------------------------------------------
+// sym *kcc_symtab_lookup_current(char *name, uint64_t len)
+// Searches ONLY the innermost (current) scope, so a redefinition check can
+// tell a same-scope duplicate from a legal shadow of an outer declaration.
+.text
+.globl _kcc_symtab_lookup_current
+.p2align 2
+_kcc_symtab_lookup_current:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // name
+    mov x20, x1                     // len
+    adrp x0, _kcc_sym_ordinary@@PAGE
+    add  x0, x0, _kcc_sym_ordinary@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1                 // top index
+    bl _kcc_vec_get
+    ldr x0, [x0]                   // current scope ht
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_ht_get                 // sym or 0
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
 @| _kcc_symtab_lookup
+@| _kcc_symtab_lookup_current
 @}
 
 \section{Tag Name Space}

@@ -281,9 +281,24 @@ _kcc_parse_expect:
     b .Lexpect_done
 
 .Lexpect_error:
-    // Emit "expected 'X'"
+    // Pick a specific "expected 'X'" message for a known punctuator; fall back
+    // to the generic message otherwise.  x19 = expected token type.
+    adrp x2, _kcc_pe_table@@PAGE
+    add  x2, x2, _kcc_pe_table@@PAGEOFF
+.Lexpect_look:
+    ldr x3, [x2]                 // candidate token type (0 terminates)
+    cbz x3, .Lexpect_generic
+    cmp x3, x19
+    b.eq .Lexpect_found
+    add x2, x2, #16
+    b .Lexpect_look
+.Lexpect_found:
+    ldr x0, [x2, #8]
+    b .Lexpect_emit
+.Lexpect_generic:
     adrp x0, _kcc_parse_msg_expected@@PAGE
     add  x0, x0, _kcc_parse_msg_expected@@PAGEOFF
+.Lexpect_emit:
     bl _kcc_parse_error
 
 .Lexpect_done:
@@ -1439,6 +1454,33 @@ indicators for dot versus arrow syntax.
 
 _kcc_parse_msg_expected:
     .asciz "expected token"
+
+// Specific messages for the punctuators the parser most often expects, so a
+// mismatch reads "expected ';'" rather than the bare "expected token".
+_kcc_pe_semi:   .asciz "expected ';'"
+_kcc_pe_lparen: .asciz "expected '('"
+_kcc_pe_rparen: .asciz "expected ')'"
+_kcc_pe_lbrace: .asciz "expected '{'"
+_kcc_pe_rbrace: .asciz "expected '}'"
+_kcc_pe_lbrack: .asciz "expected '['"
+_kcc_pe_rbrack: .asciz "expected ']'"
+_kcc_pe_comma:  .asciz "expected ','"
+_kcc_pe_colon:  .asciz "expected ':'"
+
+.data
+.p2align 3
+_kcc_pe_table:
+    .quad TOK_SEMI,     _kcc_pe_semi
+    .quad TOK_LPAREN,   _kcc_pe_lparen
+    .quad TOK_RPAREN,   _kcc_pe_rparen
+    .quad TOK_LBRACE,   _kcc_pe_lbrace
+    .quad TOK_RBRACE,   _kcc_pe_rbrace
+    .quad TOK_LBRACKET, _kcc_pe_lbrack
+    .quad TOK_RBRACKET, _kcc_pe_rbrack
+    .quad TOK_COMMA,    _kcc_pe_comma
+    .quad TOK_COLON,    _kcc_pe_colon
+    .quad 0, 0
+.section __TEXT,__cstring,cstring_literals
 
 _kcc_ast_msg_at:
     .asciz " @@ "

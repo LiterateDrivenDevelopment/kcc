@@ -7178,7 +7178,7 @@ Two functions may each declare their own \texttt{static int i}, so the
 hoisted global needs a name that is unique yet reproducible from the
 declaration alone.  \texttt{\_kcc\_ir\_static\_name} supplies it by
 formatting the declaration node's own address as
-\texttt{sl\_}\meta{16 hex digits}.  Because the name is a pure function
+\texttt{sl\_}\\meta{16 hex digits}.  Because the name is a pure function
 of the node pointer, the two passes that must agree on it---the
 declaration builder, which records the mapping and suppresses the
 alloca, and \texttt{\_kcc\_ir\_emit\_global\_inits}, which emits the

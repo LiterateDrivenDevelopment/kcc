@@ -957,12 +957,27 @@ _kcc_ir_emit_global_inits:
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_INIT_LIST
     b.eq .Legi_initlist
+    cmp x1, #AST_STR_LIT
+    b.eq .Legi_string
 
+.Legi_scalar:
     // Build the initializer expression
     ldr x0, [x19, #AST_F2]
     bl _kcc_ir_build_expr
     mov x21, x0                  // x21 = value vreg
 
+    // A _Bool global normalises its initializer to 0/1.
+    ldr x0, [x19, #AST_F0]      // declared type spec
+    bl _kcc_sema_resolve_type
+    cbz x0, .Legi_scalar_store
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_BOOL
+    b.ne .Legi_scalar_store
+    mov x0, x21
+    bl _kcc_ir_emit_bool_norm
+    mov x21, x0
+
+.Legi_scalar_store:
     // Emit IR_STORE: value -> global address
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
@@ -1032,6 +1047,30 @@ _kcc_ir_emit_global_inits:
     add x21, x21, #1
     ldr x20, [x20, #AST_F4]      // next element
     b .Legi_il_loop
+
+.Legi_string:
+    // File-scope char s[] = "abc": copy bytes into BSS (a char *g stores the
+    // address, so only an array target takes this path).
+    ldr x0, [x19, #AST_F0]      // declared type
+    bl _kcc_sema_resolve_type
+    cbz x0, .Legi_scalar
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Legi_scalar
+    ldr x21, [x0, #TY_F1]       // array length (char → bytes)
+    ldr x0, [x19, #AST_F2]
+    ldr x23, [x0, #AST_F0]      // str_ptr
+    ldr x24, [x0, #AST_F1]      // str_len
+    cbnz x21, .Legi_str_call
+    add x21, x24, #1
+.Legi_str_call:
+    mov x0, x22                  // base = global address vreg
+    mov x1, x23                  // str_ptr
+    mov x2, x24                  // str_len
+    mov x3, x21                  // array_len
+    mov x4, #0                   // BSS already zero
+    bl _kcc_ir_emit_string_init
+    b .Legi_next
 
 .Legi_next:
     ldr x19, [x19, #AST_F4]     // next sibling
@@ -2487,9 +2526,19 @@ _kcc_ir_convert:
     cbz x0, .Licv_done
     ldr x0, [x0, #TY_KIND]
     cmp x0, #TY_FLOAT
-    b.ne .Licv_done
+    b.ne .Licv_maybe_bool
     mov x0, x19
     bl _kcc_ir_emit_fpround
+    mov x19, x0
+.Licv_maybe_bool:
+    // Converting to _Bool normalises any non-zero value to 1 (\stdref{6.3.1.2}).
+    ldr x0, [sp, #40]
+    cbz x0, .Licv_done
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_BOOL
+    b.ne .Licv_done
+    mov x0, x19
+    bl _kcc_ir_emit_bool_norm
     mov x19, x0
 .Licv_done:
     mov x0, x19
@@ -3984,6 +4033,81 @@ _kcc_ir_store_elem:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_emit_string_init ----------------------------------------------
+// void kcc_ir_emit_string_init(base, str_ptr, str_len, array_len, zero_first)
+// Copies min(str_len, array_len) bytes of a compile-time string into an array
+// as per-byte constant stores; the NUL and tail come from the zero-fill/BSS.
+.globl _kcc_ir_emit_string_init
+.p2align 2
+_kcc_ir_emit_string_init:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // base
+    mov x20, x1                  // str_ptr
+    mov x21, x2                  // str_len
+    mov x22, x3                  // array_len
+    cbz x4, .Lesi_copy
+    add x0, x22, #7
+    lsr x23, x0, #3              // slot count
+    mov x24, #0
+.Lesi_zloop:
+    cmp x24, x23
+    b.ge .Lesi_copy
+    mov x0, #0
+    bl _kcc_ir_emit_const
+    mov x2, x0
+    mov x0, x19
+    lsl x1, x24, #3
+    mov x3, #0
+    bl _kcc_ir_emit_indexed_store
+    add x24, x24, #1
+    b .Lesi_zloop
+.Lesi_copy:
+    mov x23, x21
+    cmp x22, x23
+    csel x23, x22, x23, lo       // min(array_len, str_len)
+    mov x24, #0
+.Lesi_cloop:
+    cmp x24, x23
+    b.ge .Lesi_done
+    ldrb w0, [x20, x24]
+    bl _kcc_ir_emit_const
+    mov x2, x0
+    mov x0, x19
+    mov x1, x24
+    mov x3, #1
+    bl _kcc_ir_emit_indexed_store
+    add x24, x24, #1
+    b .Lesi_cloop
+.Lesi_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_ir_emit_bool_norm ------------------------------------------------
+// uint64_t kcc_ir_emit_bool_norm(uint64_t vreg) → (vreg != 0) as 0/1
+.globl _kcc_ir_emit_bool_norm
+.p2align 2
+_kcc_ir_emit_bool_norm:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    mov x0, #0
+    bl _kcc_ir_emit_const
+    mov x1, x19
+    mov x2, x0
+    mov x0, #IR_CMP_NE
+    bl _kcc_ir_emit_binop
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
     ret
 
 // -- kcc_ir_tok_to_binop --------------------------------------------------
@@ -7194,6 +7318,15 @@ _kcc_ir_build_cast:
     b .Lbc_done
 
 .Lbc_int_resize:
+    // A cast to _Bool normalises to 0/1, not a low-byte truncation.
+    ldr x0, [x22, #TY_KIND]
+    cmp x0, #TY_BOOL
+    b.ne .Lbc_resize_sizes
+    mov x0, x21
+    bl _kcc_ir_emit_bool_norm
+    mov x21, x0
+    b .Lbc_done
+.Lbc_resize_sizes:
     // Compare sizes
     ldr x1, [x22, #TY_SIZE]     // target size
     ldr x2, [x23, #TY_SIZE]     // source size
@@ -7983,12 +8116,41 @@ _kcc_ir_build_var_decl:
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_INIT_LIST
     b.eq .Libvd_initlist
+    cmp x1, #AST_STR_LIT
+    b.eq .Libvd_string_init
 
     // Struct types need field-by-field copy
     ldr x1, [x21, #TY_KIND]
     cmp x1, #TY_STRUCT
     b.eq .Libvd_struct_init
+    b .Libvd_scalar_init
 
+.Libvd_string_init:
+    // char s[] = "abc" copies the bytes; char *s = "abc" (pointer) instead
+    // holds the string's address, so only an array target takes the copy path.
+    ldr x22, [x0, #AST_F0]      // str_ptr
+    ldr x24, [x0, #AST_F1]      // str_len
+    ldr x0, [x19, #AST_F0]      // declared type spec
+    bl _kcc_sema_resolve_type
+    cbz x0, .Libvd_str_scalar
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Libvd_str_scalar
+    ldr x21, [x0, #TY_F1]       // array length (char → bytes)
+    cbnz x21, .Libvd_str_call
+    add x21, x24, #1
+.Libvd_str_call:
+    mov x0, x23                  // base alloca
+    mov x1, x22                  // str_ptr
+    mov x2, x24                  // str_len
+    mov x3, x21                  // array_len
+    mov x4, #1                   // zero-fill (local)
+    bl _kcc_ir_emit_string_init
+    b .Libvd_done
+.Libvd_str_scalar:
+    ldr x0, [x19, #AST_F2]      // reload init node (clobbered by resolve)
+
+.Libvd_scalar_init:
     // Build initializer expression (scalar/pointer)
     ldr x24, [x0, #AST_F3]      // init expr's sema type (stash before building)
     str x24, [sp, #72]

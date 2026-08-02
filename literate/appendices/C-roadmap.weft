@@ -795,7 +795,7 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 2  & \texttt{-Wall} warnings \stDone            & \meterB & \meterC & 9e\\
 3  & Designated initializers \stDone            & \meterA & \meterB & 9a\\
 4  & Bit-fields \stDone                         & \meterA & \meterB & 9a\\
-5  & \_Bool normalize, \texttt{char\,s[]="\dots"} & \meterB & \meterC & 9a\\
+5  & \_Bool normalize, \texttt{char\,s[]="\dots"} \stDone & \meterB & \meterC & 9a\\
 6  & DWARF debug info                           & \meterB & \meterA & 9e\\
 7  & Harden vs.\ malformed input                & \meterB & \meterB & new\\
 8  & Optimizer \& global/FP reg-alloc           & \meterB & \meterA & 9c--9d\\
@@ -919,9 +919,20 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       sign-extension, container crossing, and truncation included).
       \emph{Not modelled:} mixed-type packing and zero-width separators.
 \item \textbf{\_Bool normalization and \texttt{char s[] = "..."}}
-      (Stage~9a).  Cheap, high-frequency gaps: truncate any non-zero value to
-      1 on a \texttt{\_Bool} store, and initialize a \texttt{char} array from
-      a string literal.
+      (Stage~9a).  \emph{Landed.}  Two cheap, high-frequency gaps.  A
+      conversion to \texttt{\_Bool} now normalises any non-zero value to~1
+      (an \texttt{x != 0} folded into \texttt{\_kcc\_ir\_convert}, the integer
+      cast path, and file-scope initialisation), and a \texttt{char} array
+      initialised from a string literal copies the literal's bytes into its
+      storage---zero-filling or relying on BSS for the terminating NUL---rather
+      than storing a pointer, while a \texttt{char\,*} target still correctly
+      takes the address.  \texttt{sizeof} of an implicitly-sized array
+      (\texttt{char s[] = "abc"}, \texttt{int a[] = \{1,2,3\}}) is correct
+      too: \texttt{\_kcc\_sema\_infer\_array\_len} completes the array type's
+      length from its initializer before the type is resolved, so every use
+      sees the real length.  Only the multi-dimensional case
+      (\texttt{int m[][3]}) remains, awaiting nested-aggregate
+      initialization---a gap present for explicit sizes as well.
 \item \textbf{DWARF debug information} (Stage~9e).  The line table first
       (source-level stepping and breakpoints), then variable DIEs.  Large but
       additive---it emits \texttt{\_\_debug\_*} sections without changing code

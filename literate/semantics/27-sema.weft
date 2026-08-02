@@ -261,7 +261,19 @@ _kcc_sema_resolve_type:
 The declaration checker dispatches on the AST tag to handle each
 declaration kind.  Variable declarations resolve their type and
 register a \texttt{SYM\_VAR} in the symbol table, optionally
-type-checking the initialiser.  Function declarations resolve the
+type-checking the initialiser.  A variable whose type is an
+\emph{incomplete} array (\texttt{int a[] = \dots}) first has its length
+inferred by \texttt{kcc\_sema\_infer\_array\_len}, which reads the
+initializer---the element span of a brace list, or the string length
+plus one for a string literal---and synthesises a size expression onto
+the array type node \emph{before} it is resolved.  Because every later
+resolve of that node (for \texttt{sizeof}, for the stack slot, for a
+file-scope object's storage) reads the now-present size, the completed
+length is seen uniformly rather than only by the one site that happened
+to look at the initializer.  Multi-dimensional inner brace lists are not
+yet composed, so an inferred outer dimension over nested braces
+(\texttt{int m[][3] = \{\{\dots\}\}}) is left to the same nested-aggregate
+gap noted elsewhere.  Function declarations resolve the
 return type, wrap it in a \texttt{TY\_FUNC} descriptor via
 \texttt{\_kcc\_type\_func}, and register the resulting function type
 as \texttt{SYM\_FUNC}.  The \texttt{TY\_FUNC} wrapper is essential:
@@ -327,6 +339,11 @@ _kcc_sema_check_decl:
     b .Lscd_done
 
 .Lscd_var:
+    // Complete an incomplete array's length from its initializer (so every
+    // later resolve — sizeof, the alloca, BSS sizing — sees the real length).
+    mov x0, x19                    // decl node
+    bl _kcc_sema_infer_array_len
+
     // Resolve type
     ldr x0, [x19, #AST_F0]         // type node
     bl _kcc_sema_resolve_type
@@ -1653,6 +1670,54 @@ _kcc_sema_check_redef:
 .Lscr_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_infer_array_len ---------------------------------------------
+// void kcc_sema_infer_array_len(node *decl)
+// If the declaration's type is an incomplete array (an AST_TYPE_ARRAY with no
+// size expression) and it has an initializer, synthesise an AST_INT_LIT
+// length and hang it on the type node's size-expr slot, so that every later
+// resolve of that node yields a *complete* array type.  A string literal
+// gives strlen+1; a brace list gives its element span (designator-aware).
+.globl _kcc_sema_infer_array_len
+.p2align 2
+_kcc_sema_infer_array_len:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    ldr x19, [x0, #AST_F0]         // type node
+    cbz x19, .Lial_done
+    ldr x1, [x19, #AST_TAG]
+    cmp x1, #AST_TYPE_ARRAY
+    b.ne .Lial_done
+    ldr x1, [x19, #AST_F1]         // existing size expr?
+    cbnz x1, .Lial_done            // already a complete array
+    ldr x20, [x0, #AST_F2]         // initializer
+    cbz x20, .Lial_done
+    ldr x1, [x20, #AST_TAG]
+    cmp x1, #AST_STR_LIT
+    b.eq .Lial_str
+    cmp x1, #AST_INIT_LIST
+    b.eq .Lial_list
+    b .Lial_done
+.Lial_str:
+    ldr x21, [x20, #AST_F1]        // string length
+    add x21, x21, #1              // + terminating NUL
+    b .Lial_make
+.Lial_list:
+    mov x0, x20
+    bl _kcc_ir_initlist_count      // element span (max index + 1)
+    mov x21, x0
+.Lial_make:
+    mov x0, #AST_INT_LIT
+    bl _kcc_ast_alloc
+    str x21, [x0, #AST_F0]        // literal value = inferred length
+    str x0, [x19, #AST_F1]        // type node's size expr
+.Lial_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 @}
 

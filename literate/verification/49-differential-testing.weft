@@ -642,6 +642,30 @@ difftest "compound-bitfield" \
     "struct B { unsigned a:4; unsigned b:8; }; int main(void){ struct B f; f.a=4; f.b=100; f.a+=3; f.b-=50; f.a|=8; return f.a*1000 + f.b; }"
 difftest "compound-nested" \
     "struct S { int arr[4]; int v; }; int main(void){ struct S a; a.v=100; a.arr[2]=7; a.v/=4; a.arr[2]<<=3; a.v&=30; return a.v + a.arr[2]; }"
+difftest "bool-normalize" \
+    "int main(void){ _Bool a=5; _Bool b=(7&4); _Bool c=0; _Bool d=256; return a+b+c+d; }"
+difftest "bool-cast" \
+    "int main(void){ int x=3; return (_Bool)x + (int)(_Bool)0 + (int)(_Bool)99; }"
+difftest "bool-global" \
+    "_Bool g = 42; int main(void){ return g; }"
+difftest "bool-runtime" \
+    "int main(void){ _Bool a; a = 7; a = a && 1; return a; }"
+difftest "char-array-string" \
+    "int main(void){ char s[] = \"ABC\"; return s[0]+s[1]+s[2]+s[3]; }"
+difftest "char-array-sized" \
+    "int main(void){ char s[8] = \"Hi\"; return s[0]+s[1]+s[2]+s[7]; }"
+difftest "char-array-global" \
+    "char g[] = \"xy\"; int main(void){ return g[0]+g[1]+g[2]; }"
+difftest "char-array-index" \
+    "int main(void){ char s[] = \"hello\"; int n=0; int i=0; while(s[i]){ n+=s[i]; i++; } return n % 200; }"
+difftest "sizeof-inferred-int" \
+    "int main(void){ int a[] = {1,2,3,4,5}; return sizeof(a)/sizeof(int); }"
+difftest "sizeof-inferred-char" \
+    "int main(void){ char s[] = \"hello\"; return (int)sizeof(s); }"
+difftest "sizeof-inferred-desig" \
+    "int main(void){ int d[] = {[5]=1, [2]=9}; return (int)(sizeof(d)/sizeof(int)); }"
+difftest "sizeof-inferred-global" \
+    "char g[] = \"global\"; int ga[] = {10,20,30,40}; int main(void){ return (int)sizeof(g) + (int)(sizeof(ga)/sizeof(int)); }"
 @}
 
 \section{Known Divergences}

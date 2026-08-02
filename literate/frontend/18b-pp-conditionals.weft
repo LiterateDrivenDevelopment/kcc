@@ -1,0 +1,974 @@
+% 18b-pp-conditionals.weft — conditional compilation (#if family)
+%
+% Split from 18-preprocessor.weft (structural refactor, no content changes):
+% #if/#ifdef/#elif/#else/#endif handling and the #if constant-expression
+% evaluator.
+
+\section{Conditional Compilation}
+
+The conditional directives \texttt{\#ifdef}, \texttt{\#ifndef},
+\texttt{\#if}, \texttt{\#elif}, \texttt{\#else}, and
+\texttt{\#endif} control which sections of the source are processed.
+
+A conditional stack records the state of each nested group.  States
+are \texttt{ACTIVE} (processing tokens), \texttt{SKIP} (discarding
+tokens), and \texttt{DONE} (active branch already seen, skip rest).
+
+@d PP: conditional @{
+.text
+// -- _kcc_pp_do_ifdef -----------------------------------------------
+// x0 = negate (0 for ifdef, 1 for ifndef)
+.p2align 2
+_kcc_pp_do_ifdef:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0               // x19 = negate flag
+
+    // Read macro name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Lifdef_err
+
+    // Look up in macro table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+
+    bl _kcc_ht_get             // x0 = value (0 if not found)
+
+    // Determine condition: ifdef → (value != 0), ifndef → (value == 0)
+    cmp  x0, #0
+    cset x0, ne                // x0 = 1 if defined, 0 if not
+    eor  x0, x0, x19          // negate if ifndef
+
+    // Push conditional: ACTIVE if true, SKIP if false
+    cmp  x0, #0
+    mov  x0, #PP_COND_SKIP
+    mov  x1, #PP_COND_ACTIVE
+    csel x0, x1, x0, ne       // x0 = state
+
+    bl _kcc_pp_cond_push
+    bl _kcc_pp_skip_line
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Lifdef_err:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_ifdef_name@@PAGE
+    add  x2, x2, _kcc_pp_err_ifdef_name@@PAGEOFF
+    bl _kcc_diag_error
+    // Push SKIP so we don't process the body
+    mov x0, #PP_COND_SKIP
+    bl _kcc_pp_cond_push
+    bl _kcc_pp_skip_line
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+The \texttt{\#if} and \texttt{\#elif} directives evaluate a constant
+integer expression to decide whether to process the enclosed source.
+\texttt{\_kcc\_pp\_do\_if} extracts the rest of the directive line,
+temporarily redirects the lexer to scan the expression text, calls the
+recursive-descent evaluator, and pushes an \texttt{ACTIVE} or
+\texttt{SKIP} state accordingly.  \texttt{\_kcc\_pp\_do\_elif} follows
+the same pattern but must also account for whether a previous branch
+in the same group was already taken---if so, the state becomes
+\texttt{DONE} regardless of the expression's value.
+
+@d PP: conditional @{
+// -- _kcc_pp_do_if --------------------------------------------------
+// Handles #if with basic expression evaluation.
+.p2align 2
+_kcc_pp_do_if:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Get rest of line as expression text
+    bl _kcc_pp_rest_of_line
+    mov x19, x0               // x19 = expr text
+    mov x20, x1               // x20 = expr len
+
+    // Save lexer state
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x22, [x0]
+
+    // Point lexer at expression text
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x19, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    add  x1, x19, x20
+    str  x1, [x0]
+
+    // Evaluate
+    bl _kcc_lex_next           // get first token
+    bl _kcc_pp_eval_expr       // x0 = result
+    mov x19, x0                // save result
+
+    // Restore lexer state
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    str  x22, [x0]
+
+    // Push conditional
+    cmp  x19, #0
+    mov  x0, #PP_COND_SKIP
+    mov  x1, #PP_COND_ACTIVE
+    csel x0, x1, x0, ne
+
+    bl _kcc_pp_cond_push
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\paragraph{The \texttt{\#elif} directive.}
+The \texttt{\#elif} handler must determine whether a previous branch in
+the same conditional group was already taken.  If the current state is
+\texttt{ACTIVE}, the branch just processed was chosen, so the state
+transitions to \texttt{DONE} and the rest of the group is skipped.  If
+the state is already \texttt{DONE}, the directive line is consumed
+without evaluation.  Only when the state is \texttt{SKIP}---meaning no
+branch has yet matched---does the handler evaluate the expression and
+potentially activate the branch.
+
+@d PP: conditional @{
+// -- _kcc_pp_do_elif ------------------------------------------------
+.p2align 2
+_kcc_pp_do_elif:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    // Check conditional depth
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lelif_stray
+
+    // Check current state
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+    ldrb w3, [x2, x1]
+
+    cmp  w3, #PP_COND_ACTIVE
+    b.eq .Lelif_was_active     // previous branch was active → DONE
+    cmp  w3, #PP_COND_DONE
+    b.eq .Lelif_done_skip      // already found active → stay DONE
+
+    // State is SKIP: evaluate expression to see if this branch is active
+    bl _kcc_pp_rest_of_line
+    mov x19, x0
+    mov x20, x1
+
+    // Save/restore lexer, evaluate
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x22, [x0]
+
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x19, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    add  x1, x19, x20
+    str  x1, [x0]
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_expr
+    mov x19, x0
+
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    str  x22, [x0]
+
+    // Update conditional stack top
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+
+    cmp  x19, #0
+    mov  w3, #PP_COND_SKIP
+    mov  w4, #PP_COND_ACTIVE
+    csel w3, w4, w3, ne
+    strb w3, [x2, x1]
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lelif_was_active:
+    // Previous branch was active → mark DONE, skip rest
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+    mov  w3, #PP_COND_DONE
+    strb w3, [x2, x1]
+    bl _kcc_pp_skip_line
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lelif_done_skip:
+    bl _kcc_pp_skip_line
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Lelif_stray:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_stray_elif@@PAGE
+    add  x2, x2, _kcc_pp_err_stray_elif@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\paragraph{\texttt{\#else}, \texttt{\#endif}, and the conditional push helper.}
+The \texttt{\#else} directive toggles the conditional stack: if the
+current branch was \texttt{ACTIVE} it becomes \texttt{DONE}, and if
+it was \texttt{SKIP} it becomes \texttt{ACTIVE}.  \texttt{\#endif}
+simply pops the stack by decrementing the depth counter.
+\texttt{\_kcc\_pp\_cond\_push} is the shared helper that stores a new
+state byte onto the stack and increments the depth.
+
+@d PP: conditional @{
+// -- _kcc_pp_do_else ------------------------------------------------
+.p2align 2
+_kcc_pp_do_else:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lelse_stray
+
+    sub  x1, x0, #1
+    adrp x2, _kcc_pp_cond_stack@@PAGE
+    add  x2, x2, _kcc_pp_cond_stack@@PAGEOFF
+    ldrb w3, [x2, x1]
+
+    cmp  w3, #PP_COND_ACTIVE
+    b.eq .Lelse_was_active
+    cmp  w3, #PP_COND_DONE
+    b.eq .Lelse_keep_done
+
+    // Was SKIP → now ACTIVE
+    mov  w3, #PP_COND_ACTIVE
+    strb w3, [x2, x1]
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lelse_was_active:
+    mov  w3, #PP_COND_DONE
+    strb w3, [x2, x1]
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lelse_keep_done:
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lelse_stray:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_stray_else@@PAGE
+    add  x2, x2, _kcc_pp_err_stray_else@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- _kcc_pp_do_endif -----------------------------------------------
+.p2align 2
+_kcc_pp_do_endif:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_pp_cond_depth@@PAGE
+    add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x1, [x0]
+    cbz  x1, .Lendif_stray
+
+    sub  x1, x1, #1
+    str  x1, [x0]
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lendif_stray:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_stray_endif@@PAGE
+    add  x2, x2, _kcc_pp_err_stray_endif@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- _kcc_pp_cond_push ----------------------------------------------
+// x0 = state to push
+.p2align 2
+_kcc_pp_cond_push:
+    adrp x1, _kcc_pp_cond_depth@@PAGE
+    add  x1, x1, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x2, [x1]
+    cmp  x2, #PP_MAX_COND
+    b.hs .Lcpush_overflow
+    adrp x3, _kcc_pp_cond_stack@@PAGE
+    add  x3, x3, _kcc_pp_cond_stack@@PAGEOFF
+    strb w0, [x3, x2]
+    add  x2, x2, #1
+    str  x2, [x1]
+    ret
+.Lcpush_overflow:
+    ret                        // silently cap depth
+@}
+
+When the preprocessor is skipping tokens inside a false conditional
+branch, it must still track nested \texttt{\#if}/\texttt{\#endif}
+pairs so that a matching \texttt{\#endif} pops the correct level.
+\texttt{\_kcc\_pp\_skip\_directive} examines directives encountered
+during skipping: \texttt{\#if}, \texttt{\#ifdef}, and
+\texttt{\#ifndef} push a new \texttt{SKIP} state, \texttt{\#endif}
+pops a level, and \texttt{\#elif}/\texttt{\#else} toggle the top of
+the conditional stack when the depth matches.
+
+@d PP: conditional @{
+// -- _kcc_pp_skip_directive -----------------------------------------
+// Handle directives encountered while skipping (conditional false).
+// Only #if/#ifdef/#ifndef (push), #elif/#else (toggle), #endif (pop)
+// are meaningful; all others are ignored.
+.p2align 2
+_kcc_pp_skip_directive:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    // Save directive line
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_pp_dir_line@@PAGE
+    add  x1, x1, _kcc_pp_dir_line@@PAGEOFF
+    str  x0, [x1]
+
+    // Read directive name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    // Directive name can be TOK_IDENT(1) or a keyword(10-53)
+    cmp  x0, #TOK_IDENT
+    b.eq .Lskipd_has_name
+    cmp  x0, #10
+    b.lt .Lskipd_done
+    cmp  x0, #53
+    b.gt .Lskipd_done
+.Lskipd_has_name:
+
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]
+
+    // Check for "if" (2), "ifdef" (5), "ifndef" (6) → push SKIP
+    cmp x20, #2
+    b.ne .Lskipd_not2
+    mov x0, x19
+    adrp x1, _kcc_pp_s_if@@PAGE
+    add  x1, x1, _kcc_pp_s_if@@PAGEOFF
+    mov x2, #2
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_push
+    b .Lskipd_done
+.Lskipd_not2:
+
+    cmp x20, #5
+    b.ne .Lskipd_not5
+    mov x0, x19
+    adrp x1, _kcc_pp_s_ifdef@@PAGE
+    add  x1, x1, _kcc_pp_s_ifdef@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_push
+    mov x0, x19
+    adrp x1, _kcc_pp_s_endif@@PAGE
+    add  x1, x1, _kcc_pp_s_endif@@PAGEOFF
+    mov x2, #5
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_endif
+    b .Lskipd_done
+.Lskipd_not5:
+
+    cmp x20, #6
+    b.ne .Lskipd_not6
+    mov x0, x19
+    adrp x1, _kcc_pp_s_ifndef@@PAGE
+    add  x1, x1, _kcc_pp_s_ifndef@@PAGEOFF
+    mov x2, #6
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_push
+    b .Lskipd_check46
+.Lskipd_not6:
+
+.Lskipd_check46:
+    // Check "elif" (4), "else" (4)
+    cmp x20, #4
+    b.ne .Lskipd_done
+    mov x0, x19
+    adrp x1, _kcc_pp_s_elif@@PAGE
+    add  x1, x1, _kcc_pp_s_elif@@PAGEOFF
+    mov x2, #4
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_elif
+    mov x0, x19
+    adrp x1, _kcc_pp_s_else@@PAGE
+    add  x1, x1, _kcc_pp_s_else@@PAGEOFF
+    mov x2, #4
+    bl _kcc_memcmp
+    cbz x0, .Lskipd_else
+    b .Lskipd_done
+
+.Lskipd_push:
+    // Nested #if/#ifdef/#ifndef while skipping: push SKIP
+    mov x0, #PP_COND_SKIP
+    bl _kcc_pp_cond_push
+    b .Lskipd_done
+
+.Lskipd_endif:
+    bl _kcc_pp_do_endif
+    b .Lskipd_ret
+
+.Lskipd_elif:
+    bl _kcc_pp_do_elif
+    b .Lskipd_ret
+
+.Lskipd_else:
+    bl _kcc_pp_do_else
+    b .Lskipd_ret
+
+.Lskipd_done:
+    bl _kcc_pp_skip_line
+.Lskipd_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Expression Evaluation for \texttt{\#if}}
+
+The \texttt{\#if} and \texttt{\#elif} directives require evaluating
+a constant integer expression.  We support the subset commonly used
+in practice: integer literals, \texttt{defined(NAME)},
+\texttt{defined NAME}, the logical operators \texttt{!}, \texttt{\&\&},
+\texttt{||}, and comparison operators.
+
+Any identifier not recognized as a macro evaluates to~0 per
+\stdref{6.10.1} paragraph~4.
+
+@d PP: eval @{
+.text
+// -- _kcc_pp_eval_expr ----------------------------------------------
+// Evaluates #if expression. Token stream already set up.
+// Returns x0 = integer result.
+.globl _kcc_pp_eval_expr
+.p2align 2
+_kcc_pp_eval_expr:
+    // Entry point: delegate to logical-or
+    b _kcc_pp_eval_lor
+
+// -- Logical OR: expr || expr
+.p2align 2
+_kcc_pp_eval_lor:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    bl _kcc_pp_eval_land
+    mov x19, x0
+
+.Leval_lor_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_OR           // ||
+    b.ne .Leval_lor_done
+
+    bl _kcc_lex_next           // consume ||
+    bl _kcc_pp_eval_land
+    orr  x19, x19, x0
+    cmp  x19, #0
+    cset x19, ne
+    b .Leval_lor_loop
+
+.Leval_lor_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Logical AND: expr && expr
+.p2align 2
+_kcc_pp_eval_land:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    bl _kcc_pp_eval_eq
+    mov x19, x0
+
+.Leval_land_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_AND          // &&
+    b.ne .Leval_land_done
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_eq
+    and  x0, x19, x0
+    cmp  x0, #0
+    cset x19, ne
+    b .Leval_land_loop
+
+.Leval_land_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+@| _kcc_pp_eval_expr
+@}
+
+The equality and relational operators form the next two precedence
+levels.  \texttt{\_kcc\_pp\_eval\_eq} handles \texttt{==} and
+\texttt{!=} by comparing the integer values returned from
+\texttt{\_kcc\_pp\_eval\_rel}, which in turn handles \texttt{<},
+\texttt{>}, \texttt{<=}, and \texttt{>=}.  All comparisons yield
+either~0 or~1 using the ARM64 \texttt{cset} instruction with the
+appropriate condition code.
+
+@d PP: eval @{
+// -- Equality: expr == expr, expr != expr
+.p2align 2
+_kcc_pp_eval_eq:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    bl _kcc_pp_eval_rel
+    mov x19, x0
+
+.Leval_eq_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x0]
+    cmp  x20, #TOK_EQ
+    b.eq .Leval_eq_op
+    cmp  x20, #TOK_NE
+    b.eq .Leval_eq_op
+    b .Leval_eq_done
+
+.Leval_eq_op:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_rel
+    cmp  x20, #TOK_EQ
+    b.eq .Leval_do_eq
+    // !=
+    cmp  x19, x0
+    cset x19, ne
+    b .Leval_eq_loop
+.Leval_do_eq:
+    cmp  x19, x0
+    cset x19, eq
+    b .Leval_eq_loop
+
+.Leval_eq_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Relational: < > <= >=
+.p2align 2
+_kcc_pp_eval_rel:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    bl _kcc_pp_eval_unary
+    mov x19, x0
+
+.Leval_rel_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x0]
+    cmp  x20, #TOK_LT
+    b.eq .Leval_rel_op
+    cmp  x20, #TOK_GT
+    b.eq .Leval_rel_op
+    cmp  x20, #TOK_LE
+    b.eq .Leval_rel_op
+    cmp  x20, #TOK_GE
+    b.eq .Leval_rel_op
+    b .Leval_rel_done
+
+.Leval_rel_op:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary
+    cmp  x20, #TOK_LT
+    b.eq .Leval_do_lt
+    cmp  x20, #TOK_GT
+    b.eq .Leval_do_gt
+    cmp  x20, #TOK_LE
+    b.eq .Leval_do_le
+    // >=
+    cmp  x19, x0
+    cset x19, ge
+    b .Leval_rel_loop
+.Leval_do_lt:
+    cmp  x19, x0
+    cset x19, lt
+    b .Leval_rel_loop
+.Leval_do_gt:
+    cmp  x19, x0
+    cset x19, gt
+    b .Leval_rel_loop
+.Leval_do_le:
+    cmp  x19, x0
+    cset x19, le
+    b .Leval_rel_loop
+
+.Leval_rel_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+@}
+
+At the lowest precedence tier sit the unary and primary expressions.
+\texttt{\_kcc\_pp\_eval\_unary} handles the logical-not operator
+\texttt{!} by recursing and then applying \texttt{cset eq}.
+\texttt{\_kcc\_pp\_eval\_primary} recognizes four forms: integer
+literals (parsed via \texttt{\_kcc\_pp\_atoi}), parenthesized
+sub-expressions, the \texttt{defined} operator (with or without
+parentheses), and bare identifiers---which evaluate to their macro
+body as an integer, or to~0 if undefined per \stdref{6.10.1}/4.
+
+@d PP: eval @{
+// -- Unary: !expr, primary
+.p2align 2
+_kcc_pp_eval_unary:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_BANG
+    b.ne .Leval_primary
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary
+    cmp  x0, #0
+    cset x0, eq                // !x
+    ldp  x29, x30, [sp], #16
+    ret
+
+.Leval_primary:
+    bl _kcc_pp_eval_primary
+    ldp  x29, x30, [sp], #16
+    ret
+@}
+
+\paragraph{Primary expressions and integer parsing.}
+A primary expression in a preprocessor \texttt{\#if} context is one
+of four forms: an integer literal, a parenthesized sub-expression,
+the \texttt{defined} operator (with or without parentheses around the
+macro name), or a bare identifier that is looked up as a macro and
+converted to an integer---defaulting to~0 for undefined names per
+\stdref{6.10.1} paragraph~4.  The helper \texttt{\_kcc\_pp\_atoi}
+performs simple decimal ASCII-to-integer conversion.
+
+@d PP: eval @{
+// -- Primary: number, defined(X), defined X, (expr), ident→0
+.p2align 2
+_kcc_pp_eval_primary:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    // Number literal
+    cmp  x0, #TOK_NUMBER
+    b.eq .Leval_number
+
+    // Parenthesized expression
+    cmp  x0, #TOK_LPAREN
+    b.eq .Leval_paren
+
+    // Identifier
+    cmp  x0, #TOK_IDENT
+    b.eq .Leval_ident
+
+    // EOF or unknown → 0
+    mov  x0, #0
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_number:
+    // Parse integer from token text
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_pp_atoi
+    mov  x19, x0
+    bl _kcc_lex_next
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_paren:
+    bl _kcc_lex_next           // consume (
+    bl _kcc_pp_eval_expr
+    mov  x19, x0
+    // Expect )
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.ne .Leval_paren_done
+    bl _kcc_lex_next           // consume )
+.Leval_paren_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+@}
+
+\paragraph{Identifier and \texttt{defined} operator handling.}
+Identifiers in a preprocessor constant expression require special
+treatment.  The \texttt{defined} operator tests whether a macro name
+exists in the macro table, returning~1 or~0 without expanding it; both
+\texttt{defined(NAME)} and \texttt{defined NAME} forms are accepted per
+\stdref{6.10.1}.  Any other identifier is looked up as a macro and its
+body parsed as an integer; undefined names evaluate to~0.
+
+@d PP: eval @{
+.Leval_ident:
+    // Check for "defined"
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x1, #7
+    b.ne .Leval_ident_macro
+
+    adrp x1, _kcc_pp_s_defined@@PAGE
+    add  x1, x1, _kcc_pp_s_defined@@PAGEOFF
+    mov  x2, #7
+    bl _kcc_memcmp
+    cbnz x0, .Leval_ident_macro
+
+    // "defined" operator
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    b.eq .Leval_defined_paren
+
+    // defined IDENT (without parens)
+    cmp  x0, #TOK_IDENT
+    b.ne .Leval_defined_zero
+    b .Leval_defined_check
+
+.Leval_defined_paren:
+    bl _kcc_lex_next           // get IDENT
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Leval_defined_zero
+
+.Leval_defined_check:
+    // Look up macro
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+    bl _kcc_ht_get
+    cmp  x0, #0
+    cset x19, ne               // 1 if defined, 0 if not
+
+    // Skip closing ) if present
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.ne .Leval_defined_noparen
+    bl _kcc_lex_next
+.Leval_defined_noparen:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_defined_zero:
+    mov  x0, #0
+    bl _kcc_lex_next
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_ident_macro:
+    // Regular identifier → look up as macro, expand to 0 if not found
+    // Per §6.10.1p4: remaining identifiers → 0
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+    bl _kcc_ht_get
+    cbz  x0, .Leval_ident_zero
+
+    // Found macro: get its body, try to parse as integer
+    mov  x19, x0
+    ldr  x0, [x19, #PP_MACRO_BODY]
+    ldr  x1, [x19, #PP_MACRO_BODYLEN]
+    bl _kcc_pp_atoi
+    mov  x19, x0
+    bl _kcc_lex_next
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_ident_zero:
+    mov  x0, #0
+    bl _kcc_lex_next
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+@}
+
+\paragraph{Decimal integer parsing.}
+The helper \texttt{\_kcc\_pp\_atoi} converts a decimal digit string to a
+64-bit integer.  It walks the byte buffer from left to right, accumulating
+the result with a multiply-by-ten-and-add loop, and stops at the first
+non-digit character or end of input.  No sign handling is needed because
+preprocessor integer constants in \texttt{\#if} expressions are
+non-negative literals at this stage.
+
+@d PP: eval @{
+// -- _kcc_pp_atoi ---------------------------------------------------
+// Simple ASCII-to-integer: x0=ptr, x1=len → x0=value
+.p2align 2
+_kcc_pp_atoi:
+    mov  x2, #0                // accumulator
+    mov  x3, #0                // index
+.Latoi_loop:
+    cmp  x3, x1
+    b.hs .Latoi_done
+    ldrb w4, [x0, x3]
+    cmp  w4, #'0'
+    b.lo .Latoi_done
+    cmp  w4, #'9'
+    b.hi .Latoi_done
+    sub  w4, w4, #'0'
+    mov  x5, #10
+    mul  x2, x2, x5
+    add  x2, x2, x4
+    add  x3, x3, #1
+    b .Latoi_loop
+.Latoi_done:
+    mov  x0, x2
+    ret
+@}
+

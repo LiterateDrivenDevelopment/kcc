@@ -1,0 +1,410 @@
+% 37a-codegen-regalloc.weft — local register allocation
+%
+% Split from 37-codegen.weft (structural refactor, no content changes):
+% the conservative BB-local linear-scan allocator (caller/callee-saved).
+
+\section{Register Allocation}
+\label{sec:regalloc}
+
+The baseline back end is an \emph{all-spill} model: every virtual register
+owns an eight-byte stack slot, and every instruction loads its operands from
+those slots and stores its result back.  That is simple and always correct,
+but it pays a memory round-trip for every value.  Register allocation removes
+the traffic for the values that can safely live in a physical register.
+
+The allocator here is a deliberately conservative \emph{local} linear scan
+over two register banks: the four caller-saved scratch registers
+\texttt{x12}--\texttt{x15} and the nine callee-saved registers
+\texttt{x19}--\texttt{x27}.  The generated code otherwise touches only
+\texttt{x0}--\texttt{x11} and \texttt{x29}, so all thirteen are free for
+allocation.  A virtual register is a candidate only when it is safe beyond any
+doubt, so the pass allocates a vreg to a physical register precisely when
+\emph{both} of these hold:
+
+\begin{itemize}
+\item Its defining instruction produces an integer or pointer scalar
+      (floating and aggregate values are never allocated---they flow through
+      the FP helpers or by address).
+\item Its definition and every use lie in a single basic block.  A block is
+      straight-line, so within it textual order \emph{is} execution order;
+      this keeps the call-crossing analysis exact even inside loops (a loop
+      body re-enters at its top, redefining the value before reusing it).
+\end{itemize}
+
+Whether the value's live range \emph{crosses a function call} then decides the
+bank.  A call clobbers the caller-saved registers but preserves the
+callee-saved ones, so a call-free value may take any register (preferring
+\texttt{x12}--\texttt{x15}, which cost no frame save), whereas a call-crossing
+value is restricted to \texttt{x19}--\texttt{x27}.  Each callee-saved register
+the function actually claims is recorded in a mask; the prologue spills exactly
+those to a save area placed \emph{above} the vreg slots and alloca storage
+(so their offsets, and the frame-relative \texttt{va\_arg}/stack-argument
+reads, are unchanged---only \texttt{frame\_size} grows), and each
+\texttt{IR\_RET} restores them before tearing the frame down.
+
+The pass makes two walks over the instruction stream.  The first computes, per
+vreg, its defining block, its last-use position, whether any use escapes the
+defining block, and whether a call falls in its live range---the last via a
+monotonically increasing call counter, comparing its value at the definition
+with its value at each use.  Determining which operand fields are vreg
+\emph{uses} mirrors the dead-code eliminator's classification
+(\S\ref{sec:dce}); over-counting a use is harmless here (it only lengthens a
+live range), so mirroring that liberal rule stays safe.  The second walk is
+the linear scan itself: at each candidate's definition it frees any register
+whose occupant's last use has passed, then claims a free one from the
+permitted bank (or leaves the vreg spilled).  The result is a map that the
+\texttt{load\_vreg}/\texttt{store\_vreg} family consults---an unallocated vreg
+(map entry~0) behaves exactly as in the all-spill model, so the change is
+transparent wherever the allocator declines to act.
+
+The use-marking helper reads the pass's array bases from the stable
+callee-saved registers the scan keeps live (\texttt{x20}--\texttt{x24}) and
+takes the per-instruction varying values---the used vreg, current block,
+position, and call count---as arguments.
+
+@d CodeGen: register allocation @{
+// -- kcc_ra_use ---------------------------------------------------------------
+// Record one vreg use during pass 1.  x0=vreg, x1=cur_bb, x2=pos, x3=calls.
+// Reads bases x20=vreg_n, x21=lastuse, x22=defbb, x23=calldef, x24=flags.
+// flags bits: 1=candidate def, 2=escapes its block, 4=crosses a call.
+.text
+.p2align 2
+_kcc_ra_use:
+    cmp x0, x20
+    b.hs .Lrau_ret               // not a vreg number
+    str x2, [x21, x0, lsl #3]     // lastuse[u] = pos
+    ldr x4, [x22, x0, lsl #3]     // defbb[u]
+    cmp x4, x1
+    b.eq .Lrau_cross
+    ldr x5, [x24, x0, lsl #3]
+    orr x5, x5, #2               // escapes defining block
+    str x5, [x24, x0, lsl #3]
+.Lrau_cross:
+    ldr x4, [x23, x0, lsl #3]     // calldef[u]
+    cmp x3, x4
+    b.ls .Lrau_ret
+    ldr x5, [x24, x0, lsl #3]
+    orr x5, x5, #4               // a call lies in [def, use]
+    str x5, [x24, x0, lsl #3]
+.Lrau_ret:
+    ret
+
+// -- kcc_cg_regalloc ----------------------------------------------------------
+// void kcc_cg_regalloc(ir_func *func)
+// Computes the per-function vreg→physreg map and publishes it in
+// _kcc_cg_regmap (0 for an unallocated vreg).
+//   Stack frame (192 bytes): x29/x30 + x19..x28 saved; locals from #96.
+.text
+.globl _kcc_cg_regalloc
+.p2align 2
+_kcc_cg_regalloc:
+    stp x29, x30, [sp, #-256]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    mov x19, x0                    // func
+    ldr x20, [x19, #IRF_VREG_N]   // vreg_n
+
+    // Default to the all-spill map (no allocation) until we build a real one.
+    adrp x0, _kcc_cg_regmap@@PAGE
+    add  x0, x0, _kcc_cg_regmap@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_cg_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_callee_mask@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_cg_save_count@@PAGE
+    add  x0, x0, _kcc_cg_save_count@@PAGEOFF
+    str xzr, [x0]
+    cbz x20, .Lra_done             // no vregs
+
+    // Allocate one zeroed block of five vreg_n-entry arrays (8 bytes each):
+    // lastuse, defbb, calldef, flags, map.
+    lsl x9, x20, #3               // vreg_n * 8  (one array's byte size)
+    add x0, x9, x9, lsl #2        // vreg_n*8 * 5 = total bytes
+    bl _kcc_arena_alloc
+    mov x21, x0                    // lastuse base (also block base)
+    lsl x9, x20, #3
+    add x22, x21, x9               // defbb  = block + vreg_n*8
+    add x23, x22, x9               // calldef= block + vreg_n*16
+    add x24, x23, x9               // flags  = block + vreg_n*24
+    add x25, x24, x9               // map    = block + vreg_n*32
+
+    // Zero the whole block (5*vreg_n entries).
+    mov x9, x20
+    add x9, x9, x9, lsl #2        // 5 * vreg_n entries
+    mov x10, x21
+.Lra_zero:
+    cbz x9, .Lra_zeroed
+    str xzr, [x10], #8
+    sub x9, x9, #1
+    b .Lra_zero
+.Lra_zeroed:
+
+    // ---- Pass 1: liveness / candidate analysis ----
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [x0, #VEC_COUNT]
+    str x1, [sp, #112]            // bb_count
+    str xzr, [sp, #104]          // bb_index
+    mov x27, #0                    // pos
+    mov x28, #0                    // calls_so_far
+.Lp1_bb:
+    ldr x0, [sp, #104]
+    ldr x1, [sp, #112]
+    cmp x0, x1
+    b.hs .Lp1_done
+    str x0, [sp, #96]            // cur_bb = bb_index
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [sp, #104]
+    bl _kcc_vec_get
+    ldr x26, [x0]                 // BB ptr
+    ldr x26, [x26, #BB_FIRST]    // first instruction
+.Lp1_instr:
+    cbz x26, .Lp1_next_bb
+
+    // --- SRC1 use? (skip CONST, CALL, BR, GLOBAL_REF) ---
+    ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_CONST
+    b.eq .Lp1_src2
+    cmp x9, #IR_CALL
+    b.eq .Lp1_src2
+    cmp x9, #IR_BR
+    b.eq .Lp1_src2
+    cmp x9, #IR_GLOBAL_REF
+    b.eq .Lp1_src2
+    ldr x0, [x26, #IR_SRC1]
+    ldr x1, [sp, #96]
+    mov x2, x27
+    mov x3, x28
+    bl _kcc_ra_use
+.Lp1_src2:
+    ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_CALL
+    b.eq .Lp1_callargs
+    cmp x9, #IR_CALL_IND
+    b.eq .Lp1_callargs
+    cmp x9, #IR_BR_COND
+    b.eq .Lp1_bccond
+    cmp x9, #IR_BR
+    b.eq .Lp1_defck
+    cmp x9, #IR_CONST
+    b.eq .Lp1_defck
+    ldr x0, [x26, #IR_SRC2]
+    ldr x1, [sp, #96]
+    mov x2, x27
+    mov x3, x28
+    bl _kcc_ra_use
+    b .Lp1_defck
+
+.Lp1_bccond:
+    ldr x0, [x26, #IR_DEST]      // condition vreg is a use
+    ldr x1, [sp, #96]
+    mov x2, x27
+    mov x3, x28
+    bl _kcc_ra_use
+    b .Lp1_next                   // BR_COND defines nothing
+
+.Lp1_callargs:
+    ldr x0, [x26, #IR_SRC2]      // args array
+    cbz x0, .Lp1_call_inc
+    str x0, [sp, #128]           // args ptr
+    ldr x1, [x0]
+    and x1, x1, #0xffffffff       // arg count
+    str x1, [sp, #136]
+    str xzr, [sp, #144]          // i = 0
+.Lp1_arg:
+    ldr x5, [sp, #144]
+    ldr x6, [sp, #136]
+    cmp x5, x6
+    b.hs .Lp1_call_inc
+    ldr x7, [sp, #128]
+    lsl x8, x5, #1
+    add x8, x8, #1               // 1 + i*2
+    ldr x0, [x7, x8, lsl #3]     // arg vreg
+    ldr x1, [sp, #96]
+    mov x2, x27
+    mov x3, x28
+    bl _kcc_ra_use
+    ldr x5, [sp, #144]
+    add x5, x5, #1
+    str x5, [sp, #144]
+    b .Lp1_arg
+.Lp1_call_inc:
+    add x28, x28, #1             // a call clobbers the caller-saved pool
+    b .Lp1_defck
+
+.Lp1_defck:
+    ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_BR
+    b.eq .Lp1_next
+    cmp x9, #IR_STORE
+    b.eq .Lp1_next
+    cmp x9, #IR_RET
+    b.eq .Lp1_next
+    ldr x10, [x26, #IR_TYPE]
+    cbz x10, .Lp1_next
+    ldr x11, [x10]               // TY_KIND
+    cmp x11, #2
+    b.lo .Lp1_next
+    cmp x11, #7                   // BOOL..LLONG
+    b.ls .Lp1_defok
+    cmp x11, #11                  // PTR
+    b.eq .Lp1_defok
+    cmp x11, #16                  // ENUM
+    b.eq .Lp1_defok
+    b .Lp1_next
+.Lp1_defok:
+    ldr x0, [x26, #IR_DEST]
+    cmp x0, x20
+    b.hs .Lp1_next
+    ldr x1, [sp, #96]
+    str x1, [x22, x0, lsl #3]     // defbb[dest]
+    str x28, [x23, x0, lsl #3]    // calldef[dest]
+    ldr x2, [x24, x0, lsl #3]
+    orr x2, x2, #1               // candidate def
+    str x2, [x24, x0, lsl #3]
+.Lp1_next:
+    add x27, x27, #1
+    ldr x26, [x26, #IR_NEXT]
+    b .Lp1_instr
+.Lp1_next_bb:
+    ldr x0, [sp, #104]
+    add x0, x0, #1
+    str x0, [sp, #104]
+    b .Lp1_bb
+.Lp1_done:
+
+    // ---- Pass 2: linear scan over x12..x15 (caller-saved) and x19..x27
+    //      (callee-saved).  reg_end[i] lives at [sp,#152 + i*8]; -1 = free.
+    add x1, sp, #152
+    mov x9, #-1
+    mov x10, #0
+.Lp2_rinit:
+    cmp x10, #13
+    b.ge .Lp2_rinit_done
+    str x9, [x1, x10, lsl #3]
+    add x10, x10, #1
+    b .Lp2_rinit
+.Lp2_rinit_done:
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [x0, #VEC_COUNT]
+    str x1, [sp, #112]
+    str xzr, [sp, #104]
+    mov x27, #0                    // pos
+.Lp2_bb:
+    ldr x0, [sp, #104]
+    ldr x1, [sp, #112]
+    cmp x0, x1
+    b.hs .Lp2_done
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [sp, #104]
+    bl _kcc_vec_get
+    ldr x26, [x0]
+    ldr x26, [x26, #BB_FIRST]
+.Lp2_instr:
+    cbz x26, .Lp2_next_bb
+    ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_BR
+    b.eq .Lp2_next
+    cmp x9, #IR_BR_COND
+    b.eq .Lp2_next
+    cmp x9, #IR_STORE
+    b.eq .Lp2_next
+    cmp x9, #IR_RET
+    b.eq .Lp2_next
+    ldr x0, [x26, #IR_DEST]
+    cmp x0, x20
+    b.hs .Lp2_next
+    ldr x1, [x24, x0, lsl #3]     // flags[dest]
+    and x2, x1, #3
+    cmp x2, #1                    // candidate def that does not escape its block
+    b.ne .Lp2_next
+    and x4, x1, #4               // x4 = crossed-a-call bit
+    ldr x3, [x21, x0, lsl #3]     // lastuse[dest]
+    cmp x3, x27
+    b.ls .Lp2_next                // no later use
+    // Scan for a free register (reg_end < pos, signed).  A call-crossing
+    // value may take only a callee-saved register (index >= 4); a call-free
+    // value prefers the caller-saved registers (index 0..3) to spare a frame
+    // save, falling through to callee-saved as overflow.
+    mov x5, #0
+    cbz x4, .Lp2_scan
+    mov x5, #4
+.Lp2_scan:
+    cmp x5, #13
+    b.ge .Lp2_next                // no free register → spill
+    add x6, sp, #152
+    ldr x7, [x6, x5, lsl #3]      // reg_end[i]
+    cmp x7, x27
+    b.ge .Lp2_scan_next
+    // free: physical register = i<4 ? 12+i : 15+i
+    cmp x5, #4
+    b.lo .Lp2_caller
+    add x8, x5, #15
+    b .Lp2_assign
+.Lp2_caller:
+    add x8, x5, #12
+.Lp2_assign:
+    str x8, [x25, x0, lsl #3]     // map[dest] = physreg
+    add x6, sp, #152
+    str x3, [x6, x5, lsl #3]      // reg_end[i] = lastuse[dest]
+    cmp x5, #4
+    b.lo .Lp2_next                // caller-saved: no save needed
+    sub x9, x8, #19              // callee-saved: record it in the save mask
+    mov x10, #1
+    lsl x10, x10, x9
+    adrp x6, _kcc_cg_callee_mask@@PAGE
+    add  x6, x6, _kcc_cg_callee_mask@@PAGEOFF
+    ldr x7, [x6]
+    orr x7, x7, x10
+    str x7, [x6]
+    b .Lp2_next
+.Lp2_scan_next:
+    add x5, x5, #1
+    b .Lp2_scan
+.Lp2_next:
+    add x27, x27, #1
+    ldr x26, [x26, #IR_NEXT]
+    b .Lp2_instr
+.Lp2_next_bb:
+    ldr x0, [sp, #104]
+    add x0, x0, #1
+    str x0, [sp, #104]
+    b .Lp2_bb
+.Lp2_done:
+
+    // Publish the finished map.
+    adrp x0, _kcc_cg_regmap@@PAGE
+    add  x0, x0, _kcc_cg_regmap@@PAGEOFF
+    str x25, [x0]
+
+    // save_count = popcount(callee_mask) — how many regs the prologue spills.
+    adrp x0, _kcc_cg_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_callee_mask@@PAGEOFF
+    ldr x1, [x0]
+    mov x2, #0
+.Lra_popcnt:
+    cbz x1, .Lra_popcnt_done
+    and x3, x1, #1
+    add x2, x2, x3
+    lsr x1, x1, #1
+    b .Lra_popcnt
+.Lra_popcnt_done:
+    adrp x0, _kcc_cg_save_count@@PAGE
+    add  x0, x0, _kcc_cg_save_count@@PAGEOFF
+    str x2, [x0]
+
+.Lra_done:
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #256
+    ret
+@| _kcc_cg_regalloc _kcc_ra_use
+@}
+

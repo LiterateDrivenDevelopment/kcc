@@ -1,0 +1,1396 @@
+% 32d-ir-control.weft — IR lowering of control-flow statements
+%
+% Split from 32-ir-builder.weft (dedicated structural refactor, no content
+% changes): if/while/do/for/switch/break/continue and their codegen tests.
+
+\section{Building Control Flow}
+\label{sec:ir-control-flow}
+
+Control-flow statements create fresh basic blocks and wire them
+together with \texttt{IR\_BR} and \texttt{IR\_BR\_COND}.  Each
+builder follows the same discipline: after emitting a terminator
+(\texttt{IR\_BR}, \texttt{IR\_BR\_COND}, or \texttt{IR\_RET}), it
+sets \texttt{BB\_FLAG\_TERMINATED} on the current block so that later
+code does not accidentally append instructions after a branch.  Only
+after switching to a new block with \texttt{\_kcc\_ir\_set\_bb} can
+the builder resume emitting.
+
+\subsection{If Statement}
+
+An \texttt{if} with an else clause produces three blocks:
+\emph{then\_bb}, \emph{else\_bb}, and \emph{merge\_bb}.  The
+condition vreg feeds a conditional branch; each arm builds its body,
+then jumps to \emph{merge\_bb} (unless it was already terminated by a
+\texttt{return} or \texttt{break}).  An \texttt{if} without an else
+skips the \emph{else\_bb} and branches either to \emph{then\_bb} or
+directly to \emph{merge\_bb}.
+
+@d IR: build if @{
+// -- kcc_ir_build_if ------------------------------------------------------
+// void kcc_ir_build_if(node *stmt)
+//   x0 = AST_IF_STMT (F0=cond, F1=then, F2=else)
+.text
+.globl _kcc_ir_build_if
+.p2align 2
+_kcc_ir_build_if:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // if_stmt
+
+    // Build condition
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // cond vreg
+
+    // Create BBs
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // then_bb
+    ldr x0, [x19, #AST_F2]      // else branch
+    cbz x0, .Libif_no_else
+
+    // Has else
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // else_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    // Emit br_cond
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Then block
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_stmt
+    // Branch to merge (if not already terminated)
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libif_else_block
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libif_else_block:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_stmt
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libif_merge
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libif_merge:
+    mov x0, x23
+    bl _kcc_ir_set_bb
+    b .Libif_done
+
+.Libif_no_else:
+    // No else: branch to then_bb or merge_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_stmt
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libif_merge2
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libif_merge2:
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+.Libif_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_if
+@}
+
+\subsection{While Statement}
+
+A \texttt{while} loop creates three blocks: \emph{cond\_bb} (the
+loop header), \emph{body\_bb}, and \emph{exit\_bb}.  The entry block
+branches unconditionally to \emph{cond\_bb}, which evaluates the
+condition and branches to \emph{body\_bb} (true) or \emph{exit\_bb}
+(false).  After executing the body, a back-edge branches to
+\emph{cond\_bb}.  The loop stack receives \texttt{(break=exit\_bb,
+continue=cond\_bb)} so that \texttt{break} and \texttt{continue}
+inside the body emit the correct branch target.
+
+@d IR: build while @{
+// -- kcc_ir_build_while ---------------------------------------------------
+// void kcc_ir_build_while(node *stmt)
+//   x0 = AST_WHILE_STMT (F0=cond, F1=body)
+.text
+.globl _kcc_ir_build_while
+.p2align 2
+_kcc_ir_build_while:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0
+
+    // Create: cond_bb, body_bb, exit_bb
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // cond_bb
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // body_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // exit_bb
+
+    // Branch to cond_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Cond block
+    mov x0, x20
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x23, x0                  // cond vreg
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x23, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true → body
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → exit
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Body block — push loop stack (break=exit_bb, continue=cond_bb)
+    ldr x0, [x22, #BB_ID]       // break target = exit_bb id
+    ldr x1, [x20, #BB_ID]       // continue target = cond_bb id
+    bl _kcc_loop_push
+
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_stmt
+
+    bl _kcc_loop_pop
+
+    // Loop back to cond
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libw_exit
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libw_exit:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_while
+@}
+
+\subsection{Do-While Statement}
+
+A \texttt{do-while} loop guarantees at least one body execution.
+The CFG is the mirror image of \texttt{while}: the entry block
+branches directly to \emph{body\_bb}, which falls through to
+\emph{cond\_bb}.  The condition evaluates its expression and branches
+back to \emph{body\_bb} (true) or out to \emph{exit\_bb} (false).
+The loop stack entries are \texttt{(break=exit\_bb,
+continue=cond\_bb)}, just as with \texttt{while}.
+
+@d IR: build do @{
+// -- kcc_ir_build_do ------------------------------------------------------
+// void kcc_ir_build_do(node *stmt)
+//   x0 = AST_DO_STMT (F0=body, F1=cond)
+.text
+.globl _kcc_ir_build_do
+.p2align 2
+_kcc_ir_build_do:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0
+
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // body_bb
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // cond_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // exit_bb
+
+    // Branch to body
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Body — push loop stack (break=exit_bb, continue=cond_bb)
+    ldr x0, [x22, #BB_ID]       // break target = exit_bb
+    ldr x1, [x21, #BB_ID]       // continue target = cond_bb
+    bl _kcc_loop_push
+
+    mov x0, x20
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_stmt
+
+    bl _kcc_loop_pop
+
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libd_cond
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libd_cond:
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x23, x0
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x23, [x0, #IR_DEST]
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true → body (loop)
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → exit
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x22
+    bl _kcc_ir_set_bb
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_do
+@}
+
+\subsection{For Statement}
+
+A \texttt{for} loop is the most complex control-flow construct,
+producing four blocks: \emph{cond\_bb}, \emph{body\_bb},
+\emph{incr\_bb}, and \emph{exit\_bb}.  The builder first emits the
+initialiser (which may be a declaration or expression) into the
+current block, then branches to \emph{cond\_bb}.  The condition block
+evaluates its expression (or branches unconditionally to the body for
+\texttt{for(;;)}), the body executes, control flows to
+\emph{incr\_bb} for the increment expression, and a back-edge returns
+to \emph{cond\_bb}.  Note that \texttt{continue} targets
+\emph{incr\_bb}, not \emph{cond\_bb}---ensuring the increment runs
+before the next condition test.
+
+@d IR: build for @{
+// -- kcc_ir_build_for -----------------------------------------------------
+// void kcc_ir_build_for(node *stmt)
+//   x0 = AST_FOR_STMT (F0=init, F1=cond, F2=incr, F3=body)
+.text
+.globl _kcc_ir_build_for
+.p2align 2
+_kcc_ir_build_for:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0
+
+    // Build init (may be decl or expr)
+    ldr x0, [x19, #AST_F0]
+    cbz x0, .Libfor_bbs
+    bl _kcc_ir_build_stmt
+
+.Libfor_bbs:
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // cond_bb
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // body_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // incr_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // exit_bb
+
+    // Branch to cond
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Cond block
+    mov x0, x20
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libfor_no_cond
+    bl _kcc_ir_build_expr
+    mov x24, x0
+
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x24, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+    b .Libfor_body
+
+.Libfor_no_cond:
+    // Infinite loop: branch directly to body
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libfor_body:
+    // Push loop stack (break=exit_bb, continue=incr_bb)
+    ldr x0, [x23, #BB_ID]       // break target = exit_bb
+    ldr x1, [x22, #BB_ID]       // continue target = incr_bb
+    bl _kcc_loop_push
+
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F3]
+    cbz x0, .Libfor_pop_incr
+    bl _kcc_ir_build_stmt
+
+.Libfor_pop_incr:
+    bl _kcc_loop_pop
+
+.Libfor_incr:
+    // Branch to incr (if not terminated)
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Libfor_incr_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Libfor_incr_bb:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libfor_loop_back
+    bl _kcc_ir_build_expr        // discard result
+
+.Libfor_loop_back:
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@| _kcc_ir_build_for
+@}
+
+\paragraph{End-to-end tests.}
+The IR builder lowers each control-flow construct into a graph of basic
+blocks connected by \texttt{IR\_BR} (unconditional) and
+\texttt{IR\_BR\_COND} (conditional) terminators.  An \texttt{if/else}
+produces a diamond of four blocks (entry, true, false, merge); a
+\texttt{while} loop produces a condition block with a back-edge; a
+\texttt{for} loop adds a separate increment block that
+\texttt{continue} targets.  The code generator records each basic
+block's starting offset in a hash table and patches forward branches
+after all blocks have been emitted.  These tests use the explicit
+\texttt{i = i + 1} form to isolate loop lowering from the
+increment operators tested elsewhere.
+
+@d Test: codegen control flow @{
+echo ""
+echo "--- Control Flow ---"
+
+run_test "if true" \
+    "int main(void) { if (1) return 10; return 20; }" 10
+
+run_test "if false" \
+    "int main(void) { if (0) return 10; return 20; }" 20
+
+run_test "if-else" \
+    "int main(void) { int x = 5; if (x > 3) return 1; else return 0; }" 1
+
+run_test "nested if" \
+    "int main(void) { int x = 5; if (x > 0) { if (x > 3) return 1; return 2; } return 3; }" 1
+
+run_test "while loop" \
+    "int main(void) { int x = 0; while (x < 10) x = x + 1; return x; }" 10
+
+run_test "do-while loop" \
+    "int main(void) { int i = 0; int s = 0; do { s = s + i; i = i + 1; } while (i <= 5); return s; }" 15
+
+run_test "for loop" \
+    "int main(void) { int s = 0; for (int i = 0; i < 5; i = i + 1) s = s + 2; return s; }" 10
+
+run_test "break" \
+    "int main(void) { int i = 0; while (1) { if (i == 5) break; i = i + 1; } return i; }" 5
+
+run_test "continue" \
+    "int main(void) { int s = 0; for (int i = 0; i < 10; i = i + 1) { if (i % 2 == 0) continue; s = s + 1; } return s; }" 5
+
+run_test "goto backward loop" \
+    "int main(void) { int i = 0; int s = 0; loop: if (i >= 5) goto end; s = s + i; i = i + 1; goto loop; end: return s; }" 10
+
+run_test "goto forward" \
+    "int main(void) { int x = 5; if (x > 0) goto pos; return 1; pos: return 42; }" 42
+
+run_test "goto cleanup" \
+    "int f(int n) { int r = 0; if (n < 0) goto done; r = n * 2; done: return r; } int main(void) { return f(21); }" 42
+
+run_test "multiple returns" \
+    "int f(int x) { if (x > 0) return 1; if (x < 0) return 2; return 0; } int main(void) { return f(5) + f(-3) + f(0); }" 3
+@}
+
+\subsection{Switch Statement}
+
+A \texttt{switch} statement (\stdref{6.8.4.2}) evaluates a controlling
+expression and transfers control to the matching \texttt{case} label.
+The IR builder lowers it to a compare-and-branch dispatch chain: for
+each \texttt{case}, a fresh basic block tests \texttt{cond\_vreg ==
+case\_val} and branches to the case body on success or to the next
+comparison on failure.  After all cases, the chain falls through to
+the \texttt{default} body if present, or to the exit block otherwise.
+
+Case bodies observe C fall-through semantics: unless a \texttt{break}
+terminates the current basic block, execution flows into the next
+case's body.  The builder achieves this by emitting an unconditional
+branch from a non-terminated body block to the next case's block.  The
+exit block is pushed onto the loop stack as a break target so that
+\texttt{break} statements inside the switch branch to it.
+
+The builder uses three passes over the compound body's item list.
+Pass~1 creates a basic block for every \texttt{case} and
+\texttt{default} label and stashes the BB pointer in an unused AST
+field (\texttt{F2} for cases, \texttt{F1} for default).  Pass~2 emits
+the dispatch chain: each comparison occupies its own basic block
+terminated by \texttt{IR\_BR\_COND}.  Pass~3 walks the items once more
+and builds each statement in the appropriate basic block, inserting
+fall-through branches between consecutive labels when the preceding
+block is not yet terminated.
+
+@d IR: build switch @{
+// -- kcc_ir_build_switch --------------------------------------------------
+// void kcc_ir_build_switch(node *stmt)
+//   x0 = AST_SWITCH_STMT (F0=expr, F1=compound body)
+// Lowers to: dispatch chain → case bodies → exit_bb
+.text
+.globl _kcc_ir_build_switch
+.p2align 2
+_kcc_ir_build_switch:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    mov x19, x0                  // x19 = switch node
+
+    // 1. Evaluate controlling expression
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // x20 = cond_vreg
+
+    // 2. Allocate exit BB
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // x21 = exit_bb
+
+    // 3. Get first item of compound body
+    ldr x0, [x19, #AST_F1]      // compound stmt
+    ldr x23, [x0, #AST_F0]      // x23 = first item (constant)
+
+    mov x22, #0                  // x22 = default_bb (null)
+
+    // -- Pass 1: create BBs for each case/default --
+    mov x24, x23
+.Lsw_scan:
+    cbz x24, .Lsw_scan_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.ne .Lsw_scan_nocase
+    bl _kcc_ir_alloc_bb
+    str x0, [x24, #AST_F2]      // stash case BB in F2
+    b .Lsw_scan_next
+.Lsw_scan_nocase:
+    cmp x0, #AST_DEFAULT_STMT
+    b.ne .Lsw_scan_next
+    bl _kcc_ir_alloc_bb
+    str x0, [x24, #AST_F1]      // stash default BB in F1
+    mov x22, x0                  // remember default_bb
+.Lsw_scan_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lsw_scan
+.Lsw_scan_done:
+
+    // -- Pass 2: dispatch chain --
+    // For each case: emit const + cmp_eq + br_cond in current BB,
+    // then create a fresh dispatch BB for the next comparison.
+    mov x24, x23
+.Lsw_disp:
+    cbz x24, .Lsw_disp_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.ne .Lsw_disp_next
+
+    // Get case constant value
+    ldr x0, [x24, #AST_F0]      // case expr (AST_INT_LIT)
+    ldr x25, [x0, #AST_F0]      // integer value
+
+    // Emit IR_CONST for case value
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x26, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x26, #IR_TYPE]
+    str x25, [x26, #IR_SRC1]    // immediate value
+    bl _kcc_ir_next_vreg
+    str x0, [x26, #IR_DEST]
+    mov x25, x0                  // x25 = case_const_vreg
+    mov x0, x26
+    bl _kcc_ir_emit
+
+    // Emit IR_CMP_EQ(cond_vreg, case_const_vreg)
+    mov x0, #IR_CMP_EQ
+    bl _kcc_ir_alloc_instr
+    mov x26, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x26, #IR_TYPE]
+    str x20, [x26, #IR_SRC1]    // cond_vreg
+    str x25, [x26, #IR_SRC2]    // case_const_vreg
+    bl _kcc_ir_next_vreg
+    str x0, [x26, #IR_DEST]
+    mov x25, x0                  // x25 = cmp_vreg
+    mov x0, x26
+    bl _kcc_ir_emit
+
+    // Create next dispatch BB
+    bl _kcc_ir_alloc_bb
+    mov x27, x0                  // x27 = next_dispatch_bb
+
+    // Emit IR_BR_COND: true → case_bb, false → next_dispatch_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x25, [x0, #IR_DEST]     // condition vreg
+    ldr x1, [x24, #AST_F2]      // case_bb (stashed in pass 1)
+    ldr x1, [x1, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true target
+    ldr x1, [x27, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false target
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Switch to next dispatch BB
+    mov x0, x27
+    bl _kcc_ir_set_bb
+
+.Lsw_disp_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lsw_disp
+.Lsw_disp_done:
+
+    // End of dispatch chain: branch to default or exit
+    cbz x22, .Lsw_disp_exit
+    // Branch to default_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    b .Lsw_disp_term
+.Lsw_disp_exit:
+    // Branch to exit_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+.Lsw_disp_term:
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // -- Pass 3: emit case/default bodies --
+    // Push break target (continue=0, not valid in switch)
+    ldr x0, [x21, #BB_ID]       // break → exit_bb
+    mov x1, #0                  // no continue target
+    bl _kcc_loop_push
+
+    mov x24, x23
+.Lsw_body:
+    cbz x24, .Lsw_body_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.eq .Lsw_body_case
+    cmp x0, #AST_DEFAULT_STMT
+    b.eq .Lsw_body_default
+
+    // Regular statement: build in current BB
+    mov x0, x24
+    bl _kcc_ir_build_stmt
+    b .Lsw_body_next
+
+.Lsw_body_case:
+    ldr x25, [x24, #AST_F2]     // case_bb
+
+    // If current BB not terminated, emit fallthrough branch
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Lsw_case_set_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x25, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+.Lsw_case_set_bb:
+    mov x0, x25
+    bl _kcc_ir_set_bb
+    ldr x0, [x24, #AST_F1]      // case body statement
+    cbz x0, .Lsw_body_next
+    bl _kcc_ir_build_stmt
+    b .Lsw_body_next
+
+.Lsw_body_default:
+    // If current BB not terminated, emit fallthrough
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Lsw_default_set_bb
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+.Lsw_default_set_bb:
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x24, #AST_F0]      // default body statement
+    cbz x0, .Lsw_body_next
+    bl _kcc_ir_build_stmt
+    b .Lsw_body_next
+
+.Lsw_body_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lsw_body
+.Lsw_body_done:
+    bl _kcc_loop_pop
+
+    // If current BB not terminated, branch to exit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    tst x1, #BB_FLAG_TERMINATED
+    b.ne .Lsw_set_exit
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+.Lsw_set_exit:
+    mov x0, x21
+    bl _kcc_ir_set_bb
+
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@| _kcc_ir_build_switch
+@}
+
+\paragraph{End-to-end tests.}
+The dispatch chain compares the controlling expression against each
+\texttt{case} constant in order and branches to the first match.
+Fall-through between cases follows C semantics: without a
+\texttt{break}, control flows into the next case body.  The
+\texttt{default} label catches any value not matched by the cases.
+
+@d Test: codegen switch @{
+echo ""
+echo "--- Switch ---"
+
+run_test "switch-case1" \
+    "int main(void) { switch (1) { case 1: return 10; case 2: return 20; } return 0; }" 10
+
+run_test "switch-case2" \
+    "int main(void) { switch (2) { case 1: return 10; case 2: return 20; } return 0; }" 20
+
+run_test "switch-default" \
+    "int main(void) { switch (5) { case 1: return 10; default: return 99; } return 0; }" 99
+
+run_test "switch-no-match" \
+    "int main(void) { switch (5) { case 1: return 10; case 2: return 20; } return 0; }" 0
+
+run_test "switch-break" \
+    "int main(void) { int r = 0; switch (2) { case 1: r = 10; break; case 2: r = 20; break; case 3: r = 30; break; } return r; }" 20
+
+run_test "switch-fallthrough" \
+    "int main(void) { int r = 0; switch (1) { case 1: r = r + 10; case 2: r = r + 20; case 3: r = r + 30; break; } return r; }" 60
+
+run_test "switch-default-fallthrough" \
+    "int main(void) { int r = 0; switch (9) { case 1: r = 1; break; default: r = 50; break; } return r; }" 50
+
+run_test "switch-var-expr" \
+    "int main(void) { int x = 3; int r = 0; switch (x) { case 1: r = 10; break; case 3: r = 30; break; } return r; }" 30
+@}
+
+\subsection{Break and Continue}
+
+The loop stack is a fixed-size array of 16 entries (supporting up to
+16 levels of nesting), where each entry holds a
+\texttt{(break\_bb\_id, continue\_bb\_id)} pair.  Every loop builder
+pushes its targets onto the stack before building the body, and pops
+after.  \texttt{\_kcc\_ir\_build\_break} reads the break target from
+the stack top, emits \texttt{IR\_BR} to that block, and marks the
+current block terminated.  \texttt{\_kcc\_ir\_build\_continue} does
+the same with the continue target.
+
+@d IR: build break @{
+// -- Loop Stack -----------------------------------------------------------
+// Tracks break/continue BB targets for nested loops.
+// Max 16 nesting levels. Each entry: {break_bb_id, continue_bb_id} (8 bytes each).
+.text
+
+// void _kcc_loop_push(uint64_t break_bb_id, uint64_t continue_bb_id)
+.globl _kcc_loop_push
+.p2align 2
+_kcc_loop_push:
+    adrp x2, _kcc_loop_depth@@PAGE
+    add  x2, x2, _kcc_loop_depth@@PAGEOFF
+    ldr  x3, [x2]
+    // Store break_bb at stack[depth*2]
+    adrp x4, _kcc_loop_stack@@PAGE
+    add  x4, x4, _kcc_loop_stack@@PAGEOFF
+    lsl  x5, x3, #4              // depth * 16
+    str  x0, [x4, x5]            // break_bb_id
+    add  x5, x5, #8
+    str  x1, [x4, x5]            // continue_bb_id
+    add  x3, x3, #1
+    str  x3, [x2]
+    ret
+
+// void _kcc_loop_pop(void)
+.globl _kcc_loop_pop
+.p2align 2
+_kcc_loop_pop:
+    adrp x0, _kcc_loop_depth@@PAGE
+    add  x0, x0, _kcc_loop_depth@@PAGEOFF
+    ldr  x1, [x0]
+    sub  x1, x1, #1
+    str  x1, [x0]
+    ret
+@| _kcc_loop_push
+@| _kcc_loop_pop
+@}
+
+\paragraph{Break Statement.}
+When the parser encounters a \texttt{break} statement inside a loop,
+the IR builder must emit an unconditional branch to the loop's exit
+basic block.  \texttt{\_kcc\_ir\_build\_break} reads the break target
+from the top of the loop stack, allocates an \texttt{IR\_BR} instruction
+pointing at that block, and marks the current basic block as terminated
+so that no further instructions are appended to it (\stdref{6.8.6.3}).
+
+@d IR: build break @{
+// -- kcc_ir_build_break ---------------------------------------------------
+// void kcc_ir_build_break(node *stmt)
+// Emits unconditional branch to current loop's break target (exit BB).
+.globl _kcc_ir_build_break
+.p2align 2
+_kcc_ir_build_break:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Get break target from top of loop stack
+    adrp x0, _kcc_loop_depth@@PAGE
+    add  x0, x0, _kcc_loop_depth@@PAGEOFF
+    ldr  x0, [x0]
+    sub  x0, x0, #1              // top index
+    lsl  x0, x0, #4              // *16
+    adrp x1, _kcc_loop_stack@@PAGE
+    add  x1, x1, _kcc_loop_stack@@PAGEOFF
+    ldr  x19, [x1, x0]          // x19 = break_bb_id (callee-saved)
+
+    // Emit IR_BR to break target
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    str x19, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+
+    // Mark current BB as terminated
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_build_break
+@}
+
+A \texttt{continue} statement jumps to the loop's condition-test basic
+block rather than the exit.  The logic mirrors \texttt{break} except
+that it reads the continue target (offset~+8) from the loop stack
+entry instead of the break target (offset~+0).
+
+@d IR: build continue @{
+// -- kcc_ir_build_continue ------------------------------------------------
+// void kcc_ir_build_continue(node *stmt)
+// Emits unconditional branch to current loop's continue target (cond BB).
+.text
+.globl _kcc_ir_build_continue
+.p2align 2
+_kcc_ir_build_continue:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    // Get continue target from top of loop stack
+    adrp x0, _kcc_loop_depth@@PAGE
+    add  x0, x0, _kcc_loop_depth@@PAGEOFF
+    ldr  x0, [x0]
+    sub  x0, x0, #1              // top index
+    lsl  x0, x0, #4              // *16
+    add  x0, x0, #8              // offset to continue_bb_id
+    adrp x1, _kcc_loop_stack@@PAGE
+    add  x1, x1, _kcc_loop_stack@@PAGEOFF
+    ldr  x19, [x1, x0]          // x19 = continue_bb_id (callee-saved)
+
+    // Emit IR_BR to continue target
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    str x19, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+
+    // Mark current BB as terminated
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_build_continue
+@}
+
+\paragraph{End-to-end tests: miscellaneous.}
+The comma operator evaluates the left operand for its side effects,
+discards the result, and returns the right operand---the IR builder
+simply calls \texttt{kcc\_ir\_build\_expr} on each side and returns
+the second vreg.  The remaining tests guard boundary conditions:
+returning zero (ensures the epilogue does not clobber \texttt{x0})
+and returning~255 (the maximum value representable in an 8-bit exit
+status on Unix).
+
+@d Test: codegen misc @{
+echo ""
+echo "--- Miscellaneous ---"
+
+run_test "comma operator" \
+    "int main(void) { return (1, 2, 3); }" 3
+
+run_test "return zero" \
+    "int main(void) { return 0; }" 0
+
+run_test "large constant" \
+    "int main(void) { return 255; }" 255
+@}
+
+Enumeration constants are rewritten to integer literals during
+semantic analysis, so the IR builder sees plain \texttt{IR\_CONST}
+instructions.  These tests verify the rewrite for file-scope enums,
+function-local enums, arithmetic on enumerators, and the implicit
+counter (\texttt{RED}=0, \texttt{GREEN}=1, etc.).
+
+@d Test: codegen enums @{
+echo ""
+echo "--- Enums ---"
+
+run_test "enum file-scope" \
+    "enum E { A, B, C }; int main(void) { return C; }" 2
+
+run_test "enum local" \
+    "int main(void) { enum { X, Y, Z }; return X + Y + Z; }" 3
+
+run_test "enum arithmetic" \
+    "enum D { N, E, S, W }; int main(void) { return W * 10 + S; }" 32
+
+run_test "enum in if" \
+    "enum B { OFF, ON }; int main(void) { int x = ON; if (x == ON) return 1; return 0; }" 1
+@}
+
+The following test groups exercise features added during Phase~8 work
+on self-hosting readiness.  Each group targets a specific bug that was
+discovered and fixed: nested struct member access, struct arrays with
+multi-slot elements, local array-to-pointer decay, global variable
+initializers, and pointer arithmetic scaling in the all-spill model.
+
+@d Test: codegen nested structs @{
+echo ""
+echo "--- Nested Structs ---"
+
+run_test "nested-struct-basic" \
+    "struct Inner { int x; int y; }; struct Outer { struct Inner a; int b; }; int main(void) { struct Outer o; o.a.x = 10; o.a.y = 20; o.b = 30; return o.a.x + o.a.y + o.b; }" 60
+
+run_test "nested-struct-second-inner" \
+    "struct V { int x; int y; }; struct Box { struct V lo; struct V hi; }; int main(void) { struct Box b; b.lo.x = 1; b.lo.y = 2; b.hi.x = 3; b.hi.y = 4; return b.hi.x + b.hi.y; }" 7
+
+run_test "nested-struct-overwrite" \
+    "struct Inner { int x; int y; }; struct Outer { struct Inner a; int b; }; int main(void) { struct Outer o; o.a.x = 5; o.a.x = 9; return o.a.x; }" 9
+
+run_test "nested-struct-field-isolation" \
+    "struct Inner { int x; int y; }; struct Outer { struct Inner a; int b; }; int main(void) { struct Outer o; o.a.x = 10; o.a.y = 20; o.b = 30; return o.b; }" 30
+@}
+
+@d Test: codegen struct arrays @{
+echo ""
+echo "--- Struct Arrays ---"
+
+run_test "struct-array-basic" \
+    "struct Pair { int a; int b; }; int main(void) { struct Pair arr[3]; arr[0].a=1; arr[0].b=2; arr[1].a=3; arr[1].b=4; arr[2].a=5; arr[2].b=6; return arr[1].a + arr[2].b; }" 9
+
+run_test "struct-array-first-last" \
+    "struct Pair { int a; int b; }; int main(void) { struct Pair arr[2]; arr[0].a=10; arr[0].b=20; arr[1].a=30; arr[1].b=40; return arr[0].a + arr[1].b; }" 50
+
+run_test "struct-array-decay" \
+    "struct Pair { int a; int b; }; int main(void) { struct Pair arr[3]; arr[0].a=1; arr[0].b=2; arr[1].a=3; arr[1].b=4; arr[2].a=5; arr[2].b=6; struct Pair *p = arr; return p[1].a + p[2].b; }" 9
+
+run_test "struct-array-loop" \
+    "struct V { int x; int y; }; int main(void) { struct V a[3]; a[0].x=1; a[1].x=2; a[2].x=3; a[0].y=10; a[1].y=20; a[2].y=30; int s=0; int i=0; while(i<3){s=s+a[i].x+a[i].y; i=i+1;} return s; }" 66
+@}
+
+@d Test: codegen global init @{
+echo ""
+echo "--- Global Initializers ---"
+
+run_test "global-init-simple" \
+    "int x = 42; int main(void) { return x; }" 42
+
+run_test "global-init-two" \
+    "int x = 10; int y = 20; int main(void) { return x + y; }" 30
+
+run_test "global-init-expr" \
+    "int x = 10; int y = 20; int z; int main(void) { z = x + y; return z; }" 30
+
+run_test "global-init-zero" \
+    "int x; int y = 5; int main(void) { return x + y; }" 5
+
+run_test "global-init-overwrite" \
+    "int x = 10; int main(void) { x = 20; return x; }" 20
+
+run_test "global-init-negative" \
+    "int x = 99; int main(void) { return x - 100 + 1; }" 0
+@}
+
+@d Test: codegen ptr arithmetic @{
+echo ""
+echo "--- Pointer Arithmetic ---"
+
+run_test "ptr-arith-int-scale" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int *)mmap(0,4096,3,4098,-1,0); *p = 10; *(p + 1) = 20; *(p + 2) = 30; return *(p + 0) + *(p + 1) + *(p + 2); }" 60
+
+run_test "ptr-arith-char-scale" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { char *p = (char *)mmap(0,4096,3,4098,-1,0); *p = 1; *(p + 1) = 2; *(p + 2) = 3; return *p + *(p+1) + *(p+2); }" 6
+
+run_test "ptr-arith-reverse" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int *)mmap(0,4096,3,4098,-1,0); *(p+0)=5; *(p+1)=10; *(p+2)=15; return *(p+2); }" 15
+
+run_test "ptr-arith-loop" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int *)mmap(0,4096,3,4098,-1,0); int i=0; while(i<5){*(p+i)=i*i; i=i+1;} return *(p+3); }" 9
+@}
+
+\subsection{Pointer Arrays}
+
+An array whose elements are themselves pointers---\texttt{int *a[N]},
+and the \texttt{char **argv} idiom---exercises the boundary between the
+array and pointer subscript lowerings described in
+\S\ref{sec:ir-subscript}.  The array variable is indexed from its
+alloca base to yield a slot holding a pointer, which a second
+dereference then follows; the top-level declared kind
+(\texttt{TY\_ARRAY}) rather than the element kind (\texttt{TY\_PTR})
+determines the addressing mode.  These tests cover element writes and
+reads, indirection through a decayed \texttt{int **} view, variable
+indices, and passing a pointer array to a function.
+
+@d Test: codegen pointer arrays @{
+echo ""
+echo "--- Pointer Arrays ---"
+
+run_test "ptrarr-idx0" \
+    "int main(void){ int a=20; int *arr[2]; arr[0]=&a; return *arr[0]; }" 20
+
+run_test "ptrarr-idx1" \
+    "int main(void){ int b=20; int *arr[2]; arr[1]=&b; return *arr[1]; }" 20
+
+run_test "ptrarr-var-index" \
+    "int main(void){ int a=7,b=8; int *arr[2]; arr[0]=&a; arr[1]=&b; int i=1; return *arr[i]; }" 8
+
+run_test "ptrarr-decayed-view" \
+    "int main(void){ int a=4,b=9; int *arr[2]; arr[0]=&a; arr[1]=&b; int **pp=arr; return *pp[1]; }" 9
+
+run_test "ptrarr-param" \
+    "int sum(int **pp,int n){ int i,s=0; for(i=0;i<n;i=i+1){ s=s+*pp[i]; } return s; } int main(void){ int a=1,b=2,c=3; int *arr[3]; arr[0]=&a;arr[1]=&b;arr[2]=&c; return sum(arr,3); }" 6
+
+run_test "charpp-argv-like" \
+    "int slen(char*s){int n=0; while(s[n]) n=n+1; return n;} int main(void){ char *words[2]; words[0]=\"hi\"; words[1]=\"abc\"; char **w=words; return slen(w[1]); }" 3
+@}
+
+\subsection{Initializer Lists}
+
+Brace-enclosed initializers seed an aggregate positionally, one value
+per eight-byte slot, or---with a designator---at a named position.  The
+tests below cover explicit and implicit array bounds, a short list whose
+tail must zero-fill (\S\ref{sec:ir-subscript} reads the same slots
+back), flat struct initialization, and a file-scope lookup table---the
+shape a self-hosted lexer's character-class tables take.  Designated
+forms (\texttt{[i] =}, \texttt{.member =}) are exercised against
+\texttt{clang} in the differential suite.
+
+@d Test: codegen init lists @{
+echo ""
+echo "--- Initializer Lists ---"
+
+run_test "initlist-array-explicit" \
+    "int main(void){ int a[3]={10,20,30}; return a[0]+a[1]+a[2]; }" 60
+
+run_test "initlist-array-implicit" \
+    "int main(void){ int a[]={4,5,6,7}; return a[3]; }" 7
+
+run_test "initlist-array-partial-zero" \
+    "int main(void){ int a[4]={5,6}; return a[0]+a[1]+a[2]+a[3]; }" 11
+
+run_test "initlist-array-index-loop" \
+    "int main(void){ int a[5]={2,4,6,8,10}; int s=0; int i=0; while(i<5){s=s+a[i]; i=i+1;} return s; }" 30
+
+run_test "initlist-struct-flat" \
+    "struct P{int x;int y;}; int main(void){ struct P p={3,4}; return p.x+p.y; }" 7
+
+run_test "initlist-struct-partial-zero" \
+    "struct P{int x;int y;int z;}; int main(void){ struct P p={3,4}; return p.x+p.y+p.z; }" 7
+
+run_test "initlist-global-table" \
+    "int t[4]={7,8,9,10}; int main(void){ return t[1]+t[3]; }" 18
+
+run_test "initlist-global-lut" \
+    "int digit[10]={0,1,2,3,4,5,6,7,8,9}; int main(void){ int s=0; int i=0; while(i<10){s=s+digit[i]; i=i+1;} return s; }" 45
+@}
+
+\subsection{Static Locals}
+
+A \texttt{static} local keeps its value across calls and is initialised
+just once.  The tests exercise persistence across repeated calls, the
+initialise-once rule (a non-zero seed applied at program start, not on
+each entry), the implicit zero of an uninitialised static, a static
+that shadows a like-named file-scope global, and two functions whose
+identically-named statics must stay distinct.
+
+@d Test: codegen static locals @{
+echo ""
+echo "--- Static Locals ---"
+
+run_test "static-persist" \
+    "int next(void){ static int c=0; c=c+1; return c; } int main(void){ next(); next(); return next(); }" 3
+
+run_test "static-init-once" \
+    "int f(void){ static int x=10; x=x+5; return x; } int main(void){ f(); return f(); }" 20
+
+run_test "static-zero-default" \
+    "int g(void){ static int n; n=n+2; return n; } int main(void){ g(); g(); return g(); }" 6
+
+run_test "static-compound-assign" \
+    "int acc(int v){ static int t=0; t+=v; return t; } int main(void){ acc(10); acc(20); return acc(5); }" 35
+
+run_test "static-shadows-global" \
+    "int c=100; int inc(void){ static int c=0; c=c+1; return c; } int main(void){ inc(); inc(); return inc()+c; }" 103
+
+run_test "static-two-distinct" \
+    "int a(void){ static int c=0; c=c+1; return c; } int b(void){ static int c=50; c=c+1; return c; } int main(void){ b(); b(); return a()*10 + (b()-50); }" 13
+@}
+
+The final test group assembles several patterns from the self-hosting
+compiler into one program: arena allocation, linked list traversal,
+recursive tree evaluation, and multi-field struct access through
+pointers.  Passing these tests gives high confidence that the backend
+can handle the patterns found in~\kcc{} itself.
+
+@d Test: codegen self-hosting @{
+echo ""
+echo "--- Self-hosting Patterns ---"
+
+run_test "arena-alloc-pattern" \
+    "void *mmap(void*,long,int,int,int,long); char *base; long pos; void init(void) { base=(char*)mmap(0,65536,3,4098,-1,0); pos=0; } char *alloc(long n) { char *p = base + pos; pos = pos + n; return p; } int main(void) { init(); char *a=alloc(8); char *b=alloc(8); return (b > a) ? 1 : 0; }" 1
+
+run_test "linked-list" \
+    "void *mmap(void*,long,int,int,int,long); char *base; long pos; void init(void) { base=(char*)mmap(0,65536,3,4098,-1,0); pos=0; } char *alloc(long n) { char *p = base + pos; pos = pos + n; return p; } struct Node { int val; struct Node *next; }; struct Node *make(int v, struct Node *nx) { struct Node *n = (struct Node *)alloc(16); n->val = v; n->next = nx; return n; } int sum(struct Node *n) { int s=0; while(n) { s=s+n->val; n=n->next; } return s; } int main(void) { init(); struct Node *list = make(1, make(2, make(3, 0))); return sum(list); }" 6
+
+run_test "recursive-tree-eval" \
+    "void *mmap(void*,long,int,int,int,long); char *base; long pos; void init(void) { base=(char*)mmap(0,65536,3,4098,-1,0); pos=0; } char *alloc(long n) { char *p = base + pos; pos = pos + n; return p; } struct N { int tag; long val; struct N *l; struct N *r; }; struct N *leaf(long v) { struct N *n=(struct N*)alloc(32); n->tag=1; n->val=v; n->l=0; n->r=0; return n; } struct N *bin(int t, struct N *a, struct N *b) { struct N *n=(struct N*)alloc(32); n->tag=t; n->l=a; n->r=b; n->val=0; return n; } long ev(struct N *n) { if(n->tag==1) return n->val; long a=ev(n->l); long b=ev(n->r); if(n->tag==2) return a+b; if(n->tag==3) return a-b; if(n->tag==4) return a*b; return 0; } int main(void) { init(); struct N *r=bin(4,bin(2,leaf(2),leaf(3)),leaf(4)); return (int)ev(r); }" 20
+
+run_test "string-compare" \
+    "int streq(char *a, char *b, int n) { int i=0; while(i<n){ if(*(a+i)!=*(b+i)) return 0; i=i+1; } return 1; } int main(void) { char *x = \"hello\"; char *y = \"hello\"; char *z = \"world\"; return streq(x,y,5) + streq(x,z,5); }" 1
+
+run_test "classify-char" \
+    "int cls(char c) { if(c>='a' && c<='z') return 1; if(c>='0' && c<='9') return 2; return 0; } int main(void) { return cls('x') + cls('3') + cls(' '); }" 3
+@}
+
+Function pointers require three pieces to work together: the parser
+must handle grouped declarators with function suffixes
+(\texttt{int~(*fp)(int,~int)}), the IR builder must distinguish
+indirect calls from direct calls, and the code generator must emit
+\texttt{BLR} instead of \texttt{BL}.  The tests below exercise local
+function pointer variables, function pointers as parameters, and
+higher-order patterns like \texttt{apply}.
+
+@d Test: codegen fnptr @{
+echo ""
+echo "--- Function Pointers ---"
+
+run_test "fnptr-basic" \
+    "int add(int a, int b) { return a + b; } int main(void) { int (*fp)(int, int) = add; return fp(3, 4); }" 7
+
+run_test "fnptr-swap" \
+    "int add(int a, int b) { return a + b; } int sub(int a, int b) { return a - b; } int main(void) { int (*fp)(int, int) = add; int r1 = fp(10, 3); fp = sub; int r2 = fp(10, 3); return r1 + r2; }" 20
+
+run_test "fnptr-param" \
+    "int add(int a, int b) { return a + b; } int apply(int (*fn)(int, int), int x, int y) { return fn(x, y); } int main(void) { return apply(add, 5, 6); }" 11
+
+run_test "fnptr-multi-ops" \
+    "int add(int a, int b) { return a + b; } int sub(int a, int b) { return a - b; } int mul(int a, int b) { return a * b; } int apply(int (*fn)(int, int), int x, int y) { return fn(x, y); } int main(void) { return apply(add, 3, 4) + apply(sub, 10, 3) + apply(mul, 2, 5); }" 24
+
+run_test "fnptr-higher-order" \
+    "int dbl(int x) { return x * 2; } int sq(int x) { return x * x; } int mapsum(int (*f)(int), int n) { int s=0; int i=1; while(i<=n){s=s+f(i); i=i+1;} return s; } int main(void) { return mapsum(dbl, 3) + mapsum(sq, 3); }" 26
+
+run_test "fnptr-struct-field" \
+    "struct Ops { int (*f)(int, int); }; int add(int a, int b) { return a + b; } int main(void) { struct Ops o; o.f = add; return o.f(20, 22); }" 42
+
+run_test "fnptr-struct-arrow" \
+    "struct C { int (*op)(int); }; int dbl(int x) { return x * 2; } int apply(struct C *c, int v) { return c->op(v); } int main(void) { struct C c; c.op = dbl; return apply(&c, 21); }" 42
+@}
+

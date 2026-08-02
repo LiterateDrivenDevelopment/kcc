@@ -1,0 +1,815 @@
+% 32a-ir-dump.weft — textual IR dump (--dump-ir)
+%
+% Split from 32-ir-builder.weft (structural refactor, no content changes):
+% the human-readable IR printer used by the --dump-ir flag.
+
+\section{IR Dump}
+
+We implement the dump first so that we can test the builder
+incrementally.  The format mirrors LLVM IR loosely:
+\begin{verbatim}
+func @main() -> i32:
+  bb0:
+    %0 = const i32 42
+    ret i32 %0
+\end{verbatim}
+
+@d IR: dump @{
+// -- kcc_ir_dump ----------------------------------------------------------
+// void kcc_ir_dump(void)
+// Prints all IR functions in textual form.
+.text
+.globl _kcc_ir_dump
+.p2align 2
+_kcc_ir_dump:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+
+    // Load function list vec
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x19, [x0]               // x19 = vec ptr
+    cbz x19, .Lird_done
+
+    ldr x20, [x19, #VEC_COUNT]  // x20 = func count
+    mov x21, #0                 // x21 = index
+
+.Lird_func_loop:
+    cmp x21, x20
+    b.ge .Lird_done
+
+    // Get func pointer: vec_get(vec, index)
+    mov x0, x19
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x22, [x0]              // x22 = IR func ptr (deref pointer elem)
+
+    // Print "func @@"
+    adrp x0, _kcc_ir_str_func@@PAGE
+    add  x0, x0, _kcc_ir_str_func@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Print function name
+    ldr x0, [x22, #IRF_NAME]
+    bl _kcc_io_puts
+
+    // Print "() -> "
+    adrp x0, _kcc_ir_str_arrow@@PAGE
+    add  x0, x0, _kcc_ir_str_arrow@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Print return type
+    ldr x0, [x22, #IRF_RETTYPE]
+    bl _kcc_ir_dump_type_short
+
+    // Print ":"
+    adrp x0, _kcc_ir_str_colon_nl@@PAGE
+    add  x0, x0, _kcc_ir_str_colon_nl@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Walk basic blocks via the blocks vec
+    ldr x0, [x22, #IRF_BLOCKS]
+    cbz x0, .Lird_next_func
+    // Save blocks vec info in callee-saved regs
+    // We reuse x22 temporarily - save func ptr on stack
+    str x22, [sp, #80]          // save func ptr in free stack slot
+    mov x22, x0                 // x22 = blocks vec
+    ldr x23, [x22, #VEC_COUNT]
+    mov x24, #0
+
+.Lird_bb_loop:
+    cmp x24, x23
+    b.ge .Lird_bb_done
+
+    mov x0, x22
+    mov x1, x24
+    bl _kcc_vec_get
+    ldr x25, [x0]              // x25 = BB ptr
+
+    // Print "  bb"
+    adrp x0, _kcc_ir_str_bb@@PAGE
+    add  x0, x0, _kcc_ir_str_bb@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Print BB id
+    ldr x0, [x25, #BB_ID]
+    bl _kcc_io_putu
+
+    // Print ":"
+    adrp x0, _kcc_ir_str_colon_nl@@PAGE
+    add  x0, x0, _kcc_ir_str_colon_nl@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Walk instructions in this BB
+    ldr x26, [x25, #BB_FIRST]
+
+.Lird_instr_loop:
+    cbz x26, .Lird_next_bb
+
+    mov x0, x26
+    bl _kcc_ir_dump_instr
+
+    ldr x26, [x26, #IR_NEXT]
+    b .Lird_instr_loop
+
+.Lird_next_bb:
+    add x24, x24, #1
+    b .Lird_bb_loop
+
+.Lird_bb_done:
+    ldr x22, [sp, #80]         // restore func ptr
+    // Print blank line between functions
+    mov x0, #'\n'
+    bl _kcc_io_putc
+
+.Lird_next_func:
+    add x21, x21, #1
+    b .Lird_func_loop
+
+.Lird_done:
+    bl _kcc_io_flush
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@| _kcc_ir_dump
+@}
+
+\subsection{Dumping a Single Instruction}
+
+Each instruction is printed on one line with four-space indentation.
+The general format is
+\texttt{\%\textit{dest}\;=\;\textit{op}\;\textit{type}\;\textit{src1},\;\textit{src2}},
+though the exact layout varies by opcode: branches print
+\texttt{bb\textit{N}} targets, calls print the callee name and
+argument list, and side-effect-only instructions (\textsc{store},
+\textsc{ret}, \textsc{br}) omit the destination.
+
+@d IR: dump instruction @{
+// -- kcc_ir_dump_instr ----------------------------------------------------
+// void kcc_ir_dump_instr(ir_instr *instr)
+//   x0 = instruction pointer
+// Prints one instruction line with leading "    " indent.
+.text
+.globl _kcc_ir_dump_instr
+.p2align 2
+_kcc_ir_dump_instr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0                // x19 = instr
+    ldr x20, [x19, #IR_OP]     // x20 = opcode
+
+    // Print indent
+    adrp x0, _kcc_ir_str_indent@@PAGE
+    add  x0, x0, _kcc_ir_str_indent@@PAGEOFF
+    bl _kcc_io_puts
+
+    // Opcodes that don't produce a dest: store, br, br_cond, ret, nop
+    cmp x20, #IR_STORE
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_BR
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_BR_COND
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_RET
+    b.eq .Lidi_no_dest
+    cmp x20, #IR_NOP
+    b.eq .Lidi_no_dest
+
+    // Print "%N = "
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_DEST]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_eq@@PAGE
+    add  x0, x0, _kcc_ir_str_eq@@PAGEOFF
+    bl _kcc_io_puts
+
+.Lidi_no_dest:
+    // Dispatch on opcode
+    cmp x20, #IR_ADD
+    b.eq .Lidi_add
+    cmp x20, #IR_SUB
+    b.eq .Lidi_sub
+    cmp x20, #IR_MUL
+    b.eq .Lidi_mul
+    cmp x20, #IR_SDIV
+    b.eq .Lidi_sdiv
+    cmp x20, #IR_UDIV
+    b.eq .Lidi_udiv
+    cmp x20, #IR_SMOD
+    b.eq .Lidi_smod
+    cmp x20, #IR_UMOD
+    b.eq .Lidi_umod
+    cmp x20, #IR_NEG
+    b.eq .Lidi_neg
+    cmp x20, #IR_AND
+    b.eq .Lidi_and
+    cmp x20, #IR_OR
+    b.eq .Lidi_or
+    cmp x20, #IR_XOR
+    b.eq .Lidi_xor
+    cmp x20, #IR_SHL
+    b.eq .Lidi_shl
+    cmp x20, #IR_LSHR
+    b.eq .Lidi_lshr
+    cmp x20, #IR_ASHR
+    b.eq .Lidi_ashr
+    cmp x20, #IR_NOT
+    b.eq .Lidi_not
+    cmp x20, #IR_CMP_EQ
+    b.eq .Lidi_cmp_eq
+    cmp x20, #IR_CMP_NE
+    b.eq .Lidi_cmp_ne
+    cmp x20, #IR_CMP_SLT
+    b.eq .Lidi_cmp_slt
+    cmp x20, #IR_CMP_SLE
+    b.eq .Lidi_cmp_sle
+    cmp x20, #IR_CMP_SGT
+    b.eq .Lidi_cmp_sgt
+    cmp x20, #IR_CMP_SGE
+    b.eq .Lidi_cmp_sge
+    cmp x20, #IR_CMP_ULT
+    b.eq .Lidi_cmp_ult
+    cmp x20, #IR_CMP_ULE
+    b.eq .Lidi_cmp_ule
+    cmp x20, #IR_LOAD
+    b.eq .Lidi_load
+    cmp x20, #IR_STORE
+    b.eq .Lidi_store
+    cmp x20, #IR_ALLOCA
+    b.eq .Lidi_alloca
+    cmp x20, #IR_GEP
+    b.eq .Lidi_gep
+    cmp x20, #IR_BR
+    b.eq .Lidi_br
+    cmp x20, #IR_BR_COND
+    b.eq .Lidi_br_cond
+    cmp x20, #IR_RET
+    b.eq .Lidi_ret
+    cmp x20, #IR_CALL
+    b.eq .Lidi_call
+    cmp x20, #IR_CALL_IND
+    b.eq .Lidi_call_ind
+    cmp x20, #IR_SEXT
+    b.eq .Lidi_sext
+    cmp x20, #IR_ZEXT
+    b.eq .Lidi_zext
+    cmp x20, #IR_TRUNC
+    b.eq .Lidi_trunc
+    cmp x20, #IR_BITCAST
+    b.eq .Lidi_bitcast
+    cmp x20, #IR_SITOFP
+    b.eq .Lidi_sitofp
+    cmp x20, #IR_FPTOSI
+    b.eq .Lidi_fptosi
+    cmp x20, #IR_CONST
+    b.eq .Lidi_const
+    cmp x20, #IR_NOP
+    b.eq .Lidi_nop
+    cmp x20, #IR_GLOBAL_REF
+    b.eq .Lidi_global_ref
+    cmp x20, #IR_STRING_LIT
+    b.eq .Lidi_string_lit
+
+    // Unknown opcode
+    adrp x0, _kcc_ir_str_unknown@@PAGE
+    add  x0, x0, _kcc_ir_str_unknown@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lidi_nl
+@| _kcc_ir_dump_instr
+@}
+
+\paragraph{Binary and Comparison Operations}
+
+Every arithmetic, bitwise, and comparison opcode follows the same
+printing pattern: load the opcode's string label into \texttt{x0}
+and branch to the shared \texttt{.Lidi\_binop} handler.  That handler
+emits the format \texttt{op type \%src1, \%src2}, reading the type
+descriptor from \texttt{IR\_TYPE} and both source virtual registers
+from \texttt{IR\_SRC1} and \texttt{IR\_SRC2}.  Arithmetic opcodes
+(\textsc{add}, \textsc{sub}, \textsc{mul}, \textsc{sdiv}/\textsc{udiv},
+\textsc{smod}/\textsc{umod}) come first, followed by bitwise
+(\textsc{and}, \textsc{or}, \textsc{xor}, \textsc{shl},
+\textsc{lshr}, \textsc{ashr}) and the six signed comparison
+predicates (\textsc{cmp\_eq} through \textsc{cmp\_sge}).
+
+@d IR: dump instruction @{
+// -- Binary ops: "op type %src1, %src2" -----------------------------------
+.Lidi_add:
+    adrp x0, _kcc_ir_op_add@@PAGE
+    add  x0, x0, _kcc_ir_op_add@@PAGEOFF
+    b .Lidi_binop
+.Lidi_sub:
+    adrp x0, _kcc_ir_op_sub@@PAGE
+    add  x0, x0, _kcc_ir_op_sub@@PAGEOFF
+    b .Lidi_binop
+.Lidi_mul:
+    adrp x0, _kcc_ir_op_mul@@PAGE
+    add  x0, x0, _kcc_ir_op_mul@@PAGEOFF
+    b .Lidi_binop
+.Lidi_sdiv:
+    adrp x0, _kcc_ir_op_sdiv@@PAGE
+    add  x0, x0, _kcc_ir_op_sdiv@@PAGEOFF
+    b .Lidi_binop
+.Lidi_udiv:
+    adrp x0, _kcc_ir_op_udiv@@PAGE
+    add  x0, x0, _kcc_ir_op_udiv@@PAGEOFF
+    b .Lidi_binop
+.Lidi_smod:
+    adrp x0, _kcc_ir_op_smod@@PAGE
+    add  x0, x0, _kcc_ir_op_smod@@PAGEOFF
+    b .Lidi_binop
+.Lidi_umod:
+    adrp x0, _kcc_ir_op_umod@@PAGE
+    add  x0, x0, _kcc_ir_op_umod@@PAGEOFF
+    b .Lidi_binop
+.Lidi_and:
+    adrp x0, _kcc_ir_op_and@@PAGE
+    add  x0, x0, _kcc_ir_op_and@@PAGEOFF
+    b .Lidi_binop
+.Lidi_or:
+    adrp x0, _kcc_ir_op_or@@PAGE
+    add  x0, x0, _kcc_ir_op_or@@PAGEOFF
+    b .Lidi_binop
+.Lidi_xor:
+    adrp x0, _kcc_ir_op_xor@@PAGE
+    add  x0, x0, _kcc_ir_op_xor@@PAGEOFF
+    b .Lidi_binop
+.Lidi_shl:
+    adrp x0, _kcc_ir_op_shl@@PAGE
+    add  x0, x0, _kcc_ir_op_shl@@PAGEOFF
+    b .Lidi_binop
+.Lidi_lshr:
+    adrp x0, _kcc_ir_op_lshr@@PAGE
+    add  x0, x0, _kcc_ir_op_lshr@@PAGEOFF
+    b .Lidi_binop
+.Lidi_ashr:
+    adrp x0, _kcc_ir_op_ashr@@PAGE
+    add  x0, x0, _kcc_ir_op_ashr@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_eq:
+    adrp x0, _kcc_ir_op_cmp_eq@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_eq@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_ne:
+    adrp x0, _kcc_ir_op_cmp_ne@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_ne@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_slt:
+    adrp x0, _kcc_ir_op_cmp_slt@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_slt@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_sle:
+    adrp x0, _kcc_ir_op_cmp_sle@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_sle@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_sgt:
+    adrp x0, _kcc_ir_op_cmp_sgt@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_sgt@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_sge:
+    adrp x0, _kcc_ir_op_cmp_sge@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_sge@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_ult:
+    adrp x0, _kcc_ir_op_cmp_ult@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_ult@@PAGEOFF
+    b .Lidi_binop
+.Lidi_cmp_ule:
+    adrp x0, _kcc_ir_op_cmp_ule@@PAGE
+    add  x0, x0, _kcc_ir_op_cmp_ule@@PAGEOFF
+    b .Lidi_binop
+
+.Lidi_binop:
+    bl _kcc_io_puts
+    // Print " type %src1, %src2"
+    mov x0, #' '
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma@@PAGE
+    add  x0, x0, _kcc_ir_str_comma@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC2]
+    bl _kcc_io_putu
+    b .Lidi_nl
+@}
+
+\paragraph{Unary and Type-Conversion Operations}
+
+Unary instructions---\textsc{neg}, \textsc{not}, and the three
+width-changing casts \textsc{sext}, \textsc{zext}, \textsc{trunc}---use
+the shared \texttt{.Lidi\_unop} handler.  The output format is
+\texttt{op type \%src1}, identical to the binary pattern but with
+only one source operand read from \texttt{IR\_SRC1}.  Sign- and
+zero-extension are semantically distinct at the IR level so that
+the backend can select the correct ARM64 widening instruction
+(\texttt{SXTW} versus \texttt{UXTW}).
+
+@d IR: dump instruction @{
+// -- Unary ops: "op type %src1" -------------------------------------------
+.Lidi_neg:
+    adrp x0, _kcc_ir_op_neg@@PAGE
+    add  x0, x0, _kcc_ir_op_neg@@PAGEOFF
+    b .Lidi_unop
+.Lidi_not:
+    adrp x0, _kcc_ir_op_not@@PAGE
+    add  x0, x0, _kcc_ir_op_not@@PAGEOFF
+    b .Lidi_unop
+.Lidi_sext:
+    adrp x0, _kcc_ir_op_sext@@PAGE
+    add  x0, x0, _kcc_ir_op_sext@@PAGEOFF
+    b .Lidi_unop
+.Lidi_zext:
+    adrp x0, _kcc_ir_op_zext@@PAGE
+    add  x0, x0, _kcc_ir_op_zext@@PAGEOFF
+    b .Lidi_unop
+.Lidi_trunc:
+    adrp x0, _kcc_ir_op_trunc@@PAGE
+    add  x0, x0, _kcc_ir_op_trunc@@PAGEOFF
+    b .Lidi_unop
+.Lidi_bitcast:
+    adrp x0, _kcc_ir_op_bitcast@@PAGE
+    add  x0, x0, _kcc_ir_op_bitcast@@PAGEOFF
+    b .Lidi_unop
+.Lidi_sitofp:
+    adrp x0, _kcc_ir_op_sitofp@@PAGE
+    add  x0, x0, _kcc_ir_op_sitofp@@PAGEOFF
+    b .Lidi_unop
+.Lidi_fptosi:
+    adrp x0, _kcc_ir_op_fptosi@@PAGE
+    add  x0, x0, _kcc_ir_op_fptosi@@PAGEOFF
+    b .Lidi_unop
+
+.Lidi_unop:
+    bl _kcc_io_puts
+    mov x0, #' '
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+@}
+
+\paragraph{Memory, Control Flow, and Miscellaneous Operations}
+
+The remaining opcodes each have their own bespoke printing logic
+because their operand layouts differ from one another.  Memory
+operations \textsc{load} and \textsc{store} include pointer
+annotations; \textsc{alloca} prints only its type.  The branch
+family uses basic-block identifiers (\texttt{bb\textit{N}}) rather
+than virtual registers: \textsc{br} takes one target while
+\textsc{br\_cond} takes a condition vreg plus true/false targets.
+\textsc{ret} checks whether the return type is \texttt{void} to
+decide if a value operand follows.  \textsc{call} prints the callee
+name prefixed with \texttt{@@}.  Finally, \textsc{const},
+\textsc{nop}, \textsc{global\_ref}, and \textsc{string\_lit} handle
+immediates, no-ops, global symbol references, and inline string
+data respectively.  The shared epilogue at \texttt{.Lidi\_nl}
+appends a newline and restores callee-saved registers before
+returning.
+
+@d IR: dump instruction @{
+// -- load: "load type, ptr %src1" -----------------------------------------
+.Lidi_load:
+    adrp x0, _kcc_ir_op_load@@PAGE
+    add  x0, x0, _kcc_ir_op_load@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    adrp x0, _kcc_ir_str_ptr_pct@@PAGE
+    add  x0, x0, _kcc_ir_str_ptr_pct@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- store: "store type %src1, ptr %src2" ---------------------------------
+.Lidi_store:
+    adrp x0, _kcc_ir_op_store@@PAGE
+    add  x0, x0, _kcc_ir_op_store@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_ptr_pct@@PAGE
+    add  x0, x0, _kcc_ir_str_ptr_pct@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC2]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- alloca: "alloca type" ------------------------------------------------
+.Lidi_alloca:
+    adrp x0, _kcc_ir_op_alloca@@PAGE
+    add  x0, x0, _kcc_ir_op_alloca@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    b .Lidi_nl
+
+// -- gep: "gep %base, %index" ---------------------------------------------
+.Lidi_gep:
+    adrp x0, _kcc_ir_op_gep@@PAGE
+    add  x0, x0, _kcc_ir_op_gep@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma@@PAGE
+    add  x0, x0, _kcc_ir_str_comma@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC2]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- br: "br bb<N>" -------------------------------------------------------
+.Lidi_br:
+    adrp x0, _kcc_ir_op_br@@PAGE
+    add  x0, x0, _kcc_ir_op_br@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- br_cond: "br_cond %cond, bb<T>, bb<F>" ------------------------------
+.Lidi_br_cond:
+    adrp x0, _kcc_ir_op_br_cond@@PAGE
+    add  x0, x0, _kcc_ir_op_br_cond@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_DEST]   // cond vreg is in DEST for br_cond
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma_bb@@PAGE
+    add  x0, x0, _kcc_ir_str_comma_bb@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC1]   // true BB id
+    bl _kcc_io_putu
+    adrp x0, _kcc_ir_str_comma_bb@@PAGE
+    add  x0, x0, _kcc_ir_str_comma_bb@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_SRC2]   // false BB id
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- ret: "ret type %src1" or "ret void" ----------------------------------
+.Lidi_ret:
+    adrp x0, _kcc_ir_op_ret@@PAGE
+    add  x0, x0, _kcc_ir_op_ret@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    // Check if void return
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lidi_nl
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_VOID
+    b.eq .Lidi_nl
+    // Non-void: print " %src1"
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- call: "call type @@name(%src1, ...)" ---------------------------------
+.Lidi_call:
+    adrp x0, _kcc_ir_op_call@@PAGE
+    add  x0, x0, _kcc_ir_op_call@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    // Print " @@<name>"
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'@@'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]   // SRC1 = name pointer
+    cbz x0, .Lidi_nl
+    bl _kcc_io_puts
+    b .Lidi_nl
+
+// -- call_ind: "call_ind type %<vreg>(...)" --------------------------------
+.Lidi_call_ind:
+    adrp x0, _kcc_ir_op_call_ind@@PAGE
+    add  x0, x0, _kcc_ir_op_call_ind@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    // Print " %<vreg>"
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'%'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]      // SRC1 = fn-ptr vreg
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- const: "const type <imm>" -------------------------------------------
+.Lidi_const:
+    adrp x0, _kcc_ir_op_const@@PAGE
+    add  x0, x0, _kcc_ir_op_const@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]   // immediate value
+    bl _kcc_io_putu
+    b .Lidi_nl
+
+// -- nop ------------------------------------------------------------------
+.Lidi_nop:
+    adrp x0, _kcc_ir_op_nop@@PAGE
+    add  x0, x0, _kcc_ir_op_nop@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lidi_nl
+
+// -- global_ref: "global_ref type @@name" ---------------------------------
+.Lidi_global_ref:
+    adrp x0, _kcc_ir_op_global_ref@@PAGE
+    add  x0, x0, _kcc_ir_op_global_ref@@PAGEOFF
+    bl _kcc_io_puts
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_dump_type_short
+    mov x0, #' '
+    bl _kcc_io_putc
+    mov x0, #'@@'
+    bl _kcc_io_putc
+    ldr x0, [x19, #IR_SRC1]   // name pointer
+    cbz x0, .Lidi_nl
+    bl _kcc_io_puts
+    b .Lidi_nl
+
+// -- string_lit: "string_lit \"<data>\"" ----------------------------------
+.Lidi_string_lit:
+    adrp x0, _kcc_ir_op_string_lit@@PAGE
+    add  x0, x0, _kcc_ir_op_string_lit@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #'"'
+    bl _kcc_io_putc
+    ldr x21, [x19, #IR_SRC1]
+    ldr x22, [x19, #IR_SRC2]
+    mov x20, #0
+.Lidi_string_ch:
+    cmp x20, x22
+    b.ge .Lidi_string_end
+    ldrb w0, [x21, x20]
+    bl _kcc_io_putc
+    add x20, x20, #1
+    b .Lidi_string_ch
+.Lidi_string_end:
+    mov x0, #'"'
+    bl _kcc_io_putc
+    b .Lidi_nl
+
+.Lidi_nl:
+    mov x0, #'\n'
+    bl _kcc_io_putc
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Short Type Name}
+
+For IR output we print compact type names: \texttt{i32}, \texttt{i64},
+\texttt{void}, \texttt{ptr}, etc.
+
+@d IR: dump type short @{
+// -- kcc_ir_dump_type_short -----------------------------------------------
+// void kcc_ir_dump_type_short(type_desc *t)
+//   x0 = type descriptor (may be NULL)
+// Prints a short type label.
+.text
+.globl _kcc_ir_dump_type_short
+.p2align 2
+_kcc_ir_dump_type_short:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    cbz x0, .Lidts_unknown
+    mov x19, x0
+
+    ldr x0, [x19, #TY_KIND]
+
+    cmp x0, #TY_VOID
+    b.eq .Lidts_void
+    cmp x0, #TY_BOOL
+    b.eq .Lidts_i1
+    cmp x0, #TY_CHAR
+    b.eq .Lidts_i8
+    cmp x0, #TY_SHORT
+    b.eq .Lidts_i16
+    cmp x0, #TY_INT
+    b.eq .Lidts_i32
+    cmp x0, #TY_LONG
+    b.eq .Lidts_i64
+    cmp x0, #TY_LLONG
+    b.eq .Lidts_i64
+    cmp x0, #TY_FLOAT
+    b.eq .Lidts_f32
+    cmp x0, #TY_DOUBLE
+    b.eq .Lidts_f64
+    cmp x0, #TY_PTR
+    b.eq .Lidts_ptr
+    cmp x0, #TY_ARRAY
+    b.eq .Lidts_ptr
+    cmp x0, #TY_FUNC
+    b.eq .Lidts_ptr
+    cmp x0, #TY_STRUCT
+    b.eq .Lidts_struct
+    cmp x0, #TY_UNION
+    b.eq .Lidts_struct
+    cmp x0, #TY_ENUM
+    b.eq .Lidts_i32
+    b .Lidts_unknown
+
+.Lidts_void:
+    adrp x0, _kcc_ir_ty_void@@PAGE
+    add  x0, x0, _kcc_ir_ty_void@@PAGEOFF
+    b .Lidts_print
+.Lidts_i1:
+    adrp x0, _kcc_ir_ty_i1@@PAGE
+    add  x0, x0, _kcc_ir_ty_i1@@PAGEOFF
+    b .Lidts_print
+.Lidts_i8:
+    adrp x0, _kcc_ir_ty_i8@@PAGE
+    add  x0, x0, _kcc_ir_ty_i8@@PAGEOFF
+    b .Lidts_print
+.Lidts_i16:
+    adrp x0, _kcc_ir_ty_i16@@PAGE
+    add  x0, x0, _kcc_ir_ty_i16@@PAGEOFF
+    b .Lidts_print
+.Lidts_i32:
+    adrp x0, _kcc_ir_ty_i32@@PAGE
+    add  x0, x0, _kcc_ir_ty_i32@@PAGEOFF
+    b .Lidts_print
+.Lidts_i64:
+    adrp x0, _kcc_ir_ty_i64@@PAGE
+    add  x0, x0, _kcc_ir_ty_i64@@PAGEOFF
+    b .Lidts_print
+.Lidts_f32:
+    adrp x0, _kcc_ir_ty_f32@@PAGE
+    add  x0, x0, _kcc_ir_ty_f32@@PAGEOFF
+    b .Lidts_print
+.Lidts_f64:
+    adrp x0, _kcc_ir_ty_f64@@PAGE
+    add  x0, x0, _kcc_ir_ty_f64@@PAGEOFF
+    b .Lidts_print
+.Lidts_ptr:
+    adrp x0, _kcc_ir_ty_ptr@@PAGE
+    add  x0, x0, _kcc_ir_ty_ptr@@PAGEOFF
+    b .Lidts_print
+.Lidts_struct:
+    adrp x0, _kcc_ir_ty_struct@@PAGE
+    add  x0, x0, _kcc_ir_ty_struct@@PAGEOFF
+    b .Lidts_print
+.Lidts_unknown:
+    adrp x0, _kcc_ir_ty_unknown@@PAGE
+    add  x0, x0, _kcc_ir_ty_unknown@@PAGEOFF
+
+.Lidts_print:
+    bl _kcc_io_puts
+
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_dump_type_short
+@}
+

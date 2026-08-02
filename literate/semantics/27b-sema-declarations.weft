@@ -1,0 +1,631 @@
+% 27b-sema-declarations.weft — declaration checking and aggregate layout
+%
+% Split from 27-sema.weft (structural refactor, no content changes):
+% variable/function/typedef/tag checking, array-length inference, byte-
+% accurate struct/union + bit-field layout, and redefinition checks.
+
+\section{Declaration Checking}
+
+The declaration checker dispatches on the AST tag to handle each
+declaration kind.  Variable declarations resolve their type and
+register a \texttt{SYM\_VAR} in the symbol table, optionally
+type-checking the initialiser.  A variable whose type is an
+\emph{incomplete} array (\texttt{int a[] = \dots}) first has its length
+inferred by \texttt{kcc\_sema\_infer\_array\_len}, which reads the
+initializer---the element span of a brace list, or the string length
+plus one for a string literal---and synthesises a size expression onto
+the array type node \emph{before} it is resolved.  Because every later
+resolve of that node (for \texttt{sizeof}, for the stack slot, for a
+file-scope object's storage) reads the now-present size, the completed
+length is seen uniformly rather than only by the one site that happened
+to look at the initializer.  Multi-dimensional inner brace lists are not
+yet composed, so an inferred outer dimension over nested braces
+(\texttt{int m[][3] = \{\{\dots\}\}}) is left to the same nested-aggregate
+gap noted elsewhere.  Function declarations resolve the
+return type, wrap it in a \texttt{TY\_FUNC} descriptor via
+\texttt{\_kcc\_type\_func}, and register the resulting function type
+as \texttt{SYM\_FUNC}.  The \texttt{TY\_FUNC} wrapper is essential:
+without it, identifier lookup returns the bare return type, and
+function-decay produces the wrong kind of pointer---the call handler
+then falls back to \texttt{int}, corrupting pointer return values.
+After registration the checker pushes a scope for parameters and body,
+then checks the body statements.  Typedef declarations register
+\texttt{SYM\_TYPEDEF}.  Struct and union declarations register the
+tag in the tag namespace via \texttt{\_kcc\_symtab\_declare\_tag}.
+After creating the type descriptor, the checker counts the struct's
+fields and sets \texttt{TY\_SIZE} to $\mathit{nfields}\times 8$,
+matching the all-spill backend's slot size.  This size is essential
+for pointer subscript on struct pointers (\texttt{arr[i].x}), where
+the stride must equal the full struct width.
+Enum declarations register the tag and walk the enumerator list,
+assigning each constant an incrementing integer value.  The parser
+wraps standalone enum declarations in an \texttt{AST\_TYPE\_ENUM}
+node; the dispatcher unwraps it to reach the inner
+\texttt{AST\_ENUM\_DECL} before processing.  The same unwrapping
+is needed in the statement checker, since enums may be declared
+inside function bodies.
+
+@d Sema: check declaration @{
+// -- kcc_sema_check_decl --------------------------------------------------
+// void kcc_sema_check_decl(node *decl)
+//   x0 = declaration AST node
+// Processes declarations, registers symbols.
+.text
+.globl _kcc_sema_check_decl
+.p2align 2
+_kcc_sema_check_decl:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    cbz x0, .Lscd_done
+    mov x19, x0
+
+    ldr x20, [x19, #AST_TAG]
+
+    cmp x20, #AST_VAR_DECL
+    b.eq .Lscd_var
+    cmp x20, #AST_FUNC_DECL
+    b.eq .Lscd_func
+    cmp x20, #AST_TYPEDEF_DECL
+    b.eq .Lscd_typedef
+    cmp x20, #AST_STRUCT_DECL
+    b.eq .Lscd_struct
+    cmp x20, #AST_UNION_DECL
+    b.eq .Lscd_struct       // same handling as struct
+    cmp x20, #AST_TYPE_STRUCT
+    b.eq .Lscd_type_struct
+    cmp x20, #AST_TYPE_UNION
+    b.eq .Lscd_type_struct
+    cmp x20, #AST_ENUM_DECL
+    b.eq .Lscd_enum
+    cmp x20, #AST_TYPE_ENUM
+    b.eq .Lscd_type_enum
+
+    // Other nodes (e.g., static_assert): skip
+    b .Lscd_done
+
+.Lscd_var:
+    // Complete an incomplete array's length from its initializer (so every
+    // later resolve — sizeof, the alloca, BSS sizing — sees the real length).
+    mov x0, x19                    // decl node
+    bl _kcc_sema_infer_array_len
+
+    // Resolve type
+    ldr x0, [x19, #AST_F0]         // type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0                     // resolved type
+
+    // Register in symbol table
+    ldr x0, [x19, #AST_F1]         // name_ptr
+    cbz x0, .Lscd_var_init
+    mov x22, x0                     // name
+
+    // Reject a same-scope redefinition (block scope only; see the helper).
+    mov x0, x19                    // decl node
+    mov x1, x22                    // name
+    bl _kcc_sema_check_redef
+
+    mov x0, x22                    // name
+    bl _kcc_strlen
+    mov x1, x0                     // len
+    mov x0, x22                    // name
+    mov x2, #SYM_VAR
+    mov x3, x21
+    bl _kcc_symtab_declare
+    // Record the declaration's real location on the symbol (declare stamps a
+    // stale EOF line); the unused-variable warning reads it back.
+    ldr x1, [x19, #AST_LINE]
+    str x1, [x0, #SYM_LINE]
+    ldr x1, [x19, #AST_COL]
+    str x1, [x0, #SYM_COL]
+
+.Lscd_var_init:
+    // Check initializer if present
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Lscd_done
+    bl _kcc_sema_expr               // x0 = initializer type
+
+    // -Wall -Wint-conversion: declared type (x21) vs initializer type
+    mov x2, x0                      // src type
+    mov x1, x21                     // dst = declared type
+    mov x0, x19                     // location node
+    ldr x3, [x19, #AST_F2]         // src node
+    bl _kcc_sema_check_int_ptr
+    b .Lscd_done
+
+.Lscd_func:
+    // Resolve return type
+    ldr x0, [x19, #AST_F0]         // type node
+    bl _kcc_sema_resolve_type
+    // Wrap in TY_FUNC so callers see a proper function type
+    mov x1, #0                     // no param vec for now
+    bl _kcc_type_func
+    mov x21, x0                     // TY_FUNC descriptor
+
+    // Variadic prototype: record the fixed-param count in TY_QUALS (see prose).
+    ldr x2, [x19, #AST_F2]         // params pointer (bit 0 = variadic)
+    tst x2, #1
+    b.eq .Lscd_func_declared
+    bic x2, x2, #1
+    mov x3, #0                     // nfixed
+.Lscd_func_nfixed:
+    cbz x2, .Lscd_func_setq
+    add x3, x3, #1
+    ldr x2, [x2, #AST_F4]
+    b .Lscd_func_nfixed
+.Lscd_func_setq:
+    str x3, [x21, #TY_QUALS]
+.Lscd_func_declared:
+
+    // Register function in symbol table
+    ldr x0, [x19, #AST_F1]         // name_ptr
+    cbz x0, .Lscd_func_body
+    mov x22, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, #SYM_FUNC
+    mov x3, x21
+    bl _kcc_symtab_declare
+
+.Lscd_func_body:
+    // Check function body if present
+    ldr x0, [x19, #AST_F3]         // body
+    cbz x0, .Lscd_done
+
+    // Store current function return type (extract from TY_FUNC)
+    ldr x0, [x21, #TY_F0]          // return type from TY_FUNC
+    adrp x1, _kcc_sema_cur_ret@@PAGE
+    add  x1, x1, _kcc_sema_cur_ret@@PAGEOFF
+    str x0, [x1]
+
+    // Push scope for function body
+    bl _kcc_symtab_push_scope
+    bl _kcc_symtab_label_begin
+
+    // Process parameters (mask the variadic tag in bit 0)
+    ldr x0, [x19, #AST_F2]         // first param (bit 0 = variadic)
+    bic x0, x0, #1
+.Lscd_param_loop:
+    cbz x0, .Lscd_func_stmts
+    mov x22, x0
+
+    // Resolve param type and register
+    ldr x0, [x22, #AST_F0]         // param type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0
+
+    ldr x0, [x22, #AST_F1]         // param name
+    cbz x0, .Lscd_param_next
+    mov x20, x0
+    // A duplicate parameter name is a redefinition (params live in the body
+    // scope, depth >= 2).
+    mov x0, x22                    // param node
+    mov x1, x20                    // name
+    bl _kcc_sema_check_redef
+    mov x0, x20
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    mov x2, #SYM_VAR
+    mov x3, x21
+    bl _kcc_symtab_declare
+
+.Lscd_param_next:
+    ldr x0, [x22, #AST_F4]         // next param
+    b .Lscd_param_loop
+
+.Lscd_func_stmts:
+    // Check function body statements
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_sema_check_stmt
+
+    // -Wall: warn if a non-void function can reach the end of its body
+    mov x0, x19                    // func node
+    bl _kcc_sema_check_return_path
+
+    bl _kcc_symtab_label_end
+    bl _kcc_symtab_pop_scope
+    b .Lscd_done
+@| _kcc_sema_check_decl
+@}
+
+\paragraph{Typedefs, Aggregate Tags, and Enumerations}
+
+Typedef declarations resolve the underlying type and register the name
+with kind \texttt{SYM\_TYPEDEF}.  Struct and union declarations create
+the corresponding type descriptor via \texttt{kcc\_type\_struct} or
+\texttt{kcc\_type\_union} and register the tag in the tag name space.
+The struct size, alignment, and per-field byte offsets are computed by
+\texttt{\_kcc\_type\_layout} (below), which lays out the aggregate
+following the standard C rules rather than the earlier one-slot-per-field
+approximation.
+Enum declarations register both the tag itself and each enumerator
+constant as an ordinary symbol of type \texttt{int}, assigning
+consecutive integer values starting from zero.
+
+\paragraph{Aggregate Layout}
+
+\texttt{\_kcc\_type\_layout} computes the byte-accurate layout of a
+\texttt{struct} or \texttt{union} following \stdref{6.7.2.1}: each member
+is placed at the next offset that satisfies its alignment, the aggregate's
+alignment is the maximum member alignment, and the total size is padded up
+to that alignment.  For a \texttt{union} every member sits at offset~0 and
+the size is the largest member's size.  The routine is idempotent and
+memoised: once \texttt{TY\_SIZE} is non-zero the cached layout is returned,
+so it is safe to call from any later phase (\texttt{sizeof}, alloca sizing,
+member addressing) to force a lazy layout.  Each member's byte offset is
+stored in its declaration node's \texttt{AST\_F3} slot, from which the IR
+builder reads it when addressing a member.  Because a member of aggregate
+type must be laid out before its own offset can be known, the routine
+recurses into nested aggregates first, and it recomputes array sizes from
+the (possibly just-laid-out) element type; C forbids a struct from
+containing itself by value, so the recursion always terminates.
+\texttt{\_kcc\_type\_align} returns a type's alignment, reading
+\texttt{TY\_ALIGN} directly for scalars, pointers, and already-laid-out
+aggregates, and recursing through the element type of an array.
+
+@d Sema: struct layout @{
+// -- kcc_type_align -------------------------------------------------------
+// uint64_t kcc_type_align(type_desc *ty)
+//   Alignment in bytes; 8 for null/unknown.  Arrays inherit element align.
+.text
+.globl _kcc_type_align
+.p2align 2
+_kcc_type_align:
+    cbz x0, .Lta_def
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lta_read
+    ldr x0, [x0, #TY_F0]        // element type
+    b _kcc_type_align           // tail recurse
+.Lta_read:
+    ldr x0, [x0, #TY_ALIGN]
+    cbz x0, .Lta_def
+    ret
+.Lta_def:
+    mov x0, #8
+    ret
+
+// -- kcc_type_layout ------------------------------------------------------
+// uint64_t kcc_type_layout(type_desc *ty)
+//   Ensures ty (and any aggregate it transitively contains) has a
+//   byte-accurate TY_SIZE/TY_ALIGN, and stores each struct/union member's
+//   byte offset in its field decl's AST_F3.  Returns TY_SIZE.  Idempotent.
+.text
+.globl _kcc_type_layout
+.p2align 2
+_kcc_type_layout:
+    stp x29, x30, [sp, #-112]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    cbz x0, .Ltl_zero
+    mov x19, x0                 // ty
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.eq .Ltl_array
+    cmp x1, #TY_STRUCT
+    b.eq .Ltl_aggregate
+    cmp x1, #TY_UNION
+    b.eq .Ltl_aggregate
+    // Scalar / pointer / enum: already sized by its constructor.
+    ldr x0, [x19, #TY_SIZE]
+    b .Ltl_ret
+
+.Ltl_array:
+    ldr x20, [x19, #TY_F0]      // element type
+    ldr x21, [x19, #TY_F1]      // length
+    mov x0, x20
+    bl _kcc_type_layout         // ensure element laid out → element size
+    mul x0, x0, x21
+    str x0, [x19, #TY_SIZE]     // size = element_size * length
+    mov x0, x20
+    bl _kcc_type_align
+    str x0, [x19, #TY_ALIGN]    // align = element align
+    ldr x0, [x19, #TY_SIZE]
+    b .Ltl_ret
+
+.Ltl_aggregate:
+    ldr x0, [x19, #TY_SIZE]
+    cbnz x0, .Ltl_ret           // memoised: already laid out
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_UNION
+    cset x20, eq                // x20 = is_union
+    ldr x21, [x19, #TY_F0]      // AST_STRUCT_DECL
+    cbz x21, .Ltl_zero
+    ldr x21, [x21, #AST_F1]     // first field
+    cbz x21, .Ltl_zero          // opaque (no body): cannot size
+    mov x22, #0                 // running offset (struct)
+    mov x23, #1                 // max alignment
+    mov x24, #0                 // max member size (union)
+    // Bit-field container state (slots survive the calls in the loop body):
+    // [sp,#80] container byte offset, [sp,#88] next free bit, [sp,#96] container
+    // size in bytes (0 = no active container).
+    str xzr, [sp, #96]
+
+.Ltl_loop:
+    cbz x21, .Ltl_finish
+    ldr x0, [x21, #AST_F0]      // field type specifier
+    cbz x0, .Ltl_field_default
+    bl _kcc_sema_resolve_type
+    cbz x0, .Ltl_field_default
+    str x0, [sp, #64]           // stash ftype across the calls
+    bl _kcc_type_layout         // ensure laid out → field size in x0
+    str x0, [sp, #72]           // stash fsize
+    ldr x0, [sp, #64]           // ftype
+    bl _kcc_type_align          // falign in x0
+    mov x3, x0                  // falign
+    ldr x2, [sp, #72]           // fsize
+    b .Ltl_field_have
+.Ltl_field_default:
+    mov x2, #8                  // unresolved: assume one 8-byte slot
+    mov x3, #8
+.Ltl_field_have:
+    // A bit-field is marked by a non-null width in AST_F2 (an expression node).
+    // Everything else is a whole-byte member.
+    ldr x5, [x21, #AST_F2]
+    cbz x5, .Ltl_not_bitfield
+    @<Sema: layout bit-field@>
+.Ltl_not_bitfield:
+    str xzr, [sp, #96]         // a plain member ends any bit-field container run
+    cbnz x20, .Ltl_union_field
+    // struct: round running offset up to the field's alignment
+    sub x4, x3, #1
+    add x22, x22, x4
+    bic x22, x22, x4            // aligned offset (falign is a power of two)
+    str x22, [x21, #AST_F3]     // record field byte offset
+    add x22, x22, x2            // advance by field size
+    b .Ltl_field_align
+.Ltl_union_field:
+    str xzr, [x21, #AST_F3]     // union member: offset 0
+    cmp x2, x24
+    csel x24, x2, x24, gt       // track largest member
+.Ltl_field_align:
+    cmp x3, x23
+    csel x23, x3, x23, gt       // track maximum alignment
+    ldr x21, [x21, #AST_F4]     // next field
+    b .Ltl_loop
+
+.Ltl_finish:
+    cbz x20, .Ltl_total
+    mov x22, x24                // union total = largest member
+.Ltl_total:
+    // pad total size up to the aggregate alignment
+    sub x4, x23, #1
+    add x22, x22, x4
+    bic x22, x22, x4
+    str x22, [x19, #TY_SIZE]
+    str x23, [x19, #TY_ALIGN]
+    mov x0, x22
+    b .Ltl_ret
+
+.Ltl_zero:
+    mov x0, #0
+.Ltl_ret:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #112
+    ret
+@| _kcc_type_align _kcc_type_layout
+@}
+
+\paragraph{Bit-field packing}
+
+A bit-field member (\stdref{6.7.2.1}) declares a width in bits rather
+than occupying a whole storage unit.  \kcc{} lays consecutive bit-fields
+of the \emph{same declared type} into one \emph{container}---an aligned
+unit the size of that type---filling it from the least-significant bit
+upward, which is the little-endian AArch64 convention.  A bit-field that
+would not fit in the remaining space of the current container (or whose
+declared type differs from it) starts a fresh, type-aligned container;
+its own container is reserved whole, so a lone \texttt{unsigned x : 3}
+still makes the struct four bytes.  The layout records two numbers on the
+field node: \texttt{AST\_F3} becomes the container's byte offset (the
+address the member access will load), and \texttt{AST\_F2}---which held
+the width expression---is overwritten with the packed pair
+\texttt{(bit\_offset~$\ll$~16)~$\vert$~width}.  A zero there afterwards
+means ``not a bit-field,'' so ordinary members are untouched.  This is a
+deliberately conservative model: same-type runs, which is what real
+bit-field structs overwhelmingly use, match \texttt{clang} exactly;
+mixed-type packing and zero-width separators are not yet modelled.
+
+@d Sema: layout bit-field @{
+// x2 = fsize (container bytes), x3 = falign, x5 = width expr, x20 = is_union,
+// x21 = field, x22 = struct byte cursor.  Falls through to .Ltl_field_align.
+    ldr x7, [x5, #AST_TAG]
+.Ltl_bf_unwrap:
+    cmp x7, #AST_PAREN_EXPR
+    b.ne .Ltl_bf_folded
+    ldr x5, [x5, #AST_F0]
+    cbz x5, .Ltl_bf_w0
+    ldr x7, [x5, #AST_TAG]
+    b .Ltl_bf_unwrap
+.Ltl_bf_folded:
+    cmp x7, #AST_INT_LIT
+    b.eq .Ltl_bf_getval
+    cmp x7, #AST_CHAR_LIT
+    b.eq .Ltl_bf_getval
+.Ltl_bf_w0:
+    mov x6, #0                 // non-constant width → 0 (degrades to plain)
+    b .Ltl_bf_wdone
+.Ltl_bf_getval:
+    ldr x6, [x5, #AST_F0]      // width value
+.Ltl_bf_wdone:
+    cbnz x20, .Ltl_bf_union
+    lsl x7, x2, #3             // container bits
+    ldr x8, [sp, #96]          // active container size (0 = none)
+    cmp x8, x2
+    b.ne .Ltl_bf_newcont
+    ldr x9, [sp, #88]          // next free bit
+    add x10, x9, x6
+    cmp x10, x7
+    b.gt .Ltl_bf_newcont
+    ldr x11, [sp, #80]         // reuse the active container
+    b .Ltl_bf_store
+.Ltl_bf_newcont:
+    sub x4, x3, #1
+    add x22, x22, x4
+    bic x22, x22, x4           // align the cursor to the container type
+    mov x11, x22
+    str x11, [sp, #80]
+    str x2, [sp, #96]          // container size
+    mov x9, #0                 // bit offset 0 in the fresh unit
+    add x22, x22, x2           // reserve the whole container
+.Ltl_bf_store:
+    str x11, [x21, #AST_F3]     // container byte offset
+    lsl x12, x9, #16
+    orr x12, x12, x6
+    str x12, [x21, #AST_F2]     // (bit_offset << 16) | width
+    add x9, x9, x6
+    str x9, [sp, #88]           // advance the bit cursor
+    b .Ltl_field_align
+.Ltl_bf_union:
+    str xzr, [x21, #AST_F3]     // union bit-field shares offset 0
+    and x12, x6, #0xffff
+    str x12, [x21, #AST_F2]     // bit_offset 0, width
+    cmp x2, x24
+    csel x24, x2, x24, gt
+    b .Ltl_field_align
+@| _kcc_type_layout
+@}
+
+@d Sema: check declaration @{
+.Lscd_typedef:
+    // Resolve type and register as typedef
+    ldr x0, [x19, #AST_F0]         // type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0
+
+    ldr x0, [x19, #AST_F1]         // name_ptr
+    cbz x0, .Lscd_done
+    mov x22, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, #SYM_TYPEDEF
+    mov x3, x21
+    bl _kcc_symtab_declare
+    b .Lscd_done
+
+.Lscd_type_struct:
+    // AST_TYPE_STRUCT/UNION wrapper: unwrap to inner struct_decl
+    ldr x19, [x19, #AST_F0]        // inner AST_STRUCT_DECL
+    cbz x19, .Lscd_done
+    ldr x20, [x19, #AST_TAG]
+    // Fall through to .Lscd_struct
+
+.Lscd_struct:
+    // Register struct/union tag if named
+    ldr x0, [x19, #AST_F0]         // name_ptr
+    cbz x0, .Lscd_done
+    mov x22, x0
+
+    // Create type for struct/union
+    mov x0, x19
+    cmp x20, #AST_STRUCT_DECL
+    b.ne .Lscd_make_union
+    bl _kcc_type_struct
+    b .Lscd_tag_register
+.Lscd_make_union:
+    bl _kcc_type_union
+
+.Lscd_tag_register:
+    mov x21, x0                     // type descriptor
+
+    // Lay out the aggregate: byte-accurate size, alignment, field offsets.
+    mov x0, x21
+    bl _kcc_type_layout
+
+    mov x0, x22                     // name
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, x21
+    bl _kcc_symtab_declare_tag
+    b .Lscd_done
+
+.Lscd_type_enum:
+    // Unwrap AST_TYPE_ENUM → get EnumDecl child
+    ldr x19, [x19, #AST_F0]
+    cbz x19, .Lscd_done
+
+.Lscd_enum:
+    // Register enum tag and enumerator constants
+    ldr x0, [x19, #AST_F0]         // name_ptr
+    cbz x0, .Lscd_enum_consts
+
+    mov x22, x0
+    mov x0, x19
+    bl _kcc_type_enum
+    mov x21, x0
+    mov x0, x22
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    mov x2, x21
+    bl _kcc_symtab_declare_tag
+
+.Lscd_enum_consts:
+    // Register each enumerator as SYM_ENUM_CONST with int type
+    ldr x22, [x19, #AST_F1]        // first enumerator
+    mov x20, #0                     // counter value
+
+.Lscd_enum_loop:
+    cbz x22, .Lscd_done
+
+    // Explicit value (= expr) resets the running counter (§6.7.2.2).
+    ldr x0, [x22, #AST_F1]         // value expr, or 0
+    cbz x0, .Lscd_enum_reg
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INT_LIT
+    b.eq .Lscd_enum_lit
+    cmp x1, #AST_CHAR_LIT
+    b.eq .Lscd_enum_lit
+    cmp x1, #AST_UNARY_EXPR
+    b.ne .Lscd_enum_reg            // unsupported const form: keep the counter
+    ldr x1, [x0, #AST_F0]          // unary op token
+    cmp x1, #TOK_MINUS
+    b.ne .Lscd_enum_reg
+    ldr x1, [x0, #AST_F1]          // operand
+    cbz x1, .Lscd_enum_reg
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_INT_LIT
+    b.ne .Lscd_enum_reg
+    ldr x20, [x1, #AST_F0]
+    neg x20, x20                   // = -literal
+    b .Lscd_enum_reg
+.Lscd_enum_lit:
+    ldr x20, [x0, #AST_F0]         // = literal
+
+.Lscd_enum_reg:
+    ldr x0, [x22, #AST_F0]         // name_ptr
+    cbz x0, .Lscd_enum_next
+    mov x21, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x21
+    mov x2, #SYM_ENUM_CONST
+    adrp x3, _kcc_type_int_s@@PAGE
+    add  x3, x3, _kcc_type_int_s@@PAGEOFF
+    ldr  x3, [x3]
+    bl _kcc_symtab_declare
+    // Store enum value
+    str x20, [x0, #SYM_VALUE]
+
+.Lscd_enum_next:
+    add x20, x20, #1
+    ldr x22, [x22, #AST_F4]        // next enumerator
+    b .Lscd_enum_loop
+
+.Lscd_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+

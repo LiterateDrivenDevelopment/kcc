@@ -1,0 +1,1510 @@
+% 32e-ir-assign-call.weft — IR lowering of assignment, calls, and tail expressions
+%
+% Split from 32-ir-builder.weft (structural refactor, no content changes):
+% assignment (incl. the address-lvalue helper), function calls, variadic
+% builtins, string literals, the conditional operator, and casts.
+
+\subsection{Assignment}
+
+Assignment handles three cases.  A simple \texttt{=} evaluates the
+RHS, looks up the LHS identifier in the locals table, and emits
+\texttt{IR\_STORE} to write the value into the variable's alloca.
+Compound assignments (\texttt{+=}, \texttt{-=}, \texttt{*=},
+\texttt{/=}, \texttt{\%=}, \texttt{\&=}, \texttt{|=}, \texttt{\^{}=},
+\texttt{<<=}, \texttt{>>=}) first load the current value, emit the
+corresponding binary operation, then store the result back---exactly
+the read-modify-write pattern described for increment/decrement above.
+Finally, if the LHS identifier is not in locals, it must be a global:
+the builder emits \texttt{IR\_GLOBAL\_REF} to materialise the
+address.  For simple assignment the value is stored directly; for
+compound operators the same load-binop-store sequence is applied,
+loading from the global address vreg before emitting the binary
+operation and storing the result back.
+
+The three \emph{address-based} lvalues---a member \texttt{s.f}, a
+subscript \texttt{a[i]}, and a dereference \texttt{*p}---share a single
+helper, \texttt{kcc\_ir\_assign\_through}.  Each computes its target
+address once, then hands the address, the right-hand value, the operator
+token, an optional bit-field descriptor, and the access type to the
+helper, which performs a plain store for \texttt{=} or a
+load-operate-store for a compound operator, sized to the lvalue's type
+(so a narrow field is not clobbered) and routed through the bit-field
+read-modify-write when the target is a bit-field.  Sharing this path is
+what makes \texttt{s.f\;+=\;v}, \texttt{a[i]\;*=\;v}, and
+\texttt{*p\;-=\;v} work uniformly---and, because the helper reuses the
+bit-field primitives, a compound assignment to a bit-field member folds
+out for free.
+
+When the LHS has type \texttt{TY\_STRUCT}, a single store would only
+copy the first field.  Instead, the builder resolves both the LHS
+and RHS struct base addresses (alloca vreg or global ref) and calls
+\texttt{\_kcc\_ir\_emit\_struct\_copy} for a field-by-field copy,
+identical to the struct initialisation path described above.
+
+The compound path uses callee-saved registers \texttt{x23} (current
+value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
+bytes to save \texttt{x19}--\texttt{x24}.  In all cases the returned
+vreg is the stored value, matching the C semantics where assignment
+is an expression (\stdref{6.5.16}).
+
+@d IR: build assign @{
+// -- kcc_ir_build_assign --------------------------------------------------
+// uint64_t kcc_ir_build_assign(node *expr)
+//   x0 = AST_ASSIGN_EXPR (F0=op, F1=lhs, F2=rhs)
+// For simple assignment (=), evaluates RHS and stores to LHS alloca.
+.text
+.globl _kcc_ir_build_assign
+.p2align 2
+_kcc_ir_build_assign:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0
+    ldr x0, [x19, #AST_F3]      // assignment result type (= LHS type)
+    str x0, [sp, #64]           // stashed for compound-assign width normalisation
+    ldr x20, [x19, #AST_F0]     // op token
+
+    // Check for struct assignment (simple assign only)
+    cmp x20, #TOK_ASSIGN
+    b.ne .Liba_normal_rhs
+    ldr x0, [x19, #AST_F1]      // LHS node
+    cbz x0, .Liba_normal_rhs
+    ldr x1, [x0, #AST_F3]       // LHS sema type
+    cbz x1, .Liba_normal_rhs
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_STRUCT
+    b.eq .Liba_struct_copy
+
+.Liba_normal_rhs:
+    // Build RHS first
+    ldr x0, [x19, #AST_F2]
+    ldr x2, [x0, #AST_F3]       // rhs sema type
+    str x2, [sp, #72]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // rhs vreg
+
+    // Simple assignment converts the RHS to the LHS type across the
+    // int/float boundary ([sp,#64] holds the assignment's (LHS) type).
+    cmp x20, #TOK_ASSIGN
+    b.ne .Liba_get_lhs
+    mov x0, x21
+    ldr x1, [sp, #72]           // from = rhs type
+    ldr x2, [sp, #64]           // to   = LHS type
+    bl _kcc_ir_convert
+    mov x21, x0
+
+.Liba_get_lhs:
+    // Get LHS — identifier, subscript, member, or dereference
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Liba_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Liba_subscript
+    cmp x1, #AST_MEMBER
+    b.eq .Liba_member
+    cmp x1, #AST_UNARY_EXPR
+    b.eq .Liba_deref
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Liba_done
+
+    // Look up variable alloca
+    ldr x22, [x0, #AST_F0]      // name ptr
+    cbz x22, .Liba_done
+
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0
+
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22
+    bl _kcc_ht_get
+    cbz x0, .Liba_global_store
+    bic x0, x0, #0x8000000000000000
+    sub x22, x0, #1              // alloca vreg (stored as vreg+1)
+
+    // For compound assignment (+=, etc.), load current value first
+    cmp x20, #TOK_ASSIGN
+    b.eq .Liba_store
+
+    // Load current value
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x23, x0                  // current value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Map compound op to IR opcode
+    mov x24, #IR_ADD             // default
+    cmp x20, #TOK_ADD_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SUB
+    cmp x20, #TOK_SUB_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_MUL
+    cmp x20, #TOK_MUL_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SDIV
+    cmp x20, #TOK_DIV_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SMOD
+    cmp x20, #TOK_MOD_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_AND
+    cmp x20, #TOK_AND_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_OR
+    cmp x20, #TOK_OR_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_XOR
+    cmp x20, #TOK_XOR_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_SHL
+    cmp x20, #TOK_SHL_ASSIGN
+    b.eq .Liba_compound
+    mov x24, #IR_ASHR
+    cmp x20, #TOK_SHR_ASSIGN
+    b.eq .Liba_compound
+    // Fallthrough: treat as simple assign
+    b .Liba_store
+
+.Liba_compound:
+    // Emit binop: result = current_val op rhs
+    mov x0, x24
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x23, [x0, #IR_SRC1]
+    str x21, [x0, #IR_SRC2]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x21, x0                  // new rhs = result vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Truncate the compound result to the destination's declared width
+    mov x0, x21                  // result vreg
+    mov x1, x24                  // opcode
+    ldr x2, [sp, #64]            // LHS type
+    mov x3, x2
+    bl _kcc_ir_norm32
+    mov x21, x0
+
+.Liba_store:
+    // Emit store
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]     // value
+    str x22, [x0, #IR_SRC2]     // alloca
+    bl _kcc_ir_emit
+
+    mov x0, x21                  // return the stored value's vreg
+    b .Liba_done
+
+.Liba_global_store:
+    // x22 = name ptr, x21 = rhs vreg, x20 = op token
+    // static local? redirect the store onto its mangled global
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Liba_global_ref_emit
+    mov x23, x0                  // ht
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    mov x0, x23
+    mov x1, x22                  // key = source name
+    bl _kcc_ht_get
+    cbz x0, .Liba_global_ref_emit
+    mov x22, x0                  // x22 = mangled name
+
+.Liba_global_ref_emit:
+    // Emit global_ref to get address vreg
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_SRC1]     // name ptr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x22, x0                  // x22 = global addr vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // For compound assignment on globals, load-modify-store
+    cmp x20, #TOK_ASSIGN
+    b.eq .Liba_global_simple
+
+    // Load current value from global
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // global addr vreg
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x23, x0                  // x23 = current value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Map compound op to IR opcode (same table as local path)
+    mov x24, #IR_ADD
+    cmp x20, #TOK_ADD_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SUB
+    cmp x20, #TOK_SUB_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_MUL
+    cmp x20, #TOK_MUL_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SDIV
+    cmp x20, #TOK_DIV_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SMOD
+    cmp x20, #TOK_MOD_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_AND
+    cmp x20, #TOK_AND_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_OR
+    cmp x20, #TOK_OR_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_XOR
+    cmp x20, #TOK_XOR_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_SHL
+    cmp x20, #TOK_SHL_ASSIGN
+    b.eq .Liba_global_compound
+    mov x24, #IR_ASHR
+    cmp x20, #TOK_SHR_ASSIGN
+    b.eq .Liba_global_compound
+    b .Liba_global_simple
+
+.Liba_global_compound:
+    // Emit binop: result = current_val op rhs
+    mov x0, x24
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x23, [x0, #IR_SRC1]     // current value
+    str x21, [x0, #IR_SRC2]     // rhs
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x21, x0                  // x21 = compound result vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Truncate the compound result to the destination's declared width
+    mov x0, x21
+    mov x1, x24                  // opcode
+    ldr x2, [sp, #64]            // LHS type
+    mov x3, x2
+    bl _kcc_ir_norm32
+    mov x21, x0
+
+.Liba_global_simple:
+    // Store value to global address
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]     // value (rhs or compound result)
+    str x22, [x0, #IR_SRC2]     // global addr
+    bl _kcc_ir_emit
+    mov x0, x21
+    b .Liba_done
+
+.Liba_subscript:
+    // LHS is a[i]: x0 = AST_SUBSCRIPT node, x21 = rhs vreg, x20 = op token.
+    // Same load-op-store path as a member, so a[i] += v works too.
+    mov x23, x0                  // subscript node
+    bl _kcc_ir_build_subscript_addr
+    mov x22, x0                  // element address
+    mov x0, x22                  // addr
+    mov x1, x21                  // rhs
+    mov x2, x20                  // op token
+    mov x3, #0                   // not a bit-field
+    ldr x4, [x23, #AST_F3]      // element type → access width
+    bl _kcc_ir_assign_through
+    b .Liba_done
+
+.Liba_member:
+    // LHS is s.x: x0 = AST_MEMBER node, x21 = rhs vreg, x20 = op token.
+    // The unified helper does simple or compound (load-op-store), and a
+    // bit-field read-modify-write when the field carries bit metadata.
+    mov x23, x0                  // member node
+    bl _kcc_ir_build_member_addr
+    mov x22, x0                  // field address
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x24, [x0]                // matched field decl (0 if none)
+    mov x0, x22                  // addr
+    mov x1, x21                  // rhs
+    mov x2, x20                  // op token
+    mov x3, x24                  // field (bit-field metadata)
+    ldr x4, [x23, #AST_F3]      // member's resolved type → access width
+    bl _kcc_ir_assign_through
+    b .Liba_done
+
+.Liba_deref:
+    // LHS is *expr — evaluate the pointer, store RHS through it (load-op-store
+    // for compound), reusing the shared address-lvalue helper.
+    ldr x0, [x0, #AST_F0]       // check op is TOK_STAR
+    cmp x0, #TOK_STAR
+    b.ne .Liba_done
+    ldr x23, [x19, #AST_F1]     // unary *expr
+    ldr x23, [x23, #AST_F3]     // sema type of *expr (may be 0 → 64-bit)
+    ldr x0, [x19, #AST_F1]      // unary expr
+    ldr x0, [x0, #AST_F1]       // operand of * (e.g., IdentExpr 'p')
+    bl _kcc_ir_build_expr
+    mov x22, x0                  // pointer vreg
+    mov x0, x22                  // addr
+    mov x1, x21                  // rhs
+    mov x2, x20                  // op token
+    mov x3, #0                   // not a bit-field
+    mov x4, x23                  // pointed-to type → access width
+    bl _kcc_ir_assign_through
+    b .Liba_done
+
+.Liba_struct_copy:
+    // x19 = assign node, LHS type is TY_STRUCT
+    // x0 = LHS node (from check above), x1 = struct type
+    mov x21, x1                  // x21 = struct type
+
+    // Get LHS base address (must be identifier)
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Liba_done
+
+    ldr x22, [x0, #AST_F0]      // LHS name
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22
+    bl _kcc_ht_get
+    cbz x0, .Liba_sc_dst_global
+
+    bic x0, x0, #0x8000000000000000
+    sub x23, x0, #1              // x23 = dst alloca vreg
+    b .Liba_sc_get_src
+
+.Liba_sc_dst_global:
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_SRC1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // x23 = dst global ref vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+.Liba_sc_get_src:
+    // Get RHS base address: an identifier's alloca, or a struct-returning
+    // call's result buffer.
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Liba_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_CALL_EXPR
+    b.eq .Liba_sc_src_call
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Liba_done
+
+    ldr x22, [x0, #AST_F0]      // RHS name
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22
+    bl _kcc_ht_get
+    cbz x0, .Liba_sc_src_global
+
+    bic x0, x0, #0x8000000000000000
+    sub x24, x0, #1              // x24 = src alloca vreg
+    b .Liba_sc_do_copy
+
+.Liba_sc_src_global:
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_SRC1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x24, x0                  // x24 = src global ref vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+.Liba_sc_src_call:
+    // RHS is a struct-returning call: its value is the result buffer address.
+    bl _kcc_ir_build_call
+    mov x24, x0                   // x24 = src base vreg
+    b .Liba_sc_do_copy
+
+.Liba_sc_do_copy:
+    // x24 = src, x23 = dst, x21 = struct type
+    ldr x0, [x21, #TY_F0]       // AST_STRUCT_DECL
+    ldr x0, [x0, #AST_F1]       // first field
+    mov x2, #0
+.Liba_sc_count:
+    cbz x0, .Liba_sc_go
+    add x2, x2, #1
+    ldr x0, [x0, #AST_F4]
+    b .Liba_sc_count
+.Liba_sc_go:
+    mov x0, x24                  // src
+    mov x1, x23                  // dst
+    bl _kcc_ir_emit_struct_copy
+    mov x0, x23
+    b .Liba_done
+
+.Liba_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@| _kcc_ir_build_assign
+@}
+
+\paragraph{End-to-end tests.}
+Compound assignment operators follow the read-modify-write pattern for
+both local and global variables.  For locals, the builder loads via
+the alloca vreg; for globals, it emits \texttt{IR\_GLOBAL\_REF} to
+materialise the address, then the same load-binop-store sequence.  The
+final three tests specifically exercise the global path, which was
+initially missing and caused the RHS to overwrite the variable without
+reading its current value.
+
+@d Test: codegen compound @{
+echo ""
+echo "--- Compound Assignment ---"
+
+run_test "add-assign" \
+    "int main(void) { int x = 10; x += 5; return x; }" 15
+
+run_test "sub-assign" \
+    "int main(void) { int x = 10; x -= 5; return x; }" 5
+
+run_test "mul-assign" \
+    "int main(void) { int x = 10; x *= 5; return x; }" 50
+
+run_test "div-assign" \
+    "int main(void) { int x = 100; x /= 4; return x; }" 25
+
+run_test "mod-assign" \
+    "int main(void) { int x = 17; x %= 5; return x; }" 2
+
+run_test "and-assign" \
+    "int main(void) { int x = 0xFF; x &= 0x0F; return x; }" 15
+
+run_test "or-assign" \
+    "int main(void) { int x = 0xF0; x |= 0x0F; return x; }" 255
+
+run_test "xor-assign" \
+    "int main(void) { int x = 0xFF; x ^= 0x0F; return x; }" 240
+
+run_test "shl-assign" \
+    "int main(void) { int x = 1; x <<= 4; return x; }" 16
+
+run_test "shr-assign" \
+    "int main(void) { int x = 32; x >>= 2; return x; }" 8
+
+run_test "compound in loop" \
+    "int main(void) { int s = 0; for (int i = 1; i <= 5; i++) s += i; return s; }" 15
+
+run_test "chained compound" \
+    "int main(void) { int a = 1; int b = 2; a += 10; b *= 3; return a + b; }" 17
+
+run_test "global add-assign" \
+    "int g; int main(void) { g = 10; g += 5; return g; }" 15
+
+run_test "global mul-assign" \
+    "int g; int main(void) { g = 6; g *= 7; return g; }" 42
+
+run_test "global sub-assign" \
+    "int g; int main(void) { g = 10; g -= 3; return g; }" 7
+@}
+
+\subsection{Function Call}
+
+A function call walks the argument list (linked via \texttt{AST\_F4}),
+evaluates each argument expression, and stores the resulting vregs
+into an arena-allocated array.  The array layout is
+\texttt{[count, vreg0, vreg1, \ldots]} so the code generator can
+marshal arguments into the ABI-correct registers or stack slots.
+The \texttt{IR\_CALL} instruction stores the callee name in
+\texttt{SRC1} and the argument array pointer in \texttt{SRC2}; the
+destination vreg receives the return value.
+
+The callee decides direct versus indirect dispatch.  A bare name that
+is not a local variable is a direct \texttt{IR\_CALL} by symbol.
+Anything else---a function-pointer variable, or \emph{any} other
+expression such as a struct field \texttt{o.f}, a dereference
+\texttt{(*pp)}, or a subscript \texttt{table[i]}---is evaluated for its
+function-pointer value and dispatched through \texttt{IR\_CALL\_IND}.
+Routing every non-identifier callee to that same path is what lets a
+function pointer stored in a \texttt{struct} field be called.
+
+@d IR: build call @{
+// -- kcc_ir_build_call ----------------------------------------------------
+// uint64_t kcc_ir_build_call(node *expr)
+//   x0 = AST_CALL_EXPR (F0=callee, F1=first_arg linked via F4)
+// Evaluates arguments, stores arg vregs in IR_SRC2 array, emits IR_CALL.
+// IR_SRC2 points to arena-allocated: [count(8), vreg0(8), vreg1(8), ...]
+.text
+.globl _kcc_ir_build_call
+.p2align 2
+_kcc_ir_build_call:
+    stp x29, x30, [sp, #-112]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    str xzr, [sp, #80]            // sret result-buffer vreg (0 = none)
+    mov x19, x0                   // x19 = AST_CALL_EXPR node
+
+    // Get callee expression
+    ldr x0, [x19, #AST_F0]       // callee expr
+    cbz x0, .Libc_done_zero
+    str x0, [sp, #72]            // save callee expr node (indirect path rebuilds it)
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libc_callee_indirect   // non-ident callee (o.f, (*pp), a[i]) → indirect
+
+    ldr x20, [x0, #AST_F0]       // x20 = callee name ptr
+
+    // Variadic builtins: va_start(ap, last) and va_end(ap) are lowered
+    // specially rather than emitted as calls.
+    mov x0, x20
+    adrp x1, _kcc_ir_str_va_start@@PAGE
+    add  x1, x1, _kcc_ir_str_va_start@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_va_start
+    mov x0, x20
+    adrp x1, _kcc_ir_str_va_end@@PAGE
+    add  x1, x1, _kcc_ir_str_va_end@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_va_end
+
+    // Direct name, or a local function-pointer variable?
+    mov x0, x20
+    bl _kcc_strlen
+    mov x24, x0                   // x24 = name len
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    mov x2, x24
+    bl _kcc_ht_get
+    // x0 = vreg+1 (with possible bit-63 tag) or 0 if not found
+    str x0, [sp, #64]            // locals_result: 0 → direct call by name
+    b .Libc_count_start
+
+.Libc_callee_indirect:
+    // A callee that is any expression other than a bare name: evaluate it
+    // for its function-pointer value and dispatch indirectly.
+    mov x0, #1
+    str x0, [sp, #64]            // force the indirect path
+
+.Libc_count_start:
+    // Count arguments (walk F4 chain)
+    ldr x21, [x19, #AST_F1]      // x21 = first arg
+    mov x22, #0                    // x22 = arg count
+    mov x0, x21
+.Libc_count_args:
+    cbz x0, .Libc_count_done
+    add x22, x22, #1
+    ldr x0, [x0, #AST_F4]
+    b .Libc_count_args
+.Libc_count_done:
+
+    // Struct return-by-value: if the callee returns a struct, allocate a
+    // result buffer whose address becomes a hidden trailing argument and
+    // the call's own result value.
+    ldr x0, [x19, #AST_F3]       // call result type (sema-resolved)
+    cbz x0, .Libc_alloc_args
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.ne .Libc_alloc_args
+    str x0, [sp, #88]            // result struct type
+    bl _kcc_ir_type_slots        // x0 = slot count
+    str x0, [sp, #96]            // slot count
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    ldr x1, [sp, #88]
+    str x1, [x0, #IR_TYPE]
+    ldr x1, [sp, #96]
+    str x1, [x0, #IR_SRC1]       // slot count
+    str x0, [sp, #96]            // save instr ptr
+    bl _kcc_ir_next_vreg
+    ldr x1, [sp, #96]
+    str x0, [x1, #IR_DEST]
+    add x2, x0, #1               // bias by 1: vreg 0 is a valid buffer vreg
+    str x2, [sp, #80]            // sret buffer vreg + 1 (0 = none)
+    mov x0, x1
+    bl _kcc_ir_emit
+
+.Libc_alloc_args:
+    // Allocate args array.  Layout: args[0] = total arg count, then two words
+    // per argument: args[1+i*2] = vreg, args[2+i*2] = AAPCS64 class.  Size is
+    // therefore (1 + total*2) * 8 bytes.
+    ldr x0, [sp, #80]            // biased sret buffer vreg (0 = none)
+    cmp x0, #0
+    cset x1, ne                  // has_sret ∈ {0,1}
+    add x1, x22, x1              // total argument count
+    str x1, [sp, #104]          // total count (args[0])
+    lsl x0, x1, #1              // total*2
+    add x0, x0, #1             // 1 + total*2
+    lsl x0, x0, #3               // in bytes
+    bl _kcc_arena_alloc
+    mov x23, x0                    // x23 = args array
+
+    // first_stack_idx: a variadic prototype's fixed-param count (in the callee
+    // func type's TY_QUALS), else 1.  Packed into the high half of args[0].
+    ldr x1, [sp, #72]            // callee expr node
+    mov x2, #1
+    cbz x1, .Libc_fsi_done
+    ldr x1, [x1, #AST_F3]        // callee resolved type
+    cbz x1, .Libc_fsi_done
+    ldr x3, [x1, #TY_KIND]
+    cmp x3, #TY_PTR
+    b.ne .Libc_fsi_chk
+    ldr x1, [x1, #TY_F0]         // pointer-to-function → the function type
+    cbz x1, .Libc_fsi_done
+    ldr x3, [x1, #TY_KIND]
+.Libc_fsi_chk:
+    cmp x3, #TY_FUNC
+    b.ne .Libc_fsi_done
+    ldr x3, [x1, #TY_QUALS]      // nfixed if variadic, else 0
+    cbz x3, .Libc_fsi_done
+    mov x2, x3
+.Libc_fsi_done:
+    ldr x0, [sp, #104]           // total count
+    orr x0, x0, x2, lsl #32
+    str x0, [x23]                // args[0] = count | (first_stack_idx << 32)
+
+    // Evaluate each argument expression: store its vreg and AAPCS64 class.
+    mov x24, x21                   // x24 = current arg node
+    mov x21, #0                    // x21 = arg index
+.Libc_eval_args:
+    cmp x21, x22
+    b.ge .Libc_eval_done
+    // Classify the argument; a struct/union (class >= ST1) is passed as the
+    // address of the object, scalars/doubles by value.
+    ldr x0, [x24, #AST_F3]        // argument's resolved type
+    bl _kcc_ir_classify_type
+    str x0, [sp, #104]           // stash class (total count no longer needed)
+    cmp x0, #2
+    b.lt .Libc_eval_scalar
+    mov x0, x24
+    bl _kcc_ir_build_struct_addr  // vreg holding the struct's address
+    b .Libc_eval_store
+.Libc_eval_scalar:
+    mov x0, x24
+    bl _kcc_ir_build_expr          // returns vreg in x0
+.Libc_eval_store:
+    lsl x1, x21, #1              // index*2
+    add x1, x1, #1             // 1 + index*2
+    str x0, [x23, x1, lsl #3]     // vreg
+    add x1, x1, #1
+    ldr x2, [sp, #104]           // class
+    str x2, [x23, x1, lsl #3]     // class
+    ldr x24, [x24, #AST_F4]       // next arg
+    add x21, x21, #1
+    b .Libc_eval_args
+.Libc_eval_done:
+
+    // Append the hidden result pointer with class X8 (5): the marshal loads
+    // it into x8 (AAPCS64 indirect-result register).  A >16B callee reads it;
+    // a <=16B callee ignores x8 and returns the aggregate in x0(-x1) instead.
+    ldr x0, [sp, #80]            // biased sret buffer vreg
+    cbz x0, .Libc_dispatch
+    sub x0, x0, #1              // recover real buffer vreg
+    lsl x1, x22, #1             // arg_count*2
+    add x1, x1, #1             // 1 + arg_count*2
+    str x0, [x23, x1, lsl #3]    // vreg = buffer address
+    add x1, x1, #1
+    mov x2, #5
+    str x2, [x23, x1, lsl #3]   // class = X8
+
+.Libc_dispatch:
+    // Check if indirect call (callee is a local variable)
+    ldr x0, [sp, #64]            // locals_result
+    cbnz x0, .Libc_indirect
+
+    // Direct call: emit IR_CALL.  IR_TYPE = the call's result type, so the
+    // backend knows whether the result comes back in x0 or d0.
+    mov x0, #IR_CALL
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]       // callee name
+    str x23, [x0, #IR_SRC2]       // args array ptr
+    ldr x1, [x19, #AST_F3]       // call result type (x19 = call node)
+    cbnz x1, .Libc_dtype
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+.Libc_dtype:
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    // DEST is the sret buffer vreg for a struct return (so the backend can
+    // unpack x0/x1 into it), otherwise a fresh result vreg.
+    ldr x1, [sp, #80]
+    cbz x1, .Libc_dfresh
+    sub x1, x1, #1
+    str x1, [x19, #IR_DEST]
+    b .Libc_demit
+.Libc_dfresh:
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+.Libc_demit:
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [x19, #IR_DEST]        // result vreg (.Libc_done overrides for struct)
+    b .Libc_done
+
+.Libc_indirect:
+    // Indirect call: build callee expression to get function pointer vreg
+    ldr x0, [sp, #72]            // callee expr node
+    bl _kcc_ir_build_expr          // returns fn-ptr vreg in x0
+    mov x24, x0                    // x24 = fn-ptr vreg
+
+    // Emit IR_CALL_IND (result type in IR_TYPE, as for the direct call)
+    mov x0, #IR_CALL_IND
+    bl _kcc_ir_alloc_instr
+    str x24, [x0, #IR_SRC1]       // fn-ptr vreg
+    str x23, [x0, #IR_SRC2]       // args array ptr
+    ldr x1, [x19, #AST_F3]       // call result type (x19 = call node)
+    cbnz x1, .Libc_itype
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+.Libc_itype:
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    ldr x1, [sp, #80]
+    cbz x1, .Libc_ifresh
+    sub x1, x1, #1
+    str x1, [x19, #IR_DEST]
+    b .Libc_iemit
+.Libc_ifresh:
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+.Libc_iemit:
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [x19, #IR_DEST]
+    b .Libc_done
+
+.Libc_va_start:
+    mov x0, x19                 // call node
+    bl _kcc_ir_build_va_start
+    b .Libc_epilogue
+
+.Libc_va_end:
+    mov x0, #0                  // va_end is a no-op in this ABI
+    b .Libc_epilogue
+
+.Libc_done_zero:
+    mov x0, #0
+.Libc_done:
+    // A struct-returning call yields the address of its result buffer,
+    // not the (unused) scalar result vreg.
+    ldr x1, [sp, #80]           // biased sret buffer vreg
+    cbz x1, .Libc_epilogue
+    sub x0, x1, #1              // recover real buffer vreg
+.Libc_epilogue:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #112
+    ret
+@| _kcc_ir_build_call
+@}
+
+\subsection{Variadic Function Definitions}
+\label{sec:variadic-defs}
+
+A function \emph{defined} with a trailing \texttt{...} reads its unnamed
+arguments through the \texttt{<stdarg.h>} interface---\texttt{va\_list},
+\texttt{va\_start}, \texttt{va\_arg}, \texttt{va\_end}.  \kcc{} provides
+these as built-ins rather than a header.  The call lowering pushes the
+variadic tail onto the stack (the Apple variadic ABI push), so a variadic
+callee needs only a cursor into that stack area.  Accordingly
+\texttt{va\_list} is an opaque eight-byte pointer (resolved by sema);
+\texttt{va\_start(ap, last)} points the cursor at the first variadic
+argument; \texttt{va\_arg(ap, T)} reads the eight-byte slot at the cursor
+and advances it; and \texttt{va\_end} is a no-op.
+
+Both sides depend on the prototype's fixed-parameter count.  Sema records it
+when it checks a function declaration, storing the count in the otherwise
+unused \texttt{TY\_QUALS} slot of the \texttt{TY\_FUNC} descriptor (zero there
+means non-variadic); \texttt{kcc\_ir\_build\_call} reads it back from the
+callee's type to choose the stack layout, and the caller places the variadic
+tail at \texttt{[sp,\,\#0]} of the pushed argument area
+(\texttt{kcc\_cg\_marshal\_args} indexes the stack image from that count), so
+in the callee the first variadic argument
+lives at \texttt{[x29 + frame\_size]}---independent of how many fixed
+parameters preceded it, and with \texttt{frame\_size} known only in the
+backend.  \texttt{va\_start} therefore lowers to a dedicated
+\texttt{IR\_VA\_START} instruction; the code generator materialises that
+address and \texttt{va\_start} stores it into \texttt{ap}.  (The instruction
+still records the fixed count $F$ in \texttt{SRC2} for diagnostics, though the
+offset no longer depends on it.)  \texttt{va\_arg}
+needs no new opcode: it loads the cursor, dereferences it, adds eight, and
+writes the cursor back, all with ordinary IR.  Both builtins locate
+\texttt{ap} through \texttt{\_kcc\_ir\_ident\_alloca}, which resolves a
+local identifier to its alloca vreg.
+
+@d IR: variadic builtins @{
+// -- kcc_ir_ident_alloca --------------------------------------------------
+// uint64_t kcc_ir_ident_alloca(node *ident)
+//   x0 = AST_IDENT_EXPR.  Returns the identifier's alloca vreg, or ~0 when
+//   it is not a known local.
+.text
+.globl _kcc_ir_ident_alloca
+.p2align 2
+_kcc_ir_ident_alloca:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    cbz x0, .Lia_none
+    ldr x19, [x0, #AST_F0]       // name ptr
+    cbz x19, .Lia_none
+    mov x0, x19
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19
+    bl _kcc_ht_get
+    cbz x0, .Lia_none
+    bic x0, x0, #0x8000000000000000
+    sub x0, x0, #1
+    b .Lia_done
+.Lia_none:
+    mov x0, #-1
+.Lia_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_build_va_start ------------------------------------------------
+// void kcc_ir_build_va_start(node *call)   — call = va_start(ap, last)
+.text
+.globl _kcc_ir_build_va_start
+.p2align 2
+_kcc_ir_build_va_start:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // call node
+    ldr x0, [x19, #AST_F1]       // first arg = ap ident
+    bl _kcc_ir_ident_alloca
+    mov x20, x0                  // ap alloca vreg
+    // F = current function's fixed-parameter count
+    adrp x0, _kcc_ir_cur_func@@PAGE
+    add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
+    ldr x0, [x0]
+    ldr x21, [x0, #IRF_PARAMS]
+    // IR_VA_START: DEST = base-address vreg, SRC2 = F
+    mov x0, #IR_VA_START
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // base-address vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // *ap = base
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]     // value = base address
+    str x20, [x22, #IR_SRC2]     // pointer = ap's storage
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x21
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_build_va_arg --------------------------------------------------
+// uint64_t kcc_ir_build_va_arg(node *va_arg)
+//   Loads the 8-byte slot at the va_list cursor, advances the cursor by 8,
+//   and returns the loaded value vreg.
+.text
+.globl _kcc_ir_build_va_arg
+.p2align 2
+_kcc_ir_build_va_arg:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // va_arg node
+    ldr x0, [x19, #AST_F0]       // ap ident
+    bl _kcc_ir_ident_alloca
+    mov x20, x0                  // ap alloca vreg
+    // p = *ap  (current cursor)
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // p
+    mov x0, x22
+    bl _kcc_ir_emit
+    // val = *p  (one 8-byte argument slot)
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // val
+    mov x0, x22
+    bl _kcc_ir_emit
+    // c8 = 8
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    mov x1, #8
+    str x1, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x24, x0                  // c8
+    mov x0, x22
+    bl _kcc_ir_emit
+    // p2 = p + 8
+    mov x0, #IR_ADD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    str x24, [x22, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // p2
+    mov x0, x22
+    bl _kcc_ir_emit
+    // *ap = p2
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    str x20, [x22, #IR_SRC2]
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x23                  // return val
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.section __TEXT,__cstring,cstring_literals
+_kcc_ir_str_va_start:    .asciz "va_start"
+_kcc_ir_str_va_end:      .asciz "va_end"
+.text
+@| _kcc_ir_ident_alloca _kcc_ir_build_va_start _kcc_ir_build_va_arg
+@| _kcc_ir_str_va_start _kcc_ir_str_va_end
+@}
+
+\paragraph{End-to-end tests.}
+The \texttt{IR\_CALL} instruction carries a callee name and an
+arena-allocated argument array.  The code generator loads each
+argument vreg from its stack slot into \texttt{x0}--\texttt{x7}
+(following AAPCS64), emits a \texttt{BL} with an
+\texttt{ARM64\_RELOC\_BRANCH26} relocation, and stores the return
+value from \texttt{x0} into the destination vreg's slot.  Locally
+defined functions become \texttt{N\_SECT|N\_EXT} symbols; external
+calls become \texttt{N\_UNDF|N\_EXT} symbols resolved by the linker.
+The recursive factorial test is particularly demanding: it verifies
+that the prologue and epilogue correctly save and restore the frame
+pointer and link register across a deep call chain.
+
+@d Test: codegen functions @{
+echo ""
+echo "--- Functions ---"
+
+run_test "simple call" \
+    "int foo(int x) { return x + 1; } int main(void) { return foo(41); }" 42
+
+run_test "nested calls" \
+    "int foo(int x) { return x + 1; } int main(void) { return foo(foo(1)); }" 3
+
+run_test "multi-arg" \
+    "int add(int a, int b) { return a + b; } int main(void) { return add(20, 22); }" 42
+
+run_test "three args" \
+    "int sum3(int a, int b, int c) { return a + b + c; } int main(void) { return sum3(10, 20, 12); }" 42
+
+run_test "recursive factorial" \
+    "int fact(int n) { if (n <= 1) return 1; return n * fact(n - 1); } int main(void) { return fact(5); }" 120
+@}
+
+\subsection{String Literal}
+
+A string literal is represented by \texttt{IR\_STRING\_LIT}, which
+carries the data pointer in \texttt{SRC1} and the byte length in
+\texttt{SRC2}.  The code generator
+(Chapter~\ref{ch:codegen}) later appends this data to the
+\texttt{\_\_text} section and emits a PC-relative reference so the
+vreg holds the string's run-time address.
+
+@d IR: build string literal @{
+// -- kcc_ir_build_string_lit ----------------------------------------------
+// uint64_t kcc_ir_build_string_lit(node *lit)
+//   x0 = AST_STR_LIT (F0=str_ptr, F1=str_len)
+// Returns vreg holding the string's address.
+.text
+.globl _kcc_ir_build_string_lit
+.p2align 2
+_kcc_ir_build_string_lit:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // str_ptr
+    ldr x21, [x19, #AST_F1]     // str_len
+
+    mov x0, #IR_STRING_LIT
+    bl _kcc_ir_alloc_instr
+    mov x19, x0                  // save instr
+
+    str x20, [x19, #IR_SRC1]    // str data pointer
+    str x21, [x19, #IR_SRC2]    // str length
+
+    // Type: use int for now (value is a 64-bit pointer)
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x19, #IR_TYPE]
+
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // save vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20                  // return vreg
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_string_lit
+@}
+
+\subsection{Conditional Expression}
+
+The ternary operator \texttt{cond ? then : else} is lowered to three
+fresh basic blocks plus a temporary alloca that serves as a rendezvous
+point.  The condition vreg feeds an \texttt{IR\_BR\_COND} that routes
+control to the \emph{then\_bb} or \emph{else\_bb}.  Each arm evaluates
+its expression and \emph{stores} the result into the shared alloca,
+then branches unconditionally to the \emph{merge\_bb}.  The merge block
+loads the result back from the alloca, producing a single vreg that
+the caller can reference regardless of which branch executed.
+
+This store/load pattern replaces the earlier approach of ``returning
+the last vreg,'' which failed because the then-branch vreg was never
+referenced in the merge block and DCE eliminated it.  The alloca
+approach works naturally with the all-spill code generator and avoids
+phi nodes entirely.
+
+@d IR: build conditional @{
+// -- kcc_ir_build_cond_expr -----------------------------------------------
+// uint64_t kcc_ir_build_cond_expr(node *expr)
+//   x0 = AST_COND_EXPR (F0=cond, F1=then, F2=else)
+// Lowers to: alloca tmp → br_cond → then: store → br merge
+//                                  → else: store → br merge
+//            merge: load tmp → return vreg
+.text
+.globl _kcc_ir_build_cond_expr
+.p2align 2
+_kcc_ir_build_cond_expr:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+
+    mov x19, x0
+
+    // Allocate a temporary slot for the result
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x20, x0                  // x20 = alloca instr
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x25, x0                  // x25 = alloca vreg (result slot)
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    // Build condition
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // cond vreg
+
+    // Create then/else/merge BBs
+    bl _kcc_ir_alloc_bb
+    mov x21, x0                  // then_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // else_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // merge_bb
+
+    // Branch on condition
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_DEST]
+    ldr x1, [x21, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Then branch: evaluate, store to alloca, branch to merge
+    mov x0, x21
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x24, x0                  // then_vreg
+
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]     // value
+    str x25, [x0, #IR_SRC2]     // alloca
+    bl _kcc_ir_emit
+
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Else branch: evaluate, store to alloca, branch to merge
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x24, x0                  // else_vreg
+
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]     // value
+    str x25, [x0, #IR_SRC2]     // alloca
+    bl _kcc_ir_emit
+
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // Merge: load from alloca → result vreg
+    mov x0, x23
+    bl _kcc_ir_set_bb
+
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x25, [x0, #IR_SRC1]     // alloca vreg
+    mov x20, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x24, x0                  // result vreg
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, x24                  // return result vreg
+
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@| _kcc_ir_build_cond_expr
+@}
+
+\paragraph{End-to-end tests.}
+The alloca rendezvous pattern ensures that whichever branch executes,
+the result is stored to a known location and loaded in the merge block.
+These tests cover both truth values, variable conditions, initialiser
+context, nesting, use as a function argument, and sub-expression
+evaluation within the arms.
+
+@d Test: codegen ternary @{
+echo ""
+echo "--- Ternary Operator ---"
+
+run_test "ternary-true" \
+    "int main(void) { return 1 ? 42 : 99; }" 42
+
+run_test "ternary-false" \
+    "int main(void) { return 0 ? 42 : 99; }" 99
+
+run_test "ternary-var-cond" \
+    "int main(void) { int x = 1; return x ? 10 : 20; }" 10
+
+run_test "ternary-var-init" \
+    "int main(void) { int x = 1 ? 5 : 9; return x; }" 5
+
+run_test "ternary-nested" \
+    "int main(void) { return 1 ? (0 ? 1 : 2) : 3; }" 2
+
+run_test "ternary-expr-arms" \
+    "int main(void) { int a=10; int b=3; return 1 ? a+b : a-b; }" 13
+
+run_test "ternary-false-path" \
+    "int main(void) { int a=10; int b=3; return 0 ? a+b : a-b; }" 7
+@}
+
+\section{Building Cast Expressions}
+
+An explicit cast \texttt{(T)e} compares the target type~\texttt{T}
+with the source type of the inner expression.  When the target is
+strictly narrower (by \texttt{TY\_SIZE}), the builder emits
+\texttt{IR\_TRUNC} to mask the result to the target width.
+When the target is wider, it emits \texttt{IR\_SEXT} for signed
+source types and \texttt{IR\_ZEXT} for unsigned ones; the source
+width is passed in \texttt{IR\_SRC2}.  Same-width casts return the
+inner vreg unchanged.
+
+@d IR: build cast @{
+// -- kcc_ir_build_cast ----------------------------------------------------
+// uint64_t kcc_ir_build_cast(node *cast)
+//   x0 = AST_CAST_EXPR (F0=type, F1=expr, F3=resolved target type)
+// Returns vreg.
+.text
+.globl _kcc_ir_build_cast
+.p2align 2
+_kcc_ir_build_cast:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // cast node
+
+    // Save inner expr pointer before building
+    ldr x20, [x19, #AST_F1]     // inner expression node
+
+    // Build inner expression
+    mov x0, x20
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // src_vreg
+
+    // Get target type from cast node's F3 (set by sema)
+    ldr x22, [x19, #AST_F3]
+    cbz x22, .Lbc_done
+
+    // Get source type from inner expr's F3
+    ldr x23, [x20, #AST_F3]
+    cbz x23, .Lbc_done
+
+    // Any conversion touching a floating type is delegated to
+    // _kcc_ir_convert, which inserts sitofp / fptosi as needed and rounds to
+    // single precision when the target is float.  Integer-only casts fall
+    // through to the width-resize path below.
+    mov x0, x22
+    bl _kcc_ir_type_is_fp
+    mov x1, x0                   // target_is_fp
+    mov x0, x23
+    bl _kcc_ir_type_is_fp        // source_is_fp
+    orr x0, x0, x1
+    cbz x0, .Lbc_int_resize
+    mov x0, x21                  // src vreg
+    mov x1, x23                  // from type
+    mov x2, x22                  // to type
+    bl _kcc_ir_convert
+    mov x21, x0
+    b .Lbc_done
+
+.Lbc_int_resize:
+    // A cast to _Bool normalises to 0/1, not a low-byte truncation.
+    ldr x0, [x22, #TY_KIND]
+    cmp x0, #TY_BOOL
+    b.ne .Lbc_resize_sizes
+    mov x0, x21
+    bl _kcc_ir_emit_bool_norm
+    mov x21, x0
+    b .Lbc_done
+.Lbc_resize_sizes:
+    // Compare sizes
+    ldr x1, [x22, #TY_SIZE]     // target size
+    ldr x2, [x23, #TY_SIZE]     // source size
+
+    cmp x1, x2
+    b.eq .Lbc_done               // same width: no conversion
+    b.lo .Lbc_trunc              // target < source: truncate
+    b .Lbc_extend                // target > source: extend
+
+.Lbc_trunc:
+    mov x0, #IR_TRUNC
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+
+    str x22, [x20, #IR_TYPE]    // target type
+    str x21, [x20, #IR_SRC1]    // source vreg
+
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0
+
+    mov x0, x20
+    bl _kcc_ir_emit
+    b .Lbc_done
+
+.Lbc_extend:
+    // Choose SEXT or ZEXT based on source type signedness
+    ldr x0, [x23, #TY_F0]       // 1=signed, 0=unsigned
+    cbz x0, .Lbc_zext
+    mov x0, #IR_SEXT
+    b .Lbc_ext_emit
+.Lbc_zext:
+    mov x0, #IR_ZEXT
+
+.Lbc_ext_emit:
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+
+    str x22, [x20, #IR_TYPE]    // target type
+    str x21, [x20, #IR_SRC1]    // source vreg
+    ldr x0, [x23, #TY_SIZE]     // source width in bytes
+    str x0, [x20, #IR_SRC2]     // pass source width to codegen
+
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0
+
+    mov x0, x20
+    bl _kcc_ir_emit
+
+.Lbc_done:
+    mov x0, x21                  // return vreg
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_cast
+@}
+

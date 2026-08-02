@@ -1,0 +1,2007 @@
+% 37c-codegen-dispatch.weft — per-opcode instruction selection
+%
+% Split from 37-codegen.weft (structural refactor, no content changes):
+% the IR-instruction dispatch that emits ARM64 for each IR opcode.
+
+\section{Instruction Dispatch}
+
+The instruction dispatcher is a large switch over IR opcodes.
+Most cases follow the same pattern: load source vregs into scratch
+registers, compute, store the result.  Two cases deserve special
+attention.
+
+\paragraph{Function calls and the Apple variadic ABI.}
+On Apple ARM64, variadic functions read their non-fixed arguments
+from the \emph{stack}, not from registers.  The standard AAPCS64
+passes arguments in \texttt{x0}--\texttt{x7}, but Apple diverges:
+the callee's \texttt{va\_list} walks the stack frame, and---crucially---%
+the variadic tail begins at \texttt{[sp,\,\#0]}, immediately past the
+fixed parameters, wherever those landed.  A correct caller must therefore
+know how many fixed parameters precede the ellipsis.  \kcc{} recovers this
+count from the prototype: sema records it in the callee function type
+(\S\ref{sec:variadic-defs}), and \texttt{kcc\_ir\_build\_call} threads it to
+the code generator as a \emph{first-stack-index} $F$ packed into the high
+half of the argument-array header.  The marshaller then loads the first eight
+arguments into \texttt{x0}--\texttt{x7} as usual \emph{and} writes the
+variadic tail---\texttt{args[F..N{-}1]}---to the stack starting at
+\texttt{[sp,\,\#0]}.  For an ordinary (non-variadic) call $F$ defaults to
+one, reproducing the legacy layout; the same stack image also feeds a callee
+with more than eight parameters, whose ninth-and-later arguments are read
+from this area (\S``Storing Register Arguments'').  Arguments in the tail are
+loaded from their vreg slots into scratch \texttt{x9} before being stored.
+The emitted sequence is:
+%
+\begin{enumerate}
+\item \texttt{SUB sp, sp, \#aligned\_size}
+\item \texttt{STR x\textit{k}, [sp, \#(\textit{k}{-}F)*8]}
+      for each $k \in [F, N{-}1]$
+\item \texttt{BL \_callee}
+\item \texttt{ADD sp, sp, \#aligned\_size}
+\end{enumerate}
+
+\paragraph{String literals.}
+\texttt{IR\_STRING\_LIT} delegates to
+\texttt{kcc\_codegen\_string\_lit}
+(\S\ref{sec:emit-strings}), which copies the string bytes into the
+cstring buffer, creates a local symbol, and emits an
+\textsc{adrp}+\textsc{add} pair so the generated code gets a
+pointer to the data.
+
+@d CodeGen: instruction dispatch @{
+// -- kcc_codegen_instr --------------------------------------------------------
+// void kcc_codegen_instr(ir_instr *instr, ht *bb_labels, vec *patches)
+//   x0 = instruction, x1 = bb label ht, x2 = patch vec
+.text
+.globl _kcc_codegen_instr
+.p2align 2
+_kcc_codegen_instr:
+    stp x29, x30, [sp, #-112]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    mov x19, x0                    // instr
+    mov x20, x1                    // bb_labels
+    mov x21, x2                    // patches
+
+    ldr x22, [x19, #IR_OP]        // opcode
+
+    // Floating-point arithmetic and comparison route to a parallel set of
+    // handlers.  Only these opcodes use the FP unit; IR_CONST/LOAD/STORE
+    // also carry a double type but move the raw bit pattern, so they stay
+    // on the ordinary path.
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_dispatch
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_FLOAT
+    b.eq .Lcgi_fp_dispatch
+    cmp x0, #TY_DOUBLE
+    b.ne .Lcgi_dispatch
+.Lcgi_fp_dispatch:
+    cmp x22, #IR_ADD
+    b.eq .Lcgi_fadd
+    cmp x22, #IR_SUB
+    b.eq .Lcgi_fsub
+    cmp x22, #IR_MUL
+    b.eq .Lcgi_fmul
+    cmp x22, #IR_SDIV
+    b.eq .Lcgi_fdiv
+    cmp x22, #IR_CMP_EQ
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_NE
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SLT
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SLE
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SGT
+    b.eq .Lcgi_fcmp
+    cmp x22, #IR_CMP_SGE
+    b.eq .Lcgi_fcmp
+    // Other fp-typed opcodes (const/load/store): ordinary path.
+
+.Lcgi_dispatch:
+    // Dispatch on opcode
+    cmp x22, #IR_NOP
+    b.eq .Lcgi_done
+
+    cmp x22, #IR_CONST
+    b.eq .Lcgi_const
+
+    cmp x22, #IR_ADD
+    b.eq .Lcgi_add
+    cmp x22, #IR_SUB
+    b.eq .Lcgi_sub
+    cmp x22, #IR_MUL
+    b.eq .Lcgi_mul
+    cmp x22, #IR_SDIV
+    b.eq .Lcgi_sdiv
+    cmp x22, #IR_UDIV
+    b.eq .Lcgi_udiv
+    cmp x22, #IR_SMOD
+    b.eq .Lcgi_smod
+    cmp x22, #IR_UMOD
+    b.eq .Lcgi_umod
+    cmp x22, #IR_NEG
+    b.eq .Lcgi_neg
+
+    cmp x22, #IR_AND
+    b.eq .Lcgi_and
+    cmp x22, #IR_OR
+    b.eq .Lcgi_or
+    cmp x22, #IR_XOR
+    b.eq .Lcgi_xor
+    cmp x22, #IR_SHL
+    b.eq .Lcgi_shl
+    cmp x22, #IR_LSHR
+    b.eq .Lcgi_lshr
+    cmp x22, #IR_ASHR
+    b.eq .Lcgi_ashr
+    cmp x22, #IR_NOT
+    b.eq .Lcgi_not
+
+    cmp x22, #IR_CMP_EQ
+    b.eq .Lcgi_cmp_eq
+    cmp x22, #IR_CMP_NE
+    b.eq .Lcgi_cmp_ne
+    cmp x22, #IR_CMP_SLT
+    b.eq .Lcgi_cmp_slt
+    cmp x22, #IR_CMP_SLE
+    b.eq .Lcgi_cmp_sle
+    cmp x22, #IR_CMP_SGT
+    b.eq .Lcgi_cmp_sgt
+    cmp x22, #IR_CMP_SGE
+    b.eq .Lcgi_cmp_sge
+    cmp x22, #IR_CMP_ULT
+    b.eq .Lcgi_cmp_ult
+    cmp x22, #IR_CMP_ULE
+    b.eq .Lcgi_cmp_ule
+
+    cmp x22, #IR_LOAD
+    b.eq .Lcgi_load
+    cmp x22, #IR_STORE
+    b.eq .Lcgi_store
+    cmp x22, #IR_ALLOCA
+    b.eq .Lcgi_alloca
+    cmp x22, #IR_GEP
+    b.eq .Lcgi_gep
+
+    cmp x22, #IR_BR
+    b.eq .Lcgi_br
+    cmp x22, #IR_BR_COND
+    b.eq .Lcgi_br_cond
+    cmp x22, #IR_RET
+    b.eq .Lcgi_ret
+    cmp x22, #IR_CALL
+    b.eq .Lcgi_call
+    cmp x22, #IR_CALL_IND
+    b.eq .Lcgi_call_ind
+    cmp x22, #IR_GLOBAL_REF
+    b.eq .Lcgi_global_ref
+    cmp x22, #IR_STRING_LIT
+    b.eq .Lcgi_string_lit
+
+    cmp x22, #IR_TRUNC
+    b.eq .Lcgi_trunc
+    cmp x22, #IR_BITCAST
+    b.eq .Lcgi_bitcast
+    cmp x22, #IR_SEXT
+    b.eq .Lcgi_sext
+    cmp x22, #IR_ZEXT
+    b.eq .Lcgi_zext
+    cmp x22, #IR_SITOFP
+    b.eq .Lcgi_sitofp
+    cmp x22, #IR_FPTOSI
+    b.eq .Lcgi_fptosi
+    cmp x22, #IR_VA_START
+    b.eq .Lcgi_va_start
+    cmp x22, #IR_FPROUND
+    b.eq .Lcgi_fpround
+
+    // Unknown opcode: skip
+    b .Lcgi_done
+@| _kcc_codegen_instr
+@}
+
+\subsection{Loading Constants}
+
+An \texttt{IR\_CONST} materialises an arbitrary 64-bit immediate into
+x11 using a \textsc{movz}\,+\,\textsc{movk} sequence.  \textsc{movz}
+loads the lowest 16~bits and zeroes the rest; each subsequent
+\textsc{movk} patches one 16-bit half-word lane if it is non-zero.
+This produces 1--4 instructions depending on the value.
+
+@d CodeGen: instruction dispatch @{
+// ---- IR_CONST: load immediate into x11, store to dest slot ----
+.Lcgi_const:
+    ldr x23, [x19, #IR_SRC1]      // immediate value
+    ldr x24, [x19, #IR_DEST]      // dest vreg
+
+    // Emit MOVZ for bits [15:0]
+    mov x0, #CG_REG_DST           // rd = x11
+    and x1, x23, #0xFFFF          // imm16 = low 16 bits
+    mov x2, #0                     // hw = 0
+    mov x3, #1                     // sf = 64-bit
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+
+    // Check if we need MOVK for bits [31:16]
+    lsr x0, x23, #16
+    and x0, x0, #0xFFFF
+    cbz x0, .Lcgi_const_hw2
+
+    mov x0, #CG_REG_DST
+    lsr x1, x23, #16
+    and x1, x1, #0xFFFF
+    mov x2, #1                     // hw = 1
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+
+.Lcgi_const_hw2:
+    lsr x0, x23, #32
+    and x0, x0, #0xFFFF
+    cbz x0, .Lcgi_const_hw3
+
+    mov x0, #CG_REG_DST
+    lsr x1, x23, #32
+    and x1, x1, #0xFFFF
+    mov x2, #2                     // hw = 2
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+
+.Lcgi_const_hw3:
+    lsr x0, x23, #48
+    and x0, x0, #0xFFFF
+    cbz x0, .Lcgi_const_store
+
+    mov x0, #CG_REG_DST
+    lsr x1, x23, #48
+    and x1, x1, #0xFFFF
+    mov x2, #3                     // hw = 3
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+
+.Lcgi_const_store:
+    // Store x11 to dest vreg slot
+    mov x0, x24                    // vreg
+    mov x1, #CG_REG_DST           // reg = x11
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+@}
+
+\subsection{Arithmetic and Bitwise Operations}
+
+All binary arithmetic and bitwise instructions follow the same
+pattern: load the two source vregs into x9 and x10, perform the
+operation into x11, and store x11 to the destination slot.  The
+\textsc{add}, \textsc{sub}, \textsc{mul}, \textsc{sdiv}, and
+\textsc{udiv} cases differ only in which encoder they call.
+
+Signed modulo requires two instructions: \texttt{sdiv\;x11,\;x9,\;x10}
+followed by \texttt{msub\;x11,\;x11,\;x10,\;x9}, which computes
+$x_9 - (x_9 / x_{10}) \times x_{10}$.  Negation is \texttt{sub\;x11,\;xzr,\;x9}.
+
+The bitwise operations (\textsc{and}, \textsc{orr}, \textsc{eor},
+shifts, and \textsc{not}) use the same load--compute--store pattern
+with logical-class encoders.
+
+@d CodeGen: instruction dispatch @{
+// ---- Binary arithmetic: load src1→x9, src2→x10, op→x11, store ----
+.Lcgi_add:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_add_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_sub:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_sub_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_mul:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_mul
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_sdiv:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_sdiv
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_udiv:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_udiv
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_smod:
+    // SMOD: x11 = x9 - (x9/x10)*x10  → sdiv x11,x9,x10; msub x11,x11,x10,x9
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    // sdiv x11, x9, x10
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_sdiv
+    bl _kcc_code_emit32
+
+    // msub x11, x11, x10, x9  (x11 = x9 - x11*x10)
+    mov x0, #CG_REG_DST           // rd
+    mov x1, #CG_REG_DST           // rn (quotient)
+    mov x2, #CG_REG_SRC2          // rm (divisor)
+    mov x3, #CG_REG_SRC1          // ra (dividend)
+    mov x4, #1                     // sf
+    bl _kcc_enc_msub
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_umod:
+    // UMOD: x11 = x9 - (x9/x10)*x10  → udiv x11,x9,x10; msub x11,x11,x10,x9
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    // udiv x11, x9, x10
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_udiv
+    bl _kcc_code_emit32
+
+    // msub x11, x11, x10, x9  (x11 = x9 - x11*x10)
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_DST
+    mov x2, #CG_REG_SRC2
+    mov x3, #CG_REG_SRC1
+    mov x4, #1
+    bl _kcc_enc_msub
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_neg:
+    // NEG x11, x9 → SUB x11, xzr, x9
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST           // rd
+    mov x1, #31                    // rn = xzr
+    mov x2, #CG_REG_SRC1          // rm
+    mov x3, #1                     // sf
+    bl _kcc_enc_sub_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+@}
+
+\paragraph{Bitwise Operations}
+The bitwise group---\textsc{and}, \textsc{orr}, \textsc{eor},
+shifts, and \textsc{mvn}---follows the same load--compute--store
+pattern as arithmetic.  Each binary bitwise operation loads the two
+source vregs into \texttt{x9} and \texttt{x10}, calls the
+appropriate logical-class encoder, and stores the result from
+\texttt{x11} to the destination slot.  Shifts use
+register-variable forms (\textsc{lsl}, \textsc{lsr}, \textsc{asr})
+rather than immediate encodings, since the shift amount comes from
+a vreg.  The unary \textsc{not} (\texttt{IR\_NOT}) uses
+\textsc{mvn} with a single source operand.
+
+@d CodeGen: instruction dispatch @{
+// ---- Bitwise operations ----
+.Lcgi_and:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_and_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_or:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_orr_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_xor:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_eor_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_shl:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_lsl_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_lshr:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_lsr_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_ashr:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_asr_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_not:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #1                     // sf
+    bl _kcc_enc_mvn
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+@}
+
+\subsection{Comparison Operations}
+
+Integer comparisons emit \texttt{CMP\;x9,\;x10} (which is really
+\texttt{SUBS\;xzr,\;x9,\;x10}---subtract and set flags, discard
+result) followed by \texttt{CSET\;x11,\;\textit{cond}}.  The
+\textsc{cset} pseudo-instruction encodes as
+\texttt{CSINC\;x11,\;xzr,\;xzr,\;inv(cond)}: if the
+\emph{inverted} condition is false, the result is~1; otherwise~0.
+All six comparisons share a common tail; each case simply loads
+the inverted condition code into x23 and falls through:
+
+\begin{center}
+\begin{tabular}{lcc}
+\hline
+IR opcode & ARM64 cond & Inverted \\
+\hline
+\texttt{CMP\_EQ} & EQ (0) & NE (1) \\
+\texttt{CMP\_NE} & NE (1) & EQ (0) \\
+\texttt{CMP\_SLT} & LT (11) & GE (10) \\
+\texttt{CMP\_SLE} & LE (13) & GT (12) \\
+\texttt{CMP\_SGT} & GT (12) & LE (13) \\
+\texttt{CMP\_SGE} & GE (10) & LT (11) \\
+\texttt{CMP\_ULT} & LO/CC (3) & HS/CS (2) \\
+\texttt{CMP\_ULE} & LS (9) & HI (8) \\
+\hline
+\end{tabular}
+\end{center}
+
+@d CodeGen: instruction dispatch @{
+// ---- Compare operations ----
+// Pattern: load src1→x9, src2→x10, CMP x9,x10, CSET x11,<inv_cond>
+
+.Lcgi_cmp_eq:
+    mov x23, #1                    // inv_cond for EQ = NE (1)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_ne:
+    mov x23, #0                    // inv_cond for NE = EQ (0)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_slt:
+    mov x23, #10                   // inv_cond for LT = GE (10)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_sle:
+    mov x23, #12                   // inv_cond for LE = GT (12)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_sgt:
+    mov x23, #13                   // inv_cond for GT = LE (13)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_sge:
+    mov x23, #11                   // inv_cond for GE = LT (11)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_ult:
+    mov x23, #2                    // inv_cond for LO/CC = HS/CS (2)
+    b .Lcgi_cmp_common
+.Lcgi_cmp_ule:
+    mov x23, #8                    // inv_cond for LS = HI (8)
+    b .Lcgi_cmp_common
+
+.Lcgi_cmp_common:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    // CMP x9, x10
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #1                     // sf
+    bl _kcc_enc_cmp_reg
+    bl _kcc_code_emit32
+
+    // CSET x11, inv_cond
+    mov x0, #CG_REG_DST
+    mov x1, x23                    // inv_cond
+    mov x2, #1                     // sf
+    bl _kcc_enc_cset
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+@}
+
+\subsection{Type Conversions}
+
+\texttt{IR\_TRUNC} masks a value to the width of the target type.
+The target's \texttt{TY\_SIZE} (1, 2, or~4 bytes) selects the mask;
+the handler loads the mask into \texttt{x10} and uses
+\texttt{AND\;x11,\;x9,\;x10}.  If no type is attached or the size
+is~8, the instruction is a plain copy.
+
+\texttt{IR\_SEXT} sign-extends a narrow value to 64~bits.  The source
+width is stored in \texttt{IR\_SRC2} (1, 2, or~4 bytes); the handler
+emits \textsc{sbfm} with the appropriate \texttt{imms} field (7, 15,
+or~31).  \texttt{IR\_ZEXT} zero-extends analogously using
+\textsc{ubfm}.
+
+\texttt{IR\_BITCAST} reinterprets the bit pattern as a different type
+without changing any bits---a no-op in the all-spill strategy.
+
+@d CodeGen: instruction dispatch @{
+// ---- Type conversions ----
+
+.Lcgi_trunc:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1          // x9 = source value
+    bl _kcc_cg_load_vreg
+
+    // Get target type size
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_trunc_copy
+    ldr x23, [x0, #TY_SIZE]
+
+    cmp x23, #1
+    b.eq .Lcgi_trunc_1
+    cmp x23, #2
+    b.eq .Lcgi_trunc_2
+    cmp x23, #4
+    b.eq .Lcgi_trunc_4
+    b .Lcgi_trunc_copy
+
+.Lcgi_trunc_1:
+    // MOVZ x10, #0xFF
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFF
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+    b .Lcgi_trunc_mask
+
+.Lcgi_trunc_2:
+    // MOVZ x10, #0xFFFF
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFFFF
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+    b .Lcgi_trunc_mask
+
+.Lcgi_trunc_4:
+    // MOVZ x10, #0xFFFF; MOVK x10, #0xFFFF, hw=1
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFFFF
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+
+    mov x0, #CG_REG_SRC2
+    mov x1, #0xFFFF
+    mov x2, #1
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+    b .Lcgi_trunc_mask
+
+.Lcgi_trunc_mask:
+    // AND x11, x9, x10
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #CG_REG_SRC2
+    mov x3, #1
+    bl _kcc_enc_and_reg
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_trunc_copy:
+    // No masking — copy src to dest via ADD x11, x9, #0
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_bitcast:
+    // Pure type reinterpretation — copy src to dest
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_sext:
+    // Sign-extend: SRC2 = source width in bytes
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    ldr x23, [x19, #IR_SRC2]      // source width
+    cmp x23, #1
+    b.eq .Lcgi_sext_1
+    cmp x23, #2
+    b.eq .Lcgi_sext_2
+    cmp x23, #4
+    b.eq .Lcgi_sext_4
+    b .Lcgi_sext_copy
+
+.Lcgi_sext_1:
+    // SXTB x11, x9 → SBFM x11, x9, #0, #7 = 0x93401D2B
+    movz w0, #0x1D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_sext_2:
+    // SXTH x11, x9 → SBFM x11, x9, #0, #15 = 0x93403D2B
+    movz w0, #0x3D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_sext_4:
+    // SXTW x11, x9 → SBFM x11, x9, #0, #31 = 0x93407D2B
+    movz w0, #0x7D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_sext_copy:
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+.Lcgi_sext_store:
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_zext:
+    // Zero-extend: SRC2 = source width in bytes
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    ldr x23, [x19, #IR_SRC2]
+    cmp x23, #1
+    b.eq .Lcgi_zext_1
+    cmp x23, #2
+    b.eq .Lcgi_zext_2
+    cmp x23, #4
+    b.eq .Lcgi_zext_4
+    b .Lcgi_sext_copy              // fallback: plain copy
+
+.Lcgi_zext_1:
+    // UXTB x11, x9 → UBFM x11, x9, #0, #7 = 0xD3401D2B
+    movz w0, #0x1D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_zext_2:
+    // UXTH x11, x9 → UBFM x11, x9, #0, #15 = 0xD3403D2B
+    movz w0, #0x3D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+
+.Lcgi_zext_4:
+    // 32→64: UBFM x11, x9, #0, #31 = 0xD3407D2B
+    movz w0, #0x7D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lcgi_sext_store
+@}
+
+\subsection{Floating-Point Operations}
+
+The floating-point handlers mirror the integer ones but route their
+operands through the FP register file.  A double lives in the same
+eight-byte spill slot as any other value, so \texttt{\_kcc\_cg\_load\_vreg\_fp}
+reloads it into \texttt{d0}/\texttt{d1}, the two-source op computes into
+\texttt{d2}, and \texttt{\_kcc\_cg\_store\_vreg\_fp} spills it back.
+Comparisons reuse the integer comparison tail: after \textsc{fcmp}
+sets the flags, the very same inverted condition codes drive
+\textsc{cset}, because an \emph{ordered} floating comparison leaves
+\texttt{N}, \texttt{Z}, and \texttt{V} in exactly the arrangement the
+signed integer conditions already test.  The conversions bridge the two
+register files---\textsc{scvtf} reads an integer slot and writes a
+double slot, \textsc{fcvtzs} does the reverse with round-toward-zero,
+matching C's truncating cast.
+
+@d CodeGen: floating point @{
+// ---- Floating-point arithmetic: src1→d0, src2→d1, fOP→d2, store ----
+.Lcgi_fadd:
+    mov x23, #2                    // fp dp2 opcode: fadd
+    b .Lcgi_fp_arith
+.Lcgi_fsub:
+    mov x23, #3                    // fsub
+    b .Lcgi_fp_arith
+.Lcgi_fmul:
+    mov x23, #0                    // fmul
+    b .Lcgi_fp_arith
+.Lcgi_fdiv:
+    mov x23, #1                    // fdiv
+
+.Lcgi_fp_arith:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #1                     // d1
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #2                     // Rd = d2
+    mov x1, #0                     // Rn = d0
+    mov x2, #1                     // Rm = d1
+    mov x3, x23                    // opcode
+    bl _kcc_enc_fp_dp2
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #2                     // d2
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+
+// ---- Floating-point comparison: fcmp d0,d1 then cset x11,<inv_cond> ----
+.Lcgi_fcmp:
+    mov x23, #1                    // EQ  → inv NE (1)
+    cmp x22, #IR_CMP_EQ
+    b.eq .Lcgi_fcmp_do
+    mov x23, #0                    // NE  → inv EQ (0)
+    cmp x22, #IR_CMP_NE
+    b.eq .Lcgi_fcmp_do
+    mov x23, #10                   // SLT → inv GE (10)
+    cmp x22, #IR_CMP_SLT
+    b.eq .Lcgi_fcmp_do
+    mov x23, #12                   // SLE → inv GT (12)
+    cmp x22, #IR_CMP_SLE
+    b.eq .Lcgi_fcmp_do
+    mov x23, #13                   // SGT → inv LE (13)
+    cmp x22, #IR_CMP_SGT
+    b.eq .Lcgi_fcmp_do
+    mov x23, #11                   // SGE → inv LT (11)
+
+.Lcgi_fcmp_do:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0
+    bl _kcc_cg_load_vreg_fp
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #1
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #0                     // Rn = d0
+    mov x1, #1                     // Rm = d1
+    bl _kcc_enc_fcmp
+    bl _kcc_code_emit32
+    mov x0, #CG_REG_DST
+    mov x1, x23                    // inverted condition
+    mov x2, #1
+    bl _kcc_enc_cset
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg          // result is an integer 0/1
+    b .Lcgi_done
+
+// ---- Conversions between the integer and floating register files ----
+.Lcgi_sitofp:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1           // x9
+    bl _kcc_cg_load_vreg
+    mov x0, #0                     // Rd = d0
+    mov x1, #CG_REG_SRC1           // Rn = x9
+    bl _kcc_enc_scvtf
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+
+.Lcgi_fptosi:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #CG_REG_SRC1           // Rd = x9 (integer)
+    mov x1, #0                     // Rn = d0
+    bl _kcc_enc_fcvtzs
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_fpround:
+    // Round a double to single precision: FCVT s0,d0 then FCVT d0,s0.
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #0                     // Rd = s0
+    mov x1, #0                     // Rn = d0
+    bl _kcc_enc_fcvt_s_d
+    bl _kcc_code_emit32
+    mov x0, #0                     // Rd = d0
+    mov x1, #0                     // Rn = s0
+    bl _kcc_enc_fcvt_d_s
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+@}
+
+\subsection{Memory Operations}
+
+\texttt{IR\_LOAD} dereferences a pointer: load the address from
+the source vreg into x9, then \texttt{LDR\;x11,\;[x9]} to fetch
+the value, and store x11 to the destination slot.
+
+\texttt{IR\_STORE} is the inverse: load the value into x9 and
+the pointer into x10, then \texttt{STR\;x9,\;[x10]}.  When the
+\texttt{IR\_DEST} field is nonzero it acts as an access-size
+override: 1\,$\to$\,\textsc{strb}, 2\,$\to$\,\textsc{strh},
+4\,$\to$\,32-bit \textsc{str}.  This parallels the \texttt{IR\_LOAD}
+override in \texttt{IR\_SRC2} and is used by the assignment builder
+for pointer-dereference writes (\texttt{*p\;=\;v}), where a
+64-bit store would corrupt adjacent bytes.
+
+\texttt{IR\_ALLOCA} computes the \emph{address} of the variable's
+storage.  To avoid the slot-aliasing bug (see Debugging Lessons),
+alloca storage lives past the vreg value slots.  The pre-scan in
+\texttt{kcc\_codegen\_func} assigns each alloca a running offset
+(stored in \texttt{SRC2}) and sizes the frame accordingly.  The
+address is \texttt{x29 + 16 + vreg\_count * 8 + offset * 8}, which
+is distinct from the vreg's own value slot at
+\texttt{x29 + 16 + dest * 8}.
+
+\texttt{IR\_GEP} (Get Element Pointer) computes an element or member
+address as \texttt{base + offset}, where the second operand is already a
+\emph{byte} offset.  The IR builder is responsible for byte-scaling: it
+pre-multiplies an array subscript by the element's real size and passes a
+struct member's offset as a constant.  Codegen therefore only loads the
+base pointer and the byte offset from their vreg slots and emits a single
+\texttt{ADD\;x11,\;x9,\;x10}, storing the address in the destination vreg.
+Collapsing the old fixed stride~8 into a plain add is what lets packed
+aggregates---whose fields and elements are no longer eight bytes apart---be
+addressed correctly.
+
+@d CodeGen: instruction dispatch @{
+// ---- Memory operations ----
+.Lcgi_load:
+    // Load: x9 = pointer from src1 slot, x11 = *x9, store x11 to dest
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    // Check for a narrow access (IR_SRC2 = access size override).
+    // 1/2/4 = unsigned byte/half/word; 5/6/7 = signed byte/half/word.
+    ldr x23, [x19, #IR_SRC2]
+    cmp x23, #1
+    b.eq .Lcgi_load_8
+    cmp x23, #2
+    b.eq .Lcgi_load_16
+    cmp x23, #4
+    b.eq .Lcgi_load_32
+    cmp x23, #5
+    b.eq .Lcgi_load_s8
+    cmp x23, #6
+    b.eq .Lcgi_load_s16
+    cmp x23, #7
+    b.eq .Lcgi_load_s32
+
+    // Default: 64-bit load (works for alloca slots and pointer-width values)
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_8:
+    // LDRB x11, [x9] — byte load, zero-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #2
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_16:
+    // LDRH x11, [x9] — halfword load, zero-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #3
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_32:
+    // LDR w11, [x9] — word load, zero-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #0
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_s8:
+    // LDRSB x11, [x9] — byte load, sign-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #5
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_s16:
+    // LDRSH x11, [x9] — halfword load, sign-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #6
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    b .Lcgi_load_done
+.Lcgi_load_s32:
+    // LDRSW x11, [x9] — word load, sign-extends to 64-bit
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #0
+    mov x3, #4
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+.Lcgi_load_done:
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_store:
+    // Store: x9 = value from src1, x10 = pointer from src2, *x10 = x9
+    // IR_STORE: SRC1 = value vreg, SRC2 = pointer vreg
+    // IR_DEST = access size override (0 → 64-bit default)
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2
+    bl _kcc_cg_load_vreg
+
+    ldr x23, [x19, #IR_DEST]
+    cmp x23, #1
+    b.eq .Lcgi_store_8
+    cmp x23, #2
+    b.eq .Lcgi_store_16
+    cmp x23, #4
+    b.eq .Lcgi_store_32
+
+    // Default: 64-bit store (alloca slots and pointer-sized values)
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_store_8:
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
+    mov x3, #2                     // size = byte (STRB)
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_store_16:
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
+    mov x3, #3                     // size = halfword (STRH)
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_store_32:
+    mov x0, #CG_REG_SRC1
+    mov x1, #CG_REG_SRC2
+    mov x2, #0
+    mov x3, #0                     // size = word (STR W)
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_alloca:
+    // Alloca: compute address of storage past the vreg value slots.
+    // Pre-scan stored the running offset in SRC2.
+    // Address = x29 + 16 + vreg_count*8 + SRC2*8
+    ldr x24, [x19, #IR_DEST]      // dest vreg
+    ldr x25, [x19, #IR_SRC2]      // alloca offset (from pre-scan)
+
+    ldr x0, [x19, #IR_SRC1]       // slot count (for frame calc verification)
+
+    // Get vreg_count from ir_func
+    adrp x0, _kcc_cg_vreg_count@@PAGE
+    add  x0, x0, _kcc_cg_vreg_count@@PAGEOFF
+    ldr x0, [x0]
+
+    // Storage address = 16 + vreg_count*8 + offset*8
+    lsl x1, x0, #3                // vreg_count * 8
+    lsl x2, x25, #3               // offset * 8
+    add x2, x2, x1
+    add x2, x2, #16               // imm12 = 16 + vreg_count*8 + offset*8
+
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #29                    // rn = x29
+    // x2 already set (imm12)
+    mov x3, #1                     // sf
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    // Store x11 (the address) to dest's VALUE slot
+    mov x0, x24
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_gep:
+    // GEP: base + index, where index is already a byte offset.
+    // SRC1 = base ptr vreg, SRC2 = byte-offset vreg.  The IR builder
+    // pre-scales array indices by the element size and passes member
+    // offsets as constants, so codegen only adds.
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1          // x9 = base
+    bl _kcc_cg_load_vreg
+    ldr x0, [x19, #IR_SRC2]
+    mov x1, #CG_REG_SRC2          // x10 = byte offset
+    bl _kcc_cg_load_vreg
+
+    // ADD x11, x9, x10  →  base + byte_offset
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #CG_REG_SRC1          // rn = x9 (base)
+    mov x2, #CG_REG_SRC2          // rm = x10 (byte offset)
+    mov x3, #1                    // sf = 64-bit
+    bl _kcc_enc_add_reg
+    bl _kcc_code_emit32
+
+    // Store result to dest
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_va_start:
+    // va_start: DEST = x29 + frame_size (the variadic tail; see prose).
+    adrp x1, _kcc_cg_frame_size@@PAGE
+    add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
+    ldr x25, [x1]                 // x25 = frame_size
+
+    // MOVZ x11, #(offset & 0xffff)
+    mov x0, #CG_REG_DST
+    and x1, x25, #0xffff
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_movz
+    bl _kcc_code_emit32
+    // MOVK x11, #((offset>>16)&0xffff), lsl 16   (only if non-zero)
+    lsr x1, x25, #16
+    and x1, x1, #0xffff
+    cbz x1, .Lcgi_vs_add
+    mov x0, #CG_REG_DST
+    mov x2, #1                     // hw = 1 → shift 16
+    mov x3, #1
+    bl _kcc_enc_movk
+    bl _kcc_code_emit32
+.Lcgi_vs_add:
+    // ADD x11, x29, x11
+    mov x0, #CG_REG_DST
+    mov x1, #29
+    mov x2, #CG_REG_DST
+    mov x3, #1
+    bl _kcc_enc_add_reg
+    bl _kcc_code_emit32
+    // Store the address into the DEST vreg slot
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+@}
+
+\subsection{Control Flow}
+
+Branch instructions must handle both backward and forward targets.
+For \texttt{IR\_BR} (unconditional) and \texttt{IR\_BR\_COND}
+(conditional), the code generator looks up the target BB in the
+label hash table.  If found, the offset is known and the branch
+is emitted directly.  If not found (a forward reference), a
+placeholder instruction is emitted and the location is recorded in
+the patch vector; after all BBs have been processed, the patching
+pass resolves these.
+
+Conditional branches emit \texttt{CBNZ\;x9,\;true\_bb} (branch
+if the condition vreg is non-zero) followed by
+\texttt{B\;false\_bb}.  Either or both targets may be forward
+references.
+
+\texttt{IR\_RET} loads the return value (if non-void) into x0 and
+emits the function epilogue: \texttt{LDP\;x29,\;x30,\;[sp],\;\#frame\_size}
+followed by \textsc{ret}.
+
+@d CodeGen: instruction dispatch @{
+// ---- Control flow ----
+.Lcgi_br:
+    // Unconditional branch to BB (SRC1 = target BB_ID)
+    ldr x23, [x19, #IR_SRC1]      // target BB_ID
+
+    // Look up target in bb_labels
+    str x23, [sp, #88]            // store bb_id for key
+    mov x0, x20                    // ht
+    add x1, sp, #88               // key = &bb_id
+    mov x2, #8                     // keylen
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_br_forward
+
+    // Backward branch: compute offset
+    sub x0, x0, #1                // undo +1 encoding
+    bl _kcc_code_current_pos
+    mov x24, x0                    // current pos
+
+    // Look up again (we lost the value)
+    mov x0, x20
+    add x1, sp, #88
+    mov x2, #8
+    bl _kcc_ht_get
+    sub x23, x0, #1               // target offset
+
+    // offset = target - current
+    sub x0, x23, x24
+    bl _kcc_enc_b
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_br_forward:
+    // Forward branch: emit placeholder, record for patching
+    bl _kcc_code_current_pos
+    mov x24, x0                    // patch offset
+
+    // Emit NOP as placeholder
+    mov x0, #0x14000000            // B with offset=0
+    bl _kcc_code_emit32
+
+    // Add to patch list: {code_offset, target_bb_id}
+    str x24, [sp, #88]            // PATCH_OFFSET
+    ldr x0, [x19, #IR_SRC1]
+    str x0, [sp, #96]           // PATCH_TARGET = bb_id
+
+    mov x0, x21                    // patch vec
+    add x1, sp, #88               // entry pointer
+    bl _kcc_vec_push
+    b .Lcgi_done
+
+.Lcgi_br_cond:
+    // Conditional branch: DEST=cond vreg, SRC1=true BB_ID, SRC2=false BB_ID
+    ldr x0, [x19, #IR_DEST]       // condition vreg
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+
+    // CBNZ x9, <true_bb> (may be forward)
+    ldr x23, [x19, #IR_SRC1]      // true BB_ID
+
+    // Check if true target is known
+    str x23, [sp, #88]
+    mov x0, x20
+    add x1, sp, #88
+    mov x2, #8
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_brcond_fwd_true
+
+    // True target is backward
+    sub x23, x0, #1               // target offset
+    bl _kcc_code_current_pos
+    sub x0, x23, x0               // offset = target - current
+    mov x1, x0                     // offset in bytes
+    mov x0, #CG_REG_SRC1          // rt = x9
+    mov x2, #1                     // sf
+    bl _kcc_enc_cbnz
+    bl _kcc_code_emit32
+    b .Lcgi_brcond_false
+
+.Lcgi_brcond_fwd_true:
+    // Forward: emit CBNZ placeholder
+    bl _kcc_code_current_pos
+    mov x24, x0
+
+    // CBNZ x9, +0 (placeholder)
+    mov w0, #0xB5000000            // CBNZ 64-bit with imm19=0
+    add w0, w0, #CG_REG_SRC1      // rt = x9 (Rt field at bits [4:0])
+    bl _kcc_code_emit32
+
+    // Record patch: type CBNZ
+    str x24, [sp, #88]
+    ldr x0, [x19, #IR_SRC1]
+    str x0, [sp, #96]
+    mov x0, x21
+    add x1, sp, #88
+    bl _kcc_vec_push
+
+.Lcgi_brcond_false:
+    // Now emit B to false BB_ID
+    ldr x23, [x19, #IR_SRC2]      // false BB_ID
+    str x23, [sp, #88]
+    mov x0, x20
+    add x1, sp, #88
+    mov x2, #8
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_brcond_fwd_false
+
+    // Backward
+    sub x23, x0, #1
+    bl _kcc_code_current_pos
+    sub x0, x23, x0
+    bl _kcc_enc_b
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_brcond_fwd_false:
+    bl _kcc_code_current_pos
+    mov x24, x0
+    mov x0, #0x14000000
+    bl _kcc_code_emit32
+    str x24, [sp, #88]
+    ldr x0, [x19, #IR_SRC2]
+    str x0, [sp, #96]
+    mov x0, x21
+    add x1, sp, #88
+    bl _kcc_vec_push
+    b .Lcgi_done
+@}
+
+\paragraph{Function Return}
+The \texttt{IR\_RET} handler closes the current function.  If the
+return type is not void, the source vreg is loaded into \texttt{x0}
+(the ABI return register).  For small frames ($\leq 504$ bytes)
+the epilogue uses a post-indexed \textsc{ldp} that restores
+\texttt{x29}/\texttt{x30} and deallocates the frame in one
+instruction; for larger frames it uses a signed-offset \textsc{ldp}
+followed by \texttt{ADD\;sp,\;sp,\;\#frame\_size}, mirroring the
+large-frame prologue.  Both paths finish with \textsc{ret}.  The
+504-byte limit ensures the \textsc{ldp} post-index immediate
+($\mathit{frame}/8$) fits in a signed 7-bit field whose positive
+range is $0$--$63$.
+
+@d CodeGen: instruction dispatch @{
+.Lcgi_ret:
+    // Return: load the value to x0 (scalar), d0 (floating), or x0(-x1) for a
+    // small struct, then emit the epilogue.
+    ldr x23, [x19, #IR_SRC1]      // return value vreg (0 if void)
+
+    ldr x25, [x19, #IR_TYPE]      // return type (kept in x25)
+    cbz x25, .Lcgi_ret_epilogue
+    ldr x24, [x25]                 // type kind
+    cmp x24, #1                    // TY_VOID
+    b.eq .Lcgi_ret_epilogue
+    cmp x24, #8                    // TY_FLOAT
+    b.eq .Lcgi_ret_fp
+    cmp x24, #9                    // TY_DOUBLE
+    b.eq .Lcgi_ret_fp
+    cmp x24, #14                   // TY_STRUCT
+    b.eq .Lcgi_ret_struct
+    cmp x24, #15                   // TY_UNION
+    b.eq .Lcgi_ret_struct
+
+    // Load return value to x0
+    mov x0, x23
+    mov x1, #0                     // target reg = x0
+    bl _kcc_cg_load_vreg
+    b .Lcgi_ret_epilogue
+
+.Lcgi_ret_fp:
+    // A floating return goes in d0 (AAPCS64)
+    mov x0, x23
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    b .Lcgi_ret_epilogue
+
+.Lcgi_ret_struct:
+    // Small struct (<=16 bytes): x23 = struct address vreg, x25 = struct type.
+    // Load [addr] into x0, and [addr+8] into x1 when the struct exceeds 8 bytes.
+    mov x0, x23
+    mov x1, #9                     // x9 = struct address
+    bl _kcc_cg_load_vreg
+    mov x0, #0                     // x0 = [x9]
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+    ldr x0, [x25, #TY_SIZE]
+    cmp x0, #8
+    b.le .Lcgi_ret_epilogue
+    mov x0, #1                     // x1 = [x9, #8]
+    mov x1, #9
+    mov x2, #1                     // imm12_scaled = 1 → byte offset 8
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+
+.Lcgi_ret_epilogue:
+    // Restore the callee-saved registers (the return value already sits in
+    // x0/d0), then tear the frame down.
+    mov x0, #1
+    bl _kcc_cg_callee_transfer
+
+    // Emit epilogue
+    adrp x0, _kcc_cg_frame_size@@PAGE
+    add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
+    ldr x24, [x0]
+
+    cmp x24, #504
+    b.hi .Lcgi_ret_large
+
+    // Small frame: ldp x29, x30, [sp], #frame_size
+    mov x0, #29
+    mov x1, #30
+    mov x2, #31
+    lsr x3, x24, #3
+    bl _kcc_enc_ldp_post
+    bl _kcc_code_emit32
+    b .Lcgi_ret_emit_ret
+
+.Lcgi_ret_large:
+    // Large frame: ldp x29, x30, [sp]  then  add sp, sp, #frame_size
+    // ldp x29, x30, [sp, #0] — signed-offset form: 0xA9407BFD
+    movz w0, #0x7BFD
+    movk w0, #0xA940, lsl #16
+    bl _kcc_code_emit32
+    mov x0, #31                    // rd = sp
+    mov x1, #31                    // rn = sp
+    mov x2, x24                   // imm12 = frame_size
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+.Lcgi_ret_emit_ret:
+    // RET
+    bl _kcc_enc_ret
+    bl _kcc_code_emit32
+    b .Lcgi_done
+@}
+
+\subsection{Function Calls and External References}
+
+The call sequence is the most complex case.  For each
+\texttt{IR\_CALL}:
+\begin{enumerate}
+\item Extract the argument count and load each argument vreg into
+      \texttt{x0}--\texttt{x7} using the vreg-load helper.
+\item If two or more arguments exist, push them onto the stack
+      for variadic ABI compatibility (see the discussion at the
+      start of this section).
+\item Prefix the callee name with an underscore (Mach-O convention),
+      register it as an external symbol, record a
+      \texttt{BRANCH26} relocation, and emit \texttt{BL} with a
+      zero offset (the linker fills in the real target).
+\item Store x0 (the return value) to the destination vreg slot.
+\item If we adjusted the stack, emit \texttt{ADD\;sp,\;sp,\;\#adj}
+      to restore it.
+\end{enumerate}
+
+\texttt{IR\_GLOBAL\_REF} emits an \textsc{adrp}\,+\,\textsc{add}
+pair with \texttt{PAGE21} and \texttt{PAGEOFF12} relocations,
+storing the resulting address in x11.  The symbol is registered
+via \texttt{kcc\_linker\_global\_sym}, which allocates space in
+the \texttt{\_\_DATA,\_\_common} zerofill section.
+
+\texttt{IR\_STRING\_LIT} delegates to the string literal handler
+described in \S\ref{sec:emit-strings}.
+
+@d CodeGen: instruction dispatch @{
+.Lcgi_call:
+    // Call: SRC1 = callee name, SRC2 = args array, DEST = result vreg.
+    // The args array is [count, vreg0, class0, vreg1, class1, ...]; the class
+    // drives AAPCS64 register selection (see kcc_cg_marshal_args).
+    ldr x23, [x19, #IR_SRC1]      // callee name
+    ldr x24, [x19, #IR_DEST]      // result vreg
+    ldr x26, [x19, #IR_SRC2]      // args array (or 0 if no args)
+
+    mov x22, #0
+    mov x2, #1                    // first_stack_idx default
+    cbz x26, .Lcgi_call_load
+    ldr x22, [x26]                // count | (first_stack_idx << 32)
+    lsr x2, x22, #32            // first_stack_idx
+    and x22, x22, #0xffffffff    // count
+.Lcgi_call_load:
+    mov x0, x26
+    mov x1, x22
+    bl _kcc_cg_marshal_args        // x0 = stack_adj
+    str x0, [sp, #88]
+
+    // Build Mach-O name with underscore prefix: "_" + name
+    mov x0, x23
+    bl _kcc_strlen
+    add x0, x0, #2                // +1 prefix, +1 null
+    bl _kcc_arena_alloc
+    mov x25, x0
+    mov w1, #'_'
+    strb w1, [x25]
+    mov x0, x23
+    bl _kcc_strlen
+    add x2, x0, #1               // len including null
+    add x0, x25, #1              // dest = after '_'
+    mov x1, x23                   // src = original name
+    bl _kcc_memcpy
+
+    // Add external symbol
+    mov x0, x25
+    bl _kcc_linker_extern
+    mov x25, x0                    // sym_index
+
+    // Record relocation at current position
+    bl _kcc_code_current_pos
+    mov x1, #ARM64_RELOC_BRANCH26
+    mov x2, x25                    // sym_index
+    bl _kcc_linker_add_reloc
+
+    // Emit BL with offset=0 (linker will patch)
+    mov x0, #0
+    bl _kcc_enc_bl
+    bl _kcc_code_emit32
+
+    // Store the return value: d0 (floating), x0(-x1) unpacked into the sret
+    // buffer (small struct), or x0 (scalar).
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_call_ret_gp
+    ldr x0, [x0]
+    cmp x0, #8                     // TY_FLOAT
+    b.eq .Lcgi_call_ret_fp
+    cmp x0, #9                     // TY_DOUBLE
+    b.eq .Lcgi_call_ret_fp
+    cmp x0, #14                    // TY_STRUCT
+    b.eq .Lcgi_call_ret_struct
+    cmp x0, #15                    // TY_UNION
+    b.eq .Lcgi_call_ret_struct
+.Lcgi_call_ret_gp:
+    mov x0, x24
+    mov x1, #0                     // x0
+    bl _kcc_cg_store_vreg
+    b .Lcgi_call_ret_done
+.Lcgi_call_ret_fp:
+    mov x0, x24
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_call_ret_done
+.Lcgi_call_ret_struct:
+    // >16B (REF): the callee already wrote the buffer through x8. <=16B:
+    // unpack x0(-x1) into the buffer whose address is in DEST (x24).
+    ldr x1, [x19, #IR_TYPE]
+    ldr x1, [x1, #TY_SIZE]
+    cmp x1, #16
+    b.gt .Lcgi_call_ret_done
+    mov x0, x24                    // buffer vreg → x9 = its address
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, #0                     // STR x0, [x9]
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_TYPE]
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.le .Lcgi_call_ret_done
+    mov x0, #1                     // STR x1, [x9, #8]
+    mov x1, #9
+    mov x2, #1
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+.Lcgi_call_ret_done:
+
+    // Restore stack if the marshal pushed a stack image: ADD sp, sp, #stack_adj
+    ldr x2, [sp, #88]
+    cbz x2, .Lcgi_done
+    mov x0, #31
+    mov x1, #31
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
+.Lcgi_call_ind:
+    // Indirect call: SRC1 = fn-ptr vreg, SRC2 = args array, DEST = result vreg
+    ldr x23, [x19, #IR_SRC1]      // fn-ptr vreg
+    ldr x24, [x19, #IR_DEST]
+    ldr x26, [x19, #IR_SRC2]
+
+    mov x22, #0
+    mov x2, #1                    // first_stack_idx default
+    cbz x26, .Lcgi_cind_load
+    ldr x22, [x26]                // count | (first_stack_idx << 32)
+    lsr x2, x22, #32            // first_stack_idx
+    and x22, x22, #0xffffffff    // count
+.Lcgi_cind_load:
+    mov x0, x26
+    mov x1, x22
+    bl _kcc_cg_marshal_args        // x0 = stack_adj
+    str x0, [sp, #88]
+
+    // Load fn-ptr vreg into x9 (x29-relative, unaffected by the stack image)
+    mov x0, x23
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+
+    // Emit BLR x9
+    mov x0, #9
+    bl _kcc_enc_blr
+    bl _kcc_code_emit32
+
+    // Store the return value: d0 (floating), x0(-x1) into the sret buffer
+    // (small struct), or x0 (scalar).
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_cind_ret_gp
+    ldr x0, [x0]
+    cmp x0, #8                     // TY_FLOAT
+    b.eq .Lcgi_cind_ret_fp
+    cmp x0, #9                     // TY_DOUBLE
+    b.eq .Lcgi_cind_ret_fp
+    cmp x0, #14                    // TY_STRUCT
+    b.eq .Lcgi_cind_ret_struct
+    cmp x0, #15                    // TY_UNION
+    b.eq .Lcgi_cind_ret_struct
+.Lcgi_cind_ret_gp:
+    mov x0, x24
+    mov x1, #0
+    bl _kcc_cg_store_vreg
+    b .Lcgi_cind_ret_done
+.Lcgi_cind_ret_fp:
+    mov x0, x24
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_cind_ret_done
+.Lcgi_cind_ret_struct:
+    ldr x1, [x19, #IR_TYPE]
+    ldr x1, [x1, #TY_SIZE]
+    cmp x1, #16
+    b.gt .Lcgi_cind_ret_done
+    mov x0, x24
+    mov x1, #9
+    bl _kcc_cg_load_vreg
+    mov x0, #0
+    mov x1, #9
+    mov x2, #0
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_TYPE]
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.le .Lcgi_cind_ret_done
+    mov x0, #1
+    mov x1, #9
+    mov x2, #1
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+.Lcgi_cind_ret_done:
+
+    // Restore stack if a stack image was pushed
+    ldr x2, [sp, #88]
+    cbz x2, .Lcgi_done
+    mov x0, #31
+    mov x1, #31
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+
+    b .Lcgi_done
+@}
+
+\paragraph{Indirect Calls.}
+\texttt{IR\_CALL\_IND} handles calls through function pointers.
+The code generator loads the function pointer value from the
+stack slot identified by \texttt{SRC1} into scratch register
+\texttt{x9}, marshals arguments into \texttt{x0}--\texttt{x7}
+(with variadic copies on the stack per Apple~ABI), and emits
+\texttt{BLR~x9} instead of \texttt{BL~<symbol>}.
+
+\paragraph{Global Variable References and String Literals}
+\texttt{IR\_GLOBAL\_REF} materialises the address of a global
+variable using the two-instruction \textsc{adrp}\,+\,\textsc{add}
+idiom.  The symbol is registered via
+\texttt{kcc\_linker\_global\_sym}, which allocates space in the
+\texttt{\_\_DATA,\_\_common} zerofill section, and two relocations
+(\texttt{PAGE21} and \texttt{PAGEOFF12}) are recorded so the
+linker can patch the instruction pair at link time.
+\texttt{IR\_STRING\_LIT} delegates to a dedicated handler
+described in \S\ref{sec:emit-strings}.  The \texttt{.Lcgi\_done}
+label restores callee-saved registers and returns.
+
+@d CodeGen: instruction dispatch @{
+.Lcgi_global_ref:
+    // GLOBAL_REF: SRC1 = symbol name (char*), DEST = vreg to store addr
+    ldr x23, [x19, #IR_SRC1]      // symbol name
+    ldr x24, [x19, #IR_DEST]      // dest vreg
+
+    // Build Mach-O name: "_" + name
+    mov x0, x23
+    bl _kcc_strlen
+    add x0, x0, #2                // +1 for '_', +1 for null
+    bl _kcc_arena_alloc
+    mov x25, x0                    // x25 = prefixed name buffer
+    mov w1, #'_'
+    strb w1, [x25]
+    mov x0, x23
+    bl _kcc_strlen
+    add x2, x0, #1               // len + null
+    add x0, x25, #1              // dest = after '_'
+    mov x1, x23                   // src = original name
+    bl _kcc_memcpy
+
+    // Defined in this TU, or an external reference (extern / another TU)?
+    mov x0, x23
+    bl _kcc_strlen
+    mov x2, x0                     // keylen
+    adrp x0, _kcc_cg_defined_globals@@PAGE
+    add  x0, x0, _kcc_cg_defined_globals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x23                    // key = source name
+    bl _kcc_ht_get
+    cbz x0, .Lcgi_gref_extern
+
+    // Defined here: reserve BSS storage (section 2) and address it directly
+    // with an ADRP/ADD pair, since a local symbol has an image address.
+    mov x0, x25
+    mov x1, #8                     // default 8 bytes per scalar global
+    bl _kcc_linker_global_sym
+    mov x25, x0                    // sym_index
+
+    bl _kcc_code_current_pos
+    mov x1, #ARM64_RELOC_PAGE21
+    mov x2, x25
+    bl _kcc_linker_add_reloc
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #0                     // imm21 = 0 (linker patches)
+    bl _kcc_enc_adrp
+    bl _kcc_code_emit32
+
+    bl _kcc_code_current_pos
+    mov x1, #ARM64_RELOC_PAGEOFF12
+    mov x2, x25
+    bl _kcc_linker_add_reloc
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #CG_REG_DST           // rn = x11
+    mov x2, #0                     // imm12 = 0 (linker patches)
+    mov x3, #1                     // sf = 64-bit
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+    b .Lcgi_gref_store
+
+.Lcgi_gref_extern:
+    // Defined elsewhere (another TU or a dylib import): reach the symbol's
+    // address through the GOT with ADRP GOTPAGE + LDR GOTPAGEOFF, so that
+    // dylib-imported data (stdin/stdout/stderr) resolves via a bound GOT slot.
+    mov x0, x25
+    bl _kcc_linker_extern
+    mov x25, x0                    // sym_index
+
+    bl _kcc_code_current_pos
+    mov x1, #ARM64_RELOC_GOT_LOAD_PAGE21
+    mov x2, x25
+    bl _kcc_linker_add_reloc
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, #0                     // imm21 = 0 (linker patches)
+    bl _kcc_enc_adrp
+    bl _kcc_code_emit32
+
+    bl _kcc_code_current_pos
+    mov x1, #ARM64_RELOC_GOT_LOAD_PAGEOFF12
+    mov x2, x25
+    bl _kcc_linker_add_reloc
+    mov x0, #CG_REG_DST           // rt = x11
+    mov x1, #CG_REG_DST           // rn = x11
+    mov x2, #0                     // imm12 = 0 (linker patches)
+    mov x3, #1                     // size = 64-bit
+    bl _kcc_enc_ldr_imm
+    bl _kcc_code_emit32
+
+.Lcgi_gref_store:
+    // x11 now holds the global's address (loaded from the GOT for externs).
+    mov x0, x24
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
+.Lcgi_string_lit:
+    mov x0, x19                    // instruction
+    bl _kcc_codegen_string_lit
+    b .Lcgi_done
+
+.Lcgi_done:
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #112
+    ret
+@}
+
+\paragraph{End-to-end tests: constants and arithmetic.}
+The code generator lowers each arithmetic \texttt{IR\_ADD}/\texttt{IR\_SUB}/\ldots{}
+instruction by loading the two source vregs from their stack slots into
+scratch registers \texttt{x9} and \texttt{x10}, executing the ARM64
+operation, and storing the result from \texttt{x11} back to the
+destination slot.  The simplest case---returning a constant---verifies
+that \texttt{IR\_CONST} correctly encodes a \texttt{MOVZ}/\texttt{MOVK}
+sequence and that \texttt{IR\_RET} loads the value into \texttt{x0}
+before the epilogue.  Subsequent tests exercise each binary operator
+and confirm that operator precedence (handled at the parser level) is
+preserved through IR lowering.
+
+@d Test: codegen constants @{
+echo ""
+echo "--- Constants and Arithmetic ---"
+
+run_test "return constant" \
+    "int main(void) { return 42; }" 42
+
+run_test "addition" \
+    "int main(void) { return 2 + 3; }" 5
+
+run_test "subtraction" \
+    "int main(void) { return 10 - 3; }" 7
+
+run_test "multiplication" \
+    "int main(void) { return 6 * 7; }" 42
+
+run_test "division" \
+    "int main(void) { return 100 / 10; }" 10
+
+run_test "modulo" \
+    "int main(void) { return 17 % 5; }" 2
+
+run_test "complex arithmetic" \
+    "int main(void) { return 2 + 3 * 4; }" 14
+
+run_test "negation" \
+    "int main(void) { return -(-42); }" 42
+
+run_test "bitwise and" \
+    "int main(void) { return 0xFF & 0x0F; }" 15
+
+run_test "bitwise or" \
+    "int main(void) { return 0xF0 | 0x0F; }" 255
+
+run_test "bitwise xor" \
+    "int main(void) { return 0xFF ^ 0x0F; }" 240
+
+run_test "left shift" \
+    "int main(void) { return 1 << 4; }" 16
+
+run_test "right shift" \
+    "int main(void) { return 32 >> 2; }" 8
+@}
+

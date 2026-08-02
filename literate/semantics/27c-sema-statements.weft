@@ -1,0 +1,296 @@
+% 27c-sema-statements.weft — statement checking and control flow
+%
+% Split from 27-sema.weft (structural refactor, no content changes):
+% compound/if/while/for/switch/return checking, the return type-mismatch
+% constraints, and the -Wreturn-type control-flow analysis.
+
+\section{Statement Checking}
+
+The statement checker walks the AST recursively, dispatching on the
+statement tag.  Compound statements push a new scope before walking
+their children and pop it afterward, implementing C's block scoping
+rules.  Expression statements type-check their expression via
+\texttt{\_kcc\_sema\_expr}.  Control-flow statements
+(\texttt{if}/\texttt{while}/\texttt{do}/\texttt{for}) check their
+conditions and recurse into their bodies.  \texttt{for} pushes its
+own scope to contain the loop variable declaration.  Labels register
+themselves in the label namespace.  Declarations encountered inside
+compound statements are forwarded to the declaration checker.
+
+@d Sema: check statement @{
+// -- kcc_sema_check_stmt --------------------------------------------------
+// void kcc_sema_check_stmt(node *stmt)
+//   x0 = statement AST node
+.text
+.globl _kcc_sema_check_stmt
+.p2align 2
+_kcc_sema_check_stmt:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    cbz x0, .Lscs_done
+    mov x19, x0
+
+    ldr x20, [x19, #AST_TAG]
+
+    cmp x20, #AST_COMPOUND
+    b.eq .Lscs_compound
+    cmp x20, #AST_EXPR_STMT
+    b.eq .Lscs_expr
+    cmp x20, #AST_IF_STMT
+    b.eq .Lscs_if
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lscs_while
+    cmp x20, #AST_DO_STMT
+    b.eq .Lscs_do
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lscs_for
+    cmp x20, #AST_RETURN_STMT
+    b.eq .Lscs_return
+    cmp x20, #AST_SWITCH_STMT
+    b.eq .Lscs_switch
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lscs_label
+    cmp x20, #AST_CASE_STMT
+    b.eq .Lscs_case
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Lscs_default
+    cmp x20, #AST_GOTO_STMT
+    b.eq .Lscs_done         // nothing to check
+    cmp x20, #AST_BREAK_STMT
+    b.eq .Lscs_done
+    cmp x20, #AST_CONTINUE_STMT
+    b.eq .Lscs_done
+    cmp x20, #AST_NULL_STMT
+    b.eq .Lscs_done
+
+    // Could be a declaration within a compound stmt
+    cmp x20, #AST_VAR_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_TYPEDEF_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_STRUCT_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_UNION_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_ENUM_DECL
+    b.eq .Lscs_decl
+    cmp x20, #AST_TYPE_ENUM
+    b.eq .Lscs_decl
+    cmp x20, #AST_STATIC_ASSERT
+    b.eq .Lscs_done
+
+    b .Lscs_done
+@| _kcc_sema_check_stmt
+@}
+
+\paragraph{Compound Statements and Control Flow}
+
+Compound statements push a new scope onto both the ordinary and tag
+stacks, walk their child list recursively, and pop the scope on exit.
+Just before that pop---and likewise before a \texttt{for}-scope is
+popped---\texttt{kcc\_sema\_check\_unused\_scope} runs, so a
+block-scope variable that was declared but never referenced draws an
+\texttt{unused variable '\meta{name}'} warning under \texttt{-Wall}.
+The check is placed at the block and \texttt{for} scopes but \emph{not}
+at the function scope, whose only occupants are the parameters---an
+unused parameter is outside \texttt{-Wall} (it lives in
+\texttt{-Wextra}), and a function body's top-level locals sit in the
+body's own compound scope, one level in, where they are seen normally.
+A variable counts as referenced the moment it appears in any identifier
+expression---read, written, or address-taken---which the resolver marks
+by setting the \emph{used} bit on the symbol; only a name that never
+appears at all is reported, keeping the warning free of false positives
+on genuinely-referenced variables.
+Expression statements simply type-check their contained expression.
+The \texttt{if}/\texttt{while}/\texttt{do}/\texttt{for} handlers each
+check their condition expression and recurse into their bodies;
+\texttt{for} additionally pushes its own scope to contain the loop
+variable declaration.
+
+@d Sema: check statement @{
+.Lscs_compound:
+    bl _kcc_symtab_push_scope
+
+    // Walk items
+    ldr x19, [x19, #AST_F0]        // first item
+.Lscs_compound_loop:
+    cbz x19, .Lscs_compound_end
+    mov x0, x19
+    bl _kcc_sema_check_stmt
+    ldr x19, [x19, #AST_F4]        // next
+    b .Lscs_compound_loop
+
+.Lscs_compound_end:
+    bl _kcc_sema_check_unused_scope
+    bl _kcc_symtab_pop_scope
+    b .Lscs_done
+
+.Lscs_expr:
+    ldr x0, [x19, #AST_F0]
+    cbz x0, .Lscs_done
+    bl _kcc_sema_expr
+    b .Lscs_done
+
+.Lscs_if:
+    ldr x0, [x19, #AST_F0]         // condition
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]         // then
+    bl _kcc_sema_check_stmt
+    ldr x0, [x19, #AST_F2]         // else (may be null)
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_while:
+    ldr x0, [x19, #AST_F0]         // condition
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]         // body
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_do:
+    ldr x0, [x19, #AST_F0]         // body
+    bl _kcc_sema_check_stmt
+    ldr x0, [x19, #AST_F1]         // condition
+    bl _kcc_sema_expr
+    b .Lscs_done
+
+.Lscs_for:
+    bl _kcc_symtab_push_scope
+    ldr x0, [x19, #AST_F0]         // init
+    cbz x0, .Lscs_for_cond
+    bl _kcc_sema_check_stmt
+.Lscs_for_cond:
+    ldr x0, [x19, #AST_F1]         // condition
+    cbz x0, .Lscs_for_incr
+    bl _kcc_sema_expr
+.Lscs_for_incr:
+    ldr x0, [x19, #AST_F2]         // increment
+    cbz x0, .Lscs_for_body
+    bl _kcc_sema_expr
+.Lscs_for_body:
+    ldr x0, [x19, #AST_F3]         // body
+    cbz x0, .Lscs_for_end
+    bl _kcc_sema_check_stmt
+.Lscs_for_end:
+    bl _kcc_sema_check_unused_scope
+    bl _kcc_symtab_pop_scope
+    b .Lscs_done
+@}
+
+\paragraph{Return, Switch, Labels, and Declarations}
+
+\texttt{return} type-checks its expression (if present) and enforces the
+two constraints of \stdref{6.8.6.4}: a \texttt{return} with a value may
+not appear in a \texttt{void} function, and a bare \texttt{return} may
+appear \emph{only} in a \texttt{void} function.  Both are constraint
+violations the standard requires a diagnostic for, and no valid program
+triggers either, so \kcc{} reports them as errors against the return
+statement's own location.  The comparison reads
+\texttt{\_kcc\_sema\_cur\_ret}, the return-type descriptor the
+function-definition handler stashed before walking the body; when it is
+absent (a stray \texttt{return} outside any function) the check is
+skipped.  \texttt{switch} checks the controlling
+expression and recurses into the body.  Label, case, and default
+statements register or validate their labels and recurse into their
+associated statement.  Any declaration node encountered inside a compound
+statement is forwarded to \texttt{kcc\_sema\_check\_decl}.
+
+@d Sema: check statement @{
+.Lscs_return:
+    ldr x0, [x19, #AST_F0]         // return expression
+    cbz x0, .Lscs_ret_novalue
+
+    // return <expr>; — type-check the expression, then enforce that a
+    // value is not returned from a void function (\stdref{6.8.6.4}).
+    bl _kcc_sema_expr               // x0 = returned expression type
+
+    // -Wall -Wint-conversion: return type vs expression type
+    adrp x1, _kcc_sema_cur_ret@@PAGE
+    add  x1, x1, _kcc_sema_cur_ret@@PAGEOFF
+    ldr  x1, [x1]                   // dst = current return type
+    mov  x2, x0                     // src type
+    mov  x0, x19                    // location (return node)
+    ldr  x3, [x19, #AST_F0]        // src node
+    bl _kcc_sema_check_int_ptr
+
+    adrp x0, _kcc_sema_cur_ret@@PAGE
+    add  x0, x0, _kcc_sema_cur_ret@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lscs_done            // no current return type: nothing to check
+    ldr  x1, [x0, #TY_KIND]
+    cmp  x1, #TY_VOID
+    b.ne .Lscs_done
+    ldr  x0, [x19, #AST_LINE]
+    ldr  x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_ret_void@@PAGE
+    add  x2, x2, _kcc_sema_ret_void@@PAGEOFF
+    bl   _kcc_diag_error
+    b .Lscs_done
+
+.Lscs_ret_novalue:
+    // bare return; — a value is required unless the function returns void.
+    adrp x0, _kcc_sema_cur_ret@@PAGE
+    add  x0, x0, _kcc_sema_cur_ret@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lscs_done
+    ldr  x1, [x0, #TY_KIND]
+    cmp  x1, #TY_VOID
+    b.eq .Lscs_done
+    ldr  x0, [x19, #AST_LINE]
+    ldr  x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_ret_nonvoid@@PAGE
+    add  x2, x2, _kcc_sema_ret_nonvoid@@PAGEOFF
+    bl   _kcc_diag_error
+    b .Lscs_done
+
+.Lscs_switch:
+    ldr x0, [x19, #AST_F0]         // controlling expression
+    bl _kcc_sema_expr
+    // TODO: verify integer type
+    ldr x0, [x19, #AST_F1]         // body
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_label:
+    // Register label
+    ldr x0, [x19, #AST_F0]         // label name_ptr
+    cbz x0, .Lscs_label_stmt
+    mov x20, x0
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    bl _kcc_symtab_label_add
+.Lscs_label_stmt:
+    ldr x0, [x19, #AST_F1]         // labeled statement
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_case:
+    ldr x0, [x19, #AST_F0]         // case expression
+    bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F1]         // statement
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_default:
+    ldr x0, [x19, #AST_F0]         // statement
+    cbz x0, .Lscs_done
+    bl _kcc_sema_check_stmt
+    b .Lscs_done
+
+.Lscs_decl:
+    mov x0, x19
+    bl _kcc_sema_check_decl
+    b .Lscs_done
+
+.Lscs_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+

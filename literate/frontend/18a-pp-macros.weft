@@ -1,0 +1,853 @@
+% 18a-pp-macros.weft — macro definition, expansion, and predefined macros
+%
+% Split from 18-preprocessor.weft (structural refactor, no content changes):
+% #define/#undef, function-like macro expansion, and predefined macros.
+
+\section{Macro Definition (\texttt{\#define})}
+
+A \texttt{\#define} directive creates a macro.  If the identifier is
+immediately followed by \texttt{(} (no intervening whitespace), it is
+a function-like macro with parameters (\stdref{6.10.3}).  Otherwise
+it is an object-like macro.
+
+The replacement body is the text from after the macro name (or
+parameter list) to the end of the directive line.
+
+@d PP: define @{
+.text
+// -- _kcc_pp_do_define ----------------------------------------------
+// Handles #define: reads macro name, optional params, body.
+.p2align 2
+_kcc_pp_do_define:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+
+    // Read macro name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Ldef_err_name
+
+    // Save macro name (callee-saved)
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]             // x19 = name ptr
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]             // x20 = name len
+
+    // Check if function-like: '(' immediately after name (no space)
+    // Peek at the character right after the identifier in source
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x0, x1
+    b.hs .Ldef_object          // at end → object-like
+    ldrb w2, [x0]
+    cmp  w2, #'('
+    b.eq .Ldef_funclike
+
+.Ldef_object:
+    // Object-like macro
+    mov x21, #0                // x21 = flags (not function-like)
+    mov x22, #0                // x22 = param count
+    mov x23, #0                // x23 = params ptr (none)
+
+    // Get rest of line as replacement body
+    bl _kcc_pp_rest_of_line
+    mov x24, x0                // x24 = body ptr
+    mov x25, x1                // x25 = body len
+    b .Ldef_store
+
+.Ldef_funclike:
+    // Function-like macro
+    mov x21, #PP_FLAG_FUNCLIKE
+    mov x22, #0                // param count
+    mov x23, #0                // params ptr
+
+    // Consume the '(' by calling lex_next, then read first param/rparen
+    bl _kcc_lex_next           // reads '(' token
+    bl _kcc_lex_next           // reads first param or ')'
+
+    // Allocate param array (max PP_MAX_ARGS entries)
+    mov x0, #PP_MAX_ARGS
+    mov x1, #PP_PARAM_SIZE
+    mul x0, x0, x1
+    bl _kcc_arena_alloc
+    mov x23, x0                // x23 = params array
+
+    // Read parameters
+    // Check for empty parameter list: )
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.eq .Ldef_params_done
+
+.Ldef_param_loop:
+    // Expect identifier
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Ldef_err_param
+
+    // Store parameter name
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+
+    // params[param_count] = {name, len}
+    mov x2, #PP_PARAM_SIZE
+    mul x3, x22, x2
+    add x3, x23, x3
+    str x0, [x3, #PP_PARAM_NAME]
+    str x1, [x3, #PP_PARAM_LEN]
+    add x22, x22, #1
+
+    // Read next: ',' or ')'
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Ldef_check_rparen
+
+    // Comma: read next parameter
+    bl _kcc_lex_next
+    b .Ldef_param_loop
+
+.Ldef_check_rparen:
+    cmp  x0, #TOK_RPAREN
+    b.ne .Ldef_err_param
+
+.Ldef_params_done:
+    // Get rest of line as replacement body
+    bl _kcc_pp_rest_of_line
+    mov x24, x0                // x24 = body ptr
+    mov x25, x1                // x25 = body len
+    b .Ldef_store
+@}
+
+\paragraph{Storage and error reporting.}
+Both the object-like and function-like paths converge at
+\texttt{.Ldef\_store}, which allocates the macro definition structure
+in the arena, fills in every field, and inserts the definition into
+the macro hash table.  If the directive was malformed---a missing name
+or an invalid parameter list---the corresponding error label emits a
+diagnostic and skips to the end of the line.
+
+@d PP: define @{
+.Ldef_store:
+    // Allocate macro definition in arena
+    mov x0, #PP_MACRO_SIZE
+    bl _kcc_arena_alloc
+    mov x26, x0                // x26 = macro_def ptr
+
+    // Fill in the definition
+    str x19, [x26, #PP_MACRO_NAME]
+    str x20, [x26, #PP_MACRO_NAMELEN]
+    str x21, [x26, #PP_MACRO_FLAGS]
+    str x22, [x26, #PP_MACRO_NPARAMS]
+    str x24, [x26, #PP_MACRO_BODY]
+    str x25, [x26, #PP_MACRO_BODYLEN]
+    str x23, [x26, #PP_MACRO_PARAMS]
+
+    // Store in macro hash table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]             // hash table
+    mov  x1, x19              // key = name
+    mov  x2, x20              // keylen
+    mov  x3, x26              // value = macro_def ptr
+    bl _kcc_ht_put
+
+    // Skip remaining text on directive line
+    bl _kcc_pp_skip_line
+
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+.Ldef_err_name:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_def_name@@PAGE
+    add  x2, x2, _kcc_pp_err_def_name@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+.Ldef_err_param:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_def_param@@PAGE
+    add  x2, x2, _kcc_pp_err_def_param@@PAGEOFF
+    bl _kcc_diag_error
+    bl _kcc_pp_skip_line
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+\section{Macro Undefine (\texttt{\#undef})}
+
+\texttt{\#undef} removes a macro from the table by storing zero as
+its value.
+
+@d PP: undef @{
+.text
+// -- _kcc_pp_do_undef -----------------------------------------------
+.p2align 2
+_kcc_pp_do_undef:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+
+    // Read macro name
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_IDENT
+    b.ne .Lundef_done
+
+    // Put 0 in the hash table for this name
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+
+    mov  x3, #0                // value = 0 (removed)
+    bl _kcc_ht_put
+
+.Lundef_done:
+    bl _kcc_pp_skip_line
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Macro Expansion}
+
+When \texttt{kcc\_pp\_next} encounters an identifier, it checks
+the macro table.  If a macro is found and is not currently being
+expanded (anti-recursion per \stdref{6.10.3.4}), the replacement
+text is pushed onto the context stack.
+
+For function-like macros, arguments are collected first, and
+parameter names in the replacement text are substituted with the
+corresponding argument text.
+
+@d PP: expand @{
+.text
+// -- _kcc_pp_try_expand ---------------------------------------------
+// Checks current identifier token against macro table.
+// Returns x0 = 1 if expanded (pushed context), 0 if not.
+.globl _kcc_pp_try_expand
+.p2align 2
+_kcc_pp_try_expand:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    // Get token start and length
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x19, [x0]            // x19 = name ptr
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x20, [x0]            // x20 = name len
+
+    // Look up in macro table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, x19
+    mov  x2, x20
+    bl _kcc_ht_get
+    cbz  x0, .Lexp_no         // not a macro
+    mov  x21, x0              // x21 = macro_def ptr
+
+    // Check anti-recursion flag
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    tst  x0, #PP_FLAG_EXPANDING
+    b.ne .Lexp_no             // already expanding → don't recurse
+
+    // Check if function-like
+    tst  x0, #PP_FLAG_FUNCLIKE
+    b.ne .Lexp_funclike
+
+    // --- Object-like expansion ---
+    ldr  x22, [x21, #PP_MACRO_BODY]     // body ptr
+    ldr  x23, [x21, #PP_MACRO_BODYLEN]  // body len
+    cbz  x23, .Lexp_empty     // empty replacement
+
+    // Copy body to arena buffer (for lexer to scan)
+    mov  x0, x23
+    bl _kcc_arena_alloc
+    mov  x24, x0              // x24 = buffer
+    mov  x0, x24
+    mov  x1, x22
+    mov  x2, x23
+    bl _kcc_memcpy
+
+    // Mark macro as expanding
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    orr  x0, x0, #PP_FLAG_EXPANDING
+    str  x0, [x21, #PP_MACRO_FLAGS]
+
+    // Push expansion context
+    mov  x0, #PP_CTX_EXPAND
+    mov  x1, x21              // macro_def for unmark on pop
+    mov  x2, x24              // buffer start
+    mov  x3, x23              // buffer len
+    bl _kcc_pp_ctx_push_expand
+
+    mov  x0, #1               // expanded
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_empty:
+    // Empty macro body — nothing to expand, return 1 to skip the token
+    mov  x0, #1
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_pp_try_expand
+@}
+
+\paragraph{Function-like expansion.}
+When a function-like macro is invoked, the preprocessor must first
+locate the opening parenthesis (skipping whitespace), then collect the
+argument list by tracking parenthesis depth across nested calls and
+splitting on commas at the top level.  Once all arguments are gathered,
+the substitution engine replaces each parameter name in the replacement
+body with the corresponding argument text before pushing the result
+onto the context stack.
+
+@d PP: expand @{
+.Lexp_funclike:
+    // Function-like: peek for '(' after identifier
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x1, [x1]
+
+    // Skip whitespace looking for '('
+.Lexp_peek_ws:
+    cmp  x0, x1
+    b.hs .Lexp_no              // EOF → not a function call
+    ldrb w2, [x0]
+    cmp  w2, #' '
+    b.eq .Lexp_peek_next
+    cmp  w2, #0x09
+    b.eq .Lexp_peek_next
+    cmp  w2, #0x0A
+    b.eq .Lexp_peek_next
+    cmp  w2, #0x0D
+    b.eq .Lexp_peek_next
+    // Non-whitespace found
+    cmp  w2, #'('
+    b.ne .Lexp_no              // not '(' → not a function call
+    b .Lexp_func_call
+.Lexp_peek_next:
+    add  x0, x0, #1
+    b .Lexp_peek_ws
+
+.Lexp_func_call:
+    // Consume the '(' via lexer
+    bl _kcc_lex_next           // should yield TOK_LPAREN
+
+    // Collect arguments
+    ldr  x22, [x21, #PP_MACRO_NPARAMS]  // expected param count
+
+    // Allocate argument array: PP_MAX_ARGS * 16 bytes
+    mov  x0, #PP_MAX_ARGS
+    lsl  x0, x0, #4           // * 16
+    bl _kcc_arena_alloc
+    mov  x23, x0              // x23 = arg array
+
+    // Collect arguments: track paren depth
+    mov  x24, #0              // arg count
+    mov  x3, #1               // paren depth (we already consumed '(')
+
+    // Mark start of first argument
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    // Save arg start in arg array
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    str  x0, [x1, #0]         // arg[0].start = cursor
+    str  xzr, [x1, #8]        // arg[0].len = 0 (placeholder)
+
+.Lexp_arg_loop:
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+
+    cmp  x0, #TOK_EOF
+    b.eq .Lexp_arg_err         // unterminated args
+
+    cmp  x0, #TOK_LPAREN
+    b.ne .Lexp_arg_not_lp
+    add  x3, x3, #1           // depth++
+    b .Lexp_arg_loop
+
+.Lexp_arg_not_lp:
+    cmp  x0, #TOK_RPAREN
+    b.ne .Lexp_arg_not_rp
+    sub  x3, x3, #1           // depth--
+    cbz  x3, .Lexp_arg_end    // matched → done
+    b .Lexp_arg_loop
+
+.Lexp_arg_not_rp:
+    cmp  x0, #TOK_COMMA
+    b.ne .Lexp_arg_loop
+    cmp  x3, #1
+    b.ne .Lexp_arg_loop        // comma inside nested parens
+
+    // End of argument: compute length
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]             // comma position
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    ldr  x2, [x1, #0]         // arg start
+    sub  x2, x0, x2            // length = comma_start - arg_start
+    str  x2, [x1, #8]
+
+    // Start next argument
+    add  x24, x24, #1
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    str  x0, [x1, #0]         // next arg start
+    str  xzr, [x1, #8]
+    b .Lexp_arg_loop
+
+.Lexp_arg_end:
+    // Finalize last argument
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]             // ')' position
+    lsl  x1, x24, #4
+    add  x1, x23, x1
+    ldr  x2, [x1, #0]         // arg start
+    sub  x2, x0, x2            // length
+    str  x2, [x1, #8]
+    add  x24, x24, #1         // total arg count
+@}
+
+\paragraph{Substitution and expansion context.}
+With all arguments collected in the argument array, the expansion
+proceeds to the substitution phase.  The macro's replacement body,
+parameter list, and the freshly gathered argument texts are passed to
+\texttt{\_kcc\_pp\_substitute}, which performs textual replacement of
+parameter names with argument text.  If the result is non-empty, the
+macro is marked with \texttt{PP\_FLAG\_EXPANDING} to prevent recursive
+re-expansion, and the substituted text is pushed onto the context stack.
+
+@d PP: expand @{
+    // Now substitute: build expanded text
+    // For each identifier in body matching a param name, replace with arg text
+    ldr  x0, [x21, #PP_MACRO_BODY]
+    ldr  x1, [x21, #PP_MACRO_BODYLEN]
+    ldr  x2, [x21, #PP_MACRO_PARAMS]
+    mov  x3, x22              // param count
+    mov  x4, x23              // arg array
+    mov  x5, x24              // arg count
+    bl _kcc_pp_substitute
+    // Returns x0 = buffer ptr, x1 = buffer len
+
+    cbz  x1, .Lexp_empty_func
+
+    mov  x22, x0              // buffer
+    mov  x23, x1              // len
+
+    // Mark macro as expanding
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    orr  x0, x0, #PP_FLAG_EXPANDING
+    str  x0, [x21, #PP_MACRO_FLAGS]
+
+    // Push expansion context
+    mov  x0, #PP_CTX_EXPAND
+    mov  x1, x21
+    mov  x2, x22
+    mov  x3, x23
+    bl _kcc_pp_ctx_push_expand
+
+    mov  x0, #1
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_empty_func:
+    mov  x0, #1
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_arg_err:
+    adrp x0, _kcc_pp_dir_line@@PAGE
+    add  x0, x0, _kcc_pp_dir_line@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, #1
+    adrp x2, _kcc_pp_err_unterm_args@@PAGE
+    add  x2, x2, _kcc_pp_err_unterm_args@@PAGEOFF
+    bl _kcc_diag_error
+    mov  x0, #0
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_no:
+    mov  x0, #0               // not expanded
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\subsection{Parameter Substitution}
+
+For function-like macros, parameter names appearing in the replacement
+body must be replaced with the corresponding argument text collected
+from the call site.  \texttt{\_kcc\_pp\_substitute} walks the body
+character by character; when it encounters an identifier, it compares
+it against each parameter name using \texttt{\_kcc\_memcmp}.  On a
+match, the argument text is copied to the output buffer instead of
+the parameter name.  Non-identifier characters and unmatched
+identifiers are copied verbatim.
+
+@d PP: expand @{
+// -- _kcc_pp_substitute ---------------------------------------------
+// Substitutes parameters in macro body with argument text.
+// x0=body_ptr, x1=body_len, x2=params, x3=nparam, x4=args, x5=nargs
+// Returns x0=result_ptr, x1=result_len (arena-allocated)
+.p2align 2
+_kcc_pp_substitute:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    mov x19, x0               // body ptr
+    mov x20, x1               // body len
+    mov x21, x2               // params array
+    mov x22, x3               // param count
+    mov x23, x4               // args array
+    mov x24, x5               // arg count
+
+    // Allocate output buffer (generous: 4KB)
+    mov x0, #4096
+    bl _kcc_arena_alloc
+    mov x25, x0               // x25 = output buffer
+    mov x26, #0                // x26 = output position
+
+    // Walk through body text
+    mov x27, #0                // x27 = body position
+.Lsub_loop:
+    cmp x27, x20
+    b.hs .Lsub_done
+
+    // Check for identifier start
+    add x0, x19, x27
+    ldrb w0, [x0]
+
+    // Is it an identifier char? (a-z, A-Z, _)
+    cmp w0, #'_'
+    b.eq .Lsub_ident
+    cmp w0, #'a'
+    b.lo .Lsub_not_lower
+    cmp w0, #'z'
+    b.ls .Lsub_ident
+.Lsub_not_lower:
+    cmp w0, #'A'
+    b.lo .Lsub_copy_char
+    cmp w0, #'Z'
+    b.ls .Lsub_ident
+
+.Lsub_copy_char:
+    // Not an identifier: copy byte
+    add x1, x25, x26
+    strb w0, [x1]
+    add x26, x26, #1
+    add x27, x27, #1
+    b .Lsub_loop
+@}
+
+\paragraph{Identifier extraction and parameter matching.}
+When the body walker encounters the start of an identifier (a letter or
+underscore), it enters the extraction path.  The scanner advances through
+subsequent identifier characters to delimit the full name, then compares
+it against every parameter in the macro's parameter list using
+\texttt{\_kcc\_memcmp}.  A match causes the corresponding argument text
+to be copied into the output buffer; an unmatched identifier is copied
+verbatim.
+
+@d PP: expand @{
+.Lsub_ident:
+    // Found identifier start. Extract the full identifier
+    mov x28, x27               // x28 = ident start position
+.Lsub_ident_cont:
+    add x27, x27, #1
+    cmp x27, x20
+    b.hs .Lsub_ident_end
+    add x0, x19, x27
+    ldrb w0, [x0]
+    cmp w0, #'_'
+    b.eq .Lsub_ident_cont
+    cmp w0, #'a'
+    b.lo .Lsub_id_not_lower
+    cmp w0, #'z'
+    b.ls .Lsub_ident_cont
+.Lsub_id_not_lower:
+    cmp w0, #'A'
+    b.lo .Lsub_id_not_upper
+    cmp w0, #'Z'
+    b.ls .Lsub_ident_cont
+.Lsub_id_not_upper:
+    cmp w0, #'0'
+    b.lo .Lsub_ident_end
+    cmp w0, #'9'
+    b.ls .Lsub_ident_cont
+
+.Lsub_ident_end:
+    // Identifier is body[x28..x27)
+    add  x0, x19, x28         // ident text ptr
+    sub  x1, x27, x28         // ident len
+
+    // Check against each parameter name
+    mov  x2, #0                // param index
+.Lsub_param_check:
+    cmp  x2, x22
+    b.hs .Lsub_not_param      // no match
+
+    // params[x2]
+    mov  x3, #PP_PARAM_SIZE
+    mul  x4, x2, x3
+    add  x4, x21, x4
+    ldr  x5, [x4, #PP_PARAM_NAME]
+    ldr  x6, [x4, #PP_PARAM_LEN]
+
+    // Compare lengths first
+    cmp  x1, x6
+    b.ne .Lsub_param_next
+
+    // Compare text
+    // Save registers we need across memcmp
+    stp  x0, x1, [sp, #-16]!  // push ident ptr, len
+    mov  x7, x2                // save param index
+    mov  x2, x1                // len for memcmp
+    mov  x1, x5                // param name
+    // x0 already = ident text
+    bl _kcc_memcmp
+    ldp  x8, x1, [sp], #16    // restore ident ptr, len
+    mov  x2, x7                // restore param index
+
+    cbz  x0, .Lsub_found_param
+    mov  x0, x8                // restore ident ptr
+    b .Lsub_param_next
+
+.Lsub_param_next:
+    add  x2, x2, #1
+    b .Lsub_param_check
+
+.Lsub_not_param:
+    // Not a parameter: copy identifier text as-is
+    sub  x1, x27, x28         // ident len
+    mov  x2, #0
+.Lsub_copy_ident:
+    cmp  x2, x1
+    b.hs .Lsub_loop
+    add  x3, x19, x28
+    ldrb w4, [x3, x2]
+    add  x3, x25, x26
+    strb w4, [x3]
+    add  x26, x26, #1
+    add  x2, x2, #1
+    b .Lsub_copy_ident
+
+.Lsub_found_param:
+    // Substitute: copy argument text instead
+    // x2 = param index (same as arg index)
+    lsl  x3, x2, #4           // * 16
+    add  x3, x23, x3
+    ldr  x4, [x3, #0]         // arg text ptr
+    ldr  x5, [x3, #8]         // arg text len
+
+    mov  x2, #0
+.Lsub_copy_arg:
+    cmp  x2, x5
+    b.hs .Lsub_loop
+    ldrb w6, [x4, x2]
+    add  x3, x25, x26
+    strb w6, [x3]
+    add  x26, x26, #1
+    add  x2, x2, #1
+    b .Lsub_copy_arg
+
+.Lsub_done:
+    mov  x0, x25               // result ptr
+    mov  x1, x26               // result len
+
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}
+
+\section{Predefined Macros}
+
+ISO C17 requires several predefined macros (\stdref{6.10.8}).  We
+define \texttt{\_\_STDC\_\_} (1), \texttt{\_\_STDC\_VERSION\_\_}
+(201710L), and create entries for \texttt{\_\_FILE\_\_} and
+\texttt{\_\_LINE\_\_} whose expansion is handled specially by the
+preprocessor.
+
+@d PP: predefined @{
+.text
+// -- _kcc_pp_predefine ----------------------------------------------
+// Registers predefined macros in the macro table.
+.p2align 2
+_kcc_pp_predefine:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // __STDC__ = 1
+    adrp x0, _kcc_pp_pre_stdc@@PAGE
+    add  x0, x0, _kcc_pp_pre_stdc@@PAGEOFF
+    mov  x1, #8                // len("__STDC__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1                // len("1")
+    bl _kcc_pp_def_simple
+
+    // __STDC_VERSION__ = 201710L
+    adrp x0, _kcc_pp_pre_stdc_ver@@PAGE
+    add  x0, x0, _kcc_pp_pre_stdc_ver@@PAGEOFF
+    mov  x1, #16               // len("__STDC_VERSION__")
+    adrp x2, _kcc_pp_pre_c17val@@PAGE
+    add  x2, x2, _kcc_pp_pre_c17val@@PAGEOFF
+    mov  x3, #7                // len("201710L")
+    bl _kcc_pp_def_simple
+
+    // __STDC_HOSTED__ = 1
+    adrp x0, _kcc_pp_pre_hosted@@PAGE
+    add  x0, x0, _kcc_pp_pre_hosted@@PAGEOFF
+    mov  x1, #15               // len("__STDC_HOSTED__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- _kcc_pp_def_simple ---------------------------------------------
+// Helper: define a simple object-like macro.
+// x0=name, x1=namelen, x2=body, x3=bodylen
+.p2align 2
+_kcc_pp_def_simple:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0               // name
+    mov x20, x1               // namelen
+    mov x21, x2               // body
+    mov x22, x3               // bodylen
+
+    // Allocate macro definition
+    mov x0, #PP_MACRO_SIZE
+    bl _kcc_arena_alloc
+    mov x23, x0
+
+    str x19, [x23, #PP_MACRO_NAME]
+    str x20, [x23, #PP_MACRO_NAMELEN]
+    mov x0, #PP_FLAG_BUILTIN
+    str x0, [x23, #PP_MACRO_FLAGS]
+    str xzr, [x23, #PP_MACRO_NPARAMS]
+    str x21, [x23, #PP_MACRO_BODY]
+    str x22, [x23, #PP_MACRO_BODYLEN]
+    str xzr, [x23, #PP_MACRO_PARAMS]
+
+    // Store in hash table
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    mov  x1, x19
+    mov  x2, x20
+    mov  x3, x23
+    bl _kcc_ht_put
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+

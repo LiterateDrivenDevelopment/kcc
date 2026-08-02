@@ -305,6 +305,9 @@ synchronisation-point strategy.
 
 \begin{multicols}{2}
 @i literate/frontend/18-preprocessor.weft
+@i literate/frontend/18a-pp-macros.weft
+@i literate/frontend/18b-pp-conditionals.weft
+@i literate/frontend/18c-pp-include.weft
 \end{multicols}
 \newpage
 
@@ -370,6 +373,9 @@ violation has been reported as a diagnostic.
 
 \begin{multicols}{2}
 @i literate/semantics/27-sema.weft
+@i literate/semantics/27b-sema-declarations.weft
+@i literate/semantics/27c-sema-statements.weft
+@i literate/semantics/27d-sema-expressions.weft
 \end{multicols}
 \newpage
 
@@ -403,6 +409,11 @@ before the IR is handed to later phases.
 
 \begin{multicols}{2}
 @i literate/ir/32-ir-builder.weft
+@i literate/ir/32a-ir-dump.weft
+@i literate/ir/32b-ir-expressions.weft
+@i literate/ir/32e-ir-assign-call.weft
+@i literate/ir/32c-ir-aggregates.weft
+@i literate/ir/32d-ir-control.weft
 \end{multicols}
 \newpage
 
@@ -470,6 +481,9 @@ source file to \texttt{.o}.
 
 \begin{multicols}{2}
 @i literate/backend/37-codegen.weft
+@i literate/backend/37a-codegen-regalloc.weft
+@i literate/backend/37b-codegen-frame.weft
+@i literate/backend/37c-codegen-dispatch.weft
 \end{multicols}
 \newpage
 

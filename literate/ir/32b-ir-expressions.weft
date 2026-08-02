@@ -1,0 +1,3821 @@
+% 32b-ir-expressions.weft — IR lowering of value expressions and operators
+%
+% Split from 32-ir-builder.weft (structural refactor, no content changes):
+% the expression dispatcher, literals, sizeof, subscript, member and
+% bit-field access, identifier loads, binary/unary operators, and
+% increment/decrement.
+
+\section{Building Expressions}
+
+The expression dispatcher examines the AST tag of its input node and
+delegates to a specialised builder for each expression kind.  Every
+builder returns the vreg number holding the result; this convention
+lets callers compose expressions by feeding one builder's result into
+another's operand slots.  A cast expression delegates to
+\texttt{\_kcc\_ir\_build\_cast}, which emits \texttt{IR\_TRUNC} when
+the target type is narrower than the source.  Parenthesised
+expressions unwrap to their child.  The comma operator evaluates both
+sides and returns the right-hand vreg.
+
+@d IR: build expression @{
+// -- kcc_ir_build_expr ----------------------------------------------------
+// uint64_t kcc_ir_build_expr(node *expr)
+//   x0 = AST expression node
+// Returns vreg number containing the result.
+.text
+.globl _kcc_ir_build_expr
+.p2align 2
+_kcc_ir_build_expr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    cbz x0, .Libe_zero
+    mov x19, x0
+
+    ldr x0, [x19, #AST_TAG]
+
+    cmp x0, #AST_INT_LIT
+    b.eq .Libe_int_lit
+    cmp x0, #AST_FLOAT_LIT
+    b.eq .Libe_float_lit
+    cmp x0, #AST_CHAR_LIT
+    b.eq .Libe_char_lit
+    cmp x0, #AST_IDENT_EXPR
+    b.eq .Libe_ident
+    cmp x0, #AST_BINARY_EXPR
+    b.eq .Libe_binary
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Libe_unary
+    cmp x0, #AST_ASSIGN_EXPR
+    b.eq .Libe_assign
+    cmp x0, #AST_CALL_EXPR
+    b.eq .Libe_call
+    cmp x0, #AST_CAST_EXPR
+    b.eq .Libe_cast
+    cmp x0, #AST_COMMA_EXPR
+    b.eq .Libe_comma
+    cmp x0, #AST_COND_EXPR
+    b.eq .Libe_cond
+    cmp x0, #AST_PAREN_EXPR
+    b.eq .Libe_paren
+    cmp x0, #AST_STR_LIT
+    b.eq .Libe_string_lit
+    cmp x0, #AST_SIZEOF_EXPR
+    b.eq .Libe_sizeof
+    cmp x0, #AST_SUBSCRIPT
+    b.eq .Libe_subscript
+    cmp x0, #AST_MEMBER
+    b.eq .Libe_member
+    cmp x0, #AST_VA_ARG
+    b.eq .Libe_va_arg
+
+    // Unhandled expression — return 0
+    b .Libe_zero
+
+.Libe_va_arg:
+    mov x0, x19
+    bl _kcc_ir_build_va_arg
+    b .Libe_done
+
+.Libe_int_lit:
+    mov x0, x19
+    bl _kcc_ir_build_int_lit
+    b .Libe_done
+
+.Libe_float_lit:
+    mov x0, x19
+    bl _kcc_ir_build_float_lit
+    b .Libe_done
+
+.Libe_char_lit:
+    mov x0, x19
+    bl _kcc_ir_build_int_lit   // same treatment: F0=value
+    b .Libe_done
+
+.Libe_ident:
+    mov x0, x19
+    bl _kcc_ir_build_ident
+    b .Libe_done
+
+.Libe_binary:
+    mov x0, x19
+    bl _kcc_ir_build_binary
+    b .Libe_done
+
+.Libe_unary:
+    mov x0, x19
+    bl _kcc_ir_build_unary
+    b .Libe_done
+
+.Libe_assign:
+    mov x0, x19
+    bl _kcc_ir_build_assign
+    b .Libe_done
+
+.Libe_call:
+    mov x0, x19
+    bl _kcc_ir_build_call
+    b .Libe_done
+
+.Libe_cast:
+    mov x0, x19
+    bl _kcc_ir_build_cast
+    b .Libe_done
+
+.Libe_comma:
+    // Evaluate LHS (discard), return RHS
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    b .Libe_done
+
+.Libe_cond:
+    mov x0, x19
+    bl _kcc_ir_build_cond_expr
+    b .Libe_done
+
+.Libe_paren:
+    // Unwrap parenthesized expression — just build inner
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    b .Libe_done
+
+.Libe_string_lit:
+    mov x0, x19
+    bl _kcc_ir_build_string_lit
+    b .Libe_done
+
+.Libe_sizeof:
+    mov x0, x19
+    bl _kcc_ir_build_sizeof
+    b .Libe_done
+
+.Libe_subscript:
+    mov x0, x19
+    bl _kcc_ir_build_subscript
+    b .Libe_done
+
+.Libe_member:
+    mov x0, x19
+    bl _kcc_ir_build_member
+    b .Libe_done
+
+.Libe_zero:
+    mov x0, #0
+
+.Libe_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_build_expr
+@}
+
+\subsection{Integer Literal}
+
+An integer or character literal becomes an \texttt{IR\_CONST}
+instruction whose \texttt{SRC1} field stores the immediate value.
+The builder assigns the default type \texttt{i32} and allocates a
+fresh vreg for the result.  Character literals receive the same
+treatment because the parser stores the character's numeric value in
+\texttt{AST\_F0}.
+
+@d IR: build int literal @{
+// -- kcc_ir_build_int_lit -------------------------------------------------
+// uint64_t kcc_ir_build_int_lit(node *lit)
+//   x0 = AST_INT_LIT or AST_CHAR_LIT (F0=value)
+// Returns vreg.
+.text
+.globl _kcc_ir_build_int_lit
+.p2align 2
+_kcc_ir_build_int_lit:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = AST node (KEEP)
+    ldr x20, [x19, #AST_F0]     // x20 = value
+
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x21, x0                  // x21 = instr
+
+    // Default type: i32
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x21, #IR_TYPE]
+
+    str x20, [x21, #IR_SRC1]    // immediate value
+
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x20, x0                 // save vreg
+
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    mov x0, x20                  // return vreg
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_build_float_lit -----------------------------------------------
+// uint64_t kcc_ir_build_float_lit(node *float_lit)
+//   x0 = AST_FLOAT_LIT (F0 = IEEE-754 double bit pattern)
+// A floating constant lowers to the same IR_CONST as an integer: the
+// 64-bit pattern is materialised into the vreg's slot. Only the type
+// differs (double), which is what makes the backend spill and reload it
+// through the floating-point unit.
+.text
+.globl _kcc_ir_build_float_lit
+.p2align 2
+_kcc_ir_build_float_lit:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // x20 = double bit pattern
+
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x21, #IR_TYPE]     // double
+
+    str x20, [x21, #IR_SRC1]    // bit pattern as the immediate
+
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x20, x0
+
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    mov x0, x20
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_type_is_fp ----------------------------------------------------
+// uint64_t kcc_ir_type_is_fp(type_desc *ty)  → 1 if float/double, else 0.
+.text
+.globl _kcc_ir_type_is_fp
+.p2align 2
+_kcc_ir_type_is_fp:
+    cbz x0, .Litif_no
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_FLOAT
+    b.eq .Litif_yes
+    cmp x1, #TY_DOUBLE
+    b.eq .Litif_yes
+.Litif_no:
+    mov x0, #0
+    ret
+.Litif_yes:
+    mov x0, #1
+    ret
+
+// -- kcc_ir_classify_type -------------------------------------------------
+// uint64_t kcc_ir_classify_type(type_desc *ty)
+//   AAPCS64 argument class:
+//     0 = GP    (integer/pointer, one general register)
+//     1 = FP    (float/double, one SIMD register)
+//     2 = ST1   (aggregate <=8 bytes, one general register, by value)
+//     3 = ST2   (aggregate 9..16 bytes, two general registers, by value)
+//     4 = REF   (aggregate >16 bytes, passed by reference in one register)
+.text
+.globl _kcc_ir_classify_type
+.p2align 2
+_kcc_ir_classify_type:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    cbz x0, .Lct_gp
+    mov x19, x0
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Lct_fp
+    ldr x0, [x19, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Lct_struct
+    cmp x0, #TY_UNION
+    b.eq .Lct_struct
+    b .Lct_gp
+.Lct_struct:
+    mov x0, x19
+    bl _kcc_type_layout          // x0 = byte size
+    cmp x0, #8
+    b.le .Lct_st1
+    cmp x0, #16
+    b.le .Lct_st2
+    mov x0, #4
+    b .Lct_ret
+.Lct_st1:
+    mov x0, #2
+    b .Lct_ret
+.Lct_st2:
+    mov x0, #3
+    b .Lct_ret
+.Lct_fp:
+    mov x0, #1
+    b .Lct_ret
+.Lct_gp:
+    mov x0, #0
+.Lct_ret:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_emit_sitofp ---------------------------------------------------
+// uint64_t kcc_ir_emit_sitofp(uint64_t src_vreg)
+// Emits IR_SITOFP: converts a signed integer vreg to a double vreg.
+.text
+.globl _kcc_ir_emit_sitofp
+.p2align 2
+_kcc_ir_emit_sitofp:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // src vreg
+    mov x0, #IR_SITOFP
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_double@@PAGE
+    add  x1, x1, _kcc_type_double@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    str x0, [sp, #24]            // save dest vreg across the emit call
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [sp, #24]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_emit_fpround --------------------------------------------------
+// uint64_t kcc_ir_emit_fpround(uint64_t src_vreg)
+// Emits IR_FPROUND: rounds a double vreg to single precision (float type).
+.text
+.globl _kcc_ir_emit_fpround
+.p2align 2
+_kcc_ir_emit_fpround:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // src vreg
+    mov x0, #IR_FPROUND
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_float@@PAGE
+    add  x1, x1, _kcc_type_float@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    str x0, [sp, #24]
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [sp, #24]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_emit_fptosi ---------------------------------------------------
+// uint64_t kcc_ir_emit_fptosi(uint64_t src_vreg)
+// Emits IR_FPTOSI: converts a double vreg to a signed integer vreg.
+.text
+.globl _kcc_ir_emit_fptosi
+.p2align 2
+_kcc_ir_emit_fptosi:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    mov x0, #IR_FPTOSI
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    str x0, [sp, #24]            // save dest vreg across the emit call
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [sp, #24]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_convert -------------------------------------------------------
+// uint64_t kcc_ir_convert(uint64_t vreg, type *from, type *to)
+// Inserts an int↔double conversion when the value crosses the boundary
+// between the integer and floating domains; otherwise returns the vreg
+// unchanged. (Integer↔integer resizing is handled by cast lowering.)
+.text
+.globl _kcc_ir_convert
+.p2align 2
+_kcc_ir_convert:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                  // vreg (result accumulator)
+    str x1, [sp, #32]            // from type
+    str x2, [sp, #40]            // to type
+    mov x0, x2
+    bl _kcc_ir_type_is_fp
+    mov x20, x0                  // to_is_fp
+    ldr x0, [sp, #32]
+    bl _kcc_ir_type_is_fp        // from_is_fp
+    cmp x0, x20
+    b.eq .Licv_maybe_round       // same domain → maybe just round
+    cbnz x20, .Licv_to_fp
+    mov x0, x19
+    bl _kcc_ir_emit_fptosi       // fp → int
+    mov x19, x0
+    b .Licv_maybe_round
+.Licv_to_fp:
+    mov x0, x19
+    bl _kcc_ir_emit_sitofp       // int → double
+    mov x19, x0
+.Licv_maybe_round:
+    // Converting to float truncates the value to single precision.
+    ldr x0, [sp, #40]
+    cbz x0, .Licv_done
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_FLOAT
+    b.ne .Licv_maybe_bool
+    mov x0, x19
+    bl _kcc_ir_emit_fpround
+    mov x19, x0
+.Licv_maybe_bool:
+    // Converting to _Bool normalises any non-zero value to 1 (\stdref{6.3.1.2}).
+    ldr x0, [sp, #40]
+    cbz x0, .Licv_done
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_BOOL
+    b.ne .Licv_done
+    mov x0, x19
+    bl _kcc_ir_emit_bool_norm
+    mov x19, x0
+.Licv_done:
+    mov x0, x19
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_fill_param_classes --------------------------------------------
+// void kcc_ir_fill_param_classes(ir_func *fn, node *func_decl)
+//   Allocates IRF_PARAM_CLS: one AAPCS64 class per incoming parameter, in
+//   order, so the codegen prologue can spill each from the right register.
+//   Named source parameters are classified from their type; a trailing
+//   hidden sret pointer (when the return type is a struct) stays GP.
+.text
+.globl _kcc_ir_fill_param_classes
+.p2align 2
+_kcc_ir_fill_param_classes:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // ir_func
+    mov x23, x1                  // func_decl
+    ldr x20, [x19, #IRF_PARAMS]
+    cbz x20, .Lfpc_done
+    lsl x0, x20, #3
+    bl _kcc_arena_alloc
+    str x0, [x19, #IRF_PARAM_CLS]
+    mov x22, x0                  // class array
+    // Default every slot to GP (arena is not zero-initialised).
+    mov x21, #0
+.Lfpc_zero:
+    cmp x21, x20
+    b.ge .Lfpc_walk
+    str xzr, [x22, x21, lsl #3]
+    add x21, x21, #1
+    b .Lfpc_zero
+.Lfpc_walk:
+    ldr x24, [x23, #AST_F2]      // first param decl (bit 0 = variadic)
+    bic x24, x24, #1
+    mov x21, #0                  // named-param index
+.Lfpc_loop:
+    cbz x24, .Lfpc_sret
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_PARAM_DECL
+    b.ne .Lfpc_next
+    ldr x0, [x24, #AST_F1]       // name (skip the (void) marker)
+    cbz x0, .Lfpc_next
+    ldr x0, [x24, #AST_F0]       // param type spec
+    bl _kcc_sema_resolve_type
+    bl _kcc_ir_classify_type
+    str x0, [x22, x21, lsl #3]
+    add x21, x21, #1
+.Lfpc_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lfpc_loop
+.Lfpc_sret:
+    // A >16B struct return adds a trailing hidden parameter received in x8
+    // (class 5), not in a general argument register.
+    ldr x0, [x19, #IRF_RETTYPE]
+    bl _kcc_ir_classify_type
+    cmp x0, #4
+    b.ne .Lfpc_done
+    sub x0, x20, #1              // last param index
+    mov x1, #5                   // class X8
+    str x1, [x22, x0, lsl #3]
+.Lfpc_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_classify_type _kcc_ir_emit_sitofp _kcc_ir_emit_fptosi _kcc_ir_emit_fpround _kcc_ir_convert _kcc_ir_fill_param_classes
+@}
+
+\subsection{Sizeof Expression}
+
+The \texttt{sizeof} operator (\stdref{6.5.3.4}) is a compile-time
+constant: it measures the size of a type without generating any
+run-time code.  The IR builder lowers it to a single
+\texttt{IR\_CONST} whose immediate value is the type's size in bytes.
+
+Two forms are possible.  When the operand is a type name
+(\texttt{AST\_F1 = 1}), the builder calls
+\texttt{\_kcc\_sema\_resolve\_type} on the type AST node to obtain a
+type descriptor and reads its \texttt{TY\_SIZE} field.  When the
+operand is an expression (\texttt{AST\_F1 = 0}), the semantic pass has
+already type-checked the operand and stored its resolved type in the
+operand node's \texttt{AST\_F3} field; the builder reads the size from
+that descriptor.  In neither case is the operand expression evaluated
+at run time.
+
+@d IR: build sizeof @{
+// -- kcc_ir_build_sizeof --------------------------------------------------
+// uint64_t kcc_ir_build_sizeof(node *expr)
+//   x0 = AST_SIZEOF_EXPR (F0=operand, F1=is_type)
+// Returns vreg holding the size constant.
+.text
+.globl _kcc_ir_build_sizeof
+.p2align 2
+_kcc_ir_build_sizeof:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = sizeof node
+
+    // Determine operand type
+    ldr x0, [x19, #AST_F1]      // is_type flag
+    cbnz x0, .Libs_sizeof_type
+
+    // sizeof(expr): operand's resolved type is in F0->AST_F3
+    ldr x0, [x19, #AST_F0]      // operand expression
+    ldr x0, [x0, #AST_F3]       // resolved type descriptor
+    b .Libs_sizeof_emit
+
+.Libs_sizeof_type:
+    // sizeof(type-name): resolve the type AST node
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+
+.Libs_sizeof_emit:
+    // x0 = type descriptor → read TY_SIZE
+    ldr x20, [x0, #TY_SIZE]     // x20 = size in bytes
+
+    // Emit IR_CONST with the size value
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x21, x0                  // x21 = instr
+
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x21, #IR_TYPE]     // sizeof yields unsigned long
+
+    str x20, [x21, #IR_SRC1]    // immediate = size
+
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x20, x0                  // save vreg
+
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    mov x0, x20                  // return vreg
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_sizeof
+@}
+
+\paragraph{End-to-end tests.}
+The sizeof operator must produce the correct size for each fundamental
+type: \texttt{char} is 1~byte, \texttt{short} is 2, \texttt{int} is 4,
+and \texttt{long} is 8 on ARM64.  The expression form
+\texttt{sizeof~expr} must also return the type's size without
+evaluating the expression.
+
+@d Test: codegen sizeof @{
+echo ""
+echo "--- Sizeof ---"
+
+run_test "sizeof-int" \
+    "int main(void) { return sizeof(int); }" 4
+
+run_test "sizeof-char" \
+    "int main(void) { return sizeof(char); }" 1
+
+run_test "sizeof-long" \
+    "int main(void) { return sizeof(long); }" 8
+
+run_test "sizeof-expr" \
+    "int main(void) { int x = 42; return sizeof(x); }" 4
+
+run_test "sizeof-ptr" \
+    "int main(void) { int *p; return sizeof(p); }" 8
+
+run_test "sizeof-arith" \
+    "int main(void) { return sizeof(int) + sizeof(char); }" 5
+@}
+
+\subsection{Array Subscript}
+\label{sec:ir-subscript}
+
+The subscript operator \texttt{e[i]} has two distinct lowerings
+depending on the declared type of the base operand.
+
+\paragraph{Array subscript.}
+When the base is a local array (\texttt{int a[N]}), the alloca vreg
+\emph{is} the array base address.  The builder emits an
+\texttt{IR\_GEP} that computes \texttt{base + index $\times$ 8}
+(the all-spill slot stride), and an \texttt{IR\_LOAD} reads the
+value at that address.
+
+\paragraph{Pointer subscript.}
+When the base is a pointer variable (\texttt{int *p}), the alloca
+holds the pointer value, which must be loaded first.  The builder
+emits \texttt{IR\_LOAD} to dereference the alloca, scales the index
+by the pointee's \texttt{TY\_SIZE} (via \texttt{IR\_CONST} +
+\texttt{IR\_MUL}), and emits \texttt{IR\_ADD} to compute the
+element address.  The resulting \texttt{LOAD}/\texttt{STORE} carries
+an access-size override so the code generator emits the correct
+width instruction (\textsc{ldrb}/\textsc{strb} for \texttt{char},
+\textsc{ldr}/\textsc{str}~\texttt{w} for \texttt{int}).
+
+Global pointer variables (and any base expression that is not a
+simple local identifier) also take the pointer subscript path.
+The fallback branch redirects to \texttt{.Libsa\_ptr}, ensuring
+that the index is scaled by \texttt{TY\_SIZE} rather than the
+fixed slot stride of~8.  Without this, \texttt{vars[i]} on a global
+\texttt{struct Var *vars} would compute
+\texttt{base + i$\times$8} instead of \texttt{base + i$\times$16}
+for a two-field struct.
+
+The local array/pointer distinction relies on a tag bit in the
+locals hash table.
+Sema applies array-to-pointer decay (\stdref{6.3.2.1p3}), so both
+arrays and pointer variables have \texttt{TY\_PTR} in
+\texttt{AST\_F3}.  Furthermore, the symbol table's local scope is
+popped after sema completes.  To communicate the original declared
+type to the IR builder, \texttt{\_kcc\_ir\_build\_var\_decl} sets
+bit~63 of the hash value when the resolved type is \texttt{TY\_PTR}.
+The subscript address builder tests this bit with \textsc{tbnz};
+all other hash-value consumers clear it with \textsc{bic}.
+
+Two helpers split the work.
+\texttt{\_kcc\_ir\_build\_subscript\_addr} resolves the address---it is
+shared by both read (\texttt{e[i]}) and write (\texttt{e[i]=v})
+paths.  \texttt{\_kcc\_ir\_build\_subscript} calls the address
+helper and then emits an \texttt{IR\_LOAD} to produce a value vreg.
+For assignment, the assign builder calls the address helper directly
+and emits an \texttt{IR\_STORE} to write the right-hand side.
+
+For arrays of structs, the element size exceeds a single eight-byte
+slot.  In that case the builder pre-scales the index by the ratio
+\texttt{TY\_SIZE~/~8} before the \texttt{IR\_GEP}, so that the
+fixed stride~8 of the GEP instruction still produces the correct byte
+offset.
+
+Global arrays require special treatment: the address produced by
+\texttt{IR\_GLOBAL\_REF} already points at element~0, so subscripting
+must \emph{not} load from it (that would misinterpret element data as
+a pointer).  The builder detects global arrays by looking up the
+symbol table for the pre-decay type (\texttt{TY\_ARRAY}), emits a
+\texttt{GLOBAL\_REF}, and feeds the resulting address vreg into the
+GEP index path.
+
+\paragraph{Slots per type.}
+Aggregates are laid out byte-accurately (see \texttt{\_kcc\_type\_layout}),
+but the all-spill frame still allocates storage in whole eight-byte slots.
+\texttt{\_kcc\_ir\_type\_slots} bridges the two: it forces a layout and then
+rounds the real byte size up to a whole number of slots,
+$\max(1,\lceil\mathrm{TY\_SIZE}/8\rceil)$.  For \texttt{int a[4]} that is two
+slots (sixteen bytes) rather than the four the old one-slot-per-element model
+used; the packed sixteen-byte object is addressed with byte-accurate strides
+by the subscript and member code below.  This figure sizes an alloca; the
+subscript's element step now comes from the element's real size, not from a
+slot count.
+
+@d IR: build subscript @{
+// -- kcc_ir_type_slots ----------------------------------------------------
+// uint64_t kcc_ir_type_slots(type_desc *ty)
+//   Number of 8-byte all-spill slots a value of this type occupies.
+.text
+.globl _kcc_ir_type_slots
+.p2align 2
+_kcc_ir_type_slots:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    cbz x0, .Lts_one
+    // Force a byte-accurate layout, then round the real size up to whole
+    // 8-byte all-spill slots.  Arrays and structs are sized uniformly.
+    bl _kcc_type_layout          // x0 = TY_SIZE in bytes
+    cmp x0, #8
+    b.le .Lts_one
+    add x0, x0, #7
+    lsr x0, x0, #3               // ceil(size / 8)
+    b .Lts_done
+.Lts_one:
+    mov x0, #1
+.Lts_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_type_slots
+@}
+
+\paragraph{Access widths.}
+Once fields and array elements are packed, a memory access must name its
+exact width and signedness or it will read or clobber neighbouring bytes.
+An eight-byte slot load of a two-byte \texttt{short} field would drag in the
+next field's low bytes; an eight-byte store would overwrite them.  Two
+helpers translate a scalar type into the access-size override the code
+generator understands.  \texttt{\_kcc\_ir\_store\_width} returns the byte
+width $1$, $2$, or $4$ for a narrow integer (and $0$---meaning the natural
+eight-byte slot---for anything pointer-width or aggregate).  Stores need no
+signedness because they simply truncate.  \texttt{\_kcc\_ir\_load\_width}
+additionally encodes signedness, because a narrow load must extend into the
+full 64-bit slot: it returns $1/2/4$ for unsigned \texttt{LDRB}/\texttt{LDRH}/%
+\texttt{LDR w} and $5/6/7$ for signed \texttt{LDRSB}/\texttt{LDRSH}/%
+\texttt{LDRSW}.  A signed \texttt{int} field holding $-1$ thus round-trips as
+$-1$ rather than $2^{32}-1$.
+
+@d IR: access width @{
+// -- kcc_ir_store_width ---------------------------------------------------
+// uint64_t kcc_ir_store_width(type_desc *ty)
+//   Store access-size override: 1/2/4 for a narrow scalar, 0 for the
+//   natural 8-byte slot (pointers, long, aggregates).
+.text
+.globl _kcc_ir_store_width
+.p2align 2
+_kcc_ir_store_width:
+    cbz x0, .Lsw_default
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_BOOL
+    b.eq .Lsw_one
+    cmp x1, #TY_ENUM
+    b.eq .Lsw_int_size
+    cmp x1, #TY_CHAR
+    b.lt .Lsw_default          // void
+    cmp x1, #TY_LLONG
+    b.gt .Lsw_default          // float/double/ptr/array/struct
+.Lsw_int_size:
+    ldr x2, [x0, #TY_SIZE]
+    cmp x2, #4
+    b.eq .Lsw_from_size
+    cmp x2, #2
+    b.eq .Lsw_from_size
+    cmp x2, #1
+    b.eq .Lsw_from_size
+    b .Lsw_default             // 8-byte long → natural slot
+.Lsw_from_size:
+    mov x0, x2
+    ret
+.Lsw_one:
+    mov x0, #1
+    ret
+.Lsw_default:
+    mov x0, #0
+    ret
+
+// -- kcc_ir_load_width ----------------------------------------------------
+// uint64_t kcc_ir_load_width(type_desc *ty)
+//   Load access-size override: 1/2/4 unsigned, 5/6/7 signed, 0 = 8-byte.
+.text
+.globl _kcc_ir_load_width
+.p2align 2
+_kcc_ir_load_width:
+    cbz x0, .Llw_default
+    ldr x1, [x0, #TY_KIND]
+    ldr x2, [x0, #TY_SIZE]
+    cmp x1, #TY_BOOL
+    b.eq .Llw_unsigned
+    cmp x1, #TY_ENUM
+    b.eq .Llw_signed
+    cmp x1, #TY_CHAR
+    b.lt .Llw_default          // void
+    cmp x1, #TY_LLONG
+    b.gt .Llw_default          // float/double/ptr/array/struct
+    ldr x3, [x0, #TY_F0]       // integer signedness (1 = signed)
+    cbz x3, .Llw_unsigned
+.Llw_signed:
+    cmp x2, #1
+    b.eq .Llw_s8
+    cmp x2, #2
+    b.eq .Llw_s16
+    cmp x2, #4
+    b.eq .Llw_s32
+    b .Llw_default             // 8-byte → natural slot
+.Llw_s8:
+    mov x0, #5
+    ret
+.Llw_s16:
+    mov x0, #6
+    ret
+.Llw_s32:
+    mov x0, #7
+    ret
+.Llw_unsigned:
+    cmp x2, #1
+    b.eq .Llw_u8
+    cmp x2, #2
+    b.eq .Llw_u16
+    cmp x2, #4
+    b.eq .Llw_u32
+    b .Llw_default
+.Llw_u8:
+    mov x0, #1
+    ret
+.Llw_u16:
+    mov x0, #2
+    ret
+.Llw_u32:
+    mov x0, #4
+    ret
+.Llw_default:
+    mov x0, #0
+    ret
+@| _kcc_ir_store_width _kcc_ir_load_width
+@}
+
+@d IR: build subscript @{
+// -- kcc_ir_build_subscript_addr ------------------------------------------
+// uint64_t kcc_ir_build_subscript_addr(node *subscript)
+//   x0 = AST_SUBSCRIPT (F0=array ident, F1=index expr)
+// Returns vreg holding the element address (GEP result).
+.text
+.globl _kcc_ir_build_subscript_addr
+.p2align 2
+_kcc_ir_build_subscript_addr:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    mov x19, x0                  // x19 = subscript node
+
+    // Get base expression — check its shape
+    ldr x0, [x19, #AST_F0]      // array/pointer expression
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Libsa_nested_base
+    cmp x1, #AST_MEMBER
+    b.eq .Libsa_member_base
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libsa_expr
+
+    // Ident: look up in locals
+    ldr x20, [x0, #AST_F0]      // name ptr
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    bl _kcc_ht_get
+    cbz x0, .Libsa_expr
+
+    // Bit 63 of the hash value tags pointer variables (set by
+    // _kcc_ir_build_var_decl).  Pointer subscripts need load +
+    // scaled ADD; arrays use GEP with the alloca directly.
+    tbnz x0, #63, .Libsa_ptr_local
+    sub x20, x0, #1              // x20 = alloca vreg (array/scalar)
+    b .Libsa_index
+
+.Libsa_ptr_local:
+    b .Libsa_ptr
+
+.Libsa_nested_base:
+    // base is a[i] of a multi-dimensional array: its ADDRESS is the sub-array
+    // base (contiguous), so recurse for the address rather than loading it.
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_subscript_addr
+    mov x20, x0
+    b .Libsa_index
+
+.Libsa_member_base:
+    // base is s.arr / s->arr.  When the member is itself an array, its
+    // ADDRESS is the array base; a pointer member is loaded like any pointer.
+    ldr x1, [x0, #AST_F3]       // member's resolved type
+    cbz x1, .Libsa_ptr
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.ne .Libsa_ptr
+    bl _kcc_ir_build_member_addr // x0 = base member node → member address
+    mov x20, x0
+    b .Libsa_index
+
+.Libsa_expr:
+    // Check if base is a global array (needs global_ref + GEP,
+    // not global_ref + load + ADD like pointer globals).
+    ldr x0, [x19, #AST_F0]      // base expression
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libsa_ptr
+
+    // Look up in symbol table for pre-decay type
+    ldr x22, [x0, #AST_F0]      // name ptr
+    mov x0, x22
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    bl _kcc_symtab_lookup
+    cbz x0, .Libsa_ptr
+    ldr x1, [x0, #SYM_TYPE]
+    cbz x1, .Libsa_ptr
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.ne .Libsa_ptr
+
+    // Global array: emit IR_GLOBAL_REF for the base address
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_SRC1]     // name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x23, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x20, x0                  // x20 = global address vreg
+    mov x0, x23
+    bl _kcc_ir_emit
+    b .Libsa_index
+
+.Libsa_index:
+    // Build index expression
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // index vreg
+
+    // Scale the index by the element's real byte size so the stride-1 GEP
+    // lands on the right byte (a[i] steps by sizeof(element), including
+    // packed structs and sub-arrays).
+    ldr x0, [x19, #AST_F3]      // subscript result type (element type)
+    cbz x0, .Libsa_gep
+    bl _kcc_type_layout         // x0 = element size in bytes
+    mov x22, x0
+    cmp x22, #1
+    b.le .Libsa_gep             // size 1: index is already the byte offset
+
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x22, [x23, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x22, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x21, [x23, #IR_SRC1]
+    str x22, [x23, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x21, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+.Libsa_gep:
+    // Emit IR_GEP: base + byte offset (index already scaled by element size)
+    mov x0, #IR_GEP
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]    // base pointer
+    str x21, [x22, #IR_SRC2]    // byte offset
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // result vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    mov x0, x23                  // return GEP vreg
+    b .Libsa_done
+
+.Libsa_ptr:
+    // Pointer subscript: load pointer, scale index, emit ADD
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // x20 = loaded pointer vreg
+
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // x21 = index vreg
+
+    // Get pointee size (real, byte-accurate — the array it points into is
+    // now packed at the same stride, so no clamp to 8 is needed).
+    ldr x0, [x19, #AST_F0]
+    ldr x0, [x0, #AST_F3]       // TY_PTR
+    ldr x0, [x0, #TY_F0]        // pointee type
+    cbz x0, .Libsa_ptr_add
+    bl _kcc_type_layout         // x22 = sizeof(pointee)
+    mov x22, x0
+    cmp x22, #1
+    b.le .Libsa_ptr_add         // size 1: index is already the byte offset
+
+    // Scale index by pointee size
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x22, [x23, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x22, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x23, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x23, #IR_TYPE]
+    str x21, [x23, #IR_SRC1]
+    str x22, [x23, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x21, x0
+    mov x0, x23
+    bl _kcc_ir_emit
+
+.Libsa_ptr_add:
+    mov x0, #IR_ADD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]
+    str x21, [x22, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    mov x0, x23
+
+.Libsa_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_subscript_addr
+@}
+
+@d IR: build subscript @{
+// -- kcc_ir_build_subscript -----------------------------------------------
+// uint64_t kcc_ir_build_subscript(node *subscript)
+//   x0 = AST_SUBSCRIPT (F0=array, F1=index)
+// Returns vreg holding the loaded value.
+.text
+.globl _kcc_ir_build_subscript
+.p2align 2
+_kcc_ir_build_subscript:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x20, x0                  // x20 = subscript node
+
+    // Get element address
+    bl _kcc_ir_build_subscript_addr
+    mov x19, x0                  // address vreg
+
+    // Element load width+sign from the subscript result (element) type —
+    // covers both array and pointer element sizes now that they are packed.
+    ldr x0, [x20, #AST_F3]
+    bl _kcc_ir_load_width
+    mov x21, x0
+
+.Libs_load:
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x19, [x20, #IR_SRC1]    // pointer
+    str x21, [x20, #IR_SRC2]    // access size override
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0                  // result vreg
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, x19                  // return value vreg
+
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_subscript
+@}
+
+Array tests verify declaration, element write, element read, multiple
+elements, loop-based filling, and variable indexing.
+
+@d Test: codegen arrays @{
+echo ""
+echo "--- Arrays ---"
+
+run_test "array-write-read" \
+    "int main(void) { int a[3]; a[0] = 10; return a[0]; }" 10
+
+run_test "array-multi-elem" \
+    "int main(void) { int a[3]; a[0] = 1; a[1] = 2; a[2] = 3; return a[0] + a[1] + a[2]; }" 6
+
+run_test "array-overwrite" \
+    "int main(void) { int a[2]; a[0] = 5; a[0] = 9; return a[0]; }" 9
+
+run_test "array-index-var" \
+    "int main(void) { int a[4]; int i = 2; a[i] = 7; return a[2]; }" 7
+
+run_test "array-loop-fill" \
+    "int main(void) { int a[5]; int i = 0; while (i < 5) { a[i] = i; i = i + 1; } return a[3]; }" 3
+
+run_test "array-sum-loop" \
+    "int main(void) { int a[4]; a[0]=1; a[1]=2; a[2]=3; a[3]=4; int s=0; int i=0; while(i<4){s=s+a[i];i=i+1;} return s; }" 10
+
+run_test "array-2d" \
+    "int main(void) { int a[3][3]; int i; int j; for (i=0;i<3;i=i+1) for (j=0;j<3;j=j+1) a[i][j]=i*3+j; return a[2][2]; }" 8
+
+run_test "array-2d-rows" \
+    "int main(void) { int a[4][2]; int i; for (i=0;i<4;i=i+1) { a[i][0]=i; a[i][1]=i*i; } return a[3][0]+a[3][1]; }" 12
+
+run_test "array-3d" \
+    "int main(void) { int a[2][2][2]; a[1][1][1]=42; a[0][1][0]=5; return a[1][1][1]+a[0][1][0]; }" 47
+
+echo ""
+echo "--- Pointer Subscript ---"
+
+run_test "ptr-sub-write-read" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0] = 42; return p[0]; }" 42
+
+run_test "ptr-sub-multi" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0]=1; p[1]=2; p[2]=3; return p[0]+p[1]+p[2]; }" 6
+
+run_test "ptr-sub-var-index" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); int i = 2; p[i] = 99; return p[2]; }" 99
+
+run_test "ptr-sub-char" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { char *s = (char*)mmap(0,4096,3,4098,-1,0); s[0]=65; s[1]=66; return s[0]+s[1]; }" 131
+
+run_test "ptr-sub-expr-index" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0]=10; p[1]=20; p[2]=30; int j=0; return p[j+1]; }" 20
+
+run_test "ptr-sub-swap" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); p[0]=50; p[1]=10; int t=p[0]; p[0]=p[1]; p[1]=t; return p[0]; }" 10
+
+run_test "ptr-sub-bubble" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *a = (int*)mmap(0,4096,3,4098,-1,0); a[0]=5; a[1]=3; a[2]=4; a[3]=1; a[4]=2; int i=0; while(i<4){int j=0; while(j<4-i){if(a[j]>a[j+1]){int t=a[j]; a[j]=a[j+1]; a[j+1]=t;} j=j+1;} i=i+1;} return a[0]+a[4]; }" 6
+@}
+
+\subsection{Struct Member Access}
+
+The struct member access \texttt{s.x} follows the same pattern as
+array subscript: an \texttt{IR\_GEP} computes the field address, and
+an \texttt{IR\_LOAD} reads the value.  The key difference is that the
+field index comes from semantic analysis (stored in
+\texttt{AST\_MEMBER.F3} during \texttt{kcc\_sema\_expr\_member})
+rather than from a runtime expression.
+
+The address helper \texttt{\_kcc\_ir\_build\_member\_addr} looks up
+the struct variable's alloca vreg, emits \texttt{IR\_CONST} with
+the field index, and emits \texttt{IR\_GEP}.  It is shared by both
+the read path (\texttt{s.x} in expressions) and the write path
+(\texttt{s.x = v} in assignments).  When the object is a
+subscript expression rather than a simple identifier---as in
+\texttt{arr[i].x}---the handler calls
+\texttt{\_kcc\_ir\_build\_subscript\_addr} to obtain the element's
+\emph{address} rather than \texttt{\_kcc\_ir\_build\_expr} which
+would dereference it.  Nested struct access (\texttt{o.a.x}) is
+handled similarly: when the object is itself an
+\texttt{AST\_MEMBER} with dot access, the handler calls itself
+recursively to obtain the inner field's \emph{address}.  Loading
+the inner field's value would produce raw struct bytes rather than
+a valid pointer, causing a crash on the subsequent GEP.
+
+Arrow access (\texttt{p->x}) requires two adjustments.  First, the
+identifier path must emit an \texttt{IR\_LOAD} to read the pointer
+value stored in the local variable's alloca---the alloca holds the
+address of \texttt{p}, not of the struct.  Second, the type
+resolution must dereference through the pointer type: the object's
+\texttt{AST\_F3} is \texttt{TY\_PTR}; we follow \texttt{TY\_F0} to
+reach the underlying \texttt{TY\_STRUCT} so that the field-name
+walk produces the correct index.
+
+Global structs require a separate path from local structs.  When
+the identifier is not found in the locals hash table, the builder
+emits \texttt{IR\_GLOBAL\_REF} to materialise the struct's address.
+For dot access, this address is the base for \texttt{IR\_GEP}
+directly.  For arrow access on a global pointer, an additional
+\texttt{IR\_LOAD} fetches the pointer value before the GEP.
+
+@d IR: build member @{
+// -- kcc_ir_build_member_addr ---------------------------------------------
+// uint64_t kcc_ir_build_member_addr(node *member)
+//   x0 = AST_MEMBER (F0=object, F1=name_ptr, F3=resolved type)
+// Returns vreg holding the field address (GEP result).
+// The field index is computed by walking the struct declaration's
+// field chain and matching the member name.
+.text
+.globl _kcc_ir_build_member_addr
+.p2align 2
+_kcc_ir_build_member_addr:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+
+    mov x19, x0                  // x19 = member node
+
+    // Get object (struct variable) — must be an identifier
+    ldr x0, [x19, #AST_F0]      // object expression
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libma_expr
+
+    // Local struct: look up alloca vreg
+    ldr x20, [x0, #AST_F0]      // name ptr
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    bl _kcc_ht_get
+    cbz x0, .Libma_global
+    bic x0, x0, #0x8000000000000000
+    sub x20, x0, #1              // alloca vreg
+
+    // Arrow access: load the pointer value from the alloca
+    ldr x1, [x19, #AST_F2]
+    cbz x1, .Libma_find_index    // dot access → alloca IS struct base
+    // alloca holds a pointer — emit load to get the actual pointer
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]    // load from alloca
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0                  // now x20 = loaded pointer value
+    mov x0, x22
+    bl _kcc_ir_emit
+    b .Libma_find_index
+
+.Libma_global:
+    // Global struct: emit global_ref for the address
+    ldr x0, [x19, #AST_F0]      // object ident node
+    ldr x0, [x0, #AST_F0]       // name ptr
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    ldr x1, [x19, #AST_F0]
+    ldr x1, [x1, #AST_F0]       // name ptr
+    str x1, [x22, #IR_SRC1]     // symbol name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0                  // global address vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // Arrow on global: also load the pointer value
+    ldr x1, [x19, #AST_F2]
+    cbz x1, .Libma_find_index    // dot → address is the base
+    // arrow → load pointer from global address
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    b .Libma_find_index
+
+.Libma_expr:
+    // Non-identifier object: arrow uses value (pointer), dot+subscript uses address
+    ldr x0, [x19, #AST_F0]
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_SUBSCRIPT
+    b.ne .Libma_check_nested
+    ldr x1, [x19, #AST_F2]
+    cbnz x1, .Libma_expr_val     // arrow → value path
+    // dot + subscript: get element address, not value
+    bl _kcc_ir_build_subscript_addr
+    mov x20, x0
+    b .Libma_find_index
+.Libma_check_nested:
+    cmp x1, #AST_MEMBER
+    b.ne .Libma_expr_val
+    ldr x1, [x19, #AST_F2]
+    cbnz x1, .Libma_expr_val     // arrow → value path
+    // dot + nested member: get field address recursively
+    bl _kcc_ir_build_member_addr
+    mov x20, x0
+    b .Libma_find_index
+.Libma_expr_val:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_build_expr
+    mov x20, x0                  // base vreg
+
+.Libma_find_index:
+    // Find the field's byte offset by walking the struct type's field list.
+    // Get struct type from sema (AST_F3 of object expression).
+    ldr x0, [x19, #AST_F0]      // object node
+    ldr x0, [x0, #AST_F3]       // resolved type
+    cbz x0, .Libma_index_zero
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Libma_check_struct
+    ldr x0, [x0, #TY_F0]        // arrow: follow pointer to struct type
+    cbz x0, .Libma_index_zero
+    ldr x1, [x0, #TY_KIND]
+.Libma_check_struct:
+    cmp x1, #TY_STRUCT
+    b.eq .Libma_have_struct
+    cmp x1, #TY_UNION
+    b.ne .Libma_index_zero
+.Libma_have_struct:
+    // Ensure the aggregate is laid out (per-field byte offsets in AST_F3).
+    mov x25, x0                 // preserve struct type across the call
+    bl _kcc_type_layout
+
+    // Walk field list: TY_F0 = AST_STRUCT_DECL, F1 = first field
+    ldr x0, [x25, #TY_F0]       // AST_STRUCT_DECL
+    cbz x0, .Libma_index_zero
+    ldr x23, [x0, #AST_F1]      // first field
+    ldr x24, [x19, #AST_F1]     // member name to find
+
+.Libma_field_loop:
+    cbz x23, .Libma_index_zero
+    ldr x0, [x23, #AST_F1]      // field name_ptr
+    cbz x0, .Libma_field_next
+    mov x1, x24
+    bl _kcc_strcmp
+    cbz x0, .Libma_found
+
+.Libma_field_next:
+    ldr x23, [x23, #AST_F4]     // next field
+    b .Libma_field_loop
+
+.Libma_found:
+    ldr x21, [x23, #AST_F3]      // field byte offset (set by _kcc_type_layout)
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str x23, [x0]                // expose the field decl for bit-field access
+    b .Libma_emit_const
+
+.Libma_index_zero:
+    mov x21, #0
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str xzr, [x0]                // not a resolved field → no bit-field metadata
+
+.Libma_emit_const:
+    // Emit IR_CONST for the field's byte offset
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    str x21, [x22, #IR_SRC1]    // constant value = field byte offset
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // offset vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    // Emit IR_GEP: base + byte offset (stride 1)
+    mov x0, #IR_GEP
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x20, [x22, #IR_SRC1]    // base pointer
+    str x21, [x22, #IR_SRC2]    // index
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // result vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    mov x0, x23                  // return GEP vreg
+
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@| _kcc_ir_build_member_addr
+@}
+
+@d IR: build member @{
+// -- kcc_ir_build_member --------------------------------------------------
+// uint64_t kcc_ir_build_member(node *member)
+//   x0 = AST_MEMBER (F0=object, F1=name_ptr, F3=field_index)
+// Returns vreg holding the loaded value.
+.text
+.globl _kcc_ir_build_member
+.p2align 2
+_kcc_ir_build_member:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    mov x19, x0                  // save member node (for field type)
+
+    // Get field address
+    bl _kcc_ir_build_member_addr
+    mov x20, x0                  // GEP vreg (field address)
+
+    // Bit-field?  _kcc_ir_build_member_addr published the matched field decl;
+    // a non-zero packed AST_F2 means a bit-field, read by shift-and-mask.
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x1, [x0]
+    cbz x1, .Libm_scalar
+    ldr x2, [x1, #AST_F2]
+    cbz x2, .Libm_scalar
+    mov x0, x20                  // container address
+    bl _kcc_ir_bitfield_load     // x1 = field decl
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.Libm_scalar:
+    // Field access width + signedness from the member's resolved type.
+    ldr x0, [x19, #AST_F3]      // field type
+    bl _kcc_ir_load_width
+    mov x19, x0                  // load-size override
+
+    // Emit IR_LOAD from field address
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x1, x0
+    adrp x2, _kcc_type_int_s@@PAGE
+    add  x2, x2, _kcc_type_int_s@@PAGEOFF
+    ldr x2, [x2]
+    str x2, [x1, #IR_TYPE]
+    str x20, [x1, #IR_SRC1]     // pointer = GEP result
+    str x19, [x1, #IR_SRC2]     // access-size override
+    mov x20, x1                  // load instr
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0                  // result vreg
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, x19                  // return value vreg
+
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_build_member
+@}
+
+\subsection{Bit-field Access}
+\label{sec:ir-bitfield}
+
+A bit-field is stored inside a wider container, so it cannot be read
+with a plain load or written with a plain store.  Rather than teach the
+backend new instructions, \kcc{} \emph{synthesises} the access out of IR
+operations it already lowers: shifts, masks, and---for the write---an
+or.  A read loads the whole container, shifts the field down to bit
+zero, masks it to its width, and, for a signed bit-field,
+sign-extends by shifting left then arithmetic-right by
+\texttt{64\,$-$\,width}.  A write is a read-modify-write: load the
+container, clear the field's bits with \texttt{AND\,\texttilde
+(mask\,$\ll$\,offset)}, splice in \texttt{(value\,\&\,mask)\,$\ll$\,%
+offset} with an \texttt{OR}, and store the container back.  All the
+intermediate values are 64-bit so masks up to a full \texttt{long}
+container materialise correctly; only the final store narrows to the
+container's width.
+
+Two tiny emitters keep the synthesis readable:
+\texttt{kcc\_ir\_emit\_const} materialises an integer, and
+\texttt{kcc\_ir\_emit\_binop} emits one two-operand instruction and
+returns its result vreg.  The field to act on is the one
+\texttt{\_kcc\_ir\_build\_member\_addr} just matched, published through
+\texttt{\_kcc\_ir\_member\_field}; its packed \texttt{AST\_F2} gives the
+bit offset and width, and its declared type gives the container size and
+signedness.
+
+@d IR: bitfield access @{
+// -- kcc_ir_emit_const ----------------------------------------------------
+// uint64_t kcc_ir_emit_const(uint64_t value) → result vreg
+.text
+.p2align 2
+_kcc_ir_emit_const:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    str x19, [x20, #IR_SRC1]
+    adrp x1, _kcc_type_long_u@@PAGE
+    add  x1, x1, _kcc_type_long_u@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    mov x0, x19
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_emit_binop ----------------------------------------------------
+// uint64_t kcc_ir_emit_binop(int op, uint64_t a_vreg, uint64_t b_vreg) → vreg
+.p2align 2
+_kcc_ir_emit_binop:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x1                  // a
+    mov x20, x2                  // b
+    bl _kcc_ir_alloc_instr       // x0 = op passed through
+    mov x21, x0
+    adrp x1, _kcc_type_long_u@@PAGE
+    add  x1, x1, _kcc_type_long_u@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x21, #IR_TYPE]
+    str x19, [x21, #IR_SRC1]
+    str x20, [x21, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x22, x0
+    mov x0, x21
+    bl _kcc_ir_emit
+    mov x0, x22
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_bf_code -------------------------------------------------------
+// int kcc_ir_bf_code(uint64_t container_bytes) → access-size override
+// (unsigned): 8→0 (full 64-bit), 4→4, 2→2, 1→1.
+.p2align 2
+_kcc_ir_bf_code:
+    cmp x0, #4
+    b.eq .Lbfc_4
+    cmp x0, #2
+    b.eq .Lbfc_2
+    cmp x0, #1
+    b.eq .Lbfc_1
+    mov x0, #0
+    ret
+.Lbfc_4:
+    mov x0, #4
+    ret
+.Lbfc_2:
+    mov x0, #2
+    ret
+.Lbfc_1:
+    mov x0, #1
+    ret
+
+// -- kcc_ir_bf_mask -------------------------------------------------------
+// uint64_t kcc_ir_bf_mask(uint64_t width) → (1<<width)-1, saturating at ~0.
+.p2align 2
+_kcc_ir_bf_mask:
+    cmp x0, #64
+    b.hs .Lbfm_all
+    mov x1, #1
+    lsl x1, x1, x0
+    sub x0, x1, #1
+    ret
+.Lbfm_all:
+    mov x0, #-1
+    ret
+
+// -- kcc_ir_bitfield_load -------------------------------------------------
+// uint64_t kcc_ir_bitfield_load(uint64_t addr_vreg, node *field) → value vreg
+//   addr_vreg = container address, field = the bit-field decl node.
+.globl _kcc_ir_bitfield_load
+.p2align 2
+_kcc_ir_bitfield_load:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // addr
+    ldr x0, [x1, #AST_F2]        // packed (bit_offset<<16)|width
+    and x22, x0, #0xffff         // width
+    lsr x23, x0, #16             // bit offset (lsb)
+    ldr x0, [x1, #AST_F0]        // field type spec
+    bl _kcc_sema_resolve_type
+    mov x24, x0                  // field type
+    bl _kcc_ir_type_layout_size  // x0 = container bytes
+    bl _kcc_ir_bf_code
+    mov x20, x0                  // unsigned load code
+    // container LOAD
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_ir_emit_load
+    mov x21, x0                  // loaded value vreg
+    // shift right by lsb
+    cbz x23, .Lbfl_mask
+    mov x0, x23
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_LSHR
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+.Lbfl_mask:
+    mov x0, x22
+    bl _kcc_ir_bf_mask
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_AND
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+    // signed? sign-extend from `width` bits
+    mov x0, x24
+    bl _kcc_sema_int_signedness
+    cmp x0, #1
+    b.ne .Lbfl_done
+    mov x0, #64
+    sub x0, x0, x22              // s = 64 - width
+    mov x24, x0                  // reuse x24 = shift amount
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_SHL
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+    mov x0, x24
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_ASHR
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+.Lbfl_done:
+    mov x0, x21
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_ir_bitfield_store ------------------------------------------------
+// uint64_t kcc_ir_bitfield_store(uint64_t addr, uint64_t value, node *field)
+//   → the stored value vreg.  Read-modify-write of the container.
+.globl _kcc_ir_bitfield_store
+.p2align 2
+_kcc_ir_bitfield_store:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x19, x0                  // addr
+    mov x20, x1                  // value
+    ldr x0, [x2, #AST_F2]        // packed
+    and x22, x0, #0xffff         // width
+    lsr x23, x0, #16             // lsb
+    ldr x0, [x2, #AST_F0]        // field type
+    bl _kcc_sema_resolve_type
+    bl _kcc_ir_type_layout_size  // container bytes
+    bl _kcc_ir_bf_code
+    mov x24, x0                  // access-size code
+    // old = LOAD(addr)  (intermediates live in x21/x22/x26; the emitters only
+    // clobber x0-x2 and their own x19-x22, so x23-x26 survive across calls)
+    mov x0, x19
+    mov x1, x24
+    bl _kcc_ir_emit_load
+    mov x26, x0                  // old container vreg
+    mov x0, x22
+    bl _kcc_ir_bf_mask
+    mov x22, x0                  // mask (integer)
+    // vbits = value & mask
+    bl _kcc_ir_emit_const        // x0 already = mask
+    mov x1, x20
+    mov x2, x0
+    mov x0, #IR_AND
+    bl _kcc_ir_emit_binop
+    mov x21, x0                  // vbits vreg
+    cbz x23, .Lbfs_cleared
+    mov x0, x23
+    bl _kcc_ir_emit_const        // lsb const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_SHL
+    bl _kcc_ir_emit_binop        // vbits <<= lsb
+    mov x21, x0
+.Lbfs_cleared:
+    // cleared = old & ~(mask << lsb)
+    lsl x0, x22, x23
+    mvn x0, x0
+    bl _kcc_ir_emit_const
+    mov x1, x26
+    mov x2, x0
+    mov x0, #IR_AND
+    bl _kcc_ir_emit_binop
+    mov x1, x0                   // cleared
+    mov x2, x21                  // vbits
+    mov x0, #IR_OR
+    bl _kcc_ir_emit_binop
+    mov x21, x0                  // newval
+    // STORE newval → addr (container width)
+    mov x0, x21
+    mov x1, x19
+    mov x2, x24
+    bl _kcc_ir_emit_store
+    mov x0, x20                  // assignment result = the value
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+// -- kcc_ir_emit_load / kcc_ir_emit_store ---------------------------------
+// vreg kcc_ir_emit_load(addr_vreg, size_code); void kcc_ir_emit_store(value,
+// addr, size_code).  Thin wrappers around IR_LOAD / IR_STORE with an
+// access-size override, used by the bit-field synthesis.
+.p2align 2
+_kcc_ir_emit_load:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x1                  // size code
+    mov x20, x0                  // addr
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x1, x0
+    adrp x2, _kcc_type_long_u@@PAGE
+    add  x2, x2, _kcc_type_long_u@@PAGEOFF
+    ldr x2, [x2]
+    str x2, [x1, #IR_TYPE]
+    str x20, [x1, #IR_SRC1]
+    str x19, [x1, #IR_SRC2]
+    mov x20, x1
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    mov x0, x19
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.p2align 2
+_kcc_ir_emit_store:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // value
+    mov x20, x1                  // addr
+    mov x21, x2                  // size code
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x2, _kcc_type_long_u@@PAGE
+    add  x2, x2, _kcc_type_long_u@@PAGEOFF
+    ldr x2, [x2]
+    str x2, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]      // value
+    str x20, [x0, #IR_SRC2]      // addr
+    str x21, [x0, #IR_DEST]      // access-size override
+    bl _kcc_ir_emit
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_type_layout_size ----------------------------------------------
+// uint64_t kcc_ir_type_layout_size(type *t) → size in bytes (forces layout).
+.p2align 2
+_kcc_ir_type_layout_size:
+    cbz x0, .Ltls_zero
+    b _kcc_type_layout           // tail call: returns TY_SIZE in x0
+.Ltls_zero:
+    mov x0, #0
+    ret
+
+// -- kcc_ir_emit_gep_const ------------------------------------------------
+// uint64_t kcc_ir_emit_gep_const(base_vreg, byte_offset) → address vreg
+.p2align 2
+_kcc_ir_emit_gep_const:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // base
+    mov x0, x1                   // offset
+    bl _kcc_ir_emit_const
+    mov x20, x0                  // offset vreg
+    mov x0, #IR_GEP
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+    adrp x1, _kcc_type_long_u@@PAGE
+    add  x1, x1, _kcc_type_long_u@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x21, #IR_TYPE]
+    str x19, [x21, #IR_SRC1]
+    str x20, [x21, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x19, x0
+    mov x0, x21
+    bl _kcc_ir_emit
+    mov x0, x19
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_store_elem ----------------------------------------------------
+// void kcc_ir_store_elem(base_vreg, byte_offset, value_vreg, width)
+// Writes one initializer element.  If the field just resolved by
+// _kcc_ir_elem_off_width (published in _kcc_ir_member_field) is a bit-field,
+// read-modify-write its container; otherwise a plain sized store.
+.globl _kcc_ir_store_elem
+.p2align 2
+_kcc_ir_store_elem:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // base
+    mov x20, x1                  // offset
+    mov x21, x2                  // value
+    mov x22, x3                  // width
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lse_plain
+    ldr x1, [x0, #AST_F2]
+    cbz x1, .Lse_plain
+    mov x22, x0                  // field decl (survives emit_gep_const)
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_ir_emit_gep_const    // x0 = container address
+    mov x1, x21                  // value
+    mov x2, x22                  // field
+    bl _kcc_ir_bitfield_store
+    b .Lse_done
+.Lse_plain:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x21
+    mov x3, x22
+    bl _kcc_ir_emit_indexed_store
+.Lse_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_emit_string_init ----------------------------------------------
+// void kcc_ir_emit_string_init(base, str_ptr, str_len, array_len, zero_first)
+// Copies min(str_len, array_len) bytes of a compile-time string into an array
+// as per-byte constant stores; the NUL and tail come from the zero-fill/BSS.
+.globl _kcc_ir_emit_string_init
+.p2align 2
+_kcc_ir_emit_string_init:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // base
+    mov x20, x1                  // str_ptr
+    mov x21, x2                  // str_len
+    mov x22, x3                  // array_len
+    cbz x4, .Lesi_copy
+    add x0, x22, #7
+    lsr x23, x0, #3              // slot count
+    mov x24, #0
+.Lesi_zloop:
+    cmp x24, x23
+    b.ge .Lesi_copy
+    mov x0, #0
+    bl _kcc_ir_emit_const
+    mov x2, x0
+    mov x0, x19
+    lsl x1, x24, #3
+    mov x3, #0
+    bl _kcc_ir_emit_indexed_store
+    add x24, x24, #1
+    b .Lesi_zloop
+.Lesi_copy:
+    mov x23, x21
+    cmp x22, x23
+    csel x23, x22, x23, lo       // min(array_len, str_len)
+    mov x24, #0
+.Lesi_cloop:
+    cmp x24, x23
+    b.ge .Lesi_done
+    ldrb w0, [x20, x24]
+    bl _kcc_ir_emit_const
+    mov x2, x0
+    mov x0, x19
+    mov x1, x24
+    mov x3, #1
+    bl _kcc_ir_emit_indexed_store
+    add x24, x24, #1
+    b .Lesi_cloop
+.Lesi_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_ir_emit_bool_norm ------------------------------------------------
+// uint64_t kcc_ir_emit_bool_norm(uint64_t vreg) → (vreg != 0) as 0/1
+.globl _kcc_ir_emit_bool_norm
+.p2align 2
+_kcc_ir_emit_bool_norm:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    mov x0, #0
+    bl _kcc_ir_emit_const
+    mov x1, x19
+    mov x2, x0
+    mov x0, #IR_CMP_NE
+    bl _kcc_ir_emit_binop
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_tok_to_binop --------------------------------------------------
+// int kcc_ir_tok_to_binop(int compound_assign_tok) → IR opcode
+.p2align 2
+_kcc_ir_tok_to_binop:
+    cmp x0, #TOK_SUB_ASSIGN
+    b.eq .Ltb_sub
+    cmp x0, #TOK_MUL_ASSIGN
+    b.eq .Ltb_mul
+    cmp x0, #TOK_DIV_ASSIGN
+    b.eq .Ltb_div
+    cmp x0, #TOK_MOD_ASSIGN
+    b.eq .Ltb_mod
+    cmp x0, #TOK_AND_ASSIGN
+    b.eq .Ltb_and
+    cmp x0, #TOK_OR_ASSIGN
+    b.eq .Ltb_or
+    cmp x0, #TOK_XOR_ASSIGN
+    b.eq .Ltb_xor
+    cmp x0, #TOK_SHL_ASSIGN
+    b.eq .Ltb_shl
+    cmp x0, #TOK_SHR_ASSIGN
+    b.eq .Ltb_shr
+    mov x0, #IR_ADD              // TOK_ADD_ASSIGN (and default)
+    ret
+.Ltb_sub: mov x0, #IR_SUB
+    ret
+.Ltb_mul: mov x0, #IR_MUL
+    ret
+.Ltb_div: mov x0, #IR_SDIV
+    ret
+.Ltb_mod: mov x0, #IR_SMOD
+    ret
+.Ltb_and: mov x0, #IR_AND
+    ret
+.Ltb_or:  mov x0, #IR_OR
+    ret
+.Ltb_xor: mov x0, #IR_XOR
+    ret
+.Ltb_shl: mov x0, #IR_SHL
+    ret
+.Ltb_shr: mov x0, #IR_ASHR
+    ret
+
+// -- kcc_ir_assign_through ------------------------------------------------
+// uint64_t kcc_ir_assign_through(addr, rhs, op_tok, field, type) → result vreg
+// Stores `rhs` (simple `=`) or `old op rhs` (compound) through the address
+// vreg `addr`.  `field` non-null with a packed AST_F2 selects a bit-field
+// read-modify-write; otherwise `type` gives the scalar access width.  This is
+// the load-modify-store any address-based lvalue (member, subscript, deref)
+// needs for compound assignment.
+.globl _kcc_ir_assign_through
+.p2align 2
+_kcc_ir_assign_through:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // addr
+    mov x20, x1                  // rhs (later reused for the value to store)
+    mov x21, x2                  // op token
+    mov x22, x3                  // field decl (0 if none)
+    mov x23, x4                  // scalar type
+    mov x24, #0                  // is-bit-field?
+    cbz x22, .Lat_op
+    ldr x0, [x22, #AST_F2]
+    cbz x0, .Lat_op
+    mov x24, #1
+.Lat_op:
+    cmp x21, #TOK_ASSIGN
+    b.ne .Lat_compound
+    // simple assignment: store rhs directly
+    cbnz x24, .Lat_simple_bf
+    mov x0, x23
+    bl _kcc_ir_store_width
+    mov x2, x0
+    mov x0, x20                  // value
+    mov x1, x19                  // addr
+    bl _kcc_ir_emit_store
+    b .Lat_ret
+.Lat_simple_bf:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x22
+    bl _kcc_ir_bitfield_store
+    b .Lat_ret
+.Lat_compound:
+    // load the current value
+    cbnz x24, .Lat_load_bf
+    mov x0, x23
+    bl _kcc_ir_load_width
+    mov x1, x0
+    mov x0, x19
+    bl _kcc_ir_emit_load
+    b .Lat_haveold
+.Lat_load_bf:
+    mov x0, x19
+    mov x1, x22
+    bl _kcc_ir_bitfield_load
+.Lat_haveold:
+    str x0, [sp, #64]            // stash old value vreg
+    mov x0, x21
+    bl _kcc_ir_tok_to_binop
+    ldr x1, [sp, #64]           // old
+    mov x2, x20                  // rhs
+    bl _kcc_ir_emit_binop        // new = old op rhs
+    mov x20, x0                  // value to store = new
+    cbnz x24, .Lat_store_bf
+    mov x0, x23
+    bl _kcc_ir_store_width
+    mov x2, x0
+    mov x0, x20
+    mov x1, x19
+    bl _kcc_ir_emit_store
+    b .Lat_ret
+.Lat_store_bf:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x22
+    bl _kcc_ir_bitfield_store
+.Lat_ret:
+    mov x0, x20                  // result of the assignment expression
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+Struct tests verify field write, field read, multiple fields, and
+structs with initializers.
+
+@d Test: codegen structs @{
+echo ""
+echo "--- Structs ---"
+
+run_test "struct-write-read" \
+    "struct S { int x; int y; }; int main(void) { struct S s; s.x = 10; return s.x; }" 10
+
+run_test "struct-two-fields" \
+    "struct S { int x; int y; }; int main(void) { struct S s; s.x = 3; s.y = 7; return s.x + s.y; }" 10
+
+run_test "struct-three-fields" \
+    "struct S { int a; int b; int c; }; int main(void) { struct S s; s.a = 1; s.b = 2; s.c = 3; return s.a + s.b + s.c; }" 6
+
+run_test "struct-overwrite" \
+    "struct S { int x; int y; }; int main(void) { struct S s; s.x = 5; s.x = 9; return s.x; }" 9
+
+run_test "struct-independent" \
+    "struct S { int x; int y; }; int main(void) { struct S s; s.x = 10; s.y = 20; return s.y; }" 20
+
+run_test "struct-arithmetic" \
+    "struct P { int x; int y; }; int main(void) { struct P p; p.x = 3; p.y = 4; return p.x * p.x + p.y * p.y; }" 25
+
+run_test "struct-ptr-subscript" \
+    "void *mmap(void*,long,int,int,int,long); struct S { int a; int b; }; int main(void) { struct S *p = (struct S*)mmap(0,4096,3,4098,-1,0); p[0].a=10; p[0].b=20; p[1].a=30; p[1].b=40; return p[0].a + p[1].b; }" 50
+
+run_test "struct-ptr-sub-loop" \
+    "void *mmap(void*,long,int,int,int,long); struct V { int x; int y; }; int main(void) { struct V *v = (struct V*)mmap(0,4096,3,4098,-1,0); v[0].x=1; v[1].x=2; v[2].x=3; int s=0; int i=0; while(i<3){s=s+v[i].x; i=i+1;} return s; }" 6
+
+run_test "struct-arrow-write-read" \
+    "struct S { int x; int y; }; void set(struct S *p) { p->x=10; p->y=20; } int main(void) { struct S s; set(&s); return s.x + s.y; }" 30
+
+run_test "struct-arrow-second-field" \
+    "struct S { int a; int b; int c; }; int get(struct S *p) { return p->c; } int main(void) { struct S s; s.a=1; s.b=2; s.c=3; return get(&s); }" 3
+
+run_test "struct-arrow-overwrite" \
+    "struct S { int x; int y; }; void f(struct S *p) { p->x=5; p->x=9; } int main(void) { struct S s; f(&s); return s.x; }" 9
+@}
+
+\subsection{Identifier (Variable Load)}
+
+Loading a variable is a two-step lookup.  First the builder searches
+the \texttt{\_kcc\_ir\_locals} hash table, which maps variable names
+to alloca vreg numbers (stored as \texttt{vreg+1} so that zero can
+serve as ``not found'').  If the name is found, a single
+\texttt{IR\_LOAD} from the alloca vreg suffices.
+
+Local \emph{arrays} receive the same decay treatment.  The locals
+hash table tags pointer variables with bit~63; non-pointer locals
+that have a \texttt{TY\_PTR} resolved type (stored in
+\texttt{AST\_F3} by sema's array decay) must be arrays whose
+alloca vreg \emph{is} the decayed pointer.  The builder returns
+it directly instead of loading from it.
+
+If the name is absent from locals, the variable must be a global.
+For scalar and pointer globals, the builder emits
+\texttt{IR\_GLOBAL\_REF} followed by \texttt{IR\_LOAD}---two
+instructions.  Global \emph{arrays} are different: the address
+produced by \texttt{GLOBAL\_REF} already represents the decayed
+pointer to element~0, so no load is needed; the builder checks the
+symbol table for \texttt{TY\_ARRAY} and returns the address vreg
+directly.
+
+@d IR: build ident @{
+// -- kcc_ir_build_ident ---------------------------------------------------
+// uint64_t kcc_ir_build_ident(node *ident)
+//   x0 = AST_IDENT_EXPR (F0=name_ptr)
+// Looks up the variable in locals and emits a load.
+.text
+.globl _kcc_ir_build_ident
+.p2align 2
+_kcc_ir_build_ident:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // name ptr
+    cbz x20, .Libi_zero
+
+    // Look up in locals hash table
+    mov x0, x20
+    bl _kcc_strlen
+    mov x21, x0                  // keylen
+
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20                  // key
+    mov x2, x21                  // keylen
+    bl _kcc_ht_get
+    // x0 = value (vreg+1) or 0 if not found
+    cbz x0, .Libi_global
+    // Bit 63 marks pointer variables; arrays have no tag
+    tbnz x0, #63, .Libi_local_ptr
+    // Non-pointer local (scalar or array)
+    sub x22, x0, #1              // x22 = alloca vreg
+    // Detect array decay: sema sets AST_F3 = TY_PTR for decayed arrays
+    ldr x0, [x19, #AST_F3]
+    cbz x0, .Libi_local_load
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.eq .Libi_local_array
+    b .Libi_local_load
+
+.Libi_local_ptr:
+    bic x0, x0, #0x8000000000000000
+    sub x22, x0, #1              // x22 = alloca vreg
+
+.Libi_local_load:
+    // Load from the alloca with a width+sign override matching the variable's
+    // declared type: a narrow variable was stored with its own width (e.g. a
+    // char as one byte), so it must be reloaded and sign/zero-extended the same
+    // way, not read as a raw 8-byte slot (which would pick up stale bytes).
+    ldr x0, [x19, #AST_F3]      // variable type
+    bl _kcc_ir_load_width
+    mov x21, x0                 // width+sign override
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // src = alloca vreg
+    str x21, [x0, #IR_SRC2]     // access-size override
+
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // save result vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libi_done
+
+.Libi_local_array:
+    // Local array: alloca vreg IS the decayed pointer — no load
+    mov x0, x22
+    b .Libi_done
+
+.Libi_global:
+    // static local hoisted to a global? redirect onto its mangled symbol
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libi_global_notstatic
+    mov x1, x20                  // key = source name
+    mov x2, x21                  // keylen
+    bl _kcc_ht_get
+    cbz x0, .Libi_global_notstatic
+    mov x20, x0                  // x20 = mangled name ptr
+    b .Libi_global_scalar
+
+.Libi_global_notstatic:
+    // Not a local — check if it's an array (address = decayed pointer)
+    mov x0, x20                  // name
+    mov x1, x21                  // len
+    bl _kcc_symtab_lookup
+    cbz x0, .Libi_global_scalar
+    ldr x1, [x0, #SYM_TYPE]
+    cbz x1, .Libi_global_scalar
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.eq .Libi_global_array
+    cmp x2, #TY_FUNC
+    b.eq .Libi_global_array
+
+.Libi_global_scalar:
+    // Scalar/pointer global: emit global_ref + load.  Capture the variable's
+    // load width+sign first (x19 still points at the ident node here).
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_load_width
+    mov x21, x0                 // width+sign override
+
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]     // name ptr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x22, x0                  // x22 = address vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Emit load from the global address (width+sign-aware, like locals)
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // src = address vreg
+    str x21, [x0, #IR_SRC2]     // access-size override
+
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0                  // x20 = loaded value vreg
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libi_done
+
+.Libi_global_array:
+    // Array global: address IS the decayed pointer — no load needed
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0
+
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    b .Libi_done
+
+.Libi_zero:
+    mov x0, #0
+
+.Libi_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_ident
+@}
+
+\subsection{Binary Expression}
+
+Binary expressions follow one of two paths.  For ordinary operators
+(\texttt{+}, \texttt{-}, \texttt{*}, etc.) the builder evaluates both
+sides, maps the AST token to an IR opcode, and emits a single
+instruction.  For the short-circuit logical operators \texttt{\&\&}
+and \texttt{||}, it must generate control flow: evaluating the
+right-hand side only when the left-hand side does not already
+determine the result.
+
+\paragraph{Ordinary operators.}
+The builder evaluates LHS and RHS first (in that order), then
+dispatches through a token-to-opcode table covering arithmetic
+(\texttt{+~-~*~/~\%}), bitwise (\texttt{\&~|~\^{}~<<~>>}), and
+relational (\texttt{== != < <= > >=}) operators.  Each case sets
+\texttt{x23} to the corresponding IR opcode and falls through to
+the common emitter.  Before allocating the instruction, the emitter
+checks the left operand's type: if unsigned, it remaps signed
+opcodes to their unsigned variants (\texttt{SDIV}$\to$\texttt{UDIV},
+\texttt{SMOD}$\to$\texttt{UMOD}, \texttt{CMP\_SLT}$\to$%
+\texttt{CMP\_ULT}, \texttt{CMP\_SLE}$\to$\texttt{CMP\_ULE}).
+
+\paragraph{Pointer arithmetic scaling.}
+When \texttt{+} or \texttt{-} involves a pointer operand, the C
+standard requires the integer operand to be scaled by
+\texttt{sizeof(*ptr)} (\stdref{6.5.6}).  The builder inspects each
+operand's sema type; if one is \texttt{TY\_PTR}, it emits
+\texttt{IR\_CONST} + \texttt{IR\_MUL} to scale the non-pointer
+operand by the pointee's \texttt{TY\_SIZE}.  If the pointee size is
+$\le 1$ (e.g.\ \texttt{char~*}), no scaling is needed.
+
+@d IR: build binary @{
+// -- kcc_ir_build_binary --------------------------------------------------
+// uint64_t kcc_ir_build_binary(node *expr)
+//   x0 = AST_BINARY_EXPR (F0=op token, F1=lhs, F2=rhs)
+// Returns vreg.
+.text
+.globl _kcc_ir_build_binary
+.p2align 2
+_kcc_ir_build_binary:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+
+    mov x19, x0                  // AST node
+    ldr x20, [x19, #AST_F0]     // op token code
+
+    // Check for short-circuit operators
+    cmp x20, #TOK_AND
+    b.eq .Libb_short_and
+    cmp x20, #TOK_OR
+    b.eq .Libb_short_or
+
+    // Build LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // x21 = lhs vreg
+
+    // Build RHS
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x22, x0                  // x22 = rhs vreg
+
+    // Map token to IR opcode
+    cmp x20, #TOK_PLUS
+    b.eq .Libb_op_add
+    cmp x20, #TOK_MINUS
+    b.eq .Libb_op_sub
+    cmp x20, #TOK_STAR
+    b.eq .Libb_op_mul
+    cmp x20, #TOK_SLASH
+    b.eq .Libb_op_sdiv
+    cmp x20, #TOK_PERCENT
+    b.eq .Libb_op_smod
+    cmp x20, #TOK_AMP
+    b.eq .Libb_op_and
+    cmp x20, #TOK_PIPE
+    b.eq .Libb_op_or
+    cmp x20, #TOK_CARET
+    b.eq .Libb_op_xor
+    cmp x20, #TOK_SHL
+    b.eq .Libb_op_shl
+    cmp x20, #TOK_SHR
+    b.eq .Libb_op_ashr
+    cmp x20, #TOK_EQ
+    b.eq .Libb_op_eq
+    cmp x20, #TOK_NE
+    b.eq .Libb_op_ne
+    cmp x20, #TOK_LT
+    b.eq .Libb_op_slt
+    cmp x20, #TOK_LE
+    b.eq .Libb_op_sle
+    cmp x20, #TOK_GT
+    b.eq .Libb_op_sgt
+    cmp x20, #TOK_GE
+    b.eq .Libb_op_sge
+
+    // Default: add
+    b .Libb_op_add
+
+.Libb_op_add:  mov x23, #IR_ADD
+    b .Libb_ptr_scale
+.Libb_op_sub:  mov x23, #IR_SUB
+    b .Libb_ptr_scale
+
+// Pointer arithmetic: ptr+int or int+ptr must scale the integer
+// operand by the pointed-to type's real byte size.  x23 = opcode
+// (ADD or SUB), x21 = LHS vreg, x22 = RHS vreg.  Since arrays are now
+// packed at their natural stride, the scale is the exact pointee size
+// (no clamp to 8).  After scaling, falls through to the emitter.
+.Libb_ptr_scale:
+    // Check if LHS is a pointer type
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_emit
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_ps_check_rhs
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Libb_ps_check_rhs
+
+    // LHS is a pointer.  ptr - ptr is a pointer difference: fall through to
+    // the ptrdiff handler; ptr + int / ptr - int scales the integer.
+    cmp x23, #IR_SUB
+    b.ne .Libb_ps_scale_rhs
+    ldr x2, [x19, #AST_F2]
+    cbz x2, .Libb_ps_scale_rhs
+    ldr x2, [x2, #AST_F3]
+    cbz x2, .Libb_ps_scale_rhs
+    ldr x2, [x2, #TY_KIND]
+    cmp x2, #TY_PTR
+    b.eq .Libb_ptr_diff
+    b .Libb_ps_scale_rhs
+
+.Libb_ps_check_rhs:
+    // Check if RHS is a pointer type (int + ptr)
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_emit
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_emit
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_PTR
+    b.ne .Libb_emit
+
+    // RHS is pointer — scale LHS (x21) by the real pointee size
+    ldr x0, [x0, #TY_F0]
+    cbz x0, .Libb_emit
+    bl _kcc_type_layout
+    mov x24, x0
+    cmp x24, #1
+    b.le .Libb_emit
+
+    // Emit const + mul to scale x21
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x24, [x20, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x24, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x21, [x20, #IR_SRC1]
+    str x24, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    b .Libb_emit
+
+.Libb_ps_scale_rhs:
+    // LHS is pointer — scale RHS (x22) by the real pointee size
+    ldr x0, [x0, #TY_F0]
+    cbz x0, .Libb_emit
+    bl _kcc_type_layout
+    mov x24, x0
+    cmp x24, #1
+    b.le .Libb_emit
+
+    // Emit const + mul to scale x22
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x24, [x20, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x24, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+
+    mov x0, #IR_MUL
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x22, [x20, #IR_SRC1]
+    str x24, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x22, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    b .Libb_emit
+
+.Libb_ptr_diff:
+    // Pointer difference: (lhs - rhs) / stride.  The stride is the real
+    // pointee size, mirroring the ptr+int scaling so the two are consistent.
+    ldr x0, [x19, #AST_F1]
+    ldr x0, [x0, #AST_F3]
+    ldr x0, [x0, #TY_F0]           // pointee type
+    mov x24, #1
+    cbz x0, .Libb_pd_have
+    bl _kcc_type_layout            // real pointee size (matches ptr+int stride)
+    mov x24, x0
+    cbnz x24, .Libb_pd_have
+    mov x24, #1
+.Libb_pd_have:
+    // SUB: byte difference of the two addresses
+    mov x0, #IR_SUB
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_long_s@@PAGE
+    add  x1, x1, _kcc_type_long_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x21, [x20, #IR_SRC1]
+    str x22, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0                    // x21 = byte difference
+    mov x0, x20
+    bl _kcc_ir_emit
+    // CONST stride
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_long_s@@PAGE
+    add  x1, x1, _kcc_type_long_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x24, [x20, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x22, x0                    // x22 = stride
+    mov x0, x20
+    bl _kcc_ir_emit
+    // SDIV: element count = byte difference / stride
+    mov x0, #IR_SDIV
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    adrp x1, _kcc_type_long_s@@PAGE
+    add  x1, x1, _kcc_type_long_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x20, #IR_TYPE]
+    str x21, [x20, #IR_SRC1]
+    str x22, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x23, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    mov x0, x23
+    b .Libb_done
+
+.Libb_op_mul:  mov x23, #IR_MUL
+    b .Libb_emit
+.Libb_op_sdiv: mov x23, #IR_SDIV
+    b .Libb_emit
+.Libb_op_smod: mov x23, #IR_SMOD
+    b .Libb_emit
+.Libb_op_and:  mov x23, #IR_AND
+    b .Libb_emit
+.Libb_op_or:   mov x23, #IR_OR
+    b .Libb_emit
+.Libb_op_xor:  mov x23, #IR_XOR
+    b .Libb_emit
+.Libb_op_shl:  mov x23, #IR_SHL
+    b .Libb_emit
+.Libb_op_ashr: mov x23, #IR_ASHR
+    b .Libb_emit
+.Libb_op_eq:   mov x23, #IR_CMP_EQ
+    b .Libb_emit
+.Libb_op_ne:   mov x23, #IR_CMP_NE
+    b .Libb_emit
+.Libb_op_slt:  mov x23, #IR_CMP_SLT
+    b .Libb_emit
+.Libb_op_sle:  mov x23, #IR_CMP_SLE
+    b .Libb_emit
+.Libb_op_sgt:  mov x23, #IR_CMP_SGT
+    b .Libb_emit
+.Libb_op_sge:  mov x23, #IR_CMP_SGE
+    b .Libb_emit
+
+.Libb_emit:
+    // Floating-point operation? If the result or either operand is
+    // float/double, take the FP path (promote int operands, emit with
+    // double type so codegen uses the floating-point unit).
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_emit
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_chk_rhs_fp
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_emit
+.Libb_chk_rhs_fp:
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_emit_int
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_emit
+
+.Libb_emit_int:
+    // Check left operand type for unsigned — remap signed opcodes
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_emit_alloc
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_emit_alloc
+    ldr x0, [x0, #TY_F0]
+    cbnz x0, .Libb_emit_alloc
+
+    cmp x23, #IR_SDIV
+    b.eq .Libb_u_div
+    cmp x23, #IR_SMOD
+    b.eq .Libb_u_mod
+    cmp x23, #IR_CMP_SLT
+    b.eq .Libb_u_lt
+    cmp x23, #IR_CMP_SLE
+    b.eq .Libb_u_le
+    b .Libb_emit_alloc
+
+.Libb_u_div:
+    mov x23, #IR_UDIV
+    b .Libb_emit_alloc
+.Libb_u_mod:
+    mov x23, #IR_UMOD
+    b .Libb_emit_alloc
+.Libb_u_lt:
+    mov x23, #IR_CMP_ULT
+    b .Libb_emit_alloc
+.Libb_u_le:
+    mov x23, #IR_CMP_ULE
+    b .Libb_emit_alloc
+
+.Libb_emit_alloc:
+    mov x25, x23                 // preserve opcode across the alloc
+    mov x0, x23
+    bl _kcc_ir_alloc_instr
+    mov x24, x0
+
+    // Type: default i32
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x24, #IR_TYPE]
+    str x21, [x24, #IR_SRC1]
+    str x22, [x24, #IR_SRC2]
+
+    bl _kcc_ir_next_vreg
+    str x0, [x24, #IR_DEST]
+    mov x23, x0                  // result vreg
+
+    mov x0, x24
+    bl _kcc_ir_emit
+
+    // Truncate 32-bit integer results of width-growing ops to their width
+    mov x2, #0
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_norm_lhs
+    ldr x2, [x0, #AST_F3]        // lhs sema type
+.Libb_norm_lhs:
+    mov x3, #0
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_norm_rhs
+    ldr x3, [x0, #AST_F3]        // rhs sema type
+.Libb_norm_rhs:
+    mov x0, x23                  // result vreg
+    mov x1, x25                  // opcode
+    bl _kcc_ir_norm32
+    mov x23, x0
+
+    mov x0, x23
+    b .Libb_done
+
+.Libb_fp_emit:
+    // Promote any integer operand to double, then emit the operation with
+    // double type — the codegen signal to use floating-point instructions.
+    // No 32-bit normalisation applies. Comparisons still yield an int 0/1
+    // but are computed with fcmp.
+    ldr x0, [x19, #AST_F1]
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_rhs
+    mov x0, x21
+    bl _kcc_ir_emit_sitofp
+    mov x21, x0
+.Libb_fp_rhs:
+    ldr x0, [x19, #AST_F2]
+    ldr x0, [x0, #AST_F3]
+    bl _kcc_ir_type_is_fp
+    cbnz x0, .Libb_fp_do
+    mov x0, x22
+    bl _kcc_ir_emit_sitofp
+    mov x22, x0
+.Libb_fp_do:
+    mov x0, x23                  // opcode (ADD/SUB/MUL/SDIV or CMP_*)
+    bl _kcc_ir_alloc_instr
+    mov x24, x0
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x24, #IR_TYPE]      // double → floating-point codegen
+    str x21, [x24, #IR_SRC1]
+    str x22, [x24, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x24, #IR_DEST]
+    mov x23, x0
+    mov x0, x24
+    bl _kcc_ir_emit
+    mov x0, x23
+    b .Libb_done
+@| _kcc_ir_build_binary
+@}
+
+\paragraph{Truncating to the declared width.}
+The all-spill backend computes in 64-bit registers, so an
+\texttt{int} or \texttt{unsigned int} sum that overflows 32~bits keeps
+its extra high bits---an unsigned wraparound past $2^{32}$ then differs
+from Standard~C.  \texttt{\_kcc\_ir\_norm32} closes that gap for the
+operations that can \emph{grow} a value past its width
+(\texttt{+}, \texttt{-}, \texttt{*}, \texttt{<<}): when both operands are
+integers no wider than \texttt{int}, it appends an \texttt{IR\_SEXT} or
+\texttt{IR\_ZEXT} (source width~4) that re-canonicalises the result to
+32~bits---sign-extending a signed result, zero-extending an unsigned
+one.  Operands wider than \texttt{int} (a \texttt{long}) or of pointer
+type fall outside the kind window and are left in 64~bits, so pointer
+arithmetic and \texttt{long} computations are untouched.  For values
+that never leave 32-bit range the extension is a no-op, so nothing else
+changes.
+
+@d IR: build binary @{
+// -- kcc_ir_norm32 --------------------------------------------------------
+// uint64_t kcc_ir_norm32(vreg, opcode, lhs_type, rhs_type)
+//   x0 = op result vreg, x1 = IR opcode, x2 = lhs sema type, x3 = rhs sema type
+// For width-growing ops (ADD/SUB/MUL/SHL/NEG/NOT) whose operands are both
+// <=32-bit integers, emit IR_SEXT/IR_ZEXT to truncate the result to 32-bit
+// width; returns the (possibly new) vreg.  Unary callers pass the operand
+// type as both lhs_type and rhs_type.
+.text
+.globl _kcc_ir_norm32
+.p2align 2
+_kcc_ir_norm32:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // vreg
+    mov x20, x1                  // opcode
+    mov x21, x2                  // lhs type
+
+    cmp x20, #IR_ADD
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_SUB
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_MUL
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_SHL
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_NEG
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_NOT
+    b.eq .Lnorm_op_ok
+    b .Lnorm_skip
+.Lnorm_op_ok:
+
+    // lhs: a <=32-bit integer? (TY_KIND in [TY_BOOL(2)..TY_INT(5)])
+    cbz x21, .Lnorm_skip
+    ldr x0, [x21, #TY_KIND]
+    sub x0, x0, #2
+    cmp x0, #3
+    b.hi .Lnorm_skip
+
+    // rhs: also a <=32-bit integer?
+    cbz x3, .Lnorm_skip
+    ldr x0, [x3, #TY_KIND]
+    sub x0, x0, #2
+    cmp x0, #3
+    b.hi .Lnorm_skip
+
+    // Unsigned result if either operand is unsigned (TY_F0 == 0)
+    ldr x0, [x21, #TY_F0]        // lhs signed flag
+    ldr x1, [x3, #TY_F0]         // rhs signed flag
+    mov x20, #IR_SEXT
+    cbz x0, .Lnorm_unsigned
+    cbz x1, .Lnorm_unsigned
+    b .Lnorm_emit
+.Lnorm_unsigned:
+    mov x20, #IR_ZEXT
+
+.Lnorm_emit:
+    mov x0, x20
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x21, #IR_TYPE]
+    str x19, [x21, #IR_SRC1]     // source = op result vreg
+    mov x1, #4
+    str x1, [x21, #IR_SRC2]      // source width = 4 bytes (32-bit)
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x19, x0                  // normalised vreg
+    mov x0, x21
+    bl _kcc_ir_emit
+    mov x0, x19
+    b .Lnorm_done
+
+.Lnorm_skip:
+    mov x0, x19
+.Lnorm_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_norm32
+@}
+
+\paragraph{Short-circuit logical AND.}
+The C standard requires that \texttt{a \&\& b} evaluate \texttt{b}
+only when \texttt{a} is nonzero.  The builder creates three fresh
+basic blocks: \emph{rhs\_bb}, \emph{short\_bb}, and
+\emph{merge\_bb}.  It allocates a temporary variable and emits a
+conditional branch on the LHS vreg: true falls through to
+\emph{rhs\_bb} (which evaluates the RHS, stores the result, and
+branches to \emph{merge\_bb}), false jumps to \emph{short\_bb}
+(which stores zero and branches to \emph{merge\_bb}).  The returned
+vreg is a load from the temporary, ensuring a defined value on
+both paths.
+
+The short-circuit \texttt{||} mirrors this logic with the branch
+targets swapped and the short-circuit value set to one.
+
+@d IR: build binary @{
+// -- Short-circuit && ----------------------------------------------------
+.Libb_short_and:
+    // Allocate temporary for merge result
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x26, x0                  // x26 = tmp alloca vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
+    // Evaluate LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // lhs vreg
+
+    // Create BBs: rhs_bb, short_bb, merge_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // rhs_bb
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // short_bb
+    bl _kcc_ir_alloc_bb
+    mov x24, x0                  // merge_bb
+
+    // br_cond: if lhs, goto rhs_bb, else goto short_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_DEST]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true → rhs_bb
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → short_bb
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // -- short_bb: store 0 to tmp, branch to merge --
+    mov x0, x23
+    bl _kcc_ir_set_bb
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    str xzr, [x25, #IR_SRC1]    // constant 0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // zero vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+    // store zero to tmp alloca
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = 0
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
+    // branch to merge
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x24, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // -- rhs_bb: evaluate RHS, store to tmp, branch to merge --
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // rhs vreg
+    // store rhs to tmp alloca
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = rhs
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
+    // branch to merge
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x24, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // -- merge_bb: load result from tmp --
+    mov x0, x24
+    bl _kcc_ir_set_bb
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    str x26, [x25, #IR_SRC1]    // load from tmp alloca
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // result vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
+    mov x0, x21
+    b .Libb_done
+
+// -- Short-circuit || ----------------------------------------------------
+.Libb_short_or:
+    // Allocate temporary for merge result
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x26, x0                  // x26 = tmp alloca vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
+    // Evaluate LHS
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0
+
+    // Create BBs: short_bb, rhs_bb, merge_bb
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // short_bb (lhs true → skip rhs)
+    bl _kcc_ir_alloc_bb
+    mov x23, x0                  // rhs_bb
+    bl _kcc_ir_alloc_bb
+    mov x24, x0                  // merge_bb
+
+    // br_cond: if lhs, goto short_bb, else goto rhs_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_DEST]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]      // true → short_bb
+    ldr x1, [x23, #BB_ID]
+    str x1, [x0, #IR_SRC2]      // false → rhs_bb
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // -- short_bb: store 1 to tmp, branch to merge --
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    mov x1, #1
+    str x1, [x25, #IR_SRC1]     // constant 1
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // one vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = 1
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x24, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // -- rhs_bb: evaluate RHS, store to tmp, branch to merge --
+    mov x0, x23
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x21, x0
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_SRC1]     // value = rhs
+    str x26, [x0, #IR_SRC2]     // ptr = tmp alloca
+    bl _kcc_ir_emit
+    mov x0, #IR_BR
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x24, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    bl _kcc_ir_emit
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+
+    // -- merge_bb: load result from tmp --
+    mov x0, x24
+    bl _kcc_ir_set_bb
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x25, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x25, #IR_TYPE]
+    str x26, [x25, #IR_SRC1]    // load from tmp alloca
+    bl _kcc_ir_next_vreg
+    str x0, [x25, #IR_DEST]
+    mov x21, x0                  // result vreg
+    mov x0, x25
+    bl _kcc_ir_emit
+
+    mov x0, x21
+    b .Libb_done
+
+.Libb_done:
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@}
+
+\paragraph{End-to-end tests.}
+Comparison operators (\texttt{==}, \texttt{!=}, \texttt{<}, \texttt{>},
+\texttt{<=}, \texttt{>=}) lower to an \texttt{IR\_CMP\_*} instruction
+that the code generator implements as \texttt{CMP} followed by
+\texttt{CSET} with the appropriate condition code.  The logical
+connectives \texttt{\&\&} and \texttt{||} use short-circuit evaluation:
+the IR builder creates conditional branches so that the right-hand
+operand is only evaluated when the left-hand side does not already
+determine the result.  Logical negation \texttt{!} is lowered to
+\texttt{IR\_CMP\_EQ} against a synthesised zero constant.
+
+@d Test: codegen logical @{
+echo ""
+echo "--- Logical and Comparison ---"
+
+run_test "logical and true" \
+    "int main(void) { return 1 && 1; }" 1
+
+run_test "logical and false" \
+    "int main(void) { return 1 && 0; }" 0
+
+run_test "logical or" \
+    "int main(void) { return 0 || 1; }" 1
+
+run_test "logical not" \
+    "int main(void) { return !0; }" 1
+
+run_test "logical not true" \
+    "int main(void) { return !42; }" 0
+
+run_test "chained comparison" \
+    "int main(void) { return (3 > 2) + (2 > 1); }" 2
+
+run_test "equality" \
+    "int main(void) { return (5 == 5) + (5 != 3); }" 2
+
+run_test "less/greater" \
+    "int main(void) { return (1 < 2) + (2 > 1) + (2 <= 2) + (3 >= 3); }" 4
+
+run_test "complex logical" \
+    "int main(void) { return (1 && 0) || (1 && 1); }" 1
+@}
+
+\subsection{Unary Expression}
+
+Unary operators dispatch on the token stored in \texttt{AST\_F0}.
+Increment and decrement (\texttt{++}/\texttt{-{}-}) are intercepted
+first and delegated to a dedicated builder (see below), because they
+require address-based read-modify-write lowering rather than a simple
+value transformation.  Arithmetic negation (\texttt{-}) emits
+\texttt{IR\_NEG}, bitwise complement (\texttt{\~{}}) emits
+\texttt{IR\_NOT}, and logical negation (\texttt{!}) is lowered to
+\texttt{IR\_CMP\_EQ} against a synthesised zero constant---producing~1
+when the operand is zero and 0 otherwise.
+
+Address-of (\texttt{\&e}) dispatches on the shape of its operand
+rather than assuming a bare variable.  For an identifier it returns the
+storage address directly---the vreg produced by \texttt{IR\_ALLOCA}
+already holds the stack address, or a file-scope name yields an
+\texttt{IR\_GLOBAL\_REF}---so no load is needed.  For a subscript
+\texttt{\&a[i]} or a member \texttt{\&s.f} it reuses the very address
+computation the assignment and load paths use
+(\texttt{build\_subscript\_addr}, \texttt{build\_member\_addr}),
+returning the element or field address.  Without this dispatch,
+\texttt{\&a[i]} would mis-read the subscript node as if it were an
+identifier and emit a nonsensical global reference---the exact defect a
+tokenizer's \texttt{lex\_next(\&tokens[n])} call surfaces.
+Dereference (\texttt{*p}) evaluates the pointer operand and emits an
+\texttt{IR\_LOAD} from the resulting address.
+
+@d IR: build unary @{
+// -- kcc_ir_build_unary ---------------------------------------------------
+// uint64_t kcc_ir_build_unary(node *expr)
+//   x0 = AST_UNARY_EXPR (F0=op, F1=operand, F2=prefix/postfix)
+.text
+.globl _kcc_ir_build_unary
+.p2align 2
+_kcc_ir_build_unary:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x19, x0
+    ldr x20, [x19, #AST_F0]     // op token
+
+    // Operators that need special operand handling (no _kcc_ir_build_expr)
+    cmp x20, #TOK_INC
+    b.eq .Libu_inc_dec
+    cmp x20, #TOK_DEC
+    b.eq .Libu_inc_dec
+    cmp x20, #TOK_AMP
+    b.eq .Libu_addr
+
+    // Build operand (value)
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // operand vreg
+
+    cmp x20, #TOK_MINUS
+    b.eq .Libu_neg
+    cmp x20, #TOK_TILDE
+    b.eq .Libu_not
+    cmp x20, #TOK_BANG
+    b.eq .Libu_lnot
+    cmp x20, #TOK_STAR
+    b.eq .Libu_deref
+
+    // Default: return operand as-is
+    mov x0, x21
+    b .Libu_done
+
+.Libu_neg:
+    mov x0, #IR_NEG
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x1, #IR_NEG
+    b .Libu_norm
+
+.Libu_not:
+    mov x0, #IR_NOT
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x1, #IR_NOT
+
+.Libu_norm:
+    // Truncate an unsigned -a / ~a result to 32-bit width (x1 = opcode)
+    mov x2, #0
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libu_norm_emit
+    ldr x2, [x0, #AST_F3]        // operand sema type
+.Libu_norm_emit:
+    mov x3, x2
+    mov x0, x20                  // result vreg
+    bl _kcc_ir_norm32
+    mov x20, x0
+    mov x0, x20
+    b .Libu_done
+
+.Libu_lnot:
+    // Logical not: cmp_eq operand, 0
+    // First emit const 0
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str xzr, [x0, #IR_SRC1]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0                  // zero vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    // Now cmp_eq
+    mov x0, #IR_CMP_EQ
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    str x20, [x0, #IR_SRC2]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_deref:
+    // Dereference: operand vreg is a pointer, emit load through it
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    // Use pointee type from sema (AST_F3) for IR_TYPE
+    ldr x1, [x19, #AST_F3]
+    cbz x1, .Libu_deref_default
+    str x1, [x22, #IR_TYPE]
+    // Access width+sign override from the pointee type.
+    mov x0, x1
+    bl _kcc_ir_load_width
+    str x0, [x22, #IR_SRC2]
+    b .Libu_deref_type
+.Libu_deref_default:
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str xzr, [x22, #IR_SRC2]
+.Libu_deref_type:
+    str x21, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_addr:
+    // Address-of: dispatch on the operand's shape.
+    ldr x21, [x19, #AST_F1]      // operand node
+    cbz x21, .Libu_addr_zero
+    ldr x0, [x21, #AST_TAG]
+    cmp x0, #AST_SUBSCRIPT
+    b.eq .Libu_addr_subscript
+    cmp x0, #AST_MEMBER
+    b.eq .Libu_addr_member
+    cmp x0, #AST_IDENT_EXPR
+    b.ne .Libu_addr_zero         // unsupported operand → 0
+
+    // &ident: the variable's storage address (alloca vreg, or global_ref)
+    ldr x20, [x21, #AST_F0]      // name ptr
+    cbz x20, .Libu_addr_zero
+    mov x0, x20
+    bl _kcc_strlen
+    mov x21, x0
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    mov x2, x21
+    bl _kcc_ht_get
+    cbz x0, .Libu_addr_global
+    bic x0, x0, #0x8000000000000000
+    sub x0, x0, #1              // alloca vreg (stored as vreg+1)
+    b .Libu_done
+
+.Libu_addr_subscript:
+    // &a[i]: the element address is exactly the subscript's GEP result
+    mov x0, x21
+    bl _kcc_ir_build_subscript_addr
+    b .Libu_done
+
+.Libu_addr_member:
+    // &s.f / &s->f: the member address
+    mov x0, x21
+    bl _kcc_ir_build_member_addr
+    b .Libu_done
+
+.Libu_addr_global:
+    // Global: emit global_ref, return address vreg
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libu_done
+
+.Libu_addr_zero:
+    mov x0, xzr
+    b .Libu_done
+
+.Libu_inc_dec:
+    mov x0, x19                  // pass AST node
+    bl _kcc_ir_build_inc_dec
+    b .Libu_done
+
+.Libu_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_unary
+@}
+
+\paragraph{End-to-end tests: pointers.}
+The address-of operator \texttt{\&x} returns the alloca vreg directly,
+which already holds the stack address of the variable.  Dereferencing a
+pointer \texttt{*p} emits \texttt{IR\_LOAD} with the pointer vreg as
+source, producing the value stored at that address.  Cast expressions
+currently pass through the inner expression unchanged, which is correct
+for same-width integer casts on a 64-bit architecture.
+
+@d Test: codegen pointers @{
+echo ""
+echo "--- Pointers ---"
+
+run_test "address and deref" \
+    "int main(void) { int x = 42; int *p = &x; return *p; }" 42
+
+run_test "cast expression" \
+    "int main(void) { long x = 42; return (int)x; }" 42
+
+run_test "trunc int-to-char" \
+    "int main(void) { int x = 321; return (char)x; }" 65
+
+run_test "trunc mask byte" \
+    "int main(void) { int x = 256; return (char)x; }" 0
+
+run_test "trunc preserves low" \
+    "int main(void) { int x = 42; return (char)x; }" 42
+
+run_test "trunc short" \
+    "int main(void) { int x = 65537; return (short)x; }" 1
+
+run_test "cast same-width" \
+    "int main(void) { int x = 99; return (int)x; }" 99
+
+echo ""
+echo "--- Pointer Arithmetic ---"
+
+run_test "ptr-arith-add" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); *p = 10; *(p + 1) = 20; return *(p + 1); }" 20
+
+run_test "ptr-arith-stride" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { int *p = (int*)mmap(0,4096,3,4098,-1,0); *(p+0)=1; *(p+1)=2; *(p+2)=3; return *(p+0)+*(p+1)+*(p+2); }" 6
+
+run_test "ptr-arith-char" \
+    "void *mmap(void*,long,int,int,int,long); int main(void) { char *s = (char*)mmap(0,4096,3,4098,-1,0); *(s+0)=65; *(s+1)=66; return *(s+0)+*(s+1); }" 131
+@}
+
+\subsection{Increment and Decrement}
+
+The increment and decrement operators (\texttt{++} and \texttt{-{}-})
+are the only unary operators that \emph{modify} their operand: they
+read the current value, add or subtract one, and write the result back.
+The C17 standard (\stdref{6.5.2.4}, \stdref{6.5.3.1}) distinguishes
+\emph{postfix} (\texttt{x++}) from \emph{prefix} (\texttt{++x}): the
+postfix form evaluates to the value \emph{before} the modification,
+while the prefix form evaluates to the value \emph{after}.
+
+\paragraph{IR lowering pattern.}
+Both forms produce the same four-instruction sequence---only the
+returned vreg differs:
+
+\begin{verbatim}
+  %old  = load  i32, ptr %x_alloca
+  %one  = const i32, 1
+  %new  = add   i32, %old, %one    ; or sub for --
+  store i32, %new, ptr %x_alloca
+  ; result = %old (postfix) or %new (prefix)
+\end{verbatim}
+
+The builder looks up the operand in the locals table to obtain the
+alloca vreg.  If the identifier is not a local, it falls back to
+\texttt{IR\_GLOBAL\_REF} to obtain the address.  The
+\texttt{AST\_F2} field of the \texttt{AST\_UNARY\_EXPR} node
+carries the prefix/postfix flag (1 for prefix, 0 for postfix),
+set by the parser.
+
+@d IR: build increment/decrement @{
+// -- kcc_ir_build_inc_dec -------------------------------------------------
+// uint64_t kcc_ir_build_inc_dec(node *expr)
+//   x0 = AST_UNARY_EXPR (F0=op, F1=operand, F2=prefix(1)/postfix(0))
+// Lowers i++, ++i, i--, --i into a load-add/sub-store sequence.
+// Returns old value (postfix) or new value (prefix).
+.text
+.globl _kcc_ir_build_inc_dec
+.p2align 2
+_kcc_ir_build_inc_dec:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                  // AST node
+    ldr x20, [x19, #AST_F0]     // op (TOK_INC or TOK_DEC)
+    ldr x21, [x19, #AST_F2]     // prefix flag (1=prefix, 0=postfix)
+
+    // Operand must be an identifier (lvalue)
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libid_zero
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Libid_zero
+
+    ldr x22, [x0, #AST_F0]      // name ptr
+    cbz x22, .Libid_zero
+
+    // Look up in locals hash table
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22
+    bl _kcc_ht_get
+    cbz x0, .Libid_global
+    bic x0, x0, #0x8000000000000000
+    sub x22, x0, #1              // x22 = alloca vreg
+    b .Libid_load
+@| _kcc_ir_build_inc_dec
+@}
+
+For global variables, the builder first emits an \texttt{IR\_GLOBAL\_REF}
+to materialise the address into a vreg, then continues with the same
+load-modify-store sequence.
+
+@d IR: build increment/decrement @{
+.Libid_global:
+    // Emit GLOBAL_REF to get address vreg
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_SRC1]     // name ptr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x22, x0                  // x22 = address vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+@}
+
+The core read-modify-write sequence is shared by both local and global
+operands.  The four steps---load, constant~1, add or subtract, and
+store---follow directly.
+
+@d IR: build increment/decrement @{
+.Libid_load:
+    // Step 1: load current value
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x22, [x0, #IR_SRC1]     // address vreg
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x23, x0                  // x23 = old value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Step 2: constant 1
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x2, #1
+    str x2, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x24, x0                  // x24 = const 1 vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Step 3: add (++) or sub (--)
+    cmp x20, #TOK_INC
+    mov x0, #IR_ADD
+    b.eq .Libid_binop
+    mov x0, #IR_SUB
+.Libid_binop:
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x23, [x0, #IR_SRC1]     // old value
+    str x24, [x0, #IR_SRC2]     // const 1
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x24, x0                  // x24 = new value vreg
+    mov x0, x19
+    bl _kcc_ir_emit
+
+    // Step 4: store new value back
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]     // new value
+    str x22, [x0, #IR_SRC2]     // address
+    bl _kcc_ir_emit
+
+    // Return old (postfix) or new (prefix)
+    cbnz x21, .Libid_prefix
+    mov x0, x23                  // postfix: return old value
+    b .Libid_done
+.Libid_prefix:
+    mov x0, x24                  // prefix: return new value
+    b .Libid_done
+
+.Libid_zero:
+    mov x0, #0
+
+.Libid_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\paragraph{End-to-end tests.}
+The following tests verify the full compilation pipeline for all four
+operator forms.  The for-loop test with \texttt{i++} is the most
+critical: before this feature was implemented, the increment emitted
+\texttt{IR\_NOP} and the loop ran forever.
+
+@d Test: codegen increment @{
+echo ""
+echo "--- Increment / Decrement ---"
+
+run_test "postfix increment stmt" \
+    "int main(void) { int x = 5; x++; return x; }" 6
+
+run_test "prefix increment" \
+    "int main(void) { int x = 5; return ++x; }" 6
+
+run_test "postfix returns old" \
+    "int main(void) { int x = 5; int y = x++; return y; }" 5
+
+run_test "prefix returns new" \
+    "int main(void) { int x = 5; int y = ++x; return y; }" 6
+
+run_test "postfix decrement stmt" \
+    "int main(void) { int x = 5; x--; return x; }" 4
+
+run_test "prefix decrement" \
+    "int main(void) { int x = 5; return --x; }" 4
+
+run_test "for-loop with i++" \
+    "int main(void) { int s = 0; for (int i = 0; i < 5; i++) s = s + 2; return s; }" 10
+
+run_test "for-loop sum with i++" \
+    "int main(void) { int s = 0; for (int i = 0; i < 5; i++) s = s + i; return s; }" 10
+
+run_test "do-while with i++" \
+    "int main(void) { int i = 0; int s = 0; do { s = s + i; i++; } while (i <= 5); return s; }" 15
+
+run_test "while with decrement" \
+    "int main(void) { int x = 5; while (x > 0) x--; return x; }" 0
+
+run_test "triple increment" \
+    "int main(void) { int x = 0; x++; x++; x++; return x; }" 3
+@}
+

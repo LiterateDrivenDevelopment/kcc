@@ -8,7 +8,7 @@
 \chapter{Symbol Table}
 \label{ch:symtab}
 
-The C language requires that every identifier be declared before use and that declarations obey scoping rules: a name declared inside a block shadows any outer declaration, and each name space (ordinary identifiers, tags, labels) is resolved independently (\stdref{6.2.1}).  This chapter implements the symbol table that enforces these rules.  It defines a 64-byte symbol record carrying kind, type, linkage, and scope depth, then builds three scope stacks---one per name space---where each level is a separate hash table.  The API provides functions for initialization, scope push/pop, symbol insertion, and lookup by walking the stack from innermost to outermost scope.
+The C language requires that every identifier be declared before use and that declarations obey scoping rules: a name declared inside a block shadows any outer declaration, and each name space (ordinary identifiers, tags, labels) is resolved independently (\stdref{6.2.1}).  This chapter implements the symbol table that enforces these rules.  It defines a 72-byte symbol record carrying kind, type, linkage, scope depth, and declaration line/column (the last so an unused-variable warning can point at the declaration), then builds three scope stacks---one per name space---where each level is a separate hash table.  The API provides functions for initialization, scope push/pop, symbol insertion, and lookup by walking the stack from innermost to outermost scope.
 
 \section{Symbol Record Layout}
 
@@ -24,7 +24,8 @@ Each symbol is a 64-byte arena-allocated record:
 .equ SYM_DEPTH,     40    // scope depth
 .equ SYM_LINE,      48    // declaration line
 .equ SYM_FLAGS,     56    // bit 0=defined, bit 1=used
-.equ SYM_SIZE,      64
+.equ SYM_COL,       64    // declaration column (for -Wunused-variable)
+.equ SYM_SIZE,      72
 
 // -- Symbol kind constants ------------------------------------------------
 .equ SYM_VAR,         1
@@ -249,6 +250,9 @@ _kcc_symtab_declare:
     // flags = defined
     mov x0, #1
     str x0, [x23, #SYM_FLAGS]
+    // Column is unknown at declare time (runs at sema, so the token globals
+    // sit at EOF); the caller overwrites SYM_LINE/SYM_COL from the decl node.
+    str xzr, [x23, #SYM_COL]
 
     // Get current scope ht (top of ordinary stack)
     adrp x0, _kcc_sym_ordinary@@PAGE
@@ -279,7 +283,13 @@ _kcc_symtab_declare:
 top to bottom, returning the first symbol that matches the given name.
 This top-down walk implements C's scoping rule: an inner declaration
 shadows any outer declaration of the same name.  If no scope contains
-the name, the function returns zero.
+the name, the function returns zero.  Two narrower accessors round out
+the interface: \texttt{kcc\_symtab\_lookup\_current} consults only the
+innermost scope (so a redefinition check can distinguish a same-scope
+duplicate from a legal shadow), and \texttt{kcc\_symtab\_current\_ht}
+hands back that innermost scope's hash table whole, so semantic analysis
+can walk every symbol declared in a block as the block is left---the
+basis for the unused-variable warning.
 
 @d Symtab: lookup @{
 // -- kcc_symtab_lookup ----------------------------------------------------
@@ -364,8 +374,30 @@ _kcc_symtab_lookup_current:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+
+// -- kcc_symtab_current_ht ------------------------------------------------
+// void *kcc_symtab_current_ht(void)
+// Returns the hash table of the innermost (current) ordinary scope, so a
+// caller can iterate the symbols declared directly in that scope (used by
+// the unused-variable warning at scope exit).
+.text
+.globl _kcc_symtab_current_ht
+.p2align 2
+_kcc_symtab_current_ht:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    adrp x0, _kcc_sym_ordinary@@PAGE
+    add  x0, x0, _kcc_sym_ordinary@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0, #VEC_COUNT]
+    sub  x1, x1, #1                 // top index
+    bl _kcc_vec_get
+    ldr x0, [x0]                   // current scope ht
+    ldp x29, x30, [sp], #16
+    ret
 @| _kcc_symtab_lookup
 @| _kcc_symtab_lookup_current
+@| _kcc_symtab_current_ht
 @}
 
 \section{Tag Name Space}

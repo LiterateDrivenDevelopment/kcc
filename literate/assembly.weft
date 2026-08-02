@@ -332,6 +332,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Types: constants@>
 @<Symtab: constants@>
 @<Vec: constants@>
+@<Hash: constants@>
 @<Sema: check@>
 @<Sema: resolve type@>
 @<Sema: check declaration@>
@@ -637,4 +638,12 @@ check the diagnostics (Section~\ref{sec:diag-tests}):
 
 @o tmp/tests/diagtest.sh @{
 @<Diag: tests@>
+@}
+
+\noindent\textbf{warntest.sh} --- feed the compiler valid programs and
+check that \texttt{-Wall} warns while the default build stays silent
+(Section~\ref{sec:warn-tests}):
+
+@o tmp/tests/warntest.sh @{
+@<Warn: tests@>
 @}

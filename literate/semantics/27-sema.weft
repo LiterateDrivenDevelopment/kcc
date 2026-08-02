@@ -349,6 +349,12 @@ _kcc_sema_check_decl:
     mov x2, #SYM_VAR
     mov x3, x21
     bl _kcc_symtab_declare
+    // Record the declaration's real location on the symbol (declare stamps a
+    // stale EOF line); the unused-variable warning reads it back.
+    ldr x1, [x19, #AST_LINE]
+    str x1, [x0, #SYM_LINE]
+    ldr x1, [x19, #AST_COL]
+    str x1, [x0, #SYM_COL]
 
 .Lscd_var_init:
     // Check initializer if present
@@ -841,6 +847,20 @@ _kcc_sema_check_stmt:
 
 Compound statements push a new scope onto both the ordinary and tag
 stacks, walk their child list recursively, and pop the scope on exit.
+Just before that pop---and likewise before a \texttt{for}-scope is
+popped---\texttt{kcc\_sema\_check\_unused\_scope} runs, so a
+block-scope variable that was declared but never referenced draws an
+\texttt{unused variable '\meta{name}'} warning under \texttt{-Wall}.
+The check is placed at the block and \texttt{for} scopes but \emph{not}
+at the function scope, whose only occupants are the parameters---an
+unused parameter is outside \texttt{-Wall} (it lives in
+\texttt{-Wextra}), and a function body's top-level locals sit in the
+body's own compound scope, one level in, where they are seen normally.
+A variable counts as referenced the moment it appears in any identifier
+expression---read, written, or address-taken---which the resolver marks
+by setting the \emph{used} bit on the symbol; only a name that never
+appears at all is reported, keeping the warning free of false positives
+on genuinely-referenced variables.
 Expression statements simply type-check their contained expression.
 The \texttt{if}/\texttt{while}/\texttt{do}/\texttt{for} handlers each
 check their condition expression and recurse into their bodies;
@@ -861,6 +881,7 @@ variable declaration.
     b .Lscs_compound_loop
 
 .Lscs_compound_end:
+    bl _kcc_sema_check_unused_scope
     bl _kcc_symtab_pop_scope
     b .Lscs_done
 
@@ -912,6 +933,7 @@ variable declaration.
     cbz x0, .Lscs_for_end
     bl _kcc_sema_check_stmt
 .Lscs_for_end:
+    bl _kcc_sema_check_unused_scope
     bl _kcc_symtab_pop_scope
     b .Lscs_done
 @}
@@ -1210,8 +1232,23 @@ element.  An undeclared identifier used as a \emph{value} is a hard error
 (\texttt{use of undeclared identifier '\\meta{name}'}); the one exception is a
 bare name in call position, which is taken as an implicit function declaration
 (legacy C) rather than an error---the call handler signals that case through
-\texttt{\_kcc\_sema\_callee\_ctx}.  Either way the node's type falls back to
-\texttt{int} so the pass keeps running and reports any further errors.
+\texttt{\_kcc\_sema\_callee\_ctx}.  Under \texttt{-Wall} that implicit
+declaration is not silent: \kcc{} emits an
+\texttt{implicit declaration of function '\\meta{name}'} warning (but still
+compiles, assuming an \texttt{int}-returning signature).  Either way the
+node's type falls back to \texttt{int} so the pass keeps running and reports
+any further errors.
+
+\paragraph{The named-message helpers.}
+Several diagnostics have the shape \texttt{\meta{prefix}\meta{name}'} --- an
+undeclared identifier, a missing member, a redefinition, an implicit
+declaration, an unused variable.  \texttt{\_kcc\_sema\_build\_named} assembles
+that body once in the arena (the prefix carries its own opening quote; the
+closing quote and NUL are appended), and two thin wrappers hand it to the
+diagnostic engine: \texttt{\_kcc\_sema\_err\_named} as an error,
+\texttt{\_kcc\_sema\_warn\_named} as a warning.  Splitting error from warning
+at this seam is what lets the \texttt{-Wall} family reuse the exact message
+machinery the hard errors already use.
 
 Enumeration constants receive special treatment.  When the lookup
 returns a symbol whose kind is \texttt{SYM\_ENUM\_CONST}, the AST
@@ -1260,6 +1297,10 @@ _kcc_sema_expr_ident:
     b .Lsei_int_type
 
 .Lsei_normal:
+    // Mark the symbol used (for -Wunused-variable); harmless for functions.
+    ldr w1, [x0, #SYM_FLAGS]
+    orr w1, w1, #2
+    str w1, [x0, #SYM_FLAGS]
     // Return symbol's type
     ldr x0, [x0, #SYM_TYPE]
     // Apply function/array decay
@@ -1286,6 +1327,18 @@ _kcc_sema_expr_ident:
     add  x1, x1, _kcc_sema_callee_implicit@@PAGEOFF
     mov  x2, #1
     str  x2, [x1]
+    // -Wall: warn about the implicit declaration (still lenient — compilation
+    // continues with an int-returning signature).
+    adrp x0, _kcc_warn_all@@PAGE
+    add  x0, x0, _kcc_warn_all@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lsei_int_type
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    mov x2, x20                    // name
+    adrp x3, _kcc_sema_implicit_pre@@PAGE
+    add  x3, x3, _kcc_sema_implicit_pre@@PAGEOFF
+    bl _kcc_sema_warn_named
     b .Lsei_int_type
 .Lsei_emit_undecl:
     ldr x0, [x19, #AST_LINE]
@@ -1305,33 +1358,29 @@ _kcc_sema_expr_ident:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_err_named ---------------------------------------------------
-// void kcc_sema_err_named(uint64_t line, uint64_t col,
-//                         const char *name, const char *prefix)
-// Emits "<prefix>name'" at line:col, building the quoted message in an arena
-// buffer (the prefix supplies its own opening quote).  Shared by the
-// undeclared-identifier, no-member, and redefinition diagnostics.
+// -- kcc_sema_build_named -------------------------------------------------
+// char *kcc_sema_build_named(const char *name, const char *prefix)
+//   x0 = name, x1 = prefix ; returns x0 = arena "<prefix>name'"
+// Builds the quoted message body once (the prefix supplies its own opening
+// quote); the closing quote and NUL are appended here.  Shared by the error
+// and warning wrappers below.
 .text
-.globl _kcc_sema_err_named
 .p2align 2
-_kcc_sema_err_named:
-    stp x29, x30, [sp, #-80]!
+_kcc_sema_build_named:
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
-    stp x25, x26, [sp, #64]
-    mov x19, x0                    // line
-    mov x20, x1                    // col
-    mov x21, x2                    // name
-    mov x22, x3                    // prefix
+    mov x21, x0                    // name
+    mov x22, x1                    // prefix
     mov x0, x22
     bl _kcc_strlen
     mov x24, x0                    // prefix_len
     mov x0, x21
     bl _kcc_strlen
-    mov x25, x0                    // name_len
-    add x0, x24, x25
+    mov x20, x0                    // name_len
+    add x0, x24, x20
     add x0, x0, #2                 // + closing quote + NUL
     bl _kcc_arena_alloc
     mov x23, x0                    // buffer
@@ -1341,22 +1390,121 @@ _kcc_sema_err_named:
     bl _kcc_memcpy                 // prefix
     add x0, x23, x24
     mov x1, x21
-    mov x2, x25
+    mov x2, x20
     bl _kcc_memcpy                 // name
     add x9, x23, x24
-    add x9, x9, x25
+    add x9, x9, x20
     mov w10, #0x27                 // '\''
     strb w10, [x9]
     strb wzr, [x9, #1]
-    mov x0, x19                    // line
-    mov x1, x20                    // col
-    mov x2, x23
-    bl _kcc_diag_error
-    ldp x25, x26, [sp, #64]
+    mov x0, x23                    // return buffer
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #80
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_sema_err_named ---------------------------------------------------
+// void kcc_sema_err_named(uint64_t line, uint64_t col,
+//                         const char *name, const char *prefix)
+// Emits "<prefix>name'" as an error at line:col.  Shared by the
+// undeclared-identifier, no-member, and redefinition diagnostics.
+.globl _kcc_sema_err_named
+.p2align 2
+_kcc_sema_err_named:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                    // line
+    mov x20, x1                    // col
+    mov x0, x2                     // name
+    mov x1, x3                     // prefix
+    bl _kcc_sema_build_named
+    mov x2, x0
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_diag_error
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_warn_named --------------------------------------------------
+// void kcc_sema_warn_named(uint64_t line, uint64_t col,
+//                          const char *name, const char *prefix)
+// Same message body as err_named, emitted as a warning.  Used by the
+// -Wall family (implicit function declaration, unused variable, ...).
+.globl _kcc_sema_warn_named
+.p2align 2
+_kcc_sema_warn_named:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                    // line
+    mov x20, x1                    // col
+    mov x0, x2                     // name
+    mov x1, x3                     // prefix
+    bl _kcc_sema_build_named
+    mov x2, x0
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_diag_warning
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_check_unused_scope ------------------------------------------
+// void kcc_sema_check_unused_scope(void)
+// Under -Wall, walk the innermost ordinary scope and warn for each SYM_VAR
+// that was declared but never referenced.  Called just before a block or
+// for-scope is popped; the function/parameter scope is deliberately not
+// checked (unused parameters are outside -Wall).
+.globl _kcc_sema_check_unused_scope
+.p2align 2
+_kcc_sema_check_unused_scope:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+    adrp x0, _kcc_warn_all@@PAGE
+    add  x0, x0, _kcc_warn_all@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lcus_done
+    bl _kcc_symtab_current_ht
+    cbz x0, .Lcus_done
+    ldr x19, [x0, #HT_ENTRIES]     // entries base
+    ldr x20, [x0, #HT_CAP]         // capacity
+    mov x21, #0                    // i
+.Lcus_loop:
+    cmp x21, x20
+    b.hs .Lcus_done
+    mov x22, #HTE_SIZE
+    mul x22, x21, x22
+    add x22, x19, x22              // entry ptr
+    ldr x0, [x22, #HTE_KEY]
+    cbz x0, .Lcus_next             // empty slot
+    ldr x23, [x22, #HTE_VALUE]     // sym
+    cbz x23, .Lcus_next
+    ldr x0, [x23, #SYM_KIND]
+    cmp x0, #SYM_VAR
+    b.ne .Lcus_next
+    ldr w0, [x23, #SYM_FLAGS]
+    tst w0, #2                     // used bit set?
+    b.ne .Lcus_next
+    ldr x0, [x23, #SYM_LINE]
+    ldr x1, [x23, #SYM_COL]
+    ldr x2, [x23, #SYM_NAME]
+    adrp x3, _kcc_sema_unused_pre@@PAGE
+    add  x3, x3, _kcc_sema_unused_pre@@PAGEOFF
+    bl _kcc_sema_warn_named
+.Lcus_next:
+    add x21, x21, #1
+    b .Lcus_loop
+.Lcus_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
     ret
 
 // -- kcc_sema_check_redef -------------------------------------------------
@@ -2136,6 +2284,10 @@ _kcc_sema_nomember_pre:
 .globl _kcc_sema_redef_pre
 _kcc_sema_redef_pre:
     .asciz "redefinition of '"
+_kcc_sema_implicit_pre:
+    .asciz "implicit declaration of function '"
+_kcc_sema_unused_pre:
+    .asciz "unused variable '"
 _kcc_sema_err_undecl:
     .asciz "use of undeclared identifier"
 _kcc_sema_err_not_func:

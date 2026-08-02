@@ -792,7 +792,7 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 \textbf{\#} & \textbf{Open item} & \textbf{Impact} & \textbf{Effort} & \textbf{Home}\\
 \hline
 1  & Multi-error recovery \& diagnostics \stDone & \meterA & \meterB & 9e\\
-2  & \texttt{-Wall} warnings                    & \meterB & \meterC & 9e\\
+2  & \texttt{-Wall} warnings \stPart            & \meterB & \meterC & 9e\\
 3  & Designated initializers                    & \meterA & \meterB & 9a\\
 4  & Bit-fields                                 & \meterA & \meterB & 9a\\
 5  & \_Bool normalize, \texttt{char\,s[]="\dots"} & \meterB & \meterC & 9a\\
@@ -851,9 +851,33 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       itself treats as \texttt{-Wall} warnings rather than errors, and whose
       false-positive risk against pointer-heavy systems C argues for the
       warning machinery, not the error path.
-\item \textbf{\texttt{-Wall}-equivalent warnings} (Stage~9e).  Nearly free
-      once error recovery exists: unused variables, missing returns, implicit
-      conversions, shadowed declarations, signed/unsigned comparisons.
+\item \textbf{\texttt{-Wall}-equivalent warnings} (Stage~9e).  \emph{In
+      progress.}  The whole family sits behind a single default-off
+      \texttt{-Wall} flag (\texttt{\_kcc\_warn\_all}, set while the driver
+      scans arguments), and warnings go through the warning path of the
+      diagnostic engine, which counts but does not abort---so a compile
+      without \texttt{-Wall} is byte-for-byte what it was before, and a
+      warning never turns a valid program into a failed build.  Two of the
+      canonical warnings are landed.  \emph{Implicit function declaration:}
+      an undeclared name used in call position, previously accepted silently
+      for legacy leniency, now draws
+      \texttt{implicit declaration of function '\meta{name}'} under
+      \texttt{-Wall} (the compile still proceeds).  \emph{Unused variable:}
+      a block-scope local that is declared but never referenced draws
+      \texttt{unused variable '\meta{name}'}, checked as each block and
+      \texttt{for} scope is left; a variable counts as referenced the moment
+      it appears in any expression, so the check never fires on a
+      genuinely-used name, and parameters---which live in the function scope,
+      not the body's---are excluded, matching \texttt{clang}'s placement of
+      unused parameters in \texttt{-Wextra}.  A dedicated \texttt{just
+      warntest} harness checks all three properties at once: the warning
+      appears with \texttt{-Wall}, the program still compiles, and the very
+      same source is silent without the flag.  \emph{Still open:}
+      \texttt{-Wreturn-type} (a non-void function that can fall off its end),
+      which needs genuine control-flow reasoning to avoid false positives on
+      \texttt{if}/\texttt{else} that both return, infinite loops, and calls to
+      \texttt{\_Noreturn} functions; then the pointer/integer conversion
+      warnings deferred from item~1, and signed/unsigned comparison.
 \item \textbf{Designated initializers} (Stage~9a).  Pervasive in real systems
       C (\texttt{\{.field = v\}}, \texttt{[i] = v}); without them a great deal
       of ordinary code simply will not compile, which caps conformance no

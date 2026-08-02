@@ -96,6 +96,11 @@ diagtest: build
     chmod +x tmp/tests/diagtest.sh
     tmp/tests/diagtest.sh
 
+# Warnings: valid programs, -Wall must warn while the default build stays silent
+warntest: build
+    chmod +x tmp/tests/warntest.sh
+    tmp/tests/warntest.sh
+
 # Code generation tests: compile C programs with kcc, link, run, check exit codes
 test-codegen: build
     chmod +x tmp/tests/test_codegen.sh

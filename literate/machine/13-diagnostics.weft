@@ -723,6 +723,30 @@ run_warn "unused-gated"        gated "" \
     "int main(void){ int x = 5; int y = 3; return y; }"
 run_warn "implicit-gated"      gated "" \
     "int main(void){ return foo(3); }"
+run_warn "reach-end-plain"     warn "control reaches end of non-void function" \
+    "int f(void){ int x = 1; }
+int main(void){ return f(); }"
+run_warn "reach-end-if"        warn "control reaches end of non-void function" \
+    "int f(int c){ if(c) return 1; }
+int main(void){ return f(0); }"
+run_warn "return-ok-clean"     clean "" \
+    "int f(int c){ if(c) return 1; else return 2; }
+int main(void){ return f(1); }"
+run_warn "infinite-loop-clean" clean "" \
+    "int f(void){ for(;;){ } }
+int main(void){ return 0; }"
+run_warn "noreturn-call-clean" clean "" \
+    "void abort(void);
+int f(void){ abort(); }
+int main(void){ return 0; }"
+run_warn "switch-return-clean" clean "" \
+    "int f(int c){ switch(c){ default: return 0; } }
+int main(void){ return f(1); }"
+run_warn "main-fallthrough-clean" clean "" \
+    "int main(void){ }"
+run_warn "reach-end-gated"     gated "" \
+    "int f(void){ int x = 1; }
+int main(void){ return f(); }"
 
 echo ""
 echo "=== warntest: $PASS ok, $FAIL fail ==="

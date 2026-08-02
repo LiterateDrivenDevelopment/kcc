@@ -450,6 +450,10 @@ _kcc_sema_check_decl:
     ldr x0, [x19, #AST_F3]
     bl _kcc_sema_check_stmt
 
+    // -Wall: warn if a non-void function can reach the end of its body
+    mov x0, x19                    // func node
+    bl _kcc_sema_check_return_path
+
     bl _kcc_symtab_label_end
     bl _kcc_symtab_pop_scope
     b .Lscd_done
@@ -1544,6 +1548,328 @@ _kcc_sema_check_redef:
     ret
 @}
 
+\subsection{Reaching the End of a Non-Void Function}
+
+\texttt{-Wreturn-type} warns when control can run off the bottom of a
+function whose return type is not \texttt{void}, because the value it
+then hands back is indeterminate.  The whole difficulty is doing this
+\emph{without} false positives: a function that ends in an exhaustive
+\texttt{if}/\texttt{else} where both arms return, or in an infinite
+loop, or in a call to \texttt{exit}, never actually falls through, and
+warning about it would be worse than saying nothing.  So the analysis is
+built the sound way round: \texttt{kcc\_sema\_falls\_through} returns
+true only when it can \emph{prove} control reaches the bottom of a
+statement, and the warning fires only on that proof.  Anything it cannot
+analyse it treats as ``might not fall through,'' which costs a missed
+warning but never a spurious one.
+
+The recursion mirrors the language's control flow.  A \texttt{return},
+\texttt{goto}, \texttt{break}, or \texttt{continue} does not fall
+through.  A block falls through only if every one of its statements
+does---the first statement that diverts control ends the block.  An
+\texttt{if} falls through if it lacks an \texttt{else} (the untaken path
+continues) or if either arm falls through.  A \texttt{while}/\texttt{for}/%
+\texttt{do} whose controlling expression is a constant truth and whose
+body contains no \texttt{break} that would leave \emph{this} loop is an
+infinite loop and does not fall through; any other loop is assumed to be
+exitable.  A \texttt{switch} is treated conservatively as possibly
+terminating (so an exhaustive returning \texttt{switch} is never
+falsely flagged), and an expression statement that is a call to a known
+\texttt{\_Noreturn} function (\texttt{exit}, \texttt{abort}, and kin)
+does not fall through.  \texttt{main} is exempt entirely, since falling
+off its end is defined to return zero (\stdref{5.1.2.2.3}).
+
+\texttt{kcc\_sema\_has\_toplevel\_break} supports the loop case: it looks
+for a \texttt{break} that belongs to the loop being analysed, stopping
+its descent at any nested loop or \texttt{switch}, whose own
+\texttt{break}s bind there instead.
+
+@d Sema: return path @{
+// -- kcc_sema_const_true --------------------------------------------------
+// int kcc_sema_const_true(node *expr)
+// 1 iff expr is (parenthesised) integer/char constant with a non-zero value.
+.text
+.p2align 2
+_kcc_sema_const_true:
+    cbz x0, .Lct_no
+.Lct_unwrap:
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Lct_check
+    ldr x0, [x0, #AST_F0]
+    cbz x0, .Lct_no
+    b .Lct_unwrap
+.Lct_check:
+    cmp x1, #AST_INT_LIT
+    b.eq .Lct_int
+    cmp x1, #AST_CHAR_LIT
+    b.eq .Lct_int
+    mov x0, #0
+    ret
+.Lct_int:
+    ldr x0, [x0, #AST_F0]          // value
+    cmp x0, #0
+    cset x0, ne
+    ret
+.Lct_no:
+    mov x0, #0
+    ret
+
+// -- kcc_sema_has_toplevel_break ------------------------------------------
+// int kcc_sema_has_toplevel_break(node *s)
+// 1 iff s contains a break that would exit the *enclosing* loop, i.e. a
+// break not itself inside a nested loop or switch.
+.p2align 2
+_kcc_sema_has_toplevel_break:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    cbz x19, .Lhb_no
+    ldr x20, [x19, #AST_TAG]
+    cmp x20, #AST_BREAK_STMT
+    b.eq .Lhb_yes
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lhb_no
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lhb_no
+    cmp x20, #AST_DO_STMT
+    b.eq .Lhb_no
+    cmp x20, #AST_SWITCH_STMT
+    b.eq .Lhb_no
+    cmp x20, #AST_COMPOUND
+    b.eq .Lhb_compound
+    cmp x20, #AST_IF_STMT
+    b.eq .Lhb_if
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lhb_inner_f1
+    cmp x20, #AST_CASE_STMT
+    b.eq .Lhb_inner_f1
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Lhb_inner_f0
+    b .Lhb_no
+.Lhb_yes:
+    mov x0, #1
+    b .Lhb_ret
+.Lhb_no:
+    mov x0, #0
+    b .Lhb_ret
+.Lhb_compound:
+    ldr x19, [x19, #AST_F0]
+.Lhb_cl:
+    cbz x19, .Lhb_no
+    mov x0, x19
+    bl _kcc_sema_has_toplevel_break
+    cbnz x0, .Lhb_yes
+    ldr x19, [x19, #AST_F4]
+    b .Lhb_cl
+.Lhb_if:
+    ldr x0, [x19, #AST_F1]         // then
+    bl _kcc_sema_has_toplevel_break
+    cbnz x0, .Lhb_yes
+    ldr x0, [x19, #AST_F2]         // else
+    cbz x0, .Lhb_no
+    bl _kcc_sema_has_toplevel_break
+    b .Lhb_ret
+.Lhb_inner_f1:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_has_toplevel_break
+    b .Lhb_ret
+.Lhb_inner_f0:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_has_toplevel_break
+.Lhb_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_is_noreturn_call --------------------------------------------
+// int kcc_sema_is_noreturn_call(node *expr)
+// 1 iff expr is a direct call to a known _Noreturn library function.
+.p2align 2
+_kcc_sema_is_noreturn_call:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    cbz x19, .Linr_no
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_CALL_EXPR
+    b.ne .Linr_no
+    ldr x0, [x19, #AST_F0]         // callee
+    cbz x0, .Linr_no
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.ne .Linr_no
+    ldr x19, [x0, #AST_F0]         // callee name
+    cbz x19, .Linr_no
+    adrp x20, _kcc_sema_noreturn_tbl@@PAGE
+    add  x20, x20, _kcc_sema_noreturn_tbl@@PAGEOFF
+.Linr_loop:
+    ldr x1, [x20]
+    cbz x1, .Linr_no
+    mov x0, x19
+    bl _kcc_strcmp
+    cbz x0, .Linr_yes
+    add x20, x20, #8
+    b .Linr_loop
+.Linr_yes:
+    mov x0, #1
+    b .Linr_ret
+.Linr_no:
+    mov x0, #0
+.Linr_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_falls_through -----------------------------------------------
+// int kcc_sema_falls_through(node *s)
+// 1 iff control can be *proven* to reach the bottom of statement s.
+.p2align 2
+_kcc_sema_falls_through:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    cbz x19, .Lft_yes              // null/empty statement falls through
+    ldr x20, [x19, #AST_TAG]
+    cmp x20, #AST_RETURN_STMT
+    b.eq .Lft_no
+    cmp x20, #AST_GOTO_STMT
+    b.eq .Lft_no
+    cmp x20, #AST_BREAK_STMT
+    b.eq .Lft_no
+    cmp x20, #AST_CONTINUE_STMT
+    b.eq .Lft_no
+    cmp x20, #AST_SWITCH_STMT
+    b.eq .Lft_no                   // conservative: never falsely flag a switch
+    cmp x20, #AST_COMPOUND
+    b.eq .Lft_compound
+    cmp x20, #AST_IF_STMT
+    b.eq .Lft_if
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lft_label
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lft_while
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lft_for
+    cmp x20, #AST_DO_STMT
+    b.eq .Lft_do
+    cmp x20, #AST_EXPR_STMT
+    b.eq .Lft_expr
+    // everything else (declarations, plain labels, case/default wrappers) is
+    // straight-line code that falls through.
+    b .Lft_yes
+.Lft_no:
+    mov x0, #0
+    b .Lft_ret
+.Lft_yes:
+    mov x0, #1
+    b .Lft_ret
+.Lft_compound:
+    ldr x19, [x19, #AST_F0]        // first item
+.Lft_comp_loop:
+    cbz x19, .Lft_yes              // ran off the end → falls through
+    mov x0, x19
+    bl _kcc_sema_falls_through
+    cbz x0, .Lft_no                // a diverting statement ends the block
+    ldr x19, [x19, #AST_F4]        // next item
+    b .Lft_comp_loop
+.Lft_if:
+    ldr x0, [x19, #AST_F2]         // else
+    cbz x0, .Lft_yes               // no else → the untaken path continues
+    ldr x0, [x19, #AST_F1]         // then
+    bl _kcc_sema_falls_through
+    cbnz x0, .Lft_yes
+    ldr x0, [x19, #AST_F2]         // else
+    bl _kcc_sema_falls_through
+    b .Lft_ret
+.Lft_label:
+    ldr x0, [x19, #AST_F1]         // labelled statement
+    bl _kcc_sema_falls_through
+    b .Lft_ret
+.Lft_while:
+    ldr x0, [x19, #AST_F0]         // cond
+    bl _kcc_sema_const_true
+    cbz x0, .Lft_yes               // exitable loop → may fall through
+    ldr x0, [x19, #AST_F1]         // body
+    bl _kcc_sema_has_toplevel_break
+    cbnz x0, .Lft_yes
+    b .Lft_no                      // infinite, no break
+.Lft_for:
+    ldr x0, [x19, #AST_F1]         // cond
+    cbz x0, .Lft_for_inf           // for(;;) → no condition → infinite
+    bl _kcc_sema_const_true
+    cbz x0, .Lft_yes
+.Lft_for_inf:
+    ldr x0, [x19, #AST_F3]         // body
+    bl _kcc_sema_has_toplevel_break
+    cbnz x0, .Lft_yes
+    b .Lft_no
+.Lft_do:
+    ldr x0, [x19, #AST_F1]         // cond
+    bl _kcc_sema_const_true
+    cbz x0, .Lft_yes
+    ldr x0, [x19, #AST_F0]         // body
+    bl _kcc_sema_has_toplevel_break
+    cbnz x0, .Lft_yes
+    b .Lft_no
+.Lft_expr:
+    ldr x0, [x19, #AST_F0]         // expression
+    bl _kcc_sema_is_noreturn_call
+    cbnz x0, .Lft_no
+    b .Lft_yes
+.Lft_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_sema_check_return_path -------------------------------------------
+// void kcc_sema_check_return_path(node *func)
+// Under -Wall, warn if a non-void, non-main function can fall off its end.
+// The return type is read from _kcc_sema_cur_ret, which the body handler set
+// (the TY_FUNC register is reused by the parameter loop and is not reliable
+// here).
+.globl _kcc_sema_check_return_path
+.p2align 2
+_kcc_sema_check_return_path:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                    // func node
+    adrp x0, _kcc_warn_all@@PAGE
+    add  x0, x0, _kcc_warn_all@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lcrp_done
+    adrp x0, _kcc_sema_cur_ret@@PAGE
+    add  x0, x0, _kcc_sema_cur_ret@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lcrp_done
+    ldr  x1, [x0, #TY_KIND]
+    cmp  x1, #TY_VOID
+    b.eq .Lcrp_done
+    ldr  x0, [x19, #AST_F1]        // name
+    cbz  x0, .Lcrp_done
+    adrp x1, _kcc_sema_main_name@@PAGE
+    add  x1, x1, _kcc_sema_main_name@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lcrp_done             // main is exempt
+    ldr x0, [x19, #AST_F3]         // body
+    cbz x0, .Lcrp_done             // no body (prototype)
+    bl _kcc_sema_falls_through
+    cbz x0, .Lcrp_done             // provably returns on all paths
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_reach_end@@PAGE
+    add  x2, x2, _kcc_sema_reach_end@@PAGEOFF
+    bl _kcc_diag_warning
+.Lcrp_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
 \subsection{Literal Expressions}
 
 Integer and character literals have type \texttt{int}.  String
@@ -2300,6 +2626,27 @@ _kcc_sema_ret_void:
     .asciz "void function should not return a value"
 _kcc_sema_ret_nonvoid:
     .asciz "non-void function should return a value"
+_kcc_sema_reach_end:
+    .asciz "control reaches end of non-void function"
+_kcc_sema_main_name:
+    .asciz "main"
+// Known _Noreturn library functions: a trailing call to one of these means
+// the function does not fall through (for -Wreturn-type).
+_kcc_nr_exit:        .asciz "exit"
+_kcc_nr_uexit:       .asciz "_exit"
+_kcc_nr_bexit:       .asciz "_Exit"
+_kcc_nr_abort:       .asciz "abort"
+_kcc_nr_longjmp:     .asciz "longjmp"
+_kcc_nr_unreach:     .asciz "__builtin_unreachable"
+_kcc_nr_trap:        .asciz "__builtin_trap"
+// Pointer table lives in .data (a cstring section holds only strings); the
+// following dump strings restore the cstring section afterwards.
+.data
+.p2align 3
+_kcc_sema_noreturn_tbl:
+    .quad _kcc_nr_exit, _kcc_nr_uexit, _kcc_nr_bexit, _kcc_nr_abort
+    .quad _kcc_nr_longjmp, _kcc_nr_unreach, _kcc_nr_trap, 0
+.section __TEXT,__cstring,cstring_literals
 
 // -- Dump type strings ----------------------------------------------------
 _kcc_sema_str_var:      .asciz "var "

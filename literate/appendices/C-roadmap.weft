@@ -872,12 +872,17 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       unused parameters in \texttt{-Wextra}.  A dedicated \texttt{just
       warntest} harness checks all three properties at once: the warning
       appears with \texttt{-Wall}, the program still compiles, and the very
-      same source is silent without the flag.  \emph{Still open:}
-      \texttt{-Wreturn-type} (a non-void function that can fall off its end),
-      which needs genuine control-flow reasoning to avoid false positives on
-      \texttt{if}/\texttt{else} that both return, infinite loops, and calls to
-      \texttt{\_Noreturn} functions; then the pointer/integer conversion
-      warnings deferred from item~1, and signed/unsigned comparison.
+      same source is silent without the flag.  A third warning,
+      \texttt{-Wreturn-type}, is now landed on top of a genuine control-flow
+      analysis (\S\ref{sec:diag-tests} describes the harness;
+      \texttt{kcc\_sema\_falls\_through} the analysis): a non-void function
+      is flagged only when control can be \emph{proven} to run off its end,
+      so an exhaustive \texttt{if}/\texttt{else}, an infinite loop, an
+      exhaustive returning \texttt{switch}, and a tail call to a
+      \texttt{\_Noreturn} function are all correctly left quiet, and
+      \texttt{main} is exempt.  \emph{Still open:} the pointer/integer
+      conversion warnings deferred from item~1, signed/unsigned comparison,
+      and shadowed declarations.
 \item \textbf{Designated initializers} (Stage~9a).  Pervasive in real systems
       C (\texttt{\{.field = v\}}, \texttt{[i] = v}); without them a great deal
       of ordinary code simply will not compile, which caps conformance no

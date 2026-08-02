@@ -338,6 +338,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Sema: check declaration@>
 @<Sema: struct layout@>
 @<Sema: check statement@>
+@<Sema: return path@>
 @<Sema: check expression@>
 @<Sema: expr ident@>
 @<Sema: expr literal@>

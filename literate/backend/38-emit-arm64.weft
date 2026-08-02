@@ -727,6 +727,32 @@ _kcc_enc_fcvt_d_s:
     mov w0, w2
     ret
 
+// -- kcc_enc_fmov_d_x / kcc_enc_fmov_x_d --------------------------------------
+// Move the raw 64 bits between a general register and a double register, so a
+// register-allocated value (which lives in a GP register) can be read or
+// written by the floating-point paths.  x0=Rd, x1=Rn.
+.text
+.globl _kcc_enc_fmov_d_x
+.p2align 2
+_kcc_enc_fmov_d_x:
+    movz w2, #0x0000
+    movk w2, #0x9E67, lsl #16     // FMOV Dd, Xn = 0x9E670000
+    orr w2, w2, w1, lsl #5        // Rn (general)
+    orr w2, w2, w0                // Rd (double)
+    mov w0, w2
+    ret
+
+.text
+.globl _kcc_enc_fmov_x_d
+.p2align 2
+_kcc_enc_fmov_x_d:
+    movz w2, #0x0000
+    movk w2, #0x9E66, lsl #16     // FMOV Xd, Dn = 0x9E660000
+    orr w2, w2, w1, lsl #5        // Rn (double)
+    orr w2, w2, w0                // Rd (general)
+    mov w0, w2
+    ret
+
 // -- kcc_enc_fcmp -------------------------------------------------------------
 // FCMP Dn, Dm — set NZCV from a double comparison.  x0=Rn, x1=Rm
 .text

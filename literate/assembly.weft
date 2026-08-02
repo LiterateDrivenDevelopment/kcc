@@ -466,6 +466,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<CodeGen: init@>
 @<CodeGen: preregister globals@>
 @<CodeGen: compile all@>
+@<CodeGen: register allocation@>
 @<CodeGen: compile function@>
 @<CodeGen: vreg slot offset@>
 @<CodeGen: marshal args@>

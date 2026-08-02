@@ -419,6 +419,8 @@ difftest "float-arith" \
     "int main(void){ float f = 1.5f, g = 2.25f; return (int)((f + g) * 8); }"
 difftest "float-func" \
     "float sq(float x){ return x * x; } int main(void){ return (int)sq(7.0f); }"
+difftest "float-int-regalloc" \
+    "int main(void){ int a = 3, b = 5, c = 7, d = 11; int e = a*b + c*d - a*c + b*d; double x = 3.5; int di = (int)(x * (a + b + c + d)); return (e % 100) + (di % 100); }"
 @}
 
 \section{Operators and Edge Cases}

@@ -887,23 +887,29 @@ load/store instructions as necessary.  This stage introduces
 register allocation to eliminate redundant memory traffic.
 
 \begin{itemize}
-\item \textbf{Liveness analysis.}  Compute live-in and live-out
-      sets for each basic block using iterative dataflow.
-      Build per-vreg live intervals from the BB-level results.
-\item \textbf{Linear-scan allocator.}  Assign physical registers
-      (\texttt{x9}--\texttt{x15}, \texttt{x19}--\texttt{x28},
-      \texttt{d0}--\texttt{d31}) to vregs based on sorted
-      live intervals.  Spill the vreg with the longest remaining
-      interval when registers are exhausted.
-\item \textbf{Spill code insertion.}  Spilled vregs get stack
-      slots; insert loads before uses and stores after defs.
-      Coalesce adjacent load/store pairs where possible.
-\item \textbf{Callee-saved management.}  The prologue/epilogue
-      must save and restore only the callee-saved registers
-      that the function actually uses, shrinking stack frames.
-\item \textbf{FP register allocation.}  Floating-point vregs
-      compete for \texttt{d8}--\texttt{d15} (callee-saved) and
-      \texttt{d16}--\texttt{d31} (caller-saved).
+\item[\checkmark] \textbf{Local linear-scan allocator}
+      (\S\ref{sec:regalloc}).  A conservative first pass allocates
+      block-local, call-free, integer-scalar temporaries to the four
+      caller-saved scratch registers \texttt{x12}--\texttt{x15}, so no
+      prologue save and no frame-layout change is needed.  Two walks over
+      the IR compute per-vreg live information (mirroring the DCE
+      use-classification, and detecting call-crossing with a monotonic call
+      counter) and then run the scan; \texttt{load\_vreg}/\texttt{store\_vreg}
+      consult the resulting map, with the FP helpers bridging a
+      register-resident value to a \texttt{d} register via \textsc{fmov}.  An
+      unallocated vreg falls back to the exact all-spill behaviour, so the
+      change is transparent.  Measured frame-memory traffic on
+      arithmetic-heavy functions drops by roughly one third to two thirds.
+\item \textbf{Global allocation over callee-saved registers.}  Extend beyond
+      block-local ranges to \texttt{x19}--\texttt{x28}, which survive calls;
+      this needs prologue/epilogue save-restore and a frame-layout shift for
+      the save area.
+\item \textbf{Spill heuristics.}  When registers are exhausted, spill the
+      vreg with the longest remaining interval rather than declining to
+      allocate; coalesce adjacent load/store pairs.
+\item \textbf{FP register allocation.}  Let floating-point vregs compete for
+      \texttt{d8}--\texttt{d15} (callee-saved) and \texttt{d16}--\texttt{d31}
+      (caller-saved) instead of riding in general registers via \textsc{fmov}.
 \end{itemize}
 
 \subsection{Stage 9d --- Optimization}

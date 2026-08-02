@@ -632,6 +632,16 @@ difftest "bitfield-desig" \
     "struct F { unsigned a:3; unsigned b:5; unsigned c:4; }; int main(void){ struct F f = { .c = 7, .a = 2 }; return f.a*100 + f.b*10 + f.c; }"
 difftest "bitfield-global" \
     "struct F { unsigned a:3; unsigned b:5; }; struct F g = { 6, 25 }; int main(void){ return g.a + g.b; }"
+difftest "compound-member" \
+    "struct S { int x; int y; }; int main(void){ struct S a; a.x=10; a.y=3; a.x+=5; a.y*=4; a.x-=2; return a.x + a.y; }"
+difftest "compound-subscript" \
+    "int main(void){ int m[3]={1,2,3}; m[0]+=m[2]; m[1]*=10; m[2]<<=2; return m[0]+m[1]+m[2]; }"
+difftest "compound-deref" \
+    "int main(void){ int z=20; int *p=&z; *p+=7; *p-=2; *p%=6; return z; }"
+difftest "compound-bitfield" \
+    "struct B { unsigned a:4; unsigned b:8; }; int main(void){ struct B f; f.a=4; f.b=100; f.a+=3; f.b-=50; f.a|=8; return f.a*1000 + f.b; }"
+difftest "compound-nested" \
+    "struct S { int arr[4]; int v; }; int main(void){ struct S a; a.v=100; a.arr[2]=7; a.v/=4; a.arr[2]<<=3; a.v&=30; return a.v + a.arr[2]; }"
 @}
 
 \section{Known Divergences}

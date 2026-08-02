@@ -3985,6 +3985,134 @@ _kcc_ir_store_elem:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+
+// -- kcc_ir_tok_to_binop --------------------------------------------------
+// int kcc_ir_tok_to_binop(int compound_assign_tok) → IR opcode
+.p2align 2
+_kcc_ir_tok_to_binop:
+    cmp x0, #TOK_SUB_ASSIGN
+    b.eq .Ltb_sub
+    cmp x0, #TOK_MUL_ASSIGN
+    b.eq .Ltb_mul
+    cmp x0, #TOK_DIV_ASSIGN
+    b.eq .Ltb_div
+    cmp x0, #TOK_MOD_ASSIGN
+    b.eq .Ltb_mod
+    cmp x0, #TOK_AND_ASSIGN
+    b.eq .Ltb_and
+    cmp x0, #TOK_OR_ASSIGN
+    b.eq .Ltb_or
+    cmp x0, #TOK_XOR_ASSIGN
+    b.eq .Ltb_xor
+    cmp x0, #TOK_SHL_ASSIGN
+    b.eq .Ltb_shl
+    cmp x0, #TOK_SHR_ASSIGN
+    b.eq .Ltb_shr
+    mov x0, #IR_ADD              // TOK_ADD_ASSIGN (and default)
+    ret
+.Ltb_sub: mov x0, #IR_SUB
+    ret
+.Ltb_mul: mov x0, #IR_MUL
+    ret
+.Ltb_div: mov x0, #IR_SDIV
+    ret
+.Ltb_mod: mov x0, #IR_SMOD
+    ret
+.Ltb_and: mov x0, #IR_AND
+    ret
+.Ltb_or:  mov x0, #IR_OR
+    ret
+.Ltb_xor: mov x0, #IR_XOR
+    ret
+.Ltb_shl: mov x0, #IR_SHL
+    ret
+.Ltb_shr: mov x0, #IR_ASHR
+    ret
+
+// -- kcc_ir_assign_through ------------------------------------------------
+// uint64_t kcc_ir_assign_through(addr, rhs, op_tok, field, type) → result vreg
+// Stores `rhs` (simple `=`) or `old op rhs` (compound) through the address
+// vreg `addr`.  `field` non-null with a packed AST_F2 selects a bit-field
+// read-modify-write; otherwise `type` gives the scalar access width.  This is
+// the load-modify-store any address-based lvalue (member, subscript, deref)
+// needs for compound assignment.
+.globl _kcc_ir_assign_through
+.p2align 2
+_kcc_ir_assign_through:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // addr
+    mov x20, x1                  // rhs (later reused for the value to store)
+    mov x21, x2                  // op token
+    mov x22, x3                  // field decl (0 if none)
+    mov x23, x4                  // scalar type
+    mov x24, #0                  // is-bit-field?
+    cbz x22, .Lat_op
+    ldr x0, [x22, #AST_F2]
+    cbz x0, .Lat_op
+    mov x24, #1
+.Lat_op:
+    cmp x21, #TOK_ASSIGN
+    b.ne .Lat_compound
+    // simple assignment: store rhs directly
+    cbnz x24, .Lat_simple_bf
+    mov x0, x23
+    bl _kcc_ir_store_width
+    mov x2, x0
+    mov x0, x20                  // value
+    mov x1, x19                  // addr
+    bl _kcc_ir_emit_store
+    b .Lat_ret
+.Lat_simple_bf:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x22
+    bl _kcc_ir_bitfield_store
+    b .Lat_ret
+.Lat_compound:
+    // load the current value
+    cbnz x24, .Lat_load_bf
+    mov x0, x23
+    bl _kcc_ir_load_width
+    mov x1, x0
+    mov x0, x19
+    bl _kcc_ir_emit_load
+    b .Lat_haveold
+.Lat_load_bf:
+    mov x0, x19
+    mov x1, x22
+    bl _kcc_ir_bitfield_load
+.Lat_haveold:
+    str x0, [sp, #64]            // stash old value vreg
+    mov x0, x21
+    bl _kcc_ir_tok_to_binop
+    ldr x1, [sp, #64]           // old
+    mov x2, x20                  // rhs
+    bl _kcc_ir_emit_binop        // new = old op rhs
+    mov x20, x0                  // value to store = new
+    cbnz x24, .Lat_store_bf
+    mov x0, x23
+    bl _kcc_ir_store_width
+    mov x2, x0
+    mov x0, x20
+    mov x1, x19
+    bl _kcc_ir_emit_store
+    b .Lat_ret
+.Lat_store_bf:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x22
+    bl _kcc_ir_bitfield_store
+.Lat_ret:
+    mov x0, x20                  // result of the assignment expression
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
 @}
 
 Struct tests verify field write, field read, multiple fields, and
@@ -5647,12 +5775,21 @@ the builder emits \texttt{IR\_GLOBAL\_REF} to materialise the
 address.  For simple assignment the value is stored directly; for
 compound operators the same load-binop-store sequence is applied,
 loading from the global address vreg before emitting the binary
-operation and storing the result back.  When the LHS is a
-dereference (\texttt{*p\;=\;v}), the builder records the
-pointed-to type's size in the store instruction's \texttt{IR\_DEST}
-field so that the code generator emits a type-sized write
-(\textsc{strb}/\textsc{strh}/32-bit \textsc{str}) rather than a
-full 64-bit store.
+operation and storing the result back.
+
+The three \emph{address-based} lvalues---a member \texttt{s.f}, a
+subscript \texttt{a[i]}, and a dereference \texttt{*p}---share a single
+helper, \texttt{kcc\_ir\_assign\_through}.  Each computes its target
+address once, then hands the address, the right-hand value, the operator
+token, an optional bit-field descriptor, and the access type to the
+helper, which performs a plain store for \texttt{=} or a
+load-operate-store for a compound operator, sized to the lvalue's type
+(so a narrow field is not clobbered) and routed through the bit-field
+read-modify-write when the target is a bit-field.  Sharing this path is
+what makes \texttt{s.f\;+=\;v}, \texttt{a[i]\;*=\;v}, and
+\texttt{*p\;-=\;v} work uniformly---and, because the helper reuses the
+bit-field primitives, a compound assignment to a bit-field member folds
+out for free.
 
 When the LHS has type \texttt{TY\_STRUCT}, a single store would only
 copy the first field.  Instead, the builder resolves both the LHS
@@ -5964,103 +6101,55 @@ _kcc_ir_build_assign:
     b .Liba_done
 
 .Liba_subscript:
-    // LHS is a[i]: x0 = AST_SUBSCRIPT node, x21 = rhs vreg
-    mov x23, x0                  // save subscript node
+    // LHS is a[i]: x0 = AST_SUBSCRIPT node, x21 = rhs vreg, x20 = op token.
+    // Same load-op-store path as a member, so a[i] += v works too.
+    mov x23, x0                  // subscript node
     bl _kcc_ir_build_subscript_addr
-    mov x22, x0                  // x22 = element address vreg
-
-    // Store width from the element (subscript result) type — covers both
-    // array and pointer element sizes now that elements are packed.
-    ldr x0, [x23, #AST_F3]
-    bl _kcc_ir_store_width
-    mov x24, x0
-
-.Liba_sub_store:
-    mov x0, #IR_STORE
-    bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]     // value
-    str x22, [x0, #IR_SRC2]     // pointer
-    str x24, [x0, #IR_DEST]     // access size override
-    bl _kcc_ir_emit
-    mov x0, x21
+    mov x22, x0                  // element address
+    mov x0, x22                  // addr
+    mov x1, x21                  // rhs
+    mov x2, x20                  // op token
+    mov x3, #0                   // not a bit-field
+    ldr x4, [x23, #AST_F3]      // element type → access width
+    bl _kcc_ir_assign_through
     b .Liba_done
 
 .Liba_member:
-    // LHS is s.x: x0 = AST_MEMBER node, x21 = rhs vreg
-    mov x23, x0                  // save member node
+    // LHS is s.x: x0 = AST_MEMBER node, x21 = rhs vreg, x20 = op token.
+    // The unified helper does simple or compound (load-op-store), and a
+    // bit-field read-modify-write when the field carries bit metadata.
+    mov x23, x0                  // member node
     bl _kcc_ir_build_member_addr
-    mov x22, x0                  // x22 = field address vreg
-
-    // Bit-field?  Read-modify-write the container instead of a plain store.
+    mov x22, x0                  // field address
     adrp x0, _kcc_ir_member_field@@PAGE
     add  x0, x0, _kcc_ir_member_field@@PAGEOFF
-    ldr x9, [x0]
-    cbz x9, .Liba_member_scalar
-    ldr x10, [x9, #AST_F2]
-    cbz x10, .Liba_member_scalar
-    mov x0, x22                  // container address
-    mov x1, x21                  // value
-    mov x2, x9                   // field decl
-    bl _kcc_ir_bitfield_store
-    b .Liba_done
-
-.Liba_member_scalar:
-    // Store width from the field type (so a narrow field is not clobbered)
-    ldr x0, [x23, #AST_F3]
-    bl _kcc_ir_store_width
-    mov x24, x0
-
-    // Emit store: rhs → field address
-    mov x0, #IR_STORE
-    bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]     // value
-    str x22, [x0, #IR_SRC2]     // pointer (GEP result)
-    str x24, [x0, #IR_DEST]     // access size override
-    bl _kcc_ir_emit
-    mov x0, x21
+    ldr x24, [x0]                // matched field decl (0 if none)
+    mov x0, x22                  // addr
+    mov x1, x21                  // rhs
+    mov x2, x20                  // op token
+    mov x3, x24                  // field (bit-field metadata)
+    ldr x4, [x23, #AST_F3]      // member's resolved type → access width
+    bl _kcc_ir_assign_through
     b .Liba_done
 
 .Liba_deref:
-    // LHS is *expr — evaluate the pointer, store RHS through it
+    // LHS is *expr — evaluate the pointer, store RHS through it (load-op-store
+    // for compound), reusing the shared address-lvalue helper.
     ldr x0, [x0, #AST_F0]       // check op is TOK_STAR
     cmp x0, #TOK_STAR
     b.ne .Liba_done
-
-    // Get access size from LHS unary expr's sema type
-    ldr x24, [x19, #AST_F1]     // unary *expr
-    ldr x24, [x24, #AST_F3]     // sema type of *expr
-    mov x23, #0                  // default: 0 = 64-bit store
-    cbz x24, .Liba_deref_eval
-    ldr x23, [x24, #TY_SIZE]    // access size in bytes
-
-.Liba_deref_eval:
-    // Evaluate the pointer expression (operand of *)
+    ldr x23, [x19, #AST_F1]     // unary *expr
+    ldr x23, [x23, #AST_F3]     // sema type of *expr (may be 0 → 64-bit)
     ldr x0, [x19, #AST_F1]      // unary expr
     ldr x0, [x0, #AST_F1]       // operand of * (e.g., IdentExpr 'p')
     bl _kcc_ir_build_expr
-    mov x22, x0                  // x22 = pointer vreg
-
-    // Emit store: value=x21 (rhs), ptr=x22, access_size=x23 in IR_DEST
-    mov x0, #IR_STORE
-    bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]
-    str x22, [x0, #IR_SRC2]
-    str x23, [x0, #IR_DEST]     // access size override
-    bl _kcc_ir_emit
-
-    mov x0, x21
+    mov x22, x0                  // pointer vreg
+    mov x0, x22                  // addr
+    mov x1, x21                  // rhs
+    mov x2, x20                  // op token
+    mov x3, #0                   // not a bit-field
+    mov x4, x23                  // pointed-to type → access width
+    bl _kcc_ir_assign_through
     b .Liba_done
 
 .Liba_struct_copy:

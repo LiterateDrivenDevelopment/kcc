@@ -1575,7 +1575,7 @@ or.  A read loads the whole container, shifts the field down to bit
 zero, masks it to its width, and, for a signed bit-field,
 sign-extends by shifting left then arithmetic-right by
 \texttt{64\,$-$\,width}.  A write is a read-modify-write: load the
-container, clear the field's bits with \texttt{AND\,\texttilde
+container, clear the field's bits with \texttt{AND\,\\texttilde
 (mask\,$\ll$\,offset)}, splice in \texttt{(value\,\&\,mask)\,$\ll$\,%
 offset} with an \texttt{OR}, and store the container back.  All the
 intermediate values are 64-bit so masks up to a full \texttt{long}

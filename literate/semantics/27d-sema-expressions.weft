@@ -202,7 +202,7 @@ node's type falls back to \texttt{int} so the pass keeps running and reports
 any further errors.
 
 \paragraph{The named-message helpers.}
-Several diagnostics have the shape \texttt{\meta{prefix}\meta{name}'} --- an
+Several diagnostics have the shape \texttt{\\meta{prefix}\\meta{name}'} --- an
 undeclared identifier, a missing member, a redefinition, an implicit
 declaration, an unused variable.  \texttt{\_kcc\_sema\_build\_named} assembles
 that body once in the arena (the prefix carries its own opening quote; the

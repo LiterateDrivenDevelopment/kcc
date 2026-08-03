@@ -861,10 +861,10 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       canonical warnings are landed.  \emph{Implicit function declaration:}
       an undeclared name used in call position, previously accepted silently
       for legacy leniency, now draws
-      \texttt{implicit declaration of function '\meta{name}'} under
+      \texttt{implicit declaration of function '\\meta{name}'} under
       \texttt{-Wall} (the compile still proceeds).  \emph{Unused variable:}
       a block-scope local that is declared but never referenced draws
-      \texttt{unused variable '\meta{name}'}, checked as each block and
+      \texttt{unused variable '\\meta{name}'}, checked as each block and
       \texttt{for} scope is left; a variable counts as referenced the moment
       it appears in any expression, so the check never fires on a
       genuinely-used name, and parameters---which live in the function scope,
@@ -1353,10 +1353,10 @@ standard struct layout           & \checkmark & padding/align, 15 diff. tests \\
 single-precision \texttt{float}  & \checkmark & rounded at boundaries; 6 diff. tests \\
 \texttt{long double}             &            & not lowered \\
 \texttt{union}                   & \checkmark & offset-0 layout; 6 diff. tests \\
-bit-fields                       &            & no real packing \\
-\texttt{\_Bool} 0/1 normalisation & $\circ$   & not verified \\
-\texttt{char s[] = "..."}        &            & string-array init \\
-designated initialisers          &            & \texttt{[i]=}, \texttt{.f=} \\
+bit-fields                       & \checkmark & LSB-first packing; 7 diff. tests \\
+\texttt{\_Bool} 0/1 normalisation & \checkmark & any non-zero $\to$ 1 \\
+\texttt{char s[] = "..."}        & \checkmark & byte-copy init; 8 diff. tests \\
+designated initialisers          & $\circ$    & single-level \texttt{[i]=}/\texttt{.f=}; nested TODO \\
 \texttt{volatile} semantics      &            & parsed, not honoured \\
 variadic \emph{definitions}      & \checkmark & \texttt{va\_arg} builtins, 3 diff. tests \\
 \texttt{\_Generic} lowering      & $\circ$    & parsed, not selected \\
@@ -1378,23 +1378,26 @@ narrower: the AAPCS64 rules for \emph{passing} small structs packed into
 layout itself is now the platform layout.
 
 \paragraph{Production engineering --- what remains.}
-This is the larger axis, and the one where \kcc{} is furthest from an
-industrial toolchain:
+Once the larger axis, this is now mostly closed; what remains is
+quality-oriented---an optimizer, global register allocation, input
+hardening, and a second target---rather than missing capability:
 
 \begin{center}
 \begin{tabular}{lcl}
 \hline
 Concern & Status & Note \\
 \hline
-optimization / reg.\ alloc. &         & all-spill; ${\sim}3\times$ memory traffic \\
+local register allocation    & \checkmark & linear-scan, caller+callee-saved \\
+optimizer / global-FP reg.\ alloc. & & no passes yet; still ${\sim}$all-spill globals \\
 $>8$ arguments on the stack  & \checkmark & self-consistent, 5 diff. tests \\
 AAPCS64 register convention  & \checkmark & FP/small+large struct/x8; interop 16/16 \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\
 automatic linking (\texttt{ld}) & \checkmark & \texttt{kcc x.c -o x}; \texttt{just e2e} \\
-standard library / sys.\ headers &     & no \texttt{<stdio.h>} \\
-multi-error recovery         &         & aborts on first error \\
-warnings (\texttt{-Wall})    &         & none \\
-debug info (DWARF)           &         & no \texttt{lldb} support \\
+freestanding sys.\ headers   & \checkmark & built-in \texttt{<stdio.h>} etc.; GOT-indirect data \\
+multi-error recovery         & \checkmark & reports every error; carets; \texttt{just diagtest} \\
+warnings (\texttt{-Wall})    & \checkmark & 5 canonical warnings; \texttt{just warntest} \\
+debug info (DWARF)           & \checkmark & \texttt{-g}; func-granularity; verify-clean + links \\
+harden vs.\ malformed input  &         & not fuzzed \\
 full \texttt{-O}/\texttt{-I}/\texttt{-D} CLI & $\circ$ & partial \\
 \hline
 \end{tabular}
@@ -1402,30 +1405,42 @@ full \texttt{-O}/\texttt{-I}/\texttt{-D} CLI & $\circ$ & partial \\
 
 \paragraph{Bottom line.}
 As a \emph{correct compiler for the integer/pointer/aggregate subset of
-C, plus \texttt{double}}, \kcc{} is in good shape and unusually
-well-tested for a hand-written assembly project.  As a \emph{complete
-C17 implementation} it is roughly three-quarters there: with
-\texttt{union}s and single-precision \texttt{float} now done, the bounded
-pieces still missing are bit-fields, \texttt{long double}, designated
-initializers, \texttt{\_Generic}, \texttt{volatile} semantics, and
-\texttt{char s[] = "..."} string-array initialization.
-Standard struct layout, more-than-eight stack arguments, variadic
-function definitions, and a fully AAPCS64-compliant calling convention
-(floating values in \texttt{d} registers, small structs in
-\texttt{x0}--\texttt{x1}, 9--16-byte struct arguments in two registers, large
-struct returns via \texttt{x8})---all previously open---are now done and
-cross-checked in both directions against \texttt{clang} with a mixed-object
-interoperability suite (16/16), so \kcc{} objects link and run correctly with
-\texttt{clang} ones.  The Stage~9b ABI is complete, and the driver now links
-automatically: \texttt{kcc hello.c -o hello} produces a runnable executable in
-one step (\S\ref{sec:auto-linking}).  As a
-\emph{production-ready} toolchain in the industrial sense it is still early:
-no optimizer, a single target, no standard
-library, and first-error-only diagnostics.  The shortest credible path
-to ``usable in production for real programs'' now runs through, in order:
-a minimal freestanding header set (so \texttt{\#include <stdio.h>} yields
-real prototypes), then register allocation for code quality, then
-multi-error recovery and \texttt{-Wall} warnings.  Everything after that---a
-second target, DWARF, an
-optimizer rivalling \texttt{clang -O1}---is refinement rather than
-feasibility.
+C, plus \texttt{double} and single-precision \texttt{float}}, \kcc{} is in
+good shape and unusually well-tested for a hand-written assembly project:
+the differential suite finds zero miscompilations against \texttt{clang}
+(187/0), the mixed-object interoperability suite is green in both
+directions (16/16), and the compiler self-hosts to a byte-identical binary.
+As a \emph{complete C17 implementation} it is roughly four-fifths there:
+with \texttt{union}s, single-precision \texttt{float}, bit-fields, single-level
+designated initializers, \texttt{\_Bool} normalization, and
+\texttt{char s[] = "..."} now done, the bounded pieces still missing are
+\texttt{long double}, \texttt{\_Generic}, \texttt{volatile} semantics, nested
+designator chains, and per-operation single-precision float rounding (today
+\texttt{float} arithmetic rounds only at conversion boundaries).
+
+The toolchain axis, previously the weakest, has closed most of its gaps.
+Standard struct layout, more-than-eight stack arguments, variadic function
+definitions, and a fully AAPCS64-compliant calling convention (floating values
+in \texttt{d} registers, small structs in \texttt{x0}--\texttt{x1},
+9--16-byte struct arguments in two registers, large struct returns via
+\texttt{x8}) are done and cross-checked against \texttt{clang}.  The driver
+links automatically---\texttt{kcc hello.c -o hello} produces a runnable
+executable in one step (\S\ref{sec:auto-linking})---serving freestanding system
+headers (\texttt{\#include <stdio.h>} yields real prototypes, imported data
+reached GOT-indirect).  The front end now recovers past the first error and
+reports every diagnostic with a \texttt{clang}-style caret (\texttt{just
+diagtest}), \texttt{-Wall} enables five canonical warnings (\texttt{just
+warntest}), a local linear-scan register allocator uses both caller- and
+callee-saved banks, and \texttt{-g} emits verify-clean, linkable DWARF
+(Chapter~\ref{ch:dwarf}).
+
+What still separates \kcc{} from an \emph{industrial} toolchain is now
+narrow and quality-oriented rather than a matter of missing capability:
+there is no optimizer and only local (not global/FP) register allocation, so
+generated code is correct but not fast; the front end has not been hardened
+against adversarial or truncated input; and there is a single target
+(ARM64/Mach-O).  The shortest credible path from here runs, in order, through
+hardening the front end against malformed input, then an optimizer with global
+and floating-point register allocation for code quality.  Everything after
+that---a second target, statement-level DWARF, an optimizer rivalling
+\texttt{clang -O1}---is refinement rather than feasibility.

@@ -92,7 +92,7 @@ stacks, walk their child list recursively, and pop the scope on exit.
 Just before that pop---and likewise before a \texttt{for}-scope is
 popped---\texttt{kcc\_sema\_check\_unused\_scope} runs, so a
 block-scope variable that was declared but never referenced draws an
-\texttt{unused variable '\meta{name}'} warning under \texttt{-Wall}.
+\texttt{unused variable '\\meta{name}'} warning under \texttt{-Wall}.
 The check is placed at the block and \texttt{for} scopes but \emph{not}
 at the function scope, whose only occupants are the parameters---an
 unused parameter is outside \texttt{-Wall} (it lives in

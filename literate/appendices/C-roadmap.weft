@@ -732,7 +732,7 @@ current standing:
 9b & Full ABI compliance    & AAPCS64, struct-by-value, variadic; \texttt{clang}-validated & \stDone\\
 9c & Register allocation    & local linear-scan, caller \& callee-saved & \stDone\\
 9d & Optimization           & CSE, copy-prop, strength reduction, global RA & \stOpen\\
-9e & Tooling \& diagnostics & auto-link \& headers done; errors, DWARF left & \stPart\\
+9e & Tooling \& diagnostics & auto-link, headers, errors, \texttt{-Wall}, DWARF done; hardening left & \stPart\\
 \hline
 \end{tabular}
 \end{center}
@@ -796,7 +796,7 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 3  & Designated initializers \stDone            & \meterA & \meterB & 9a\\
 4  & Bit-fields \stDone                         & \meterA & \meterB & 9a\\
 5  & \_Bool normalize, \texttt{char\,s[]="\dots"} \stDone & \meterB & \meterC & 9a\\
-6  & DWARF debug info                           & \meterB & \meterA & 9e\\
+6  & DWARF debug info \stDone                    & \meterB & \meterA & 9e\\
 7  & Harden vs.\ malformed input                & \meterB & \meterB & new\\
 8  & Optimizer \& global/FP reg-alloc           & \meterB & \meterA & 9c--9d\\
 9  & Tail C17 (\_Generic, \texttt{long double}) & \meterC & \meterB & 9a\\
@@ -933,10 +933,12 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       sees the real length.  Only the multi-dimensional case
       (\texttt{int m[][3]}) remains, awaiting nested-aggregate
       initialization---a gap present for explicit sizes as well.
-\item \textbf{DWARF debug information} (Stage~9e).  The line table first
-      (source-level stepping and breakpoints), then variable DIEs.  Large but
-      additive---it emits \texttt{\_\_debug\_*} sections without changing code
-      generation---and it is what lets \texttt{lldb}/\texttt{gdb} work.
+\item[\checkmark] \textbf{DWARF debug information} (Stage~9e, done).  The
+      function-granularity line table and \texttt{subprogram} DIEs now land
+      under \texttt{-g} (Chapter~\ref{ch:dwarf})---additive, emitting
+      \texttt{\_\_debug\_*} sections without touching code generation.
+      Statement-level rows and variable DIEs are the follow-ups that unlock
+      full \texttt{lldb}/\texttt{gdb} stepping and inspection.
 \item \textbf{Hardening against malformed input} (new).  A production
       compiler must reject adversarial or truncated source cleanly rather than
       crash; fuzz the front end and close the holes.
@@ -1191,11 +1193,18 @@ linking and freestanding headers here are already done.
 A production compiler needs more than correct code generation.
 
 \begin{itemize}
-\item \textbf{DWARF debug information.}  Emit
-      \texttt{\_\_debug\_info}, \texttt{\_\_debug\_line},
-      \texttt{\_\_debug\_abbrev}, and \texttt{\_\_debug\_str}
-      sections so that \texttt{lldb} can set breakpoints,
-      inspect variables, and show source locations.
+\item[\checkmark] \textbf{DWARF debug information.}  Done
+      (Chapter~\ref{ch:dwarf}): under \texttt{-g} the emitter writes
+      \texttt{\_\_debug\_abbrev}, \texttt{\_\_debug\_info} (a
+      \texttt{compile\_unit} DIE plus one \texttt{subprogram} DIE per
+      function, names inlined as \texttt{DW\_FORM\_string}), and
+      \texttt{\_\_debug\_line} (a function-granularity line-number program)
+      into a non-loaded \texttt{\_\_DWARF} \texttt{LC\_SEGMENT\_64} whose
+      VM range is placed past \texttt{\_\_TEXT} and whose file span sits
+      between the code and the LINKEDIT region.  \texttt{dwarfdump
+      --verify} reports no errors and the \texttt{-g} object still links.
+      Statement-level rows and relocated addresses (so \texttt{lldb} can
+      map a \emph{linked} binary) are the next refinements.
 \item \textbf{Warning system.}  Implement at least
       \texttt{-Wall}-equivalent diagnostics: unused variables,
       implicit int conversions, missing return statements,

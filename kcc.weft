@@ -499,6 +499,7 @@ source file to \texttt{.o}.
 
 \begin{multicols}{2}
 @i literate/backend/40-linker-info.weft
+@i literate/dwarf/41-dwarf.weft
 \end{multicols}
 \newpage
 

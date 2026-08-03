@@ -412,6 +412,10 @@ _kcc_ir_build_func:
     bl _kcc_ir_alloc_func
     mov x23, x0                  // x23 = ir_func
 
+    // Record the declaration line for DWARF debug info.
+    ldr x0, [x19, #AST_LINE]
+    str x0, [x23, #IRF_LINE]
+
     // Set as current function
     adrp x1, _kcc_ir_cur_func@@PAGE
     add  x1, x1, _kcc_ir_cur_func@@PAGEOFF

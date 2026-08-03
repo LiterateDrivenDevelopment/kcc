@@ -116,6 +116,10 @@ _kcc_driver_compile:
     // 14b. Append string literal data to code section
     bl _kcc_codegen_emit_strings
 
+    // 14c. Build DWARF debug sections (only under -g); code size and all
+    // function addresses are final by now.
+    bl _kcc_dwarf_build
+
     // 15. Write Mach-O object file
     mov x0, x20                    // out_path
     bl _kcc_macho_init
@@ -269,6 +273,11 @@ _kcc_driver_compile_all:
     bl _kcc_strcmp
     cbz x0, .Lca_scan_wall
     ldr x0, [x20, x23, lsl #3]     // argv[i]
+    adrp x1, _kcc_opt_g@@PAGE
+    add  x1, x1, _kcc_opt_g@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_scan_g
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
     adrp x1, _kcc_opt_o@@PAGE
     add  x1, x1, _kcc_opt_o@@PAGEOFF
     bl _kcc_strcmp
@@ -280,6 +289,14 @@ _kcc_driver_compile_all:
     // "-Wall": enable the warning family; not a source
     adrp x0, _kcc_warn_all@@PAGE
     add  x0, x0, _kcc_warn_all@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x23, x23, #1
+    b .Lca_scan
+.Lca_scan_g:
+    // "-g": emit DWARF debug info; not a source
+    adrp x0, _kcc_dwarf_enabled@@PAGE
+    add  x0, x0, _kcc_dwarf_enabled@@PAGEOFF
     mov  x1, #1
     str  x1, [x0]
     add x23, x23, #1
@@ -306,6 +323,11 @@ _kcc_driver_compile_all:
     add  x1, x1, _kcc_opt_wall@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lca_skip_wall
+    mov x0, x25
+    adrp x1, _kcc_opt_g@@PAGE
+    add  x1, x1, _kcc_opt_g@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_skip_wall         // -g: same as -Wall, skip (already handled)
     mov x0, x25
     adrp x1, _kcc_opt_o@@PAGE
     add  x1, x1, _kcc_opt_o@@PAGEOFF
@@ -665,6 +687,8 @@ _kcc_opt_o:
     .asciz "-o"
 _kcc_opt_wall:
     .asciz "-Wall"
+_kcc_opt_g:
+    .asciz "-g"
 _kcc_driver_err_noinput:
     .asciz "kcc: error: no input files\n"
 _kcc_str_ld_argv0:

@@ -158,6 +158,7 @@ _kcc_codegen_func:
     // 2. Record function start offset
     bl _kcc_code_current_pos
     mov x21, x0                    // x21 = func_start_offset
+    str x21, [x19, #IRF_LOWPC]     // low_pc for DWARF debug info
 
     // 3. Initialize BB label hash table (bb_id → code_offset), sized to
     //    the function's BB count: next power of two >= 4*bb_count, min 64.

@@ -493,6 +493,17 @@ physical assembly files under \texttt{tmp/src/}.
 @<MachO: data@>
 @}
 
+@o tmp/src/dwarf.s @{
+@<ARM64: common macros@>
+@<Vec: constants@>
+@<IR: constants@>
+@<DWARF: constants@>
+@<DWARF: emit@>
+@<DWARF: build@>
+@<DWARF: macho@>
+@<DWARF: data@>
+@}
+
 \noindent\textbf{driver.s} --- compilation driver:
 
 @o tmp/src/driver.s @{

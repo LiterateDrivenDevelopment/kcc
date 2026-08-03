@@ -1,0 +1,903 @@
+% 41-dwarf.weft — DWARF debug information (line table + DIEs)
+%
+% New capability file (created fresh, per the split policy: a genuinely new
+% separable capability gets its own file from the start).
+%
+% Emits DWARF v4 debug sections (__debug_abbrev, __debug_info, __debug_line)
+% into a dedicated buffer, which the Mach-O writer places in a __DWARF
+% segment.  Purely additive and gated behind -g: without the flag,
+% _kcc_dwarf_build is a no-op and the object file is byte-identical to before.
+
+\chapter{DWARF Debug Information}
+\label{ch:dwarf}
+
+Debuggers such as \texttt{lldb} read \emph{DWARF} debug information
+(\stdref{}, DWARF~4) to map machine addresses back to source functions
+and lines.  \kcc{} emits three sections: \texttt{.debug\_abbrev} (a
+table of DIE shapes), \texttt{.debug\_info} (a compile-unit DIE plus one
+\texttt{subprogram} DIE per function, carrying its name, address range,
+and declaration line), and \texttt{.debug\_line} (a line-number program
+mapping each function's entry address to its source line).  This first
+increment is at \emph{function} granularity---enough for
+\texttt{lldb} to name functions in a backtrace and break on a function;
+statement-level rows are a later refinement that needs a source line on
+each IR instruction.
+
+Everything here is additive and switched on only by \texttt{-g}: with the
+flag off, \texttt{kcc\_dwarf\_build} returns immediately and the Mach-O
+writer emits exactly the object file it did before.
+
+\section{Constants}
+
+The DWARF tag, attribute, and form codes we use, plus the standard
+line-number opcodes.
+
+@d DWARF: constants @{
+// -- DWARF v4 constants -------------------------------------------------
+.equ DW_TAG_compile_unit, 0x11
+.equ DW_TAG_subprogram,   0x2e
+.equ DW_CHILDREN_no,      0
+.equ DW_CHILDREN_yes,     1
+.equ DW_AT_name,          0x03
+.equ DW_AT_stmt_list,     0x10
+.equ DW_AT_low_pc,        0x11
+.equ DW_AT_high_pc,       0x12
+.equ DW_AT_language,      0x13
+.equ DW_AT_comp_dir,      0x1b
+.equ DW_AT_producer,      0x25
+.equ DW_AT_decl_line,     0x3b
+.equ DW_FORM_addr,        0x01
+.equ DW_FORM_data2,       0x05
+.equ DW_FORM_string,      0x08
+.equ DW_FORM_udata,       0x0f
+.equ DW_FORM_sec_offset,  0x17
+.equ DW_LANG_C99,         0x0c
+.equ DW_LNS_copy,         1
+.equ DW_LNS_advance_line, 3
+.equ DW_LNE_end_sequence, 1
+.equ DW_LNE_set_address,  2
+.equ DWARF_BUF_CAP,       262144   // 256 KiB scratch for the debug blob
+.equ LC_SEGMENT_64,       0x19     // (also defined in the Mach-O module)
+@}
+
+\section{Byte Emitters}
+
+The debug sections are built into one contiguous buffer
+(\texttt{\_kcc\_dwarf\_buf}); the Mach-O writer records each section's
+offset and length and copies the blob out.  The emitters append
+little-endian integers, LEB128 values (DWARF's variable-length
+encoding), raw strings, and---for the two length-prefixed sections---a
+back-patch of a previously reserved \texttt{u32}.
+
+@d DWARF: emit @{
+// -- dwarf byte emitters ------------------------------------------------
+// All append to _kcc_dwarf_buf at _kcc_dwarf_pos (bounds-guarded).
+.text
+.p2align 2
+_kcc_dw_u8:
+    adrp x1, _kcc_dwarf_pos@@PAGE
+    add  x1, x1, _kcc_dwarf_pos@@PAGEOFF
+    ldr  x2, [x1]
+    adrp x3, _kcc_dwarf_buf@@PAGE
+    add  x3, x3, _kcc_dwarf_buf@@PAGEOFF
+    ldr  x3, [x3]
+    strb w0, [x3, x2]
+    add  x2, x2, #1
+    str  x2, [x1]
+    ret
+
+.p2align 2
+_kcc_dw_u16:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // value (callee-saved; _kcc_dw_u8 clobbers x1-x3)
+    and x0, x19, #0xff
+    bl _kcc_dw_u8
+    lsr x0, x19, #8
+    and x0, x0, #0xff
+    bl _kcc_dw_u8
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.p2align 2
+_kcc_dw_u32:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    and x0, x19, #0xff
+    bl _kcc_dw_u8
+    lsr x0, x19, #8
+    and x0, x0, #0xff
+    bl _kcc_dw_u8
+    lsr x0, x19, #16
+    and x0, x0, #0xff
+    bl _kcc_dw_u8
+    lsr x0, x19, #24
+    and x0, x0, #0xff
+    bl _kcc_dw_u8
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+.p2align 2
+_kcc_dw_u64:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    and x0, x19, #0xffffffff
+    bl _kcc_dw_u32
+    lsr x0, x19, #32
+    bl _kcc_dw_u32
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// unsigned LEB128
+.p2align 2
+_kcc_dw_uleb:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // value
+.Luleb_loop:
+    and x0, x19, #0x7f           // low 7 bits
+    lsr x19, x19, #7
+    cbz x19, .Luleb_last
+    orr x0, x0, #0x80            // more bytes follow
+    bl _kcc_dw_u8
+    b .Luleb_loop
+.Luleb_last:
+    bl _kcc_dw_u8
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// signed LEB128
+.p2align 2
+_kcc_dw_sleb:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // value (sign-extended in x19)
+.Lsleb_loop:
+    and x0, x19, #0x7f           // low 7 bits (byte candidate)
+    asr x19, x19, #7             // arithmetic shift keeps the sign
+    // done when x19 is 0 and sign bit of byte clear, or x19 is -1 and set
+    tst x0, #0x40                // sign bit of the 7-bit group
+    b.eq .Lsleb_check_pos
+    // negative group: done if x19 == -1
+    cmn x19, #1
+    b.eq .Lsleb_last
+    b .Lsleb_more
+.Lsleb_check_pos:
+    cbz x19, .Lsleb_last
+.Lsleb_more:
+    orr x0, x0, #0x80
+    bl _kcc_dw_u8
+    b .Lsleb_loop
+.Lsleb_last:
+    bl _kcc_dw_u8
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// Append a NUL-terminated string (including the NUL).
+.p2align 2
+_kcc_dw_str:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // string ptr
+    cbz x19, .Ldwstr_nul
+.Ldwstr_loop:
+    ldrb w0, [x19]
+    cbz w0, .Ldwstr_end
+    bl _kcc_dw_u8
+    add x19, x19, #1
+    b .Ldwstr_loop
+.Ldwstr_end:
+    mov w0, #0
+    bl _kcc_dw_u8
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Ldwstr_nul:
+    mov w0, #0
+    bl _kcc_dw_u8
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// Return the current write position (for a later back-patch).
+.p2align 2
+_kcc_dw_pos:
+    adrp x0, _kcc_dwarf_pos@@PAGE
+    add  x0, x0, _kcc_dwarf_pos@@PAGEOFF
+    ldr  x0, [x0]
+    ret
+
+// Overwrite a u32 at a saved position (little-endian).  x0 = pos, x1 = value.
+.p2align 2
+_kcc_dw_patch32:
+    adrp x2, _kcc_dwarf_buf@@PAGE
+    add  x2, x2, _kcc_dwarf_buf@@PAGEOFF
+    ldr  x2, [x2]
+    add  x2, x2, x0              // &buf[pos]
+    strb w1, [x2]
+    lsr  w3, w1, #8
+    strb w3, [x2, #1]
+    lsr  w3, w1, #16
+    strb w3, [x2, #2]
+    lsr  w3, w1, #24
+    strb w3, [x2, #3]
+    ret
+@}
+
+\section{Building the Sections}
+
+\texttt{kcc\_dwarf\_build} is the entry point the driver calls.  It
+returns immediately unless \texttt{-g} set \texttt{\_kcc\_dwarf\_enabled}.
+Otherwise it allocates the scratch buffer and lays down the three
+sections back to back, recording each one's \texttt{(offset, length)} so
+the Mach-O writer can emit a \texttt{section\_64} for it.
+
+The abbreviation table declares two DIE shapes: a \texttt{compile\_unit}
+(with children) carrying the producer, language, file name, working
+directory, whole-unit address range, and a pointer to the line program;
+and a \texttt{subprogram} (leaf) carrying a function's name, address
+range, and declaration line.  The info section then instantiates one
+compile unit and one subprogram per function, reading each function's
+name (\texttt{IRF\_NAME}), entry offset (\texttt{IRF\_LOWPC}, recorded by
+codegen), and declaration line (\texttt{IRF\_LINE}, recorded by the IR
+builder).  A function's \texttt{high\_pc} is the next function's entry
+(functions are laid out in order), or the total code size for the last.
+
+@d DWARF: build @{
+// -- kcc_dwarf_build ----------------------------------------------------
+// void kcc_dwarf_build(void)
+// No-op unless -g.  Builds .debug_abbrev/.debug_info/.debug_line into
+// _kcc_dwarf_buf and records per-section offset/length globals.
+.text
+.globl _kcc_dwarf_build
+.p2align 2
+_kcc_dwarf_build:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    adrp x0, _kcc_dwarf_enabled@@PAGE
+    add  x0, x0, _kcc_dwarf_enabled@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Ldwb_done
+    // Allocate the scratch buffer.
+    mov x0, #DWARF_BUF_CAP
+    bl _kcc_arena_alloc
+    adrp x1, _kcc_dwarf_buf@@PAGE
+    add  x1, x1, _kcc_dwarf_buf@@PAGEOFF
+    str x0, [x1]
+    adrp x1, _kcc_dwarf_pos@@PAGE
+    add  x1, x1, _kcc_dwarf_pos@@PAGEOFF
+    str xzr, [x1]
+
+    bl _kcc_dwarf_build_abbrev
+    bl _kcc_dwarf_build_info
+    bl _kcc_dwarf_build_line
+.Ldwb_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- .debug_abbrev ------------------------------------------------------
+.p2align 2
+_kcc_dwarf_build_abbrev:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    bl _kcc_dw_pos
+    adrp x1, _kcc_dw_abbrev_off@@PAGE
+    add  x1, x1, _kcc_dw_abbrev_off@@PAGEOFF
+    str x0, [x1]
+    // abbrev 1: compile_unit, has children
+    mov x0, #1
+    bl _kcc_dw_uleb
+    mov x0, #DW_TAG_compile_unit
+    bl _kcc_dw_uleb
+    mov w0, #DW_CHILDREN_yes
+    bl _kcc_dw_u8
+    mov x0, #DW_AT_producer
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_string
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_language
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_data2
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_name
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_string
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_comp_dir
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_string
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_low_pc
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_addr
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_high_pc
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_addr
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_stmt_list
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_sec_offset
+    bl _kcc_dw_uleb
+    mov w0, #0
+    bl _kcc_dw_u8
+    mov w0, #0
+    bl _kcc_dw_u8    // end of attrs
+    // abbrev 2: subprogram, leaf
+    mov x0, #2
+    bl _kcc_dw_uleb
+    mov x0, #DW_TAG_subprogram
+    bl _kcc_dw_uleb
+    mov w0, #DW_CHILDREN_no
+    bl _kcc_dw_u8
+    mov x0, #DW_AT_name
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_string
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_low_pc
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_addr
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_high_pc
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_addr
+    bl _kcc_dw_uleb
+    mov x0, #DW_AT_decl_line
+    bl _kcc_dw_uleb
+    mov x0, #DW_FORM_udata
+    bl _kcc_dw_uleb
+    mov w0, #0
+    bl _kcc_dw_u8
+    mov w0, #0
+    bl _kcc_dw_u8
+    // terminator abbrev (code 0)
+    mov w0, #0
+    bl _kcc_dw_u8
+    // record length
+    bl _kcc_dw_pos
+    adrp x1, _kcc_dw_abbrev_off@@PAGE
+    add x1, x1, _kcc_dw_abbrev_off@@PAGEOFF
+    ldr x1, [x1]
+    sub x0, x0, x1
+    adrp x1, _kcc_dw_abbrev_len@@PAGE
+    add x1, x1, _kcc_dw_abbrev_len@@PAGEOFF
+    str x0, [x1]
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- .debug_info --------------------------------------------------------
+// x19 = length-field patch position, x20 = func index, x21 = func count,
+// x22 = funcs vec, x23 = current func, x24 = code size.
+.p2align 2
+_kcc_dwarf_build_info:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    bl _kcc_dw_pos
+    adrp x1, _kcc_dw_info_off@@PAGE
+    add x1, x1, _kcc_dw_info_off@@PAGEOFF
+    str x0, [x1]
+    // unit_length (patched later)
+    bl _kcc_dw_pos
+    mov x19, x0
+    mov x0, #0
+    bl _kcc_dw_u32
+    mov x0, #4
+    bl _kcc_dw_u16              // version
+    mov x0, #0
+    bl _kcc_dw_u32              // debug_abbrev_offset
+    mov w0, #8
+    bl _kcc_dw_u8               // address_size
+    // CU DIE (abbrev 1)
+    mov x0, #1
+    bl _kcc_dw_uleb
+    adrp x0, _kcc_dw_producer@@PAGE
+    add x0, x0, _kcc_dw_producer@@PAGEOFF
+    bl _kcc_dw_str
+    mov x0, #DW_LANG_C99
+    bl _kcc_dw_u16
+    adrp x0, _kcc_src_path@@PAGE
+    add x0, x0, _kcc_src_path@@PAGEOFF
+    ldr x0, [x0]
+    bl _kcc_dw_str
+    adrp x0, _kcc_dw_compdir@@PAGE
+    add x0, x0, _kcc_dw_compdir@@PAGEOFF
+    bl _kcc_dw_str
+    mov x0, #0
+    bl _kcc_dw_u64              // low_pc = text base
+    // high_pc = code size
+    adrp x0, _kcc_code_pos@@PAGE
+    add x0, x0, _kcc_code_pos@@PAGEOFF
+    ldr x24, [x0]
+    mov x0, x24
+    bl _kcc_dw_u64
+    mov x0, #0
+    bl _kcc_dw_u32              // stmt_list offset into .debug_line
+
+    // subprogram DIEs, one per function
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x22, [x0]
+    cbz x22, .Ldwinfo_end
+    ldr x21, [x22, #VEC_COUNT]
+    mov x20, #0
+.Ldwinfo_loop:
+    cmp x20, x21
+    b.ge .Ldwinfo_end
+    mov x0, x22
+    mov x1, x20
+    bl _kcc_vec_get
+    ldr x23, [x0]   // func ptr
+    cbz x23, .Ldwinfo_next
+    mov x0, #2
+    bl _kcc_dw_uleb              // abbrev subprogram
+    ldr x0, [x23, #IRF_NAME]
+    bl _kcc_dw_str
+    ldr x0, [x23, #IRF_LOWPC]
+    bl _kcc_dw_u64   // low_pc
+    // high_pc = next func low_pc, or code size for the last
+    add x1, x20, #1
+    cmp x1, x21
+    b.ge .Ldwinfo_last_hi
+    mov x0, x22
+    bl _kcc_vec_get
+    ldr x0, [x0]
+    ldr x0, [x0, #IRF_LOWPC]
+    b .Ldwinfo_emit_hi
+.Ldwinfo_last_hi:
+    mov x0, x24                              // code size
+.Ldwinfo_emit_hi:
+    bl _kcc_dw_u64
+    ldr x0, [x23, #IRF_LINE]
+    bl _kcc_dw_uleb   // decl_line
+.Ldwinfo_next:
+    add x20, x20, #1
+    b .Ldwinfo_loop
+.Ldwinfo_end:
+    mov w0, #0
+    bl _kcc_dw_u8               // null DIE ends CU children
+    // patch unit_length = (end - (patchpos+4))
+    bl _kcc_dw_pos
+    add x1, x19, #4
+    sub x1, x0, x1
+    mov x0, x19
+    bl _kcc_dw_patch32
+    // record section length
+    bl _kcc_dw_pos
+    adrp x1, _kcc_dw_info_off@@PAGE
+    add x1, x1, _kcc_dw_info_off@@PAGEOFF
+    ldr x1, [x1]
+    sub x0, x0, x1
+    adrp x1, _kcc_dw_info_len@@PAGE
+    add x1, x1, _kcc_dw_info_len@@PAGEOFF
+    str x0, [x1]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- .debug_line --------------------------------------------------------
+// x19 = unit_length patch pos, x20 = header_length patch pos,
+// x21 = func index, x22 = funcs vec, x23 = func count, x24 = cur line reg.
+.p2align 2
+_kcc_dwarf_build_line:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    bl _kcc_dw_pos
+    adrp x1, _kcc_dw_line_off@@PAGE
+    add x1, x1, _kcc_dw_line_off@@PAGEOFF
+    str x0, [x1]
+    // unit_length (patched)
+    bl _kcc_dw_pos
+    mov x19, x0
+    mov x0, #0
+    bl _kcc_dw_u32
+    mov x0, #4
+    bl _kcc_dw_u16              // version
+    // header_length (patched)
+    bl _kcc_dw_pos
+    mov x20, x0
+    mov x0, #0
+    bl _kcc_dw_u32
+    mov w0, #4
+    bl _kcc_dw_u8               // minimum_instruction_length (ARM64)
+    mov w0, #1
+    bl _kcc_dw_u8               // maximum_operations_per_instruction
+    mov w0, #1
+    bl _kcc_dw_u8               // default_is_stmt
+    mov w0, #-5
+    bl _kcc_dw_u8              // line_base (signed)
+    mov w0, #14
+    bl _kcc_dw_u8              // line_range
+    mov w0, #13
+    bl _kcc_dw_u8              // opcode_base
+    // standard_opcode_lengths for opcodes 1..12
+    mov w0, #0
+    bl _kcc_dw_u8               // 1 copy
+    mov w0, #1
+    bl _kcc_dw_u8               // 2 advance_pc
+    mov w0, #1
+    bl _kcc_dw_u8               // 3 advance_line
+    mov w0, #1
+    bl _kcc_dw_u8               // 4 set_file
+    mov w0, #1
+    bl _kcc_dw_u8               // 5 set_column
+    mov w0, #0
+    bl _kcc_dw_u8               // 6 negate_stmt
+    mov w0, #0
+    bl _kcc_dw_u8               // 7 set_basic_block
+    mov w0, #0
+    bl _kcc_dw_u8               // 8 const_add_pc
+    mov w0, #1
+    bl _kcc_dw_u8               // 9 fixed_advance_pc
+    mov w0, #0
+    bl _kcc_dw_u8               // 10 set_prologue_end
+    mov w0, #0
+    bl _kcc_dw_u8               // 11 set_epilogue_begin
+    mov w0, #1
+    bl _kcc_dw_u8               // 12 set_isa
+    // include_directories: empty → single terminating 0
+    mov w0, #0
+    bl _kcc_dw_u8
+    // file_names: one entry for the source file
+    adrp x0, _kcc_src_path@@PAGE
+    add x0, x0, _kcc_src_path@@PAGEOFF
+    ldr x0, [x0]
+    bl _kcc_dw_str
+    mov x0, #0
+    bl _kcc_dw_uleb             // dir index
+    mov x0, #0
+    bl _kcc_dw_uleb             // mtime
+    mov x0, #0
+    bl _kcc_dw_uleb             // length
+    mov w0, #0
+    bl _kcc_dw_u8               // end of file table
+    // patch header_length = (here - (patchpos+4))
+    bl _kcc_dw_pos
+    add x1, x20, #4
+    sub x1, x0, x1
+    mov x0, x20
+    bl _kcc_dw_patch32
+    // ---- line-number program ----
+    mov x24, #1                              // line register starts at 1
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x22, [x0]
+    cbz x22, .Ldwline_endseq
+    ldr x23, [x22, #VEC_COUNT]
+    mov x21, #0
+.Ldwline_loop:
+    cmp x21, x23
+    b.ge .Ldwline_endseq
+    mov x0, x22
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x2, [x0]   // func
+    cbz x2, .Ldwline_next
+    // DW_LNE_set_address low_pc
+    mov w0, #0
+    bl _kcc_dw_u8               // extended opcode intro
+    mov x0, #9
+    bl _kcc_dw_uleb             // length = 1 + 8
+    mov x0, #DW_LNE_set_address
+    bl _kcc_dw_u8
+    mov x0, x22
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x0, [x0]
+    ldr x0, [x0, #IRF_LOWPC]
+    bl _kcc_dw_u64
+    // DW_LNS_advance_line (target_line - current): opcode first, then the
+    // delta computed and sleb'd back-to-back so no temp crosses a call.
+    mov x0, #DW_LNS_advance_line
+    bl _kcc_dw_u8
+    mov x0, x22
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x0, [x0]
+    ldr x0, [x0, #IRF_LINE]
+    sub x1, x0, x24                          // delta
+    mov x24, x0                              // current = target line
+    mov x0, x1
+    bl _kcc_dw_sleb
+    // DW_LNS_copy → emit a row
+    mov x0, #DW_LNS_copy
+    bl _kcc_dw_u8
+.Ldwline_next:
+    add x21, x21, #1
+    b .Ldwline_loop
+.Ldwline_endseq:
+    // final set_address to code size, then end_sequence
+    mov w0, #0
+    bl _kcc_dw_u8
+    mov x0, #9
+    bl _kcc_dw_uleb
+    mov x0, #DW_LNE_set_address
+    bl _kcc_dw_u8
+    adrp x0, _kcc_code_pos@@PAGE
+    add x0, x0, _kcc_code_pos@@PAGEOFF
+    ldr x0, [x0]
+    bl _kcc_dw_u64
+    mov w0, #0
+    bl _kcc_dw_u8
+    mov x0, #1
+    bl _kcc_dw_uleb
+    mov x0, #DW_LNE_end_sequence
+    bl _kcc_dw_u8
+    // patch unit_length
+    bl _kcc_dw_pos
+    add x1, x19, #4
+    sub x1, x0, x1
+    mov x0, x19
+    bl _kcc_dw_patch32
+    // record section length
+    bl _kcc_dw_pos
+    adrp x1, _kcc_dw_line_off@@PAGE
+    add x1, x1, _kcc_dw_line_off@@PAGEOFF
+    ldr x1, [x1]
+    sub x0, x0, x1
+    adrp x1, _kcc_dw_line_len@@PAGE
+    add x1, x1, _kcc_dw_line_len@@PAGEOFF
+    str x0, [x1]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Mach-O Emission}
+
+The Mach-O writer keeps its own layout math; to stay decoupled it hands
+DWARF two small entry points.  \texttt{kcc\_dwarf\_emit\_macho} writes the
+extra \texttt{\_\_DWARF} \texttt{LC\_SEGMENT\_64} load command and its three
+\texttt{section\_64} descriptors (given the file offset where the blob will
+land), and \texttt{kcc\_dwarf\_append\_blob} copies the built bytes out
+immediately after the code section.  Placing the blob there---\emph{before}
+the LINKEDIT region (relocations, symbol table, string table)---is what the
+linker requires: section data first, LINKEDIT last.  A third helper,
+\texttt{kcc\_dwarf\_total\_len}, lets the writer reserve the blob's file span
+when it computes the relocation offset, so every downstream offset shifts
+past it.  All three are called only under \texttt{-g}; the Mach-O writer
+gates on \texttt{\_kcc\_dwarf\_enabled} and reserves the load-command space
+accordingly, so a non-\texttt{-g} object is unchanged.
+
+The \texttt{\_\_DWARF} segment is not memory-mapped, but the linker still
+validates that no two segments' VM ranges overlap.  The writer therefore
+passes \texttt{kcc\_dwarf\_emit\_macho} a \emph{vmaddr} placed past the end of
+\texttt{\_\_TEXT} (the code size plus the common globals); the three debug
+sections take addresses running upward from there while their \emph{file}
+offsets stay in the blob's own span.
+
+@d DWARF: macho @{
+// -- kcc_dwarf_sect64 ---------------------------------------------------
+// Write one 80-byte section_64 in the __DWARF segment.
+//   x0 = 16-byte section name ptr, x1 = addr, x2 = size, x3 = file offset
+.text
+.p2align 2
+_kcc_dwarf_sect64:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0
+    mov x20, x1
+    mov x21, x2
+    mov x22, x3
+    mov x1, #16
+    bl _kcc_macho_write_bytes          // sectname (x0=name)
+    adrp x0, _kcc_dw_segname@@PAGE
+    add x0, x0, _kcc_dw_segname@@PAGEOFF
+    mov x1, #16
+    bl _kcc_macho_write_bytes          // segname __DWARF
+    mov x0, x20
+    bl _kcc_macho_write64              // addr
+    mov x0, x21
+    bl _kcc_macho_write64              // size
+    mov x0, x22
+    bl _kcc_macho_write32              // offset
+    mov w0, #0
+    bl _kcc_macho_write32               // align
+    mov w0, #0
+    bl _kcc_macho_write32               // reloff
+    mov w0, #0
+    bl _kcc_macho_write32               // nreloc
+    mov w0, #0
+    bl _kcc_macho_write32               // flags
+    mov w0, #0
+    bl _kcc_macho_write32               // reserved1
+    mov w0, #0
+    bl _kcc_macho_write32               // reserved2
+    mov w0, #0
+    bl _kcc_macho_write32               // reserved3
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_dwarf_emit_macho -----------------------------------------------
+// void kcc_dwarf_emit_macho(uint64_t dwarf_file_base, uint64_t vmaddr)
+// Emit the __DWARF LC_SEGMENT_64 + 3 section_64 records.  vmaddr is placed
+// past the __TEXT segment so the segments' VM ranges do not overlap (the
+// linker rejects overlapping segments).
+.globl _kcc_dwarf_emit_macho
+.p2align 2
+_kcc_dwarf_emit_macho:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                              // dwarf_base (file offset)
+    mov x24, x1                              // vmaddr (past __TEXT)
+    adrp x0, _kcc_dw_abbrev_len@@PAGE
+    add x0, x0, _kcc_dw_abbrev_len@@PAGEOFF
+    ldr x20, [x0]
+    adrp x0, _kcc_dw_info_len@@PAGE
+    add x0, x0, _kcc_dw_info_len@@PAGEOFF
+    ldr x21, [x0]
+    adrp x0, _kcc_dw_line_len@@PAGE
+    add x0, x0, _kcc_dw_line_len@@PAGEOFF
+    ldr x22, [x0]
+    add x23, x20, x21
+    add x23, x23, x22    // total blob size
+    // ---- LC_SEGMENT_64 (__DWARF) ----
+    mov w0, #LC_SEGMENT_64
+    bl _kcc_macho_write32
+    mov w0, #(72 + 80*3)
+    bl _kcc_macho_write32   // cmdsize = 312
+    adrp x0, _kcc_dw_segname@@PAGE
+    add x0, x0, _kcc_dw_segname@@PAGEOFF
+    mov x1, #16
+    bl _kcc_macho_write_bytes  // segname __DWARF
+    mov x0, x24
+    bl _kcc_macho_write64        // vmaddr (past __TEXT)
+    mov x0, x23
+    bl _kcc_macho_write64       // vmsize = total
+    mov x0, x19
+    bl _kcc_macho_write64       // fileoff
+    mov x0, x23
+    bl _kcc_macho_write64       // filesize
+    mov w0, #0
+    bl _kcc_macho_write32        // maxprot (not mapped)
+    mov w0, #0
+    bl _kcc_macho_write32        // initprot
+    mov w0, #3
+    bl _kcc_macho_write32        // nsects
+    mov w0, #0
+    bl _kcc_macho_write32        // flags
+    // __debug_abbrev: addr vmaddr, offset dwarf_base
+    adrp x0, _kcc_dw_sn_abbrev@@PAGE
+    add x0, x0, _kcc_dw_sn_abbrev@@PAGEOFF
+    mov x1, x24
+    mov x2, x20
+    mov x3, x19
+    bl _kcc_dwarf_sect64
+    // __debug_info: addr vmaddr+abbrev_len, offset dwarf_base+abbrev_len
+    adrp x0, _kcc_dw_sn_info@@PAGE
+    add x0, x0, _kcc_dw_sn_info@@PAGEOFF
+    add x1, x24, x20
+    mov x2, x21
+    add x3, x19, x20
+    bl _kcc_dwarf_sect64
+    // __debug_line: addr vmaddr+abbrev_len+info_len, offset dwarf_base+that
+    adrp x0, _kcc_dw_sn_line@@PAGE
+    add x0, x0, _kcc_dw_sn_line@@PAGEOFF
+    add x2, x20, x21
+    add x1, x24, x2
+    add x3, x19, x2
+    mov x2, x22
+    bl _kcc_dwarf_sect64
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_dwarf_total_len ------------------------------------------------
+// uint64_t kcc_dwarf_total_len(void) -> abbrev_len + info_len + line_len.
+// The Mach-O layout uses this to reserve the debug blob's file span between
+// the code bytes and the LINKEDIT region (relocs/symtab/strtab).
+.globl _kcc_dwarf_total_len
+.p2align 2
+_kcc_dwarf_total_len:
+    adrp x0, _kcc_dw_abbrev_len@@PAGE
+    add x0, x0, _kcc_dw_abbrev_len@@PAGEOFF
+    ldr x0, [x0]
+    adrp x1, _kcc_dw_info_len@@PAGE
+    add x1, x1, _kcc_dw_info_len@@PAGEOFF
+    ldr x1, [x1]
+    add x0, x0, x1
+    adrp x1, _kcc_dw_line_len@@PAGE
+    add x1, x1, _kcc_dw_line_len@@PAGEOFF
+    ldr x1, [x1]
+    add x0, x0, x1
+    ret
+
+// -- kcc_dwarf_append_blob ----------------------------------------------
+// void kcc_dwarf_append_blob(void)
+// Copy the built debug sections into the Mach-O output.  Called right after
+// the code bytes so the blob precedes the LINKEDIT region.
+.globl _kcc_dwarf_append_blob
+.p2align 2
+_kcc_dwarf_append_blob:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    adrp x0, _kcc_dwarf_buf@@PAGE
+    add x0, x0, _kcc_dwarf_buf@@PAGEOFF
+    ldr x0, [x0]
+    adrp x1, _kcc_dw_abbrev_len@@PAGE
+    add x1, x1, _kcc_dw_abbrev_len@@PAGEOFF
+    ldr x1, [x1]
+    adrp x2, _kcc_dw_info_len@@PAGE
+    add x2, x2, _kcc_dw_info_len@@PAGEOFF
+    ldr x2, [x2]
+    add x1, x1, x2
+    adrp x2, _kcc_dw_line_len@@PAGE
+    add x2, x2, _kcc_dw_line_len@@PAGEOFF
+    ldr x2, [x2]
+    add x1, x1, x2                            // total length
+    bl _kcc_macho_write_bytes
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Global State}
+
+@d DWARF: data @{
+// -- DWARF global state -------------------------------------------------
+.data
+.p2align 3
+.globl _kcc_dwarf_enabled
+_kcc_dwarf_enabled: .quad 0     // set by -g
+_kcc_dwarf_buf:     .quad 0     // scratch blob
+_kcc_dwarf_pos:     .quad 0     // write cursor
+.globl _kcc_dw_abbrev_off
+_kcc_dw_abbrev_off: .quad 0
+.globl _kcc_dw_abbrev_len
+_kcc_dw_abbrev_len: .quad 0
+.globl _kcc_dw_info_off
+_kcc_dw_info_off:   .quad 0
+.globl _kcc_dw_info_len
+_kcc_dw_info_len:   .quad 0
+.globl _kcc_dw_line_off
+_kcc_dw_line_off:   .quad 0
+.globl _kcc_dw_line_len
+_kcc_dw_line_len:   .quad 0
+.globl _kcc_dwarf_buf
+.globl _kcc_dwarf_pos
+
+// Fixed 16-byte section/segment names for the Mach-O section_64 records.
+.p2align 3
+_kcc_dw_segname:    .ascii "__DWARF"
+    .space 9
+_kcc_dw_sn_abbrev:  .ascii "__debug_abbrev"
+    .space 2
+_kcc_dw_sn_info:    .ascii "__debug_info"
+    .space 4
+_kcc_dw_sn_line:    .ascii "__debug_line"
+    .space 4
+
+.section __TEXT,__cstring,cstring_literals
+_kcc_dw_producer:   .asciz "kcc"
+_kcc_dw_compdir:    .asciz "/"
+@}

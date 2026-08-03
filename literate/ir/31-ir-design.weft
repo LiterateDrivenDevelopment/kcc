@@ -54,7 +54,9 @@ Offset & Field & Description \\
 .equ IRF_RETTYPE,   32     // return type descriptor
 .equ IRF_PARAMS,    40     // param count
 .equ IRF_PARAM_CLS, 48     // arena array of per-param AAPCS64 classes (or 0)
-.equ IR_FUNC_SIZE,  56
+.equ IRF_LINE,      56     // source declaration line (for DWARF; 0 if unknown)
+.equ IRF_LOWPC,     64     // code offset where the function begins (set by codegen)
+.equ IR_FUNC_SIZE,  72
 
 // -- BB flags -------------------------------------------------------------
 .equ BB_FLAG_TERMINATED, 1
@@ -303,6 +305,8 @@ _kcc_ir_alloc_func:
     str xzr, [x21, #IRF_VREG_N]
     str xzr, [x21, #IRF_PARAMS]
     str xzr, [x21, #IRF_PARAM_CLS]
+    str xzr, [x21, #IRF_LINE]      // set by the builder from the FUNC_DECL node
+    str xzr, [x21, #IRF_LOWPC]     // set by codegen at function entry
 
     // Allocate blocks vec
     mov x0, #VEC_SIZE

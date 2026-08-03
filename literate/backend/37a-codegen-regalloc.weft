@@ -12,24 +12,42 @@ those slots and stores its result back.  That is simple and always correct,
 but it pays a memory round-trip for every value.  Register allocation removes
 the traffic for the values that can safely live in a physical register.
 
-The allocator here is a deliberately conservative \emph{local} linear scan
-over two register banks: the four caller-saved scratch registers
-\texttt{x12}--\texttt{x15} and the nine callee-saved registers
-\texttt{x19}--\texttt{x27}.  The generated code otherwise touches only
-\texttt{x0}--\texttt{x11} and \texttt{x29}, so all thirteen are free for
-allocation.  A virtual register is a candidate only when it is safe beyond any
-doubt, so the pass allocates a vreg to a physical register precisely when
-\emph{both} of these hold:
+The allocator here is a linear scan over two register banks: the four
+caller-saved scratch registers \texttt{x12}--\texttt{x15} and the nine
+callee-saved registers \texttt{x19}--\texttt{x27}.  The generated code
+otherwise touches only \texttt{x0}--\texttt{x11} and \texttt{x29}, so all
+thirteen are free for allocation.  A virtual register is a candidate only when
+it is safe beyond any doubt, so the pass allocates a vreg to a physical
+register precisely when \emph{both} of these hold:
 
 \begin{itemize}
 \item Its defining instruction produces an integer or pointer scalar
       (floating and aggregate values are never allocated---they flow through
       the FP helpers or by address).
-\item Its definition and every use lie in a single basic block.  A block is
-      straight-line, so within it textual order \emph{is} execution order;
-      this keeps the call-crossing analysis exact even inside loops (a loop
-      body re-enters at its top, redefining the value before reusing it).
+\item Its live range can be reasoned about with the linear instruction
+      numbering.  This is always true for a value confined to a
+      \emph{single basic block} (straight-line code, where textual order is
+      execution order).  It is \emph{also} true for a value that escapes its
+      block, provided the function has no back-edge: with only forward control
+      flow the block layout is a topological order, so a definition still
+      precedes every use and the interval \texttt{[def,\,last-use]} is an exact
+      bound.  A back-edge breaks this---a register freed at a value's textual
+      last use could be reused before a loop re-executes an earlier use---so
+      when any back-edge is present the pass falls back to the single-block
+      rule and leaves cross-block values spilled.  This is the
+      \emph{global} step: it lifts the old single-block-only restriction for
+      the common loop-free shapes (\texttt{if}/\texttt{else}, \texttt{switch},
+      the short-circuit and ternary operators), keeping a value defined before
+      a branch in a register through the branch instead of reloading it from
+      the frame in each arm.
 \end{itemize}
+
+A back-edge is detected structurally: block ids are handed out in creation
+order, which is the layout order the back end emits, so a branch is a
+back-edge exactly when its target id does not exceed the branching block's id.
+A single pass over the blocks sets a per-function \emph{has-loop} flag from
+this test; loop-carried allocation (which needs true liveness to place the
+register reservation across the back-edge) is left for a later refinement.
 
 Whether the value's live range \emph{crosses a function call} then decides the
 bank.  A call clobbers the caller-saved registers but preserves the
@@ -42,17 +60,18 @@ those to a save area placed \emph{above} the vreg slots and alloca storage
 reads, are unchanged---only \texttt{frame\_size} grows), and each
 \texttt{IR\_RET} restores them before tearing the frame down.
 
-The pass makes two walks over the instruction stream.  The first computes, per
-vreg, its defining block, its last-use position, whether any use escapes the
+The pass makes three walks over the function.  The first computes, per vreg,
+its defining block, its last-use position, whether any use escapes the
 defining block, and whether a call falls in its live range---the last via a
 monotonically increasing call counter, comparing its value at the definition
 with its value at each use.  Determining which operand fields are vreg
 \emph{uses} mirrors the dead-code eliminator's classification
 (\S\ref{sec:dce}); over-counting a use is harmless here (it only lengthens a
 live range), so mirroring that liberal rule stays safe.  The second walk is
-the linear scan itself: at each candidate's definition it frees any register
-whose occupant's last use has passed, then claims a free one from the
-permitted bank (or leaves the vreg spilled).  The result is a map that the
+the loop check above, setting the has-loop flag.  The third walk is the linear
+scan itself: at each candidate's definition it frees any register whose
+occupant's last use has passed, then claims a free one from the permitted bank
+(or leaves the vreg spilled).  The result is a map that the
 \texttt{load\_vreg}/\texttt{store\_vreg} family consults---an unallocated vreg
 (map entry~0) behaves exactly as in the all-spill model, so the change is
 transparent wherever the allocator declines to act.
@@ -277,6 +296,62 @@ _kcc_cg_regalloc:
     b .Lp1_bb
 .Lp1_done:
 
+    // ---- Loop detection ----
+    // A value whose live range escapes its defining block can be kept in a
+    // register across blocks only when the linear instruction numbering is a
+    // valid execution order---that is, when the function has no back-edge.  A
+    // back-edge is a branch to an earlier-or-equal block; since block ids are
+    // handed out in creation (= layout) order, that is simply a branch whose
+    // target id does not exceed the branching block's id.  has_loop at
+    // [sp,#120] records whether any exists; when it is set, escaping values
+    // stay spilled (the conservative local behaviour) and only single-block
+    // values are allocated.
+    str xzr, [sp, #120]           // has_loop = 0
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [x0, #VEC_COUNT]
+    str x1, [sp, #112]
+    str xzr, [sp, #104]
+.Lhl_bb:
+    ldr x0, [sp, #104]
+    ldr x1, [sp, #112]
+    cmp x0, x1
+    b.hs .Lhl_done
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [sp, #104]
+    bl _kcc_vec_get
+    ldr x2, [x0]                  // BB ptr
+    ldr x3, [x2, #BB_ID]          // this block's id
+    ldr x4, [x2, #BB_LAST]        // terminator
+    cbz x4, .Lhl_next
+    ldr x5, [x4, #IR_OP]
+    cmp x5, #IR_BR
+    b.eq .Lhl_br
+    cmp x5, #IR_BR_COND
+    b.eq .Lhl_brcond
+    b .Lhl_next
+.Lhl_br:
+    ldr x6, [x4, #IR_SRC1]        // target id
+    cmp x6, x3
+    b.ls .Lhl_set                 // target <= current → back-edge
+    b .Lhl_next
+.Lhl_brcond:
+    ldr x6, [x4, #IR_SRC1]        // true target
+    cmp x6, x3
+    b.ls .Lhl_set
+    ldr x6, [x4, #IR_SRC2]        // false target
+    cmp x6, x3
+    b.ls .Lhl_set
+    b .Lhl_next
+.Lhl_set:
+    mov x6, #1
+    str x6, [sp, #120]
+.Lhl_next:
+    ldr x0, [sp, #104]
+    add x0, x0, #1
+    str x0, [sp, #104]
+    b .Lhl_bb
+.Lhl_done:
+
     // ---- Pass 2: linear scan over x12..x15 (caller-saved) and x19..x27
     //      (callee-saved).  reg_end[i] lives at [sp,#152 + i*8]; -1 = free.
     add x1, sp, #152
@@ -319,9 +394,13 @@ _kcc_cg_regalloc:
     cmp x0, x20
     b.hs .Lp2_next
     ldr x1, [x24, x0, lsl #3]     // flags[dest]
-    and x2, x1, #3
-    cmp x2, #1                    // candidate def that does not escape its block
-    b.ne .Lp2_next
+    tst x1, #1                    // candidate def?
+    b.eq .Lp2_next
+    tst x1, #2                    // escapes its defining block?
+    b.eq .Lp2_gate_ok             // no: a single-block value is always eligible
+    ldr x9, [sp, #120]           // yes: allocate across blocks only when loop-free
+    cbnz x9, .Lp2_next
+.Lp2_gate_ok:
     and x4, x1, #4               // x4 = crossed-a-call bit
     ldr x3, [x21, x0, lsl #3]     // lastuse[dest]
     cmp x3, x27

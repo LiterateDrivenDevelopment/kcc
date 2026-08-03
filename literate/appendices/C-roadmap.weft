@@ -956,10 +956,15 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       a function with an arbitrarily large frame---tens of thousands of
       spilled temporaries---compiles correctly.  What remains is not
       correctness but speed: very large symbol counts run in super-linear time.
-\item \textbf{Optimization and global register allocation} (Stages~9c--9d).
-      Deliberately deferred behind usability: \kcc{} already emits
-      \emph{correct} code, so cross-block (global) allocation, CSE, copy
-      propagation, and strength reduction are quality, not enablement.
+\item \textbf{Optimization and global register allocation} (Stages~9c--9d,
+      \emph{in progress}).  Cross-block (global) allocation now runs for
+      loop-free functions---a value that escapes its block is kept in a
+      register through \texttt{if}/\texttt{else}, \texttt{switch}, and the
+      short-circuit/ternary operators instead of reloading from the frame
+      (${\sim}22\%$ fewer frame accesses on a loop-free corpus).  Loop-carried
+      allocation (needs true liveness), CSE, copy propagation, and strength
+      reduction remain; all are quality, not enablement, since \kcc{} already
+      emits correct code.
 \item \textbf{Tail C17 features---\_Generic, \texttt{long double},
       \texttt{volatile}} (Stage~9a).  Low frequency; they close the last of
       conformance but rarely block real code.
@@ -1401,8 +1406,8 @@ hardening, and a second target---rather than missing capability:
 \hline
 Concern & Status & Note \\
 \hline
-local register allocation    & \checkmark & linear-scan, caller+callee-saved \\
-optimizer / global-FP reg.\ alloc. & & no passes yet; still ${\sim}$all-spill globals \\
+register allocation          & \checkmark & linear-scan; cross-block for loop-free functions \\
+optimizer / loop \& FP reg.\ alloc. & $\circ$ & no IR passes yet; loops \& FP still spill \\
 $>8$ arguments on the stack  & \checkmark & self-consistent, 5 diff. tests \\
 AAPCS64 register convention  & \checkmark & FP/small+large struct/x8; interop 16/16 \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\
@@ -1444,17 +1449,19 @@ headers (\texttt{\#include <stdio.h>} yields real prototypes, imported data
 reached GOT-indirect).  The front end now recovers past the first error and
 reports every diagnostic with a \texttt{clang}-style caret (\texttt{just
 diagtest}), \texttt{-Wall} enables five canonical warnings (\texttt{just
-warntest}), a local linear-scan register allocator uses both caller- and
-callee-saved banks, and \texttt{-g} emits verify-clean, linkable DWARF
-(Chapter~\ref{ch:dwarf}).
+warntest}), a linear-scan register allocator uses both caller- and
+callee-saved banks and keeps values in registers across blocks in loop-free
+functions, and \texttt{-g} emits verify-clean, linkable DWARF
+(Chapter~\ref{ch:dwarf}).  Ad-hoc fuzzing also closed the front end's crash
+classes (truncated input, oversized output, large frames).
 
 What still separates \kcc{} from an \emph{industrial} toolchain is now
 narrow and quality-oriented rather than a matter of missing capability:
-there is no optimizer and only local (not global/FP) register allocation, so
-generated code is correct but not fast; the front end has not been hardened
-against adversarial or truncated input; and there is a single target
-(ARM64/Mach-O).  The shortest credible path from here runs, in order, through
-hardening the front end against malformed input, then an optimizer with global
-and floating-point register allocation for code quality.  Everything after
-that---a second target, statement-level DWARF, an optimizer rivalling
-\texttt{clang -O1}---is refinement rather than feasibility.
+there is no IR optimizer, register allocation does not yet cover loop-carried
+or floating values, so generated code is correct but not fast; and there is a
+single target (ARM64/Mach-O).  The shortest credible path from here runs
+through extending register allocation to loop-carried and floating values,
+then IR optimization passes (CSE, copy propagation, strength reduction) for
+code quality.  Everything after that---a second target, statement-level DWARF,
+an optimizer rivalling \texttt{clang -O1}---is refinement rather than
+feasibility.

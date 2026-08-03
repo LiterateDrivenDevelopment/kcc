@@ -957,14 +957,18 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       spilled temporaries---compiles correctly.  What remains is not
       correctness but speed: very large symbol counts run in super-linear time.
 \item \textbf{Optimization and global register allocation} (Stages~9c--9d,
-      \emph{in progress}).  Cross-block (global) allocation now runs for
-      loop-free functions---a value that escapes its block is kept in a
-      register through \texttt{if}/\texttt{else}, \texttt{switch}, and the
-      short-circuit/ternary operators instead of reloading from the frame
-      (${\sim}22\%$ fewer frame accesses on a loop-free corpus).  Loop-carried
-      allocation (needs true liveness), CSE, copy propagation, and strength
-      reduction remain; all are quality, not enablement, since \kcc{} already
-      emits correct code.
+      \emph{in progress}).  Cross-block (global) allocation now runs in every
+      function---loop-free bodies keep an escaping value in a register through
+      \texttt{if}/\texttt{else}, \texttt{switch}, and the short-circuit/ternary
+      operators (${\sim}22\%$ fewer frame accesses on a loop-free corpus),
+      while a function with a back-edge gives each escaping value a
+      callee-saved register for the whole function---correct across the loop
+      without liveness because every vreg is single-def (${\sim}36\%$ fewer
+      frame accesses on a loopy corpus).  What remains is quality, not
+      enablement: a tighter loop reservation (real liveness), promoting
+      \texttt{alloca} locals to vregs (\emph{mem2reg}, the larger loop win),
+      floating-point allocation, and the classic IR passes (CSE, copy
+      propagation, strength reduction).
 \item \textbf{Tail C17 features---\_Generic, \texttt{long double},
       \texttt{volatile}} (Stage~9a).  Low frequency; they close the last of
       conformance but rarely block real code.
@@ -1406,8 +1410,8 @@ hardening, and a second target---rather than missing capability:
 \hline
 Concern & Status & Note \\
 \hline
-register allocation          & \checkmark & linear-scan; cross-block for loop-free functions \\
-optimizer / loop \& FP reg.\ alloc. & $\circ$ & no IR passes yet; loops \& FP still spill \\
+register allocation          & \checkmark & linear-scan; cross-block in loop-free \& loopy functions \\
+optimizer / mem2reg / FP r.a. & $\circ$ & no IR passes yet; allocas \& FP still spill \\
 $>8$ arguments on the stack  & \checkmark & self-consistent, 5 diff. tests \\
 AAPCS64 register convention  & \checkmark & FP/small+large struct/x8; interop 16/16 \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\

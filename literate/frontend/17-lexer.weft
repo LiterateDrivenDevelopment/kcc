@@ -334,10 +334,19 @@ multiple lines, so the newline counter is updated inside the loop.
 
 \paragraph{EOF and character dispatch.}
 Once whitespace and comments have been consumed, we either hit EOF
-or a meaningful character.  The dispatcher classifies the first byte
-into one of four categories---identifier start (letter or underscore),
-digit, string or character delimiter, or punctuator---and branches to
-the corresponding scanner subroutine.
+or a meaningful character.  At EOF we emit \texttt{TOK\_EOF} and, crucially,
+\emph{pin the cursor to \texttt{end}} rather than clearing it.  A null cursor
+would be a trap: the preprocessor's \texttt{\_kcc\_pp\_skip\_line} and the
+lexer's own re-entry both bound their scan by comparing the cursor against
+\texttt{end}, and a null (zero) cursor sits \emph{below} \texttt{end}, so the
+bound check passes and the very next byte load dereferences address~0.
+Leaving the cursor at \texttt{end} makes every such check terminate
+immediately, so a truncated source---\texttt{\#} at end of file, an
+unterminated comment, a directive that runs off the buffer---degrades to a
+clean diagnostic instead of a segfault.  The dispatcher then classifies the
+first byte into one of four categories---identifier start (letter or
+underscore), digit, string or character delimiter, or punctuator---and
+branches to the corresponding scanner subroutine.
 
 @d Lexer: next token @{
 .Llex_eof:
@@ -347,7 +356,7 @@ the corresponding scanner subroutine.
     adrp x1, _kcc_tok_type@@PAGE
     add  x1, x1, _kcc_tok_type@@PAGEOFF
     str  x0, [x1]
-    str  xzr, [x19]             // cursor stays at end
+    str  x21, [x19]             // cursor stays at end (NOT null — see prose)
     // tok_start = cursor, tok_len = 0
     adrp x1, _kcc_tok_start@@PAGE
     add  x1, x1, _kcc_tok_start@@PAGEOFF

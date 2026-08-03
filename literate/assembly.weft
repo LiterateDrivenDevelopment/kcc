@@ -472,6 +472,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<CodeGen: compile all@>
 @<CodeGen: register allocation@>
 @<CodeGen: compile function@>
+@<CodeGen: large immediate adjust@>
 @<CodeGen: vreg slot offset@>
 @<CodeGen: marshal args@>
 @<CodeGen: instruction dispatch@>

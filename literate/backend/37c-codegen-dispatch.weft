@@ -1247,18 +1247,18 @@ addressed correctly.
     add  x0, x0, _kcc_cg_vreg_count@@PAGEOFF
     ldr x0, [x0]
 
-    // Storage address = 16 + vreg_count*8 + offset*8
+    // Storage address = x29 + (16 + vreg_count*8 + offset*8).  The offset can
+    // exceed the 12-bit immediate on a large frame, so route through the
+    // splitting helper rather than the raw encoder.
     lsl x1, x0, #3                // vreg_count * 8
     lsl x2, x25, #3               // offset * 8
     add x2, x2, x1
-    add x2, x2, #16               // imm12 = 16 + vreg_count*8 + offset*8
+    add x2, x2, #16               // imm = 16 + vreg_count*8 + offset*8
 
     mov x0, #CG_REG_DST           // rd = x11
     mov x1, #29                    // rn = x29
-    // x2 already set (imm12)
-    mov x3, #1                     // sf
-    bl _kcc_enc_add_imm
-    bl _kcc_code_emit32
+    // x2 already set (imm)
+    bl _kcc_cg_emit_add_imm
 
     // Store x11 (the address) to dest's VALUE slot
     mov x0, x24
@@ -1485,8 +1485,10 @@ return type is not void, the source vreg is loaded into \texttt{x0}
 the epilogue uses a post-indexed \textsc{ldp} that restores
 \texttt{x29}/\texttt{x30} and deallocates the frame in one
 instruction; for larger frames it uses a signed-offset \textsc{ldp}
-followed by \texttt{ADD\;sp,\;sp,\;\#frame\_size}, mirroring the
-large-frame prologue.  Both paths finish with \textsc{ret}.  The
+followed by \texttt{ADD\;sp,\;sp,\;\#frame\_size} through the
+large-immediate helper, mirroring the large-frame prologue so frames past
+the 12-bit immediate tear down correctly.  Both
+paths finish with \textsc{ret}.  The
 504-byte limit ensures the \textsc{ldp} post-index immediate
 ($\mathit{frame}/8$) fits in a signed 7-bit field whose positive
 range is $0$--$63$.
@@ -1570,17 +1572,15 @@ range is $0$--$63$.
     b .Lcgi_ret_emit_ret
 
 .Lcgi_ret_large:
-    // Large frame: ldp x29, x30, [sp]  then  add sp, sp, #frame_size
+    // Large frame: ldp x29, x30, [sp]  then  add sp, sp, #frame_size (split if >4095)
     // ldp x29, x30, [sp, #0] — signed-offset form: 0xA9407BFD
     movz w0, #0x7BFD
     movk w0, #0xA940, lsl #16
     bl _kcc_code_emit32
     mov x0, #31                    // rd = sp
     mov x1, #31                    // rn = sp
-    mov x2, x24                   // imm12 = frame_size
-    mov x3, #1
-    bl _kcc_enc_add_imm
-    bl _kcc_code_emit32
+    mov x2, x24                    // frame_size
+    bl _kcc_cg_emit_add_imm
 
 .Lcgi_ret_emit_ret:
     // RET

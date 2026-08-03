@@ -209,13 +209,11 @@ _kcc_codegen_func:
     b .Lcgf_prologue_mov
 
 .Lcgf_large_prologue:
-    // Large frame: sub sp, sp, #frame_size  then  stp x29, x30, [sp]
+    // Large frame: sub sp, sp, #frame_size (split when >4095) then stp x29,x30,[sp]
     mov x0, #31                    // rd = sp
     mov x1, #31                    // rn = sp
-    mov x2, x20                   // imm12 = frame_size
-    mov x3, #1                    // sf = 64-bit
-    bl _kcc_enc_sub_imm
-    bl _kcc_code_emit32
+    mov x2, x20                    // frame_size
+    bl _kcc_cg_emit_sub_imm
     // stp x29, x30, [sp, #0] — signed-offset form: 0xA9007BFD
     movz w0, #0x7BFD
     movk w0, #0xA900, lsl #16
@@ -234,6 +232,193 @@ _kcc_codegen_func:
     mov x0, #0
     bl _kcc_cg_callee_transfer
 @| _kcc_codegen_func
+@}
+
+\paragraph{Adjusting a register by a large immediate}
+A subtlety that surfaces on large functions is that \texttt{add}/\texttt{sub}
+with an immediate encode it as a \emph{12-bit} unsigned field---a maximum of
+4095.  Three sites can exceed that: the large-frame prologue
+(\texttt{sub sp, sp, \#frame\_size}), the matching epilogue
+(\texttt{add sp, sp, \#frame\_size}), and the address of a stack slot
+(\texttt{add rd, x29, \#offset} for an \texttt{alloca} or a taken address).
+A function with hundreds of locals or temporaries---a large \texttt{switch},
+a deeply nested block, machine-generated code---pushes any of these past
+4095, and a naive encoder silently overflows the immediate into the adjacent
+\texttt{shift} bit, producing a tagged \textsc{addg}/\textsc{subg}
+instruction that faults with an illegal-instruction trap at run time.
+
+The ARM64 add/subtract-immediate format anticipates this: a \texttt{shift}
+bit multiplies the 12-bit immediate by 4096, so any value up to $2^{24}-1$
+splits into a \emph{high} part (bits 12--23, shifted) plus a \emph{low} part
+(bits 0--11).  The first two helpers below emit exactly that---one instruction
+when the value fits in 12 bits, otherwise the shifted high part followed by
+the low part---for an arbitrary destination and source register.  All three
+add/sub sites route through them, so frames and slot addresses of any
+realistic size are computed correctly.  When the second instruction runs it
+adds into the destination register (not the original source), so the two
+parts accumulate.
+
+The same 12-bit ceiling limits the \emph{other} frame instruction, the
+\textsc{ldr}/\textsc{str} that reads or writes a stack slot: its immediate is
+scaled by the access size, so an 8-byte load or store reaches only
+$4095\times 8 = 32760$ bytes from \texttt{x29}.  A function whose frame
+exceeds that---thousands of spilled temporaries, a callee-saved area high in a
+large frame, an incoming stack argument above a big local region---cannot
+address its upper slots with the scaled form.  The third helper,
+\texttt{\_kcc\_cg\_emit\_frame\_ldst}, closes this: for an in-range offset it
+emits the plain scaled instruction (so ordinary functions are unchanged), and
+for a larger one it materialises the slot address in the scratch register
+\texttt{x17} (through the add helper above, itself split when necessary) and
+transfers through \texttt{[x17,\,\#0]}.  Every spill path---the integer and
+floating vreg transfers, the callee-saved save/restore, and the incoming
+stack-parameter spill---routes its load and store through it, so a frame of
+any size is addressed correctly.
+
+@d CodeGen: large immediate adjust @{
+.text
+// -- _kcc_cg_emit_add_imm -----------------------------------------------
+// void _kcc_cg_emit_add_imm(uint64_t rd, uint64_t rn, uint64_t imm)
+// Emit `add rd, rn, #imm`, splitting into shifted-high + low when imm
+// exceeds the 12-bit immediate (4095).  imm==0 emits a single `add rd,rn,#0`.
+.p2align 2
+_kcc_cg_emit_add_imm:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                    // rd
+    mov x20, x1                    // rn (running source)
+    mov x21, x2                    // imm
+    lsr x9, x21, #12               // high = imm >> 12
+    cbz x9, .Leai_low
+    mov x0, x19
+    mov x1, x20
+    mov x2, x9
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    orr w0, w0, #0x400000          // set sh=1 → immediate shifted left by 12
+    bl _kcc_code_emit32
+    mov x20, x19                   // low part accumulates into rd
+.Leai_low:
+    and x2, x21, #0xFFF            // low = imm & 0xFFF
+    lsr x9, x21, #12               // recompute high (x9 clobbered by emit)
+    cbnz x2, .Leai_emit_low        // low nonzero → emit it
+    cbnz x9, .Leai_done            // low zero but high already emitted → done
+.Leai_emit_low:
+    mov x0, x19
+    mov x1, x20
+    mov x3, #1
+    bl _kcc_enc_add_imm
+    bl _kcc_code_emit32
+.Leai_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- _kcc_cg_emit_sub_imm -----------------------------------------------
+// void _kcc_cg_emit_sub_imm(uint64_t rd, uint64_t rn, uint64_t imm)
+// Emit `sub rd, rn, #imm`, splitting the same way as the add helper.
+.p2align 2
+_kcc_cg_emit_sub_imm:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                    // rd
+    mov x20, x1                    // rn
+    mov x21, x2                    // imm
+    lsr x9, x21, #12
+    cbz x9, .Lesi_low
+    mov x0, x19
+    mov x1, x20
+    mov x2, x9
+    mov x3, #1
+    bl _kcc_enc_sub_imm
+    orr w0, w0, #0x400000          // sh=1
+    bl _kcc_code_emit32
+    mov x20, x19
+.Lesi_low:
+    and x2, x21, #0xFFF
+    lsr x9, x21, #12
+    cbnz x2, .Lesi_emit_low
+    cbnz x9, .Lesi_done
+.Lesi_emit_low:
+    mov x0, x19
+    mov x1, x20
+    mov x3, #1
+    bl _kcc_enc_sub_imm
+    bl _kcc_code_emit32
+.Lesi_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- _kcc_cg_emit_frame_ldst --------------------------------------------
+// void _kcc_cg_emit_frame_ldst(uint64_t rt, uint64_t byte_off, uint64_t kind)
+//   kind: 0 = LDR int, 1 = STR int, 2 = LDR fp, 3 = STR fp
+// Emit a transfer between register rt and [x29 + byte_off].  A frame-relative
+// unsigned-offset ldr/str scales its 12-bit immediate by the access size, so
+// an 8-byte access can only reach 32760 bytes; beyond that the immediate would
+// overflow.  For a larger offset the helper materialises the address in the
+// intra-procedure scratch register x17 (add x17, x29, #byte_off, itself split
+// when needed) and uses [x17, #0].  For an in-range offset it emits the plain
+// scaled form, so small frames stay byte-for-byte identical to before.
+.p2align 2
+_kcc_cg_emit_frame_ldst:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                    // rt
+    mov x20, x1                    // byte_off
+    mov x21, x2                    // kind
+    mov x0, x19                    // rt (for encoder)
+    mov x9, #0x7FF8                // 32760 = 4095 * 8 (max scaled 8-byte reach)
+    cmp x20, x9
+    b.hi .Lefl_large
+    // In range: rn = x29, imm12 = byte_off >> 3
+    mov x1, #29
+    lsr x2, x20, #3
+    b .Lefl_encode
+.Lefl_large:
+    // Out of range: x17 = x29 + byte_off, then [x17, #0]
+    mov x0, #17
+    mov x1, #29
+    mov x2, x20
+    bl _kcc_cg_emit_add_imm
+    mov x0, x19                    // rt
+    mov x1, #17                    // rn = x17
+    mov x2, #0                     // imm12 = 0
+.Lefl_encode:
+    // x0 = rt, x1 = rn, x2 = imm12; dispatch by kind
+    cbz x21, .Lefl_ldr_int
+    cmp x21, #1
+    b.eq .Lefl_str_int
+    cmp x21, #2
+    b.eq .Lefl_ldr_fp
+    bl _kcc_enc_str_fp             // kind == 3
+    b .Lefl_emit
+.Lefl_ldr_int:
+    mov x3, #1
+    bl _kcc_enc_ldr_imm
+    b .Lefl_emit
+.Lefl_str_int:
+    mov x3, #1
+    bl _kcc_enc_str_imm
+    b .Lefl_emit
+.Lefl_ldr_fp:
+    bl _kcc_enc_ldr_fp
+.Lefl_emit:
+    bl _kcc_code_emit32
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_cg_emit_add_imm
+@| _kcc_cg_emit_sub_imm
+@| _kcc_cg_emit_frame_ldst
 @}
 
 \paragraph{Storing Register Arguments}
@@ -356,23 +541,21 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
 
 .Lcgf_sa_stack:
     // Overflow: read from [x29 + frame_size + (base-1)*8] into x9, store to
-    // slot(base); base += 1.
+    // slot(base); base += 1.  Both offsets can exceed the scaled immediate on a
+    // large frame, so they route through the frame-ldst helper.
     ldr x1, [sp, #96]           // base
-    lsr x0, x20, #3               // frame_size / 8  (x20 = frame_size)
-    add x0, x0, x1
-    sub x2, x0, #1               // imm12_scaled = frame_size/8 + base - 1
-    mov x0, #9
-    mov x1, #29
-    mov x3, #1
-    bl _kcc_enc_ldr_imm
-    bl _kcc_code_emit32
-    mov x0, #9
-    mov x1, #29
-    ldr x2, [sp, #96]
-    add x2, x2, #2
-    mov x3, #1
-    bl _kcc_enc_str_imm
-    bl _kcc_code_emit32
+    sub x1, x1, #1               // base - 1
+    lsl x1, x1, #3               // (base-1) * 8
+    add x1, x1, x20              // + frame_size  (x20 = frame_size) = byte offset
+    mov x0, #9                   // rt = x9
+    mov x2, #0                   // kind = LDR int
+    bl _kcc_cg_emit_frame_ldst
+    ldr x1, [sp, #96]           // base
+    add x1, x1, #2               // slot index = base + 2
+    lsl x1, x1, #3               // byte offset from x29
+    mov x0, #9                   // rt = x9
+    mov x2, #1                   // kind = STR int
+    bl _kcc_cg_emit_frame_ldst
     ldr x2, [sp, #96]
     add x2, x2, #1
     str x2, [sp, #96]
@@ -589,12 +772,11 @@ _kcc_cg_load_vreg:
     bl _kcc_code_emit32
     b .Llv_done
 .Llv_spill:
-    add x2, x19, #2                // imm12_scaled = vreg + 2
+    add x1, x19, #2                // slot index = vreg + 2
+    lsl x1, x1, #3                 // byte offset from x29
     mov x0, x20                    // rt = target reg
-    mov x1, #29                    // rn = x29
-    mov x3, #1                     // size = 64-bit
-    bl _kcc_enc_ldr_imm
-    bl _kcc_code_emit32
+    mov x2, #0                     // kind = LDR int
+    bl _kcc_cg_emit_frame_ldst
 .Llv_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
@@ -630,12 +812,11 @@ _kcc_cg_store_vreg:
     bl _kcc_code_emit32
     b .Lsv_done
 .Lsv_spill:
-    add x2, x19, #2                // imm12_scaled = vreg + 2
+    add x1, x19, #2                // slot index = vreg + 2
+    lsl x1, x1, #3                 // byte offset from x29
     mov x0, x20                    // rt = source reg
-    mov x1, #29                    // rn = x29
-    mov x3, #1                     // size = 64-bit
-    bl _kcc_enc_str_imm
-    bl _kcc_code_emit32
+    mov x2, #1                     // kind = STR int
+    bl _kcc_cg_emit_frame_ldst
 .Lsv_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
@@ -669,11 +850,11 @@ _kcc_cg_load_vreg_fp:
     bl _kcc_code_emit32
     b .Llvf_done
 .Llvf_spill:
-    add x2, x19, #2                // imm12 = vreg + 2
+    add x1, x19, #2                // slot index = vreg + 2
+    lsl x1, x1, #3                 // byte offset from x29
     mov x0, x20                    // Rt = fp reg
-    mov x1, #29                    // Rn = x29
-    bl _kcc_enc_ldr_fp
-    bl _kcc_code_emit32
+    mov x2, #2                     // kind = LDR fp
+    bl _kcc_cg_emit_frame_ldst
 .Llvf_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
@@ -701,11 +882,11 @@ _kcc_cg_store_vreg_fp:
     bl _kcc_code_emit32
     b .Lsvf_done
 .Lsvf_spill:
-    add x2, x19, #2
+    add x1, x19, #2                // slot index = vreg + 2
+    lsl x1, x1, #3                 // byte offset from x29
     mov x0, x20                    // Rt = fp reg
-    mov x1, #29
-    bl _kcc_enc_str_fp
-    bl _kcc_code_emit32
+    mov x2, #3                     // kind = STR fp
+    bl _kcc_cg_emit_frame_ldst
 .Lsvf_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
@@ -744,17 +925,14 @@ _kcc_cg_callee_transfer:
     lsr x1, x20, x0
     tst x1, #1
     b.eq .Lct_next
-    add x2, x21, x23              // imm12 = save_base_scaled + k
-    mov x0, x22                    // rt = register
-    mov x1, #29                    // rn = x29
-    mov x3, #1                     // size = 64-bit
-    cbz x19, .Lct_save
-    bl _kcc_enc_ldr_imm
-    b .Lct_emit
-.Lct_save:
-    bl _kcc_enc_str_imm
-.Lct_emit:
-    bl _kcc_code_emit32
+    add x1, x21, x23              // slot index = save_base_scaled + k
+    lsl x1, x1, #3                // byte offset from x29
+    mov x0, x22                   // rt = register
+    mov x2, #0                    // kind = LDR int (restore)
+    cbnz x19, .Lct_kind_ready     // restore → LDR
+    mov x2, #1                    // save → STR int
+.Lct_kind_ready:
+    bl _kcc_cg_emit_frame_ldst
     add x23, x23, #1
 .Lct_next:
     add x22, x22, #1

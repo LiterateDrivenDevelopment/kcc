@@ -62,12 +62,26 @@ All values are for the 64-bit ARM64 object file format
 \section{Output Buffer Management}
 
 Rather than seeking and writing pieces of the file in random order,
-we build the entire object file in an arena-allocated 64\,KB buffer
-and flush it in one \texttt{write} system call.  The helpers
-\texttt{write8}/\texttt{16}/\texttt{32}/\texttt{64} append
-little-endian values; \texttt{write\_bytes} copies raw data;
-\texttt{pad\_to} inserts zero bytes until the write position is
-aligned to the given power of two.
+we build the entire object file in one arena-allocated buffer and flush
+it in a single \texttt{write} system call.  A \emph{fixed} 64\,KB buffer
+was the original design, but that silently overflowed on large inputs---a
+deeply nested or very long function easily emits more than 64\,KB of
+code, and the writers would then \texttt{memcpy} past the buffer and
+crash.  Because \texttt{kcc\_macho\_init} runs \emph{after} code
+generation and string-table emission, every unbounded contributor is
+already known, so it sizes the buffer to the content: the code size, the
+DWARF blob, \texttt{nsyms} entries at a generous 288-byte budget each
+(the 16-byte \texttt{nlist\_64} plus a 256-byte name allowance), the
+relocations, and a fixed 64\,KB of slack for the header, load commands,
+and alignment.  Header, symbol table, and relocations therefore always
+fit; the sole residual risk---a symbol name longer than the per-symbol
+budget, copied through \texttt{write\_bytes}---is caught by an explicit
+capacity guard (\texttt{\_kcc\_macho\_cap}) that turns an oversized object
+into a clean diagnostic instead of memory corruption.  The helpers
+\texttt{write8}/\texttt{16}/\texttt{32}/\texttt{64} append little-endian
+values; \texttt{write\_bytes} copies raw data (and holds the guard);
+\texttt{pad\_to} inserts zero bytes until the write position is aligned to
+the given power of two.
 
 @d MachO: output buffer @{
 // -- kcc_macho_init -----------------------------------------------------------
@@ -99,12 +113,34 @@ _kcc_macho_init:
     add  x1, x1, _kcc_macho_fd@@PAGEOFF
     str x0, [x1]
 
-    // Allocate output buffer
-    mov x0, #MACHO_BUF_SIZE
+    // Size the buffer to the content (see prose): code + dwarf
+    // + nsyms*288 + nrelocs*8 + 64 KiB slack.
+    bl   _kcc_dwarf_total_len       // x0 = DWARF bytes (0 unless -g); clobbers x0-x1
+    mov  x19, x0                    // reuse x19 (filename no longer needed)
+    adrp x0, _kcc_code_pos@@PAGE
+    add  x0, x0, _kcc_code_pos@@PAGEOFF
+    ldr  x0, [x0]                   // code size
+    add  x19, x19, x0              // x19 = code + dwarf
+    adrp x1, _kcc_linker_syms@@PAGE
+    add  x1, x1, _kcc_linker_syms@@PAGEOFF
+    ldr  x1, [x1]
+    ldr  x1, [x1, #VEC_COUNT]       // nsyms
+    mov  x2, #288
+    madd x19, x1, x2, x19           // + nsyms*288
+    adrp x1, _kcc_linker_relocs@@PAGE
+    add  x1, x1, _kcc_linker_relocs@@PAGEOFF
+    ldr  x1, [x1]
+    ldr  x1, [x1, #VEC_COUNT]       // nrelocs
+    add  x19, x19, x1, lsl #3       // + nrelocs*8
+    add  x19, x19, #MACHO_BUF_SIZE  // + 64 KiB fixed slack (floors tiny objects)
+    mov  x0, x19
     bl _kcc_arena_alloc
-    adrp x1, _kcc_macho_buf@@PAGE
-    add  x1, x1, _kcc_macho_buf@@PAGEOFF
-    str x0, [x1]
+    adrp x2, _kcc_macho_buf@@PAGE
+    add  x2, x2, _kcc_macho_buf@@PAGEOFF
+    str x0, [x2]
+    adrp x2, _kcc_macho_cap@@PAGE
+    add  x2, x2, _kcc_macho_cap@@PAGEOFF
+    str x19, [x2]                   // record capacity for the overflow guard
 
     // Reset position
     adrp x1, _kcc_macho_pos@@PAGE
@@ -241,6 +277,14 @@ _kcc_macho_write_bytes:
     add  x3, x3, _kcc_macho_pos@@PAGEOFF
     ldr x4, [x3]
 
+    // Overflow guard (see prose): pos + len must fit within capacity.
+    adrp x5, _kcc_macho_cap@@PAGE
+    add  x5, x5, _kcc_macho_cap@@PAGEOFF
+    ldr x5, [x5]
+    add x6, x4, x19
+    cmp x6, x5
+    b.hi .Lmacho_overflow
+
     // memcpy(buf+pos, src, len)
     add x5, x2, x4                // dest = buf + pos
     // x0 = src, x19 = len
@@ -259,6 +303,17 @@ _kcc_macho_write_bytes:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+
+// Shared overflow bailout: the object file did not fit the sized buffer.
+// Reached only from the write_bytes guard; prints a diagnostic and exits so a
+// pathological input (e.g. an identifier longer than the per-symbol budget)
+// fails cleanly rather than corrupting memory.
+.Lmacho_overflow:
+    adrp x0, _kcc_macho_err_overflow@@PAGE
+    add  x0, x0, _kcc_macho_err_overflow@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+    bl _kcc_sys_exit
 
 // -- kcc_macho_pad_to ---------------------------------------------------------
 // void kcc_macho_pad_to(uint64_t alignment)
@@ -1241,14 +1296,19 @@ _kcc_macho_fd:       .quad 0     // output file descriptor
 _kcc_macho_buf:      .quad 0     // output buffer pointer
 .globl _kcc_macho_pos
 _kcc_macho_pos:      .quad 0     // current write position
+.globl _kcc_macho_cap
+_kcc_macho_cap:      .quad 0     // allocated output buffer size (overflow guard)
 
 .section __TEXT,__cstring,cstring_literals
 _kcc_macho_err_open:
     .asciz "kcc: error: cannot open output file\n"
+_kcc_macho_err_overflow:
+    .asciz "kcc: error: object file exceeds output buffer\n"
 
 // Section/segment names are now written as inline immediates in the emitter
 // (avoids linker dead-stripping trailing null bytes from local atoms)
 @| _kcc_macho_fd
 @| _kcc_macho_buf
 @| _kcc_macho_pos
+@| _kcc_macho_cap
 @}

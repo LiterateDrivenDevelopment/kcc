@@ -275,6 +275,18 @@ optimization is warranted.
     cmp x1, #IR_ALLOCA
     b.eq .Ldce_sweep_skip       // keep allocas
 
+    // A volatile load is a side effect: the read must occur even if its value
+    // is unused, so it is never dead.
+    cmp x1, #IR_LOAD
+    b.ne .Ldce_notvol
+    ldr x2, [x26, #IR_TYPE]
+    cmp x2, #0x1000
+    b.lo .Ldce_notvol
+    ldr x2, [x2, #TY_QUALS]
+    tst x2, #2
+    b.ne .Ldce_sweep_skip
+.Ldce_notvol:
+
     // Check if dest vreg is used
     ldr x2, [x26, #IR_DEST]
     cmp x2, x20

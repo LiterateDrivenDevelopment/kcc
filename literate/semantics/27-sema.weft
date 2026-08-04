@@ -235,11 +235,36 @@ _kcc_sema_resolve_type:
     b .Lsrt_done
 
 .Lsrt_quals:
-    // F0 = base type node, F1 = qualifier flags
+    // F0 = base type node, F1 = qualifier flags.
     ldr x0, [x19, #AST_F0]
     bl _kcc_sema_resolve_type
-    // TODO: apply qualifiers to a copy of the descriptor
-    // For now, just return the base type
+    // Only volatile is honoured (it must not be optimized away); const and
+    // restrict are still dropped, keeping the shared descriptors---and the code
+    // that compares types by identity---untouched.  A volatile object gets a
+    // fresh copy of the descriptor with the volatile bit set, so the qualifier
+    // reaches the alloca and its loads and stores without disturbing the
+    // canonical unqualified type.
+    ldr x1, [x19, #AST_F1]
+    and x1, x1, #2
+    cbz x1, .Lsrt_done
+    mov x20, x0                    // base descriptor (callee-saved)
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    ldr x1, [x20, #0]
+    str x1, [x0, #0]
+    ldr x1, [x20, #8]
+    str x1, [x0, #8]
+    ldr x1, [x20, #16]
+    str x1, [x0, #16]
+    ldr x1, [x20, #24]
+    str x1, [x0, #24]
+    ldr x1, [x20, #32]
+    str x1, [x0, #32]
+    ldr x1, [x20, #40]
+    str x1, [x0, #40]
+    ldr x1, [x0, #TY_QUALS]
+    orr x1, x1, #2               // mark volatile
+    str x1, [x0, #TY_QUALS]
     b .Lsrt_done
 
 .Lsrt_null:

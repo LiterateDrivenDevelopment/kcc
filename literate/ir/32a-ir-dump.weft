@@ -732,6 +732,15 @@ _kcc_ir_dump_type_short:
     b.lo .Lidts_unknown
     mov x19, x0
 
+    // Prefix a volatile-qualified type with "volatile " so a dump makes the
+    // qualifier visible (and confirms it reached the IR).
+    ldr x0, [x19, #TY_QUALS]
+    tst x0, #2
+    b.eq .Lidts_kind
+    adrp x0, .Lidts_volstr@@PAGE
+    add  x0, x0, .Lidts_volstr@@PAGEOFF
+    bl _kcc_io_puts
+.Lidts_kind:
     ldr x0, [x19, #TY_KIND]
 
     cmp x0, #TY_VOID

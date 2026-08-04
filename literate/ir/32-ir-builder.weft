@@ -1359,6 +1359,7 @@ _kcc_ir_ty_f64:         .asciz "f64"
 _kcc_ir_ty_ptr:         .asciz "ptr"
 _kcc_ir_ty_struct:      .asciz "struct"
 _kcc_ir_ty_unknown:     .asciz "?type"
+.Lidts_volstr:          .asciz "volatile "
 @| _kcc_ir_str_func
 @| _kcc_ir_str_arrow
 @| _kcc_ir_str_colon_nl

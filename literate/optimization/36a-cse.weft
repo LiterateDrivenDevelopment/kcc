@@ -237,6 +237,18 @@ _kcc_opt_cse:
     b .Lcse_next
 
 .Lcse_load:
+    // A volatile load must actually happen every time and must not be reordered,
+    // so it acts as a barrier: invalidate the cache and neither reuse nor record
+    // it.
+    ldr x10, [x26, #IR_TYPE]
+    cmp x10, #0x1000
+    b.lo .Lcse_load_ok
+    ldr x10, [x10, #TY_QUALS]
+    tst x10, #2
+    b.eq .Lcse_load_ok
+    str xzr, [sp, #104]          // kill cache
+    b .Lcse_next
+.Lcse_load_ok:
     ldr x10, [x26, #IR_SRC1]     // canonical address
     ldr x11, [sp, #104]          // load_count
     mov x12, #0                    // scan index

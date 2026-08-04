@@ -2248,10 +2248,11 @@ directly.
 .globl _kcc_ir_build_ident
 .p2align 2
 _kcc_ir_build_ident:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
 
     mov x19, x0
     ldr x20, [x19, #AST_F0]     // name ptr
@@ -2296,9 +2297,20 @@ _kcc_ir_build_ident:
     mov x21, x0                 // width+sign override
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
+    // The load's type is normally the canonical int; but a volatile variable
+    // must be tagged so the optimizer never merges or drops the access, so use
+    // its (volatile-qualified) descriptor in that case.
+    ldr x1, [x19, #AST_F3]      // variable type
+    cmp x1, #0x1000
+    b.lo .Libi_ll_intty
+    ldr x2, [x1, #TY_QUALS]
+    tst x2, #2
+    b.ne .Libi_ll_havety
+.Libi_ll_intty:
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
+.Libi_ll_havety:
     str x1, [x0, #IR_TYPE]
     str x22, [x0, #IR_SRC1]     // src = alloca vreg
     str x21, [x0, #IR_SRC2]     // access-size override
@@ -2352,6 +2364,19 @@ _kcc_ir_build_ident:
     ldr x0, [x19, #AST_F3]
     bl _kcc_ir_load_width
     mov x21, x0                 // width+sign override
+    // The load's type: the variable's (volatile-qualified) descriptor when it
+    // is volatile, else the canonical int.  Held in x23 across the global_ref.
+    ldr x23, [x19, #AST_F3]
+    cmp x23, #0x1000
+    b.lo .Libi_gs_intty
+    ldr x0, [x23, #TY_QUALS]
+    tst x0, #2
+    b.ne .Libi_gs_haveity
+.Libi_gs_intty:
+    adrp x23, _kcc_type_int_s@@PAGE
+    add  x23, x23, _kcc_type_int_s@@PAGEOFF
+    ldr x23, [x23]
+.Libi_gs_haveity:
 
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
@@ -2372,10 +2397,7 @@ _kcc_ir_build_ident:
     // Emit load from the global address (width+sign-aware, like locals)
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
+    str x23, [x0, #IR_TYPE]     // volatile var type when volatile, else int
     str x22, [x0, #IR_SRC1]     // src = address vreg
     str x21, [x0, #IR_SRC2]     // access-size override
 
@@ -2415,9 +2437,10 @@ _kcc_ir_build_ident:
     mov x0, #0
 
 .Libi_done:
+    ldr x23, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #64
     ret
 @| _kcc_ir_build_ident
 @}

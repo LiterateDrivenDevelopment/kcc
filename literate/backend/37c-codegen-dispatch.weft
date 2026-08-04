@@ -1090,6 +1090,13 @@ addressed correctly.
 @d CodeGen: instruction dispatch @{
 // ---- Memory operations ----
 .Lcgi_load:
+    // If the address is a promoted scalar local (mem2reg), its value lives in a
+    // register: read it directly, extending per the width/sign code, instead of
+    // touching memory.
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_cg_promoted_reg
+    cbnz x0, .Lcgi_load_promoted
+
     // Load: x9 = pointer from src1 slot, x11 = *x9, store x11 to dest
     ldr x0, [x19, #IR_SRC1]
     mov x1, #CG_REG_SRC1
@@ -1178,7 +1185,88 @@ addressed correctly.
     bl _kcc_cg_store_vreg
     b .Lcgi_done
 
+.Lcgi_load_promoted:
+    // x0 = physreg holding the local's contents.  Produce the loaded value in
+    // x11, sign/zero-extended per the SRC2 width code, then store to DEST.
+    // 0/other = 64-bit (plain move); 1/2/4 = u8/u16/u32; 5/6/7 = s8/s16/s32.
+    mov x23, x0                    // x23 = contents reg
+    ldr x24, [x19, #IR_SRC2]      // width/sign code
+    cbnz x24, .Lclp_narrow
+    mov x0, #CG_REG_DST           // rd = x11
+    mov x1, x23                    // rm = contents reg
+    mov x2, #1
+    bl _kcc_enc_mov_reg
+    bl _kcc_code_emit32
+    b .Lclp_store
+.Lclp_narrow:
+    // Move the contents into x9 so the fixed-form extend words (x9 → x11) apply.
+    mov x0, #CG_REG_SRC1
+    mov x1, x23
+    mov x2, #1
+    bl _kcc_enc_mov_reg
+    bl _kcc_code_emit32
+    cmp x24, #1
+    b.eq .Lclp_u8
+    cmp x24, #2
+    b.eq .Lclp_u16
+    cmp x24, #4
+    b.eq .Lclp_u32
+    cmp x24, #5
+    b.eq .Lclp_s8
+    cmp x24, #6
+    b.eq .Lclp_s16
+    cmp x24, #7
+    b.eq .Lclp_s32
+    // Unknown code: plain 64-bit copy x11 ← x9.
+    mov x0, #CG_REG_DST
+    mov x1, #CG_REG_SRC1
+    mov x2, #1
+    bl _kcc_enc_mov_reg
+    bl _kcc_code_emit32
+    b .Lclp_store
+.Lclp_u8:                          // UXTB x11, x9
+    movz w0, #0x1D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lclp_store
+.Lclp_u16:                         // UXTH x11, x9
+    movz w0, #0x3D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lclp_store
+.Lclp_u32:                         // UBFM x11, x9, #0, #31 (32→64 zero-extend)
+    movz w0, #0x7D2B
+    movk w0, #0xD340, lsl #16
+    bl _kcc_code_emit32
+    b .Lclp_store
+.Lclp_s8:                          // SXTB x11, x9
+    movz w0, #0x1D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lclp_store
+.Lclp_s16:                         // SXTH x11, x9
+    movz w0, #0x3D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+    b .Lclp_store
+.Lclp_s32:                         // SXTW x11, x9
+    movz w0, #0x7D2B
+    movk w0, #0x9340, lsl #16
+    bl _kcc_code_emit32
+.Lclp_store:
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #CG_REG_DST
+    bl _kcc_cg_store_vreg
+    b .Lcgi_done
+
 .Lcgi_store:
+    // If the destination is a promoted scalar local (mem2reg), write its value
+    // straight into the register that homes it, with no memory access.  The
+    // width code is irrelevant here: the matching load re-normalises on read.
+    ldr x0, [x19, #IR_SRC2]
+    bl _kcc_cg_promoted_reg
+    cbnz x0, .Lcgi_store_promoted
+
     // Store: x9 = value from src1, x10 = pointer from src2, *x10 = x9
     // IR_STORE: SRC1 = value vreg, SRC2 = pointer vreg
     // IR_DEST = access size override (0 → 64-bit default)
@@ -1233,7 +1321,26 @@ addressed correctly.
     bl _kcc_code_emit32
     b .Lcgi_done
 
+.Lcgi_store_promoted:
+    // x0 = the local's home register.  Load the value into x9 and move it there.
+    mov x23, x0                    // x23 = contents reg
+    ldr x0, [x19, #IR_SRC1]       // value vreg
+    mov x1, #CG_REG_SRC1
+    bl _kcc_cg_load_vreg
+    mov x0, x23                    // rd = contents reg
+    mov x1, #CG_REG_SRC1          // rm = x9
+    mov x2, #1
+    bl _kcc_enc_mov_reg
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
 .Lcgi_alloca:
+    // A promoted scalar local has no stack storage: its ALLOCA emits nothing,
+    // because the register holding its contents is written by the stores above.
+    ldr x0, [x19, #IR_DEST]
+    bl _kcc_cg_promoted_reg
+    cbnz x0, .Lcgi_done
+
     // Alloca: compute address of storage past the vreg value slots.
     // Pre-scan stored the running offset in SRC2.
     // Address = x29 + 16 + vreg_count*8 + SRC2*8

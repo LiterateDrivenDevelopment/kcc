@@ -69,6 +69,16 @@ _kcc_codegen_func:
     //    Each alloca records its running offset in SRC2.
     ldr x20, [x19, #IRF_VREG_N]   // vreg_count (temporary)
 
+    // Store vreg_count (the alloca address computation reads it) and run
+    // register allocation FIRST.  Allocation publishes _kcc_cg_promoted, so the
+    // pre-scan below can leave every promoted scalar local out of the frame:
+    // a local that lives in a register needs no stack slot.
+    adrp x1, _kcc_cg_vreg_count@@PAGE
+    add  x1, x1, _kcc_cg_vreg_count@@PAGEOFF
+    str x20, [x1]
+    mov x0, x19
+    bl _kcc_cg_regalloc
+
     // Pre-scan: walk all BBs/instructions, find allocas, assign offsets
     mov x0, #0                     // running alloca slot offset
     ldr x1, [x19, #IRF_BLOCKS]    // blocks vec
@@ -94,6 +104,15 @@ _kcc_codegen_func:
     ldr x5, [x4, #IR_OP]
     cmp x5, #IR_ALLOCA
     b.ne .Lcgf_alloca_scan_skip
+    // A promoted scalar local lives in a register — give it no frame storage.
+    adrp x5, _kcc_cg_promoted@@PAGE
+    add  x5, x5, _kcc_cg_promoted@@PAGEOFF
+    ldr x5, [x5]
+    cbz x5, .Lcgf_alloca_store
+    ldr x6, [x4, #IR_DEST]
+    ldr x5, [x5, x6, lsl #3]
+    cbnz x5, .Lcgf_alloca_scan_skip
+.Lcgf_alloca_store:
     // Found alloca: store running offset in SRC2, advance by SRC1
     ldr x0, [sp, #104]            // running offset
     str x0, [x4, #IR_SRC2]        // record offset for this alloca
@@ -115,20 +134,9 @@ _kcc_codegen_func:
     add x3, x3, #1
     b .Lcgf_alloca_scan_bb
 .Lcgf_alloca_scan_done:
-    // x0 = total alloca slots, x20 = vreg_count
-    mov x24, x0                    // preserve total_alloca_slots across RA
-    mov x25, x20                   // preserve vreg_count across RA
-
-    // Store vreg_count for alloca address computation
-    ldr x0, [x19, #IRF_VREG_N]
-    adrp x1, _kcc_cg_vreg_count@@PAGE
-    add  x1, x1, _kcc_cg_vreg_count@@PAGEOFF
-    str x0, [x1]
-
-    // 1b. Register allocation runs before frame sizing: it decides how many
-    //     callee-saved registers must be spilled, which enlarges the frame.
-    mov x0, x19
-    bl _kcc_cg_regalloc
+    // x0 = total alloca slots (promoted locals excluded), x20 = vreg_count
+    mov x24, x0                    // total_alloca_slots
+    mov x25, x20                   // vreg_count
 
     // save_base = 16 + vreg_count*8 + total_alloca*8 — the callee-save area
     // sits above the vreg slots and alloca storage, so those offsets (and the
@@ -820,6 +828,27 @@ _kcc_cg_store_vreg:
 .Lsv_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_cg_promoted_reg ------------------------------------------------------
+// uint64_t kcc_cg_promoted_reg(uint64_t vreg)
+//   x0 = vreg number
+// Returns the physical register holding a promoted scalar local's contents
+// (mem2reg), or 0 if the vreg is not a promoted alloca.  The load/store/alloca
+// handlers consult this to route a local's accesses to its register instead of
+// memory.
+.text
+.globl _kcc_cg_promoted_reg
+.p2align 2
+_kcc_cg_promoted_reg:
+    adrp x1, _kcc_cg_promoted@@PAGE
+    add  x1, x1, _kcc_cg_promoted@@PAGEOFF
+    ldr x1, [x1]
+    cbz x1, .Lcpr_zero
+    ldr x0, [x1, x0, lsl #3]
+    ret
+.Lcpr_zero:
+    mov x0, #0
     ret
 
 // -- kcc_cg_load_vreg_fp / kcc_cg_store_vreg_fp -------------------------------

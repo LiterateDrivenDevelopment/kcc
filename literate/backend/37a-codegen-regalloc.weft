@@ -94,6 +94,26 @@ callee-saved registers the scan keeps live (\texttt{x20}--\texttt{x24}) and
 takes the per-instruction varying values---the used vreg, current block,
 position, and call count---as arguments.
 
+\paragraph{Register promotion of scalar locals (mem2reg).}
+A C local is lowered as an \texttt{IR\_ALLOCA} with stack storage; every read
+is a \texttt{LOAD} and every write a \texttt{STORE} against that slot.  The
+allocator already treats the alloca's result vreg as an ordinary candidate---so
+today it may hold the \emph{address} of the slot in a register while the loads
+and stores still go to memory.  Promotion observes that if the local is a
+single-slot integer or pointer whose address never escapes, that same register
+can hold the local's \emph{contents} instead, and the memory traffic
+disappears.  The escape test is exact in this IR: the alloca's vreg is safe iff
+it appears only as a load's address (\texttt{SRC1}) or a store's address
+(\texttt{SRC2}); any other appearance is the value produced by \texttt{\&x}.  A
+scan after pass~1 marks each eligible alloca (bit \texttt{0x100}) and clears the
+mark on the first disqualifying use, and \texttt{volatile} locals are never
+marked.  Crucially this reuses the allocation the scan already makes---no new
+register is reserved, so promotion adds \emph{zero} register pressure, unlike a
+scheme that grabs a register per local up front.  The finalisation step
+publishes \texttt{\_kcc\_cg\_promoted[v]}, the physical register the load, store,
+and alloca handlers read to route a promoted local's accesses through a register
+(and to emit nothing for its now-storage-less \texttt{ALLOCA}).
+
 @d CodeGen: register allocation @{
 // -- kcc_ra_use ---------------------------------------------------------------
 // Record one vreg use during pass 1.  x0=vreg, x1=cur_bb, x2=pos, x3=calls.
@@ -121,6 +141,25 @@ _kcc_ra_use:
 .Lrau_ret:
     ret
 
+// -- kcc_ra_disq --------------------------------------------------------------
+// Disqualify a vreg from scalar-local promotion: if x0 is a valid vreg whose
+// flags (x1 = flags base, x2 = vreg_n) carry the promotable bit (0x100), clear
+// it.  Called for every vreg operand that appears in a position OTHER than
+// LOAD.SRC1 / STORE.SRC2 — i.e. any use of a local's address as a value, which
+// is exactly the `&x` escape that makes the local non-promotable.
+.text
+.p2align 2
+_kcc_ra_disq:
+    cmp x0, x2
+    b.hs .Lrd_ret
+    ldr x3, [x1, x0, lsl #3]
+    tst x3, #0x100
+    b.eq .Lrd_ret
+    bic x3, x3, #0x100
+    str x3, [x1, x0, lsl #3]
+.Lrd_ret:
+    ret
+
 // -- kcc_cg_regalloc ----------------------------------------------------------
 // void kcc_cg_regalloc(ir_func *func)
 // Computes the per-function vreg→physreg map and publishes it in
@@ -145,6 +184,9 @@ _kcc_cg_regalloc:
     adrp x0, _kcc_cg_regmap@@PAGE
     add  x0, x0, _kcc_cg_regmap@@PAGEOFF
     str xzr, [x0]
+    adrp x0, _kcc_cg_promoted@@PAGE
+    add  x0, x0, _kcc_cg_promoted@@PAGEOFF
+    str xzr, [x0]
     adrp x0, _kcc_cg_callee_mask@@PAGE
     add  x0, x0, _kcc_cg_callee_mask@@PAGEOFF
     str xzr, [x0]
@@ -153,21 +195,24 @@ _kcc_cg_regalloc:
     str xzr, [x0]
     cbz x20, .Lra_done             // no vregs
 
-    // Allocate one zeroed block of five vreg_n-entry arrays (8 bytes each):
-    // lastuse, defbb, calldef, flags, map.
+    // Allocate one zeroed block of six vreg_n-entry arrays (8 bytes each):
+    // lastuse, defbb, calldef, flags, map, promoted.  The sixth (promoted)
+    // becomes the alloca-vreg → contents-physreg map for mem2reg.
     lsl x9, x20, #3               // vreg_n * 8  (one array's byte size)
-    add x0, x9, x9, lsl #2        // vreg_n*8 * 5 = total bytes
+    mov x11, #6
+    mul x0, x9, x11               // vreg_n*8 * 6 = total bytes
     bl _kcc_arena_alloc
     mov x21, x0                    // lastuse base (also block base)
     lsl x9, x20, #3
-    add x22, x21, x9               // defbb  = block + vreg_n*8
-    add x23, x22, x9               // calldef= block + vreg_n*16
-    add x24, x23, x9               // flags  = block + vreg_n*24
-    add x25, x24, x9               // map    = block + vreg_n*32
+    add x22, x21, x9               // defbb    = block + vreg_n*8
+    add x23, x22, x9               // calldef  = block + vreg_n*16
+    add x24, x23, x9               // flags    = block + vreg_n*24
+    add x25, x24, x9               // map      = block + vreg_n*32
+    //                                promoted = block + vreg_n*40 (= map + n*8)
 
-    // Zero the whole block (5*vreg_n entries).
-    mov x9, x20
-    add x9, x9, x9, lsl #2        // 5 * vreg_n entries
+    // Zero the whole block (6*vreg_n entries).
+    mov x11, #6
+    mul x9, x20, x11             // 6 * vreg_n entries
     mov x10, x21
 .Lra_zero:
     cbz x9, .Lra_zeroed
@@ -308,6 +353,176 @@ _kcc_cg_regalloc:
     str x0, [sp, #104]
     b .Lp1_bb
 .Lp1_done:
+
+    // ---- Promotability analysis (mem2reg) ----
+    // A scalar local (an IR_ALLOCA of an integer/pointer type occupying a
+    // single slot) can live in a physical register instead of memory, provided
+    // its address never escapes.  In this IR the address escapes exactly when
+    // the alloca's vreg appears anywhere other than as the address operand of a
+    // load (LOAD.SRC1) or a store (STORE.SRC2) --- i.e. as a plain value, which
+    // is what `&x` produces.  We mark each eligible alloca with flags bit 0x100
+    // at its definition, then clear it for every disqualifying use.  Because the
+    // register allocator already treats an alloca's vreg as an ordinary
+    // candidate (today it holds the slot ADDRESS), promotion needs no new
+    // allocation: after the scan we simply reinterpret the register it was given
+    // as holding the local's CONTENTS.  This is why promotion adds no register
+    // pressure --- the same vregs are allocated either way.  Volatile locals are
+    // excluded so every access still touches memory.
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [x0, #VEC_COUNT]
+    str x1, [sp, #112]
+    str xzr, [sp, #104]
+.Lpr_bb:
+    ldr x0, [sp, #104]
+    ldr x1, [sp, #112]
+    cmp x0, x1
+    b.hs .Lpr_done
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [sp, #104]
+    bl _kcc_vec_get
+    ldr x26, [x0]
+    ldr x26, [x26, #BB_FIRST]
+.Lpr_instr:
+    cbz x26, .Lpr_next_bb
+    ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_ALLOCA
+    b.eq .Lpr_alloca
+    cmp x9, #IR_STORE
+    b.eq .Lpr_store
+    cmp x9, #IR_LOAD
+    b.eq .Lpr_next_i             // LOAD.SRC1 is an allowed address use
+    cmp x9, #IR_BR_COND
+    b.eq .Lpr_brcond
+    cmp x9, #IR_RET
+    b.eq .Lpr_ret
+    cmp x9, #IR_CALL
+    b.eq .Lpr_call
+    cmp x9, #IR_CALL_IND
+    b.eq .Lpr_callind
+    cmp x9, #IR_VA_START
+    b.eq .Lpr_next_i             // SRC2 = fixed count (immediate), no vreg src
+    cmp x9, #IR_CONST
+    b.eq .Lpr_next_i
+    cmp x9, #IR_NOP
+    b.eq .Lpr_next_i
+    cmp x9, #IR_GLOBAL_REF
+    b.eq .Lpr_next_i
+    cmp x9, #IR_STRING_LIT
+    b.eq .Lpr_next_i
+    cmp x9, #IR_BR
+    b.eq .Lpr_next_i
+    cmp x9, #IR_NEG
+    b.eq .Lpr_unary
+    cmp x9, #IR_NOT
+    b.eq .Lpr_unary
+    cmp x9, #50                   // SEXT..FPROUND (50-57): SRC1 value, SRC2 width
+    b.lo .Lpr_binary             // everything else <50 (arith/cmp/GEP): SRC1+SRC2
+    b .Lpr_unary
+
+.Lpr_alloca:
+    ldr x10, [x26, #IR_TYPE]     // element type
+    cbz x10, .Lpr_next_i
+    ldr x11, [x10, #TY_QUALS]
+    tst x11, #2                   // volatile → never promote
+    b.ne .Lpr_next_i
+    ldr x11, [x10]               // TY_KIND
+    cmp x11, #2                   // < BOOL → not a scalar (VOID)
+    b.lo .Lpr_next_i
+    cmp x11, #7                   // BOOL..LLONG
+    b.ls .Lpr_alloca_ok
+    cmp x11, #11                  // PTR
+    b.eq .Lpr_alloca_ok
+    cmp x11, #16                  // ENUM
+    b.eq .Lpr_alloca_ok
+    b .Lpr_next_i                 // FLOAT/DOUBLE/aggregate → not promoted here
+.Lpr_alloca_ok:
+    ldr x11, [x26, #IR_SRC1]     // slot count
+    cmp x11, #1
+    b.hi .Lpr_next_i             // multi-slot → not a single-register scalar
+    ldr x0, [x26, #IR_DEST]      // alloca vreg
+    cmp x0, x20
+    b.hs .Lpr_next_i
+    ldr x3, [x24, x0, lsl #3]
+    orr x3, x3, #0x100
+    str x3, [x24, x0, lsl #3]
+    b .Lpr_next_i
+
+.Lpr_store:
+    ldr x0, [x26, #IR_SRC1]      // stored VALUE (SRC2 address is allowed)
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+    b .Lpr_next_i
+.Lpr_brcond:
+    ldr x0, [x26, #IR_DEST]      // condition vreg
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+    b .Lpr_next_i
+.Lpr_ret:
+    ldr x10, [x26, #IR_TYPE]
+    cbz x10, .Lpr_next_i         // void return: SRC1 carries no value vreg
+    ldr x11, [x10]
+    cmp x11, #1                   // VOID
+    b.eq .Lpr_next_i
+    ldr x0, [x26, #IR_SRC1]      // returned value vreg
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+    b .Lpr_next_i
+.Lpr_callind:
+    ldr x0, [x26, #IR_SRC1]      // indirect callee target vreg
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+    // fall through to argument disqualification
+.Lpr_call:
+    ldr x7, [x26, #IR_SRC2]      // args array (count + vreg pairs)
+    cbz x7, .Lpr_next_i
+    ldr x8, [x7]
+    and x8, x8, #0xffffffff       // arg count
+    mov x5, #0
+.Lpr_carg:
+    cmp x5, x8
+    b.hs .Lpr_next_i
+    lsl x6, x5, #1
+    add x6, x6, #1               // 1 + i*2
+    ldr x0, [x7, x6, lsl #3]     // arg vreg
+    mov x1, x24
+    mov x2, x20
+    str x5, [sp, #128]
+    str x7, [sp, #136]
+    str x8, [sp, #144]
+    bl _kcc_ra_disq
+    ldr x5, [sp, #128]
+    ldr x7, [sp, #136]
+    ldr x8, [sp, #144]
+    add x5, x5, #1
+    b .Lpr_carg
+.Lpr_binary:
+    ldr x0, [x26, #IR_SRC1]
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+    ldr x0, [x26, #IR_SRC2]
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+    b .Lpr_next_i
+.Lpr_unary:
+    ldr x0, [x26, #IR_SRC1]
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+.Lpr_next_i:
+    ldr x26, [x26, #IR_NEXT]
+    b .Lpr_instr
+.Lpr_next_bb:
+    ldr x0, [sp, #104]
+    add x0, x0, #1
+    str x0, [sp, #104]
+    b .Lpr_bb
+.Lpr_done:
 
     // ---- Loop detection ----
     // A value whose live range escapes its defining block can be kept in a
@@ -512,6 +727,32 @@ _kcc_cg_regalloc:
     str x0, [sp, #104]
     b .Lp2_bb
 .Lp2_done:
+
+    // Build the promotion map: promoted[v] = map[v] for every alloca vreg the
+    // scan actually placed in a register (map[v] != 0) that survived the
+    // escape scan (flags bit 0x100).  The register the allocator handed the
+    // alloca---which would otherwise hold the slot address---is reinterpreted
+    // by the load/store/alloca codegen as the local's live-in-register value.
+    // The block was zeroed, so we only write the promoted entries.
+    lsl x13, x20, #3
+    add x13, x25, x13             // promoted base = map + vreg_n*8
+    mov x9, #0
+.Lpr_fill:
+    cmp x9, x20
+    b.hs .Lpr_fill_done
+    ldr x10, [x24, x9, lsl #3]    // flags[v]
+    tst x10, #0x100
+    b.eq .Lpr_fill_next
+    ldr x11, [x25, x9, lsl #3]    // map[v]
+    cbz x11, .Lpr_fill_next
+    str x11, [x13, x9, lsl #3]    // promoted[v] = physreg
+.Lpr_fill_next:
+    add x9, x9, #1
+    b .Lpr_fill
+.Lpr_fill_done:
+    adrp x0, _kcc_cg_promoted@@PAGE
+    add  x0, x0, _kcc_cg_promoted@@PAGEOFF
+    str x13, [x0]
 
     // Publish the finished map.
     adrp x0, _kcc_cg_regmap@@PAGE

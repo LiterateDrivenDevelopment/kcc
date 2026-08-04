@@ -21,9 +21,13 @@ it is safe beyond any doubt, so the pass allocates a vreg to a physical
 register precisely when \emph{both} of these hold:
 
 \begin{itemize}
-\item Its defining instruction produces an integer or pointer scalar
-      (floating and aggregate values are never allocated---they flow through
-      the FP helpers or by address).
+\item Its defining instruction produces a scalar---integer, pointer, or
+      floating.  A floating value is allocated to a \emph{general} register: the
+      \texttt{load\_vreg\_fp}/\texttt{store\_vreg\_fp} helpers already bridge a
+      general register to the FP unit with an \textsc{fmov} on each side, so a
+      floating value simply lives as its 64-bit pattern in a general register
+      and is moved into a \texttt{d} register only for the arithmetic itself.
+      Aggregate values are never allocated---they are addressed by pointer.
 \item Its live range can be reasoned about with the linear instruction
       numbering.  This is always true for a value confined to a
       \emph{single basic block} (straight-line code, where textual order is
@@ -328,6 +332,9 @@ _kcc_cg_regalloc:
     b.lo .Lp1_next
     cmp x11, #7                   // BOOL..LLONG
     b.ls .Lp1_defok
+    cmp x11, #10                  // FLOAT..LDOUBLE: a floating value is held in a
+    b.ls .Lp1_defok              //   general register, bridged to the FP unit by
+                                 //   the FMOV in load_vreg_fp/store_vreg_fp
     cmp x11, #11                  // PTR
     b.eq .Lp1_defok
     cmp x11, #16                  // ENUM

@@ -131,12 +131,13 @@ _kcc_ir_build_assign:
     cmp x20, #TOK_ASSIGN
     b.eq .Liba_store
 
-    // Load current value
+    // Load current value.  Use the lvalue's own type (stashed at [sp,#64]) so a
+    // floating local's compound update stays floating: the binop below inherits
+    // this type and the back end selects FADD/FSUB/FMUL/FDIV instead of the
+    // integer opcodes.
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
+    ldr x1, [sp, #64]           // lvalue (LHS) type
     str x1, [x0, #IR_TYPE]
     str x22, [x0, #IR_SRC1]
     mov x19, x0
@@ -181,12 +182,13 @@ _kcc_ir_build_assign:
     b .Liba_store
 
 .Liba_compound:
-    // Emit binop: result = current_val op rhs
+    // Emit binop: result = current_val op rhs.  Typing it with the lvalue type
+    // is what makes a floating compound assignment lower to a floating
+    // operation (the opcode is the same IR_ADD/... — the back end dispatches on
+    // the type).
     mov x0, x24
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
+    ldr x1, [sp, #64]           // lvalue (LHS) type
     str x1, [x0, #IR_TYPE]
     str x23, [x0, #IR_SRC1]
     str x21, [x0, #IR_SRC2]
@@ -197,7 +199,17 @@ _kcc_ir_build_assign:
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Truncate the compound result to the destination's declared width
+    // Truncate the compound result to the destination's declared width.  This
+    // applies only to integers; a floating result must not be masked, so skip
+    // it for a floating lvalue.
+    ldr x2, [sp, #64]           // LHS type
+    cbz x2, .Liba_store
+    ldr x3, [x2]                // TY_KIND
+    cmp x3, #8                   // FLOAT..LDOUBLE → floating: no truncation
+    b.lo .Liba_norm
+    cmp x3, #10
+    b.ls .Liba_store
+.Liba_norm:
     mov x0, x21                  // result vreg
     mov x1, x24                  // opcode
     ldr x2, [sp, #64]            // LHS type
@@ -257,12 +269,11 @@ _kcc_ir_build_assign:
     cmp x20, #TOK_ASSIGN
     b.eq .Liba_global_simple
 
-    // Load current value from global
+    // Load current value from global, using the lvalue type so a floating
+    // global's compound update stays floating (see the local path).
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
+    ldr x1, [sp, #64]           // lvalue (LHS) type
     str x1, [x0, #IR_TYPE]
     str x22, [x0, #IR_SRC1]     // global addr vreg
     mov x19, x0
@@ -306,12 +317,11 @@ _kcc_ir_build_assign:
     b .Liba_global_simple
 
 .Liba_global_compound:
-    // Emit binop: result = current_val op rhs
+    // Emit binop: result = current_val op rhs, typed by the lvalue so a
+    // floating global lowers to a floating operation.
     mov x0, x24
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
+    ldr x1, [sp, #64]           // lvalue (LHS) type
     str x1, [x0, #IR_TYPE]
     str x23, [x0, #IR_SRC1]     // current value
     str x21, [x0, #IR_SRC2]     // rhs
@@ -322,7 +332,15 @@ _kcc_ir_build_assign:
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Truncate the compound result to the destination's declared width
+    // Integer results are truncated to the declared width; floating ones are not.
+    ldr x2, [sp, #64]
+    cbz x2, .Liba_global_simple
+    ldr x3, [x2]
+    cmp x3, #8
+    b.lo .Liba_global_norm
+    cmp x3, #10
+    b.ls .Liba_global_simple
+.Liba_global_norm:
     mov x0, x21
     mov x1, x24                  // opcode
     ldr x2, [sp, #64]            // LHS type

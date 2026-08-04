@@ -989,9 +989,14 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       promotion adds zero register pressure, and a local is promoted exactly
       when the shared scan already had a register for it (the excess stays in
       memory, as before).  A promoted local also vacates its frame slot, so loop
-      bodies become memory-free.  What remains is quality, not enablement: a
-      tighter loop reservation (real liveness), floating-point allocation, and
-      the remaining classic IR passes (copy propagation, strength reduction).
+      bodies become memory-free.  Floating-point values now participate in
+      allocation as well: a floating vreg rides in a \emph{general} register
+      (its 64-bit pattern), moved into a \texttt{d} register only for the
+      arithmetic---the spill helpers already performed exactly that
+      \textsc{fmov} bridge, so allocation came free once the scan admitted the
+      floating kinds.  What remains is quality, not enablement: a tighter loop
+      reservation (real liveness), a dedicated FP register bank, and the
+      remaining classic IR passes (copy propagation, strength reduction).
 \item \textbf{Tail C17 features---\_Generic, \texttt{long double},
       \texttt{volatile}} (Stage~9a).  \texttt{volatile} is now honoured for
       every lvalue access---scalar, global, pointer dereference, array element,
@@ -1211,9 +1216,14 @@ register allocation to eliminate redundant memory traffic.
 \item \textbf{Spill heuristics.}  When registers are exhausted, spill the
       vreg with the longest remaining interval rather than declining to
       allocate; coalesce adjacent load/store pairs.
-\item \textbf{FP register allocation.}  Let floating-point vregs compete for
-      \texttt{d8}--\texttt{d15} (callee-saved) and \texttt{d16}--\texttt{d31}
-      (caller-saved) instead of riding in general registers via \textsc{fmov}.
+\item \textbf{FP register allocation.}  \emph{Done} in its first form:
+      floating vregs are now allocated, riding in general registers with an
+      \textsc{fmov} on each access (the FP spill helpers already bridged a
+      general register to the FP unit, so enabling the existing scan for
+      floating kinds was the whole change).  The refinement that remains is to
+      give them a \emph{dedicated} FP bank---\texttt{d8}--\texttt{d15}
+      (callee-saved) and \texttt{d16}--\texttt{d31} (caller-saved)---so the
+      \textsc{fmov} round-trip disappears for FP-only chains.
 \end{itemize}
 
 \subsection{Stage 9d --- Optimization}
@@ -1455,7 +1465,7 @@ hardening, and a second target---rather than missing capability:
 Concern & Status & Note \\
 \hline
 register allocation          & \checkmark & linear-scan; cross-block loop-free \& loopy; mem2reg (scalar locals) \\
-optimizer / CSE / FP r.a.    & $\circ$ & const-fold+DCE+CSE+mem2reg run; copy-prop/FP-alloc left \\
+optimizer / CSE / FP r.a.    & $\circ$ & const-fold+DCE+CSE+mem2reg+FP-alloc run; copy-prop/strength-red left \\
 $>8$ arguments on the stack  & \checkmark & self-consistent, 5 diff. tests \\
 AAPCS64 register convention  & \checkmark & FP/small+large struct/x8; interop 16/16 \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\

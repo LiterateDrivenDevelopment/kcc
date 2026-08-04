@@ -1664,18 +1664,26 @@ _kcc_ir_emit_const:
 // uint64_t kcc_ir_emit_binop(int op, uint64_t a_vreg, uint64_t b_vreg) → vreg
 .p2align 2
 _kcc_ir_emit_binop:
+    // Backwards-compatible entry: the result type is long_u, right for the
+    // integer and pointer/bit-field address arithmetic all existing callers do.
+    adrp x3, _kcc_type_long_u@@PAGE
+    add  x3, x3, _kcc_type_long_u@@PAGEOFF
+    ldr x3, [x3]
+    // fall through with x3 = result type
+_kcc_ir_emit_binop_typed:
+    // uint64_t kcc_ir_emit_binop_typed(op x0, a x1, b x2, type x3)
+    // Emit `a op b` carrying the given result type.  Typing it floating is what
+    // makes the back end select FADD/FSUB/FMUL/FDIV for a floating operand.
     stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     mov x19, x1                  // a
     mov x20, x2                  // b
+    mov x22, x3                  // result type
     bl _kcc_ir_alloc_instr       // x0 = op passed through
     mov x21, x0
-    adrp x1, _kcc_type_long_u@@PAGE
-    add  x1, x1, _kcc_type_long_u@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x21, #IR_TYPE]
+    str x22, [x21, #IR_TYPE]
     str x19, [x21, #IR_SRC1]
     str x20, [x21, #IR_SRC2]
     bl _kcc_ir_next_vreg
@@ -2188,10 +2196,24 @@ _kcc_ir_assign_through:
 .Lat_haveold:
     str x0, [sp, #64]            // stash old value vreg
     mov x0, x21
-    bl _kcc_ir_tok_to_binop
+    bl _kcc_ir_tok_to_binop     // x0 = IR opcode
+    // Result type: the lvalue type when floating (so the op lowers to
+    // FADD/FSUB/FMUL/FDIV), else long_u (integer/pointer arithmetic, unchanged).
+    mov x3, x23                  // lvalue scalar type
+    cbz x23, .Lat_binop_long
+    ldr x4, [x23]                // TY_KIND
+    cmp x4, #8                   // FLOAT
+    b.lo .Lat_binop_long
+    cmp x4, #10                  // ..LDOUBLE
+    b.ls .Lat_binop_go           // floating → keep x3 = lvalue type
+.Lat_binop_long:
+    adrp x3, _kcc_type_long_u@@PAGE
+    add  x3, x3, _kcc_type_long_u@@PAGEOFF
+    ldr x3, [x3]
+.Lat_binop_go:
     ldr x1, [sp, #64]           // old
     mov x2, x20                  // rhs
-    bl _kcc_ir_emit_binop        // new = old op rhs
+    bl _kcc_ir_emit_binop_typed  // new = old op rhs
     mov x20, x0                  // value to store = new
     cbnz x24, .Lat_store_bf
     mov x0, x23

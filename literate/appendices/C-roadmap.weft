@@ -973,10 +973,15 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       fold surfaced and fixed a dead-code-elimination bug---its mark pass read
       the stale operands of already-deleted \texttt{NOP} shells, keeping dead
       code alive and corrupting a type field---and hardened \texttt{--dump-ir}
-      to survive malformed IR.  What
+      to survive malformed IR.  Common subexpression elimination now runs too:
+      a local value-numbering pass that reuses an earlier pure computation, and
+      crucially an earlier \emph{load} of the same address (invalidated by any
+      intervening store or call), so the pervasive reload-a-local pattern
+      collapses (${\sim}19\%$ fewer instructions on a redundant-expression
+      corpus).  What
       remains is quality, not enablement: a tighter loop reservation (real
-      liveness), floating-point allocation, and the classic IR passes (CSE,
-      copy propagation, strength reduction).  \emph{Mem2reg} (promoting
+      liveness), floating-point allocation, and the remaining classic IR passes
+      (copy propagation, strength reduction).  \emph{Mem2reg} (promoting
       \texttt{alloca} locals to registers) was implemented and reverted---it
       is correct but net-negative here, because the existing allocator already
       covers loop values and mem2reg's whole-function reservation starves it;

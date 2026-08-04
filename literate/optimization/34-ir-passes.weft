@@ -6,7 +6,7 @@
 \chapter{Optimization Passes}
 \label{ch:ir-passes}
 
-Generating correct IR is necessary, but the initial translation from AST to IR often leaves redundancy---constant expressions that could be evaluated at compile time, arithmetic identities that cancel out, and instructions whose results are never consumed.  This chapter provides the pass manager that drives optimization.  It iterates over every IR function and runs the available passes (constant folding and dead code elimination) in a loop until no further changes occur, achieving a fixed-point result.
+Generating correct IR is necessary, but the initial translation from AST to IR often leaves redundancy---constant expressions that could be evaluated at compile time, subexpressions and loads computed more than once, and instructions whose results are never consumed.  This chapter provides the pass manager that drives optimization.  It iterates over every IR function and runs the available passes---constant folding, common subexpression elimination, and dead code elimination---in a loop until no further changes occur, achieving a fixed-point result.  Running them together matters: folding a cast can expose a common subexpression, eliminating it can leave a load dead, and each pass feeds the next until the IR settles.
 
 \section{Pass Manager}
 
@@ -71,7 +71,7 @@ the fixed-point loop so all passes run again on the modified IR.
 @d Opt: pass manager @{
 // -- kcc_opt_run_func -----------------------------------------------------
 // void kcc_opt_run_func(ir_func *func)
-// Iterates constfold + dce until no changes.
+// Iterates constfold + cse + dce until no changes.
 .text
 .globl _kcc_opt_run_func
 .p2align 2
@@ -91,6 +91,11 @@ _kcc_opt_run_func:
     mov x0, x19
     bl _kcc_opt_constfold
     mov x1, x0                  // fold count
+
+    // Run common subexpression elimination
+    mov x0, x19
+    bl _kcc_opt_cse
+    add x1, x1, x0              // + cse count
 
     // Run DCE
     mov x0, x19

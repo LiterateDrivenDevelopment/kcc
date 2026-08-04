@@ -1,0 +1,327 @@
+% 36a-cse.weft — Common Subexpression Elimination
+%
+% Local (per-basic-block) value numbering: reuse an earlier computation and
+% an earlier load instead of repeating them.
+
+\chapter{Common Subexpression Elimination}
+\label{ch:cse}
+
+Constant folding removes work whose \emph{operands} are known; common
+subexpression elimination removes work that is simply \emph{repeated}.  When a
+basic block computes the same pure operation on the same operands twice---or
+loads the same address twice with nothing written in between---the second
+occurrence is redundant and its result can be taken from the first.
+
+The pass is deliberately \emph{local}: it value-numbers within a single basic
+block and starts fresh at each block boundary.  Inside one block, textual order
+is execution order and the first occurrence dominates the second, so no
+dominance analysis is needed.  The IR is quasi-SSA---every instruction defines a
+fresh virtual register that is never rewritten---so two pure instructions with
+the same opcode and the same source registers are guaranteed to compute the
+same value.  A function-wide \emph{replacement map} then records, for each
+redundant register, the earlier register that supersedes it; as the walk
+proceeds it rewrites every operand through this map, so a later use of a
+redundant value reads the surviving one instead.  The redundant instruction is
+thereby left with no users and the dead-code pass deletes it.
+
+\paragraph{Loads are the real prize.}
+Because \kcc{} keeps every C local in memory, an expression like
+\texttt{(x+y)*(x+y)} reloads \texttt{x} and \texttt{y} four times; the two
+\texttt{x+y} additions look different only because each reads a fresh load.
+Eliminating the redundant \emph{loads} is therefore what unlocks the arithmetic
+CSE above it.  A load is redundant when the same address was already loaded in
+this block and nothing has been stored since.  Without alias analysis the pass
+is conservative: \emph{any} store or call invalidates every cached load, since
+either might write the address in question.  That is safe and still catches the
+common reload-a-local pattern, where the stores sit at the top of the block and
+the reloads follow uninterrupted.
+
+\paragraph{Which operands are registers.}
+Rewriting operands through the replacement map requires knowing, per opcode,
+which fields hold a virtual register and which hold something else---an
+immediate, a byte width, a basic-block id, a symbol.  Writing a canonical
+register into a width field would corrupt it, so the canonicaliser skips those
+fields precisely.  It rewrites \texttt{src1} for every value-producing op and a
+load/store/return operand, \texttt{src2} for binary arithmetic, \texttt{GEP},
+and a store's address, and the condition of a \texttt{BR\_COND}; it leaves
+constants, allocas, branches, and cast widths untouched.  Call arguments are
+left alone---rewriting them is possible but fiddly, and skipping them only
+forgoes an optimization, never correctness.
+
+@d Opt: common subexpression elimination @{
+// -- kcc_cse_canon --------------------------------------------------------
+// uint64_t kcc_cse_canon(uint64_t vreg) -> the register that supersedes it.
+// Reads x20 = vreg_n bound, x21 = replacement map.  Leaf; touches x0 only.
+.text
+.p2align 2
+_kcc_cse_canon:
+    cmp x0, x20
+    b.hs .Lcsc_ret               // not a vreg number → unchanged
+    ldr x0, [x21, x0, lsl #3]
+.Lcsc_ret:
+    ret
+
+// -- kcc_cse_canon_ops ----------------------------------------------------
+// void kcc_cse_canon_ops(ir_instr *instr)
+// Rewrite the instruction's virtual-register operands through the map, in
+// place.  x20 = vreg_n, x21 = map (canon reads them).
+.text
+.p2align 2
+_kcc_cse_canon_ops:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    mov x1, x0                    // x1 = instr (survives the leaf canon calls)
+    ldr x9, [x1, #IR_OP]
+
+    // ---- src1: a vreg for every op except these ----
+    cmp x9, #IR_CONST
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_CALL
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_BR
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_GLOBAL_REF
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_ALLOCA
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_NOP
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_BR_COND
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_STRING_LIT
+    b.eq .Lcco_src1_done
+    cmp x9, #IR_VA_START
+    b.eq .Lcco_src1_done
+    ldr x0, [x1, #IR_SRC1]
+    bl _kcc_cse_canon
+    str x0, [x1, #IR_SRC1]
+.Lcco_src1_done:
+
+    // ---- src2: a vreg only for binary arith/logic/cmp, GEP, and store ----
+    ldr x9, [x1, #IR_OP]
+    cmp x9, #IR_GEP
+    b.eq .Lcco_do_src2
+    cmp x9, #IR_STORE
+    b.eq .Lcco_do_src2
+    cmp x9, #1
+    b.lt .Lcco_src2_done
+    cmp x9, #7
+    b.le .Lcco_do_src2
+    cmp x9, #10
+    b.lt .Lcco_src2_done
+    cmp x9, #15
+    b.le .Lcco_do_src2
+    cmp x9, #20
+    b.lt .Lcco_src2_done
+    cmp x9, #27
+    b.le .Lcco_do_src2
+    b .Lcco_src2_done
+.Lcco_do_src2:
+    ldr x0, [x1, #IR_SRC2]
+    bl _kcc_cse_canon
+    str x0, [x1, #IR_SRC2]
+.Lcco_src2_done:
+
+    // ---- br_cond condition lives in dest; ret value in src1 ----
+    ldr x9, [x1, #IR_OP]
+    cmp x9, #IR_BR_COND
+    b.ne .Lcco_done
+    ldr x0, [x1, #IR_DEST]
+    bl _kcc_cse_canon
+    str x0, [x1, #IR_DEST]
+.Lcco_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_opt_cse ----------------------------------------------------------
+// uint64_t kcc_opt_cse(ir_func *func) -> number of redundancies removed.
+.text
+.globl _kcc_opt_cse
+.p2align 2
+_kcc_opt_cse:
+    stp x29, x30, [sp, #-160]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    mov x19, x0                   // func
+    mov x27, #0                   // change count
+    ldr x20, [x19, #IRF_VREG_N]
+    cbz x20, .Lcse_done
+    add x20, x20, #1              // bound (safety)
+
+    // Allocate: replacement map (8B/vreg), value table (32B/vreg),
+    // load table (16B/vreg).
+    lsl x0, x20, #3
+    bl _kcc_arena_alloc
+    mov x21, x0                   // replacement map
+    lsl x0, x20, #5              // 32 * vreg_n
+    bl _kcc_arena_alloc
+    mov x22, x0                   // value table {op,s1,s2,dest}
+    lsl x0, x20, #4              // 16 * vreg_n
+    bl _kcc_arena_alloc
+    mov x23, x0                   // load table {addr,dest}
+
+    // Initialise the replacement map to the identity (map[i] = i).
+    mov x9, #0
+.Lcse_init:
+    cmp x9, x20
+    b.hs .Lcse_init_done
+    str x9, [x21, x9, lsl #3]
+    add x9, x9, #1
+    b .Lcse_init
+.Lcse_init_done:
+
+    // ---- Walk basic blocks ----
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x25, [x0, #VEC_COUNT]     // bb count
+    mov x24, #0                    // bb index
+.Lcse_bb:
+    cmp x24, x25
+    b.hs .Lcse_done
+    // reset both tables for this block
+    str xzr, [sp, #96]           // value_count
+    str xzr, [sp, #104]          // load_count
+    ldr x0, [x19, #IRF_BLOCKS]
+    mov x1, x24
+    bl _kcc_vec_get
+    ldr x26, [x0]
+    ldr x26, [x26, #BB_FIRST]
+.Lcse_instr:
+    cbz x26, .Lcse_next_bb
+
+    // 1. Canonicalise this instruction's register operands.
+    mov x0, x26
+    bl _kcc_cse_canon_ops
+
+    ldr x9, [x26, #IR_OP]
+
+    // 2a. A store or call invalidates every cached load.
+    cmp x9, #IR_STORE
+    b.eq .Lcse_kill
+    cmp x9, #IR_CALL
+    b.eq .Lcse_kill
+    cmp x9, #IR_CALL_IND
+    b.eq .Lcse_kill
+
+    // 2b. Load: reuse an earlier load of the same address.
+    cmp x9, #IR_LOAD
+    b.eq .Lcse_load
+
+    // 2c. Pure op: value-number by (op, src1, src2).
+    // pure = 1..16, 20..27, GEP(33), 50..55, 57
+    cmp x9, #1
+    b.lt .Lcse_next
+    cmp x9, #16
+    b.le .Lcse_pure
+    cmp x9, #20
+    b.lt .Lcse_chk_cast
+    cmp x9, #27
+    b.le .Lcse_pure
+.Lcse_chk_cast:
+    cmp x9, #IR_GEP
+    b.eq .Lcse_pure
+    cmp x9, #50
+    b.lt .Lcse_next
+    cmp x9, #55
+    b.le .Lcse_pure
+    cmp x9, #57
+    b.eq .Lcse_pure
+    b .Lcse_next
+
+.Lcse_kill:
+    str xzr, [sp, #104]          // load_count = 0
+    b .Lcse_next
+
+.Lcse_load:
+    ldr x10, [x26, #IR_SRC1]     // canonical address
+    ldr x11, [sp, #104]          // load_count
+    mov x12, #0                    // scan index
+.Lcse_load_scan:
+    cmp x12, x11
+    b.hs .Lcse_load_add
+    add x13, x23, x12, lsl #4     // &load_table[i]
+    ldr x14, [x13]                // addr
+    cmp x14, x10
+    b.ne .Lcse_load_next
+    // hit: map this load's dest to the earlier load's dest
+    ldr x14, [x13, #8]           // earlier dest
+    ldr x15, [x26, #IR_DEST]
+    cmp x15, x20
+    b.hs .Lcse_next
+    str x14, [x21, x15, lsl #3]  // map[dest] = earlier
+    add x27, x27, #1
+    b .Lcse_next
+.Lcse_load_next:
+    add x12, x12, #1
+    b .Lcse_load_scan
+.Lcse_load_add:
+    add x13, x23, x11, lsl #4
+    str x10, [x13]               // addr
+    ldr x15, [x26, #IR_DEST]
+    str x15, [x13, #8]           // dest
+    add x11, x11, #1
+    str x11, [sp, #104]
+    b .Lcse_next
+
+.Lcse_pure:
+    ldr x9, [x26, #IR_OP]
+    ldr x10, [x26, #IR_SRC1]
+    ldr x11, [x26, #IR_SRC2]
+    ldr x28, [sp, #96]           // value_count
+    mov x12, #0
+.Lcse_pure_scan:
+    cmp x12, x28
+    b.hs .Lcse_pure_add
+    add x13, x22, x12, lsl #5     // &value_table[i]
+    ldr x14, [x13]               // op
+    cmp x14, x9
+    b.ne .Lcse_pure_next
+    ldr x14, [x13, #8]           // s1
+    cmp x14, x10
+    b.ne .Lcse_pure_next
+    ldr x14, [x13, #16]          // s2
+    cmp x14, x11
+    b.ne .Lcse_pure_next
+    // hit
+    ldr x14, [x13, #24]          // earlier dest
+    ldr x15, [x26, #IR_DEST]
+    cmp x15, x20
+    b.hs .Lcse_next
+    str x14, [x21, x15, lsl #3]
+    add x27, x27, #1
+    b .Lcse_next
+.Lcse_pure_next:
+    add x12, x12, #1
+    b .Lcse_pure_scan
+.Lcse_pure_add:
+    add x13, x22, x28, lsl #5
+    str x9, [x13]
+    str x10, [x13, #8]
+    str x11, [x13, #16]
+    ldr x15, [x26, #IR_DEST]
+    str x15, [x13, #24]
+    add x28, x28, #1
+    str x28, [sp, #96]
+
+.Lcse_next:
+    ldr x26, [x26, #IR_NEXT]
+    b .Lcse_instr
+.Lcse_next_bb:
+    add x24, x24, #1
+    b .Lcse_bb
+
+.Lcse_done:
+    mov x0, x27
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #160
+    ret
+@| _kcc_opt_cse _kcc_cse_canon _kcc_cse_canon_ops
+@}

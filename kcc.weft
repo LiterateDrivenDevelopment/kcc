@@ -455,6 +455,11 @@ or loop optimiser.
 \begin{multicols}{2}
 @i literate/optimization/36-dce.weft
 \end{multicols}
+\newpage
+
+\begin{multicols}{2}
+@i literate/optimization/36a-cse.weft
+\end{multicols}
 
 
 % ═══════════════════════════════════════════════════════════════════

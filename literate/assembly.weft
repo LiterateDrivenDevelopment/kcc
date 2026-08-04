@@ -422,6 +422,7 @@ physical assembly files under \texttt{tmp/src/}.
 @<Types: constants@>
 @<Opt: constant fold@>
 @<Opt: dead code elimination@>
+@<Opt: common subexpression elimination@>
 @<Opt: pass manager@>
 @}
 

@@ -965,10 +965,15 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       callee-saved register for the whole function---correct across the loop
       without liveness because every vreg is single-def (${\sim}36\%$ fewer
       frame accesses on a loopy corpus).  On the IR side, constant folding now
-      folds through the \texttt{SEXT}/\texttt{ZEXT}/\texttt{TRUNC} width casts
-      the front end inserts on every integer operation, so a whole constant
-      expression collapses to one value instead of stalling at the first cast
-      (${\sim}55\%$ fewer instructions on a constant-expression corpus).  What
+      covers binary, unary (\texttt{NEG}/\texttt{NOT}), and---load-bearing---the
+      \texttt{SEXT}/\texttt{ZEXT}/\texttt{TRUNC} width casts the front end
+      inserts on every integer operation, so a whole constant expression
+      collapses to one value instead of stalling at the first cast (${\sim}55\%$
+      fewer instructions on a constant-expression corpus).  Enabling the unary
+      fold surfaced and fixed a dead-code-elimination bug---its mark pass read
+      the stale operands of already-deleted \texttt{NOP} shells, keeping dead
+      code alive and corrupting a type field---and hardened \texttt{--dump-ir}
+      to survive malformed IR.  What
       remains is quality, not enablement: a tighter loop reservation (real
       liveness), floating-point allocation, and the classic IR passes (CSE,
       copy propagation, strength reduction).  \emph{Mem2reg} (promoting

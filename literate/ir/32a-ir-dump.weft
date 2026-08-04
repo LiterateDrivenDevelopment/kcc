@@ -724,6 +724,12 @@ _kcc_ir_dump_type_short:
     str x19, [sp, #16]
 
     cbz x0, .Lidts_unknown
+    // A real type descriptor is arena-allocated (a large address).  Guard the
+    // dereference so a malformed IR_TYPE (a small non-pointer sentinel) prints
+    // as unknown instead of faulting---this keeps --dump-ir usable for
+    // inspecting broken IR, which is exactly when a dump is most wanted.
+    cmp x0, #0x1000
+    b.lo .Lidts_unknown
     mov x19, x0
 
     ldr x0, [x19, #TY_KIND]

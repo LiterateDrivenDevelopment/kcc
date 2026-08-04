@@ -70,8 +70,14 @@ which vregs are referenced as source operands.  Special care is needed
 for instructions whose fields carry non-vreg data: \texttt{IR\_CONST}
 encodes an immediate in \texttt{src1}, \texttt{IR\_CALL} stores a
 function name pointer, and branch instructions carry basic-block
-identifiers.  The pass also handles \texttt{IR\_CALL} argument arrays by
-walking each element and marking the argument vregs individually.
+identifiers.  A subtler case is the \texttt{IR\_NOP} left behind by an
+earlier sweep: its source fields still hold whatever they carried before
+deletion (a folded constant leaves \texttt{src2} at zero), so reading them
+would spuriously mark vreg~0---or another---as used and keep a genuinely
+dead instruction alive across the fixed point.  Because the pass and the
+sweep run in a loop, a \texttt{NOP} must therefore be skipped outright.
+The pass also handles \texttt{IR\_CALL} argument arrays by walking each
+element and marking the argument vregs individually.
 
 @d Opt: dead code elimination @{
     // Pass 1: mark used vregs
@@ -94,6 +100,15 @@ walking each element and marking the argument vregs individually.
 .Ldce_mark_instr:
     cbz x0, .Ldce_mark_next_bb
     mov x26, x0
+
+    // A NOP (an instruction a previous sweep already deleted) references
+    // nothing.  Its src fields still hold whatever they did before deletion---a
+    // folded constant leaves src2 = 0---so reading them here would spuriously
+    // mark vreg 0 (or another) as used, keeping a genuinely dead instruction
+    // alive across the fixed point.  Skip NOPs entirely.
+    ldr x2, [x26, #IR_OP]
+    cmp x2, #IR_NOP
+    b.eq .Ldce_mark_next
 
     // Mark SRC1 as used (if it looks like a vreg — <vreg_n)
     ldr x1, [x26, #IR_SRC1]

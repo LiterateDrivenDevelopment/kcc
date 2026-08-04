@@ -7,7 +7,7 @@
 \chapter{Peephole Optimization}
 \label{ch:peephole}
 
-Peephole optimizations examine a small window of instructions and replace patterns that can be simplified without global analysis.  This chapter implements constant folding on the IR: an instruction whose inputs are all compile-time constants is evaluated at compile time and replaced with a single \texttt{IR\_CONST}.  Two shapes fold.  A \emph{binary} operation with two constant operands (\texttt{2 * 3}) evaluates directly.  Crucially, a \emph{width cast}---the \texttt{SEXT}/\texttt{ZEXT}/\texttt{TRUNC} the front end inserts on nearly every integer operation---also folds when its operand is constant: without this a constant chain stalls at the first cast (folding \texttt{3*4} but not the surrounding \texttt{2 + \dots - 1}, because the intervening sign-extend hid the intermediate constant), so folding through casts is what lets a whole constant expression collapse to one value.  Both feed the fixed-point loop of Chapter~\ref{ch:ir-passes}, so each fold that produces a fresh constant can unblock the next.  (Unary \texttt{NEG}/\texttt{NOT} of a constant would fold too, but is deliberately left out: it exposes a latent defect where an integer literal can carry an invalid \texttt{IR\_TYPE} that the register allocator dereferences---harmless while the literal is folded away by other means, but a compiler crash once the unary fold keeps it live.  Folding these safely waits on hardening that type field.)
+Peephole optimizations examine a small window of instructions and replace patterns that can be simplified without global analysis.  This chapter implements constant folding on the IR: an instruction whose inputs are all compile-time constants is evaluated at compile time and replaced with a single \texttt{IR\_CONST}.  Three shapes fold.  A \emph{binary} operation with two constant operands (\texttt{2 * 3}) evaluates directly.  A \emph{unary} \texttt{NEG} or \texttt{NOT} of a constant folds likewise---and although a bare 64-bit complement of \texttt{\~{}0u} is not the 32-bit \texttt{0xFFFFFFFF} the source means, the front end appends a width cast after every such operation, and that cast folds in turn, narrowing the value to the correct width.  That is the third and load-bearing shape: a \emph{width cast}---the \texttt{SEXT}/\texttt{ZEXT}/\texttt{TRUNC} inserted on nearly every integer operation---folds when its operand is constant.  Without it a constant chain stalls at the first cast (folding \texttt{3*4} but not the surrounding \texttt{2 + \dots - 1}, because the intervening sign-extend hid the intermediate constant), so folding through casts is what lets a whole constant expression collapse to one value.  All three feed the fixed-point loop of Chapter~\ref{ch:ir-passes}, so each fold that produces a fresh constant can unblock the next.
 
 \section{Constant Folding}
 
@@ -165,12 +165,13 @@ with at least one non-constant source are skipped untouched.
     b.lt .Lcf_fold_skip
     cmp x1, #IR_CMP_SGE
     b.gt .Lcf_fold_skip
-    // Skip unary NEG/NOT (folding them exposes a latent regalloc bug where a
-    // literal carries an invalid IR_TYPE; see the chapter notes).
+    // Unary NEG/NOT of a constant fold to a constant too; the width
+    // normalization the front end appends is a cast that folds in turn, so the
+    // 64-bit result is narrowed to the right width by the next iteration.
     cmp x1, #IR_NEG
-    b.eq .Lcf_fold_skip
+    b.eq .Lcf_unary
     cmp x1, #IR_NOT
-    b.eq .Lcf_fold_skip
+    b.eq .Lcf_unary
 
     // Check both sources are const
     ldr x2, [x26, #IR_SRC1]
@@ -276,6 +277,22 @@ fold counter.
 .Lcf_do_sgt:
     cmp x2, x3
     cset x4, gt
+    b .Lcf_replace
+
+.Lcf_unary:
+    ldr x2, [x26, #IR_SRC1]
+    cmp x2, x20
+    b.ge .Lcf_fold_skip
+    ldr x3, [x22, x2, lsl #3]
+    cbz x3, .Lcf_fold_skip
+    ldr x2, [x21, x2, lsl #3]
+    ldr x1, [x26, #IR_OP]
+    cmp x1, #IR_NEG
+    b.eq .Lcf_un_neg
+    mvn x4, x2
+    b .Lcf_replace
+.Lcf_un_neg:
+    neg x4, x2
     b .Lcf_replace
 
 .Lcf_ext:

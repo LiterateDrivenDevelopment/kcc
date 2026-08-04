@@ -184,10 +184,13 @@ _kcc_ir_build_expr:
 
 An integer or character literal becomes an \texttt{IR\_CONST}
 instruction whose \texttt{SRC1} field stores the immediate value.
-The builder assigns the default type \texttt{i32} and allocates a
-fresh vreg for the result.  Character literals receive the same
-treatment because the parser stores the character's numeric value in
-\texttt{AST\_F0}.
+The instruction's type is the one sema assigned to the node
+(\texttt{AST\_F3}), so a suffixed constant such as \texttt{3L} is
+materialised as a \texttt{long} rather than truncated to \texttt{i32};
+synthetic literal nodes that sema never typed fall back to \texttt{int}.
+The builder allocates a fresh vreg for the result.  Character literals
+receive the same treatment because the parser stores the character's
+numeric value in \texttt{AST\_F0}.
 
 @d IR: build int literal @{
 // -- kcc_ir_build_int_lit -------------------------------------------------
@@ -210,10 +213,16 @@ _kcc_ir_build_int_lit:
     bl _kcc_ir_alloc_instr
     mov x21, x0                  // x21 = instr
 
-    // Default type: i32
+    // Type from sema (AST_F3): honours the literal's suffix (long/unsigned)
+    // so the constant is materialised at its true width.  Fall back to int
+    // for synthetic literal nodes sema never typed (enum folds, array lengths).
+    ldr x0, [x19, #AST_F3]
+    cmp x0, #0x1000
+    b.hs .Libil_havety
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr x0, [x0]
+.Libil_havety:
     str x0, [x21, #IR_TYPE]
 
     str x20, [x21, #IR_SRC1]    // immediate value

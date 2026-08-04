@@ -300,12 +300,19 @@ stages can select the correct conversion and promotion rules.
 
 \paragraph{Floating-Point Type Singletons}
 
-The three floating-point singletons cover \texttt{float} (4~bytes),
-\texttt{double} (8~bytes), and \texttt{long double} (16~bytes on ARM64).
-Unlike integer types, floating-point descriptors do not use \texttt{TY\_F0}
-for signedness --- all three are inherently signed per \stdref{6.2.5p10}.
-After allocating the last singleton the function restores callee-saved
-registers \texttt{x19}/\texttt{x20} and returns.
+The floating-point singletons cover \texttt{float} (4~bytes) and
+\texttt{double} (8~bytes).  \texttt{long double} is a third floating type in
+the abstract machine, but the Apple ARM64 ABI defines it to have the same
+representation as \texttt{double} (64-bit IEEE-754)---unlike AArch64 Linux,
+where it is a 128-bit quad.  We honour that ABI by \emph{aliasing} the
+\texttt{long double} singleton to the \texttt{double} descriptor rather than
+allocating a distinct one, so the many places that recognise a floating type
+by its kind (\texttt{TY\_DOUBLE}) need no change and \texttt{long double}
+lowers, sizes, and passes exactly as \texttt{double}.  Unlike integer types,
+floating-point descriptors do not use \texttt{TY\_F0} for signedness --- all
+are inherently signed per \stdref{6.2.5p10}.  After allocating the last
+singleton the function restores callee-saved registers
+\texttt{x19}/\texttt{x20} and returns.
 
 @d Types: init @{
     // float
@@ -340,21 +347,17 @@ registers \texttt{x19}/\texttt{x20} and returns.
     add  x1, x1, _kcc_type_double@@PAGEOFF
     str x19, [x1]
 
-    // long double (16 bytes on ARM64)
-    mov x0, #TY_DESC_SIZE
-    bl _kcc_arena_alloc
-    mov x19, x0
-    mov x1, #TY_LDOUBLE
-    str x1, [x19, #TY_KIND]
-    mov x1, #16
-    str x1, [x19, #TY_SIZE]
-    str x1, [x19, #TY_ALIGN]
-    str xzr, [x19, #TY_QUALS]
-    str xzr, [x19, #TY_F0]
-    str xzr, [x19, #TY_F1]
+    // long double: on the Apple ARM64 ABI, long double is identical to
+    // double (64-bit IEEE-754), unlike AArch64 Linux where it is a 128-bit
+    // quad.  Alias the descriptor to the double one just built, so every
+    // path---FP lowering, sizeof, printf, argument passing---treats a
+    // long double exactly as a double.
+    adrp x1, _kcc_type_double@@PAGE
+    add  x1, x1, _kcc_type_double@@PAGEOFF
+    ldr  x0, [x1]                 // the double descriptor
     adrp x1, _kcc_type_ldouble@@PAGE
     add  x1, x1, _kcc_type_ldouble@@PAGEOFF
-    str x19, [x1]
+    str  x0, [x1]
 
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32

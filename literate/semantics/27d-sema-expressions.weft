@@ -976,10 +976,18 @@ _kcc_sema_check_return_path:
 
 \subsection{Literal Expressions}
 
-Integer and character literals have type \texttt{int}.  String
-literals have type \texttt{char~*} (pointer to signed char), matching
-the C17 rule that a string literal is an array that decays to a
-pointer.
+A character literal and an unsuffixed integer literal have type
+\texttt{int}.  A suffixed integer literal takes the type its suffix names
+(\stdref{6.4.4.1}): the parser recorded \texttt{u}/\texttt{U} and the
+\texttt{l}/\texttt{L} count as flags in \texttt{AST\_F2}, and here we decode
+them---bit~0 selects the unsigned variant, and the long rank in bits~1--2
+chooses \texttt{int}, \texttt{long}, or \texttt{long long}.  A char literal
+leaves \texttt{AST\_F2} zero and so still types as \texttt{int}.  This is a
+deliberately \emph{suffix-only} typing: it does not yet promote an unsuffixed
+constant whose magnitude overflows \texttt{int} to a wider type, which is a
+separate value-directed rule.  String literals have type \texttt{char~*}
+(pointer to signed char), matching the C17 rule that a string literal is an
+array that decays to a pointer.
 
 @d Sema: expr literal @{
 // -- kcc_sema_expr_literal ------------------------------------------------
@@ -1002,8 +1010,44 @@ _kcc_sema_expr_literal:
 
     // Default: int
 .Lsel_int:
+    // An integer literal's suffix flags live in AST_F2 (bit 0 = unsigned,
+    // bits 1-2 = long rank).  A char literal and an unsuffixed integer both
+    // leave AST_F2 == 0, so they fall through to plain int.
+    ldr x1, [x19, #AST_F2]
+    cbz x1, .Lsel_plain_int
+    lsr x2, x1, #1
+    and x2, x2, #3               // long rank: 0 int, 1 long, 2 long long
+    and x1, x1, #1               // unsigned bit
+    cbz x2, .Lsel_rank_int
+    cmp x2, #1
+    b.eq .Lsel_rank_long
+    // long long
+    cbz x1, .Lsel_llong_s
+    adrp x0, _kcc_type_llong_u@@PAGE
+    add  x0, x0, _kcc_type_llong_u@@PAGEOFF
+    b .Lsel_int_ret
+.Lsel_llong_s:
+    adrp x0, _kcc_type_llong_s@@PAGE
+    add  x0, x0, _kcc_type_llong_s@@PAGEOFF
+    b .Lsel_int_ret
+.Lsel_rank_long:
+    cbz x1, .Lsel_long_s
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    b .Lsel_int_ret
+.Lsel_long_s:
+    adrp x0, _kcc_type_long_s@@PAGE
+    add  x0, x0, _kcc_type_long_s@@PAGEOFF
+    b .Lsel_int_ret
+.Lsel_rank_int:
+    // rank int but unsigned suffix (u/U with no l/L)
+    adrp x0, _kcc_type_int_u@@PAGE
+    add  x0, x0, _kcc_type_int_u@@PAGEOFF
+    b .Lsel_int_ret
+.Lsel_plain_int:
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
+.Lsel_int_ret:
     ldr  x0, [x0]
     ldp x29, x30, [sp], #16
     ret

@@ -908,12 +908,130 @@ _kcc_parse_primary_expr:
     bl _kcc_parse_atoi
     mov x19, x0                  // x19 = numeric value
 
+    // Scan the suffix for u/U (unsigned) and l/L (long rank).  Scanning the
+    // whole token text is safe: `u` and `l` are never digits in any radix
+    // (decimal, 0x hex, 0 octal, 0b binary), so only the suffix letters match.
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    add  x1, x0, x1              // x1 = one past last char
+    mov  x21, #0                 // x21 = unsigned flag (bit 0)
+    mov  x3, #0                  // x3 = count of l/L
+.Lnum_sfx_loop:
+    cmp  x0, x1
+    b.hs .Lnum_sfx_done
+    ldrb w2, [x0], #1
+    orr  w2, w2, #0x20           // fold to lower case
+    cmp  w2, #'u'
+    b.ne .Lnum_sfx_notu
+    orr  x21, x21, #1
+    b    .Lnum_sfx_loop
+.Lnum_sfx_notu:
+    cmp  w2, #'l'
+    b.ne .Lnum_sfx_loop
+    add  x3, x3, #1
+    b    .Lnum_sfx_loop
+.Lnum_sfx_done:
+    cmp  x3, #2                  // clamp long rank at 2 (long long)
+    b.ls .Lnum_sfx_rank
+    mov  x3, #2
+.Lnum_sfx_rank:
+    lsl  x3, x3, #1             // rank into bits 1-2
+    orr  x21, x21, x3           // x21 = suffix-derived flags
+
+    // Value-directed widening (C17 6.4.4.1): the constant's type is the first
+    // in a suffix-and-base-dependent list that can represent its value.  The
+    // suffix fixed a floor (unsigned bit x4, long rank x5); climb from there
+    // by magnitude.  LP64: int=32b, long=long long=64b.
+    and  x4, x21, #1            // x4 = unsigned floor
+    lsr  x5, x21, #1
+    and  x5, x5, #3            // x5 = long-rank floor
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    ldrb w6, [x0]              // first char: '0' prefix ⇒ non-decimal
+    cmp  w6, #'0'
+    cset w7, ne               // w7 = isDecimal
+    mov  w8, #0xFFFF
+    movk w8, #0x7FFF, lsl #16 // w8 = INT_MAX (0x7FFFFFFF)
+    cmp  x19, x8
+    cset w9, ls               // w9 = fits signed int
+    mov  w10, #-1             // w10 = UINT_MAX (0xFFFFFFFF)
+    cmp  x19, x10
+    cset w11, ls              // w11 = fits unsigned int
+    cmp  x19, #0
+    cset w12, pl              // w12 = fits signed long (top bit clear)
+    cbnz x4, .Lwiden_u
+    cbnz w7, .Lwiden_dec
+    // Non-decimal, no unsigned suffix: int,uint,long,ulong,llong,ullong.
+    cbnz x5, .Lwiden_rank_hi
+    cbnz w9, .Lwiden_r0s
+    cbnz w11, .Lwiden_r0u
+    cbnz w12, .Lwiden_r1s
+    mov  x2, #1
+    mov  x3, #1
+    b .Lwiden_done
+.Lwiden_dec:
+    // Decimal, no unsigned suffix: int,long,long long (signed).
+    cbnz x5, .Lwiden_dec_hi
+    cbnz w9, .Lwiden_r0s
+    cbnz w12, .Lwiden_r1s
+    mov  x2, #1               // > LLONG_MAX: unsigned long (extension)
+    mov  x3, #1
+    b .Lwiden_done
+.Lwiden_dec_hi:
+    cbnz w12, .Lwiden_keepRs
+    mov  x2, x5
+    mov  x3, #1
+    b .Lwiden_done
+.Lwiden_rank_hi:
+    // Non-decimal, rank ≥ long: long,ulong,llong,ullong.
+    cbnz w12, .Lwiden_keepRs
+    mov  x2, x5
+    mov  x3, #1
+    b .Lwiden_done
+.Lwiden_u:
+    // Unsigned suffix: uint,ulong,ullong.
+    mov  x3, #1
+    cbnz x5, .Lwiden_keepRu
+    cbnz w11, .Lwiden_r0u_set
+    mov  x2, #1               // unsigned long
+    b .Lwiden_done
+.Lwiden_keepRu:
+    mov  x2, x5
+    b .Lwiden_done
+.Lwiden_r0u_set:
+    mov  x2, #0
+    b .Lwiden_done
+.Lwiden_r0s:
+    mov  x2, #0
+    mov  x3, #0
+    b .Lwiden_done
+.Lwiden_r0u:
+    mov  x2, #0
+    mov  x3, #1
+    b .Lwiden_done
+.Lwiden_r1s:
+    mov  x2, #1
+    mov  x3, #0
+    b .Lwiden_done
+.Lwiden_keepRs:
+    mov  x2, x5
+    mov  x3, #0
+.Lwiden_done:
+    lsl  x2, x2, #1           // rank into bits 1-2
+    orr  x21, x3, x2          // x21 = final type flags
+
     // Consume number
     bl _kcc_pp_next
 
     mov x0, #AST_INT_LIT
     bl _kcc_ast_alloc
     str x19, [x0, #AST_F0]      // value
+    str x21, [x0, #AST_F2]      // suffix flags: bit0=unsigned, bits1-2=long rank
     b .Lprimary_done
 
 .Lprimary_float:
@@ -1121,7 +1239,31 @@ The helper \texttt{kcc\_parse\_atoi} converts integer literal token text
 into a machine integer.  It recognises four radix prefixes: bare digits
 for decimal, \texttt{0x}/\texttt{0X} for hexadecimal, a leading zero for
 octal, and \texttt{0b}/\texttt{0B} for binary.  Type suffixes
-(\texttt{u}, \texttt{U}, \texttt{l}, \texttt{L}) are silently skipped.
+(\texttt{u}, \texttt{U}, \texttt{l}, \texttt{L}) are skipped when computing
+the \emph{value}---they do not change the magnitude---but they are not lost:
+back in \texttt{.Lprimary\_number} a second, whole-token scan records them as
+flags in \texttt{AST\_F2} (bit~0 for \texttt{unsigned}, bits~1--2 for the long
+rank: 0~\texttt{int}, 1~\texttt{long}, 2~\texttt{long long}).  Scanning the
+entire token is sound because \texttt{u} and \texttt{l} are digits in no
+radix, so only genuine suffix letters ever match.  Sema turns those flags into
+the constant's type, so \texttt{3L} is a \texttt{long} and \texttt{0u} an
+\texttt{unsigned int}---which in turn makes \texttt{\_Generic} select the
+matching \texttt{long}/\texttt{unsigned} association.
+
+The suffix only fixes a \emph{floor}.  \stdref{6.4.4.1} then gives the
+constant the first type from a list---dependent on the suffix and on whether
+the token is decimal or not---that can represent its value.  So a bare
+\texttt{2147483648} is too large for \texttt{int} and becomes \texttt{long};
+a hexadecimal \texttt{0xFFFFFFFF} that overflows \texttt{int} becomes
+\texttt{unsigned int} (the non-decimal lists admit the unsigned rungs, the
+decimal lists do not).  We compute this in place right after the suffix scan,
+while both the value and the original token text are still in hand: with the
+unsigned floor, the long-rank floor, the decimal flag, and three
+representability tests (fits signed \texttt{int}, fits unsigned \texttt{int},
+fits signed \texttt{long}---\texttt{long} and \texttt{long long} share a width
+on LP64) we climb the appropriate list and rewrite \texttt{AST\_F2} to the
+final type's flags.  Sema and the IR builder are unchanged; they simply read
+the upgraded flags.
 
 @d Expr: parse primary @{
 // -- kcc_parse_atoi ----------------------------------------------------

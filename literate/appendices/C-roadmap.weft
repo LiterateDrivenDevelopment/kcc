@@ -994,11 +994,21 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       volatile load.  The qualifier reaches the IR at each access and CSE/DCE
       respect it.  \texttt{\_Generic} is now selected at type-check time---the
       controlling expression is typed but not evaluated, and the compatible
-      association's expression is the one lowered.  \texttt{long double} and
-      honouring integer-literal suffixes (\texttt{3L} still types as
-      \texttt{int}, which limits \texttt{\_Generic} on literal operands) remain
-      ---low frequency, closing the last of conformance but rarely blocking
-      real code.
+      association's expression is the one lowered.  Integer constants are now
+      fully typed per \stdref{6.4.4.1}: the suffix (\texttt{3L} $\to$
+      \texttt{long}, \texttt{0u} $\to$ \texttt{unsigned}, up to \texttt{unsigned
+      long long}) fixes a floor, and value-directed widening then promotes a
+      constant whose magnitude overflows that floor---\texttt{2147483648} $\to$
+      \texttt{long}, \texttt{0xFFFFFFFF} $\to$ \texttt{unsigned int}---climbing
+      the suffix-and-base-dependent list, so \texttt{\_Generic} and
+      \texttt{sizeof} agree with the Standard on literal operands.  Finally
+      \texttt{long double} is honoured per the Apple ARM64 ABI, under which it
+      shares \texttt{double}'s 64-bit representation: its descriptor is aliased
+      to \texttt{double}, so it lowers, sizes, and passes identically and no
+      floating-point path needed a new kind.  With this the tail C17 surface is
+      complete---diagnostics, \texttt{-Wall}, designated initialisers,
+      bit-fields, \texttt{\_Bool}, \texttt{volatile}, \texttt{\_Generic},
+      integer-constant typing, and \texttt{long double} all land.
 \item \textbf{A second target} (new).  Retargeting to x86-64 or Linux/ELF is
       a strategic multiplier but an entire new backend or object writer;
       undertake it only if cross-platform support becomes an explicit goal.
@@ -1044,7 +1054,8 @@ point is now in place.  This stage adds every remaining C17 type.
       \texttt{float} boundaries (permitted excess intermediate precision);
       exact per-operation single-precision rounding and the
       \texttt{s0}--\texttt{s7} argument convention for \texttt{clang}
-      float-argument interop remain.  \texttt{long double} is unlowered.
+      float-argument interop remain.  \texttt{long double} is lowered as
+      \texttt{double} per the Apple ARM64 ABI (identical 64-bit representation).
 \item[\checkmark] \textbf{Unions.}  Done: \texttt{\_kcc\_type\_layout} lays a
       union out with every member at offset~0 and \texttt{TY\_SIZE} equal to
       the largest member (rounded to its alignment), and member access,
@@ -1401,7 +1412,7 @@ Feature & Status & Note \\
 standard struct layout           & \checkmark & padding/align, 15 diff. tests \\
 \texttt{double} floating point   & \checkmark & complete, 14 diff. tests \\
 single-precision \texttt{float}  & \checkmark & rounded at boundaries; 6 diff. tests \\
-\texttt{long double}             &            & not lowered \\
+\texttt{long double}             & \checkmark & Apple ABI: aliased to \texttt{double} (64-bit) \\
 \texttt{union}                   & \checkmark & offset-0 layout; 6 diff. tests \\
 bit-fields                       & \checkmark & LSB-first packing; 7 diff. tests \\
 \texttt{\_Bool} 0/1 normalisation & \checkmark & any non-zero $\to$ 1 \\
@@ -1460,13 +1471,15 @@ good shape and unusually well-tested for a hand-written assembly project:
 the differential suite finds zero miscompilations against \texttt{clang}
 (187/0), the mixed-object interoperability suite is green in both
 directions (16/16), and the compiler self-hosts to a byte-identical binary.
-As a \emph{complete C17 implementation} it is roughly four-fifths there:
+As a \emph{complete C17 implementation} it is nearly all the way there:
 with \texttt{union}s, single-precision \texttt{float}, bit-fields, single-level
-designated initializers, \texttt{\_Bool} normalization, and
-\texttt{char s[] = "..."} now done, the bounded pieces still missing are
-\texttt{long double}, \texttt{\_Generic}, \texttt{volatile} semantics, nested
-designator chains, and per-operation single-precision float rounding (today
-\texttt{float} arithmetic rounds only at conversion boundaries).
+designated initializers, \texttt{\_Bool} normalization,
+\texttt{char s[] = "..."}, \texttt{\_Generic} selection, full
+integer-constant typing, \texttt{volatile} semantics, and \texttt{long double}
+(Apple-ABI aliased to \texttt{double}) now done, the bounded pieces still
+missing are volatile bit-fields, nested designator chains, and per-operation
+single-precision float rounding (today \texttt{float} arithmetic rounds only at
+conversion boundaries).
 
 The toolchain axis, previously the weakest, has closed most of its gaps.
 Standard struct layout, more-than-eight stack arguments, variadic function

@@ -988,10 +988,11 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       a cost-based unified allocator would be needed to make it pay.
 \item \textbf{Tail C17 features---\_Generic, \texttt{long double},
       \texttt{volatile}} (Stage~9a).  \texttt{volatile} is now honoured for
-      scalar and pointer accesses (a soundness requirement once the optimizer
-      was added: it must not merge or drop a volatile load); the qualifier
-      reaches the IR and CSE/DCE respect it.  Volatile arrays and struct
-      members, \texttt{\_Generic}, and \texttt{long double} remain---low
+      every lvalue access---scalar, global, pointer dereference, array element,
+      and struct/union member (only volatile bit-fields remain)---a soundness
+      requirement once the optimizer was added: it must not merge or drop a
+      volatile load.  The qualifier reaches the IR at each access and CSE/DCE
+      respect it.  \texttt{\_Generic} and \texttt{long double} remain---low
       frequency, closing the last of conformance but rarely blocking real code.
 \item \textbf{A second target} (new).  Retargeting to x86-64 or Linux/ELF is
       a strategic multiplier but an entire new backend or object writer;
@@ -1401,7 +1402,7 @@ bit-fields                       & \checkmark & LSB-first packing; 7 diff. tests
 \texttt{\_Bool} 0/1 normalisation & \checkmark & any non-zero $\to$ 1 \\
 \texttt{char s[] = "..."}        & \checkmark & byte-copy init; 8 diff. tests \\
 designated initialisers          & $\circ$    & single-level \texttt{[i]=}/\texttt{.f=}; nested TODO \\
-\texttt{volatile} semantics      & $\circ$    & honoured for scalars/pointers; arrays/members left \\
+\texttt{volatile} semantics      & \checkmark & honoured for every lvalue access (bit-fields aside) \\
 variadic \emph{definitions}      & \checkmark & \texttt{va\_arg} builtins, 3 diff. tests \\
 \texttt{\_Generic} lowering      & $\circ$    & parsed, not selected \\
 \hline

@@ -1142,7 +1142,7 @@ _kcc_ir_build_subscript:
     stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
-    str x21, [sp, #32]
+    stp x21, x22, [sp, #32]
 
     mov x20, x0                  // x20 = subscript node
 
@@ -1155,15 +1155,25 @@ _kcc_ir_build_subscript:
     ldr x0, [x20, #AST_F3]
     bl _kcc_ir_load_width
     mov x21, x0
+    // Load type: the element's (volatile-qualified) descriptor when volatile,
+    // else the canonical int.  Held in x22 across the alloc.
+    ldr x22, [x20, #AST_F3]     // element type
+    cmp x22, #0x1000
+    b.lo .Libs_intty
+    ldr x0, [x22, #TY_QUALS]
+    tst x0, #2
+    b.ne .Libs_haveity
+.Libs_intty:
+    adrp x22, _kcc_type_int_s@@PAGE
+    add  x22, x22, _kcc_type_int_s@@PAGEOFF
+    ldr x22, [x22]
+.Libs_haveity:
 
 .Libs_load:
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
     mov x20, x0
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x20, #IR_TYPE]
+    str x22, [x20, #IR_TYPE]    // volatile element type when volatile, else int
     str x19, [x20, #IR_SRC1]    // pointer
     str x21, [x20, #IR_SRC2]    // access size override
     bl _kcc_ir_next_vreg
@@ -1174,7 +1184,7 @@ _kcc_ir_build_subscript:
 
     mov x0, x19                  // return value vreg
 
-    ldr x21, [sp, #32]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
@@ -1509,9 +1519,10 @@ _kcc_ir_build_member_addr:
 .globl _kcc_ir_build_member
 .p2align 2
 _kcc_ir_build_member:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
 
     mov x19, x0                  // save member node (for field type)
 
@@ -1529,11 +1540,26 @@ _kcc_ir_build_member:
     cbz x2, .Libm_scalar
     mov x0, x20                  // container address
     bl _kcc_ir_bitfield_load     // x1 = field decl
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 
 .Libm_scalar:
+    // Load type: the field's (volatile-qualified) descriptor when volatile,
+    // else the canonical int.  Held in x21 across the width call and the alloc.
+    ldr x21, [x19, #AST_F3]     // field type
+    cmp x21, #0x1000
+    b.lo .Libm_intty
+    ldr x0, [x21, #TY_QUALS]
+    tst x0, #2
+    b.ne .Libm_haveity
+.Libm_intty:
+    adrp x21, _kcc_type_int_s@@PAGE
+    add  x21, x21, _kcc_type_int_s@@PAGEOFF
+    ldr x21, [x21]
+.Libm_haveity:
+
     // Field access width + signedness from the member's resolved type.
     ldr x0, [x19, #AST_F3]      // field type
     bl _kcc_ir_load_width
@@ -1543,10 +1569,7 @@ _kcc_ir_build_member:
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
     mov x1, x0
-    adrp x2, _kcc_type_int_s@@PAGE
-    add  x2, x2, _kcc_type_int_s@@PAGEOFF
-    ldr x2, [x2]
-    str x2, [x1, #IR_TYPE]
+    str x21, [x1, #IR_TYPE]     // volatile field type when volatile, else int
     str x20, [x1, #IR_SRC1]     // pointer = GEP result
     str x19, [x1, #IR_SRC2]     // access-size override
     mov x20, x1                  // load instr
@@ -1558,8 +1581,9 @@ _kcc_ir_build_member:
 
     mov x0, x19                  // return value vreg
 
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 @| _kcc_ir_build_member
 @}

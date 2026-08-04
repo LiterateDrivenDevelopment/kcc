@@ -7,7 +7,7 @@
 \chapter{Peephole Optimization}
 \label{ch:peephole}
 
-Peephole optimizations examine a small window of instructions and replace patterns that can be simplified without global analysis.  This chapter implements two such optimizations on the IR.  Constant folding evaluates binary operations whose operands are both compile-time constants, replacing the operation with a single \texttt{IR\_CONST}.  Identity elimination removes trivially redundant operations such as adding zero, multiplying by one, or bitwise AND with all ones.  Both passes feed into the fixed-point loop described in Chapter~\ref{ch:ir-passes}, so a fold that creates new constants can trigger further simplifications.
+Peephole optimizations examine a small window of instructions and replace patterns that can be simplified without global analysis.  This chapter implements constant folding on the IR: an instruction whose inputs are all compile-time constants is evaluated at compile time and replaced with a single \texttt{IR\_CONST}.  Two shapes fold.  A \emph{binary} operation with two constant operands (\texttt{2 * 3}) evaluates directly.  Crucially, a \emph{width cast}---the \texttt{SEXT}/\texttt{ZEXT}/\texttt{TRUNC} the front end inserts on nearly every integer operation---also folds when its operand is constant: without this a constant chain stalls at the first cast (folding \texttt{3*4} but not the surrounding \texttt{2 + \dots - 1}, because the intervening sign-extend hid the intermediate constant), so folding through casts is what lets a whole constant expression collapse to one value.  Both feed the fixed-point loop of Chapter~\ref{ch:ir-passes}, so each fold that produces a fresh constant can unblock the next.  (Unary \texttt{NEG}/\texttt{NOT} of a constant would fold too, but is deliberately left out: it exposes a latent defect where an integer literal can carry an invalid \texttt{IR\_TYPE} that the register allocator dereferences---harmless while the literal is folded away by other means, but a compiler crash once the unary fold keeps it live.  Folding these safely waits on hardening that type field.)
 
 \section{Constant Folding}
 
@@ -150,12 +150,23 @@ with at least one non-constant source are skipped untouched.
     mov x26, x0
 
     ldr x1, [x26, #IR_OP]
+    // Width casts of a constant fold too: the front end inserts SEXT/ZEXT/TRUNC
+    // on nearly every integer operation, and without folding through them a
+    // constant chain stalls at the first cast (e.g. 2+3*4 folds 3*4 but the
+    // sign-extend then blocks the add).
+    cmp x1, #IR_SEXT
+    b.eq .Lcf_ext
+    cmp x1, #IR_ZEXT
+    b.eq .Lcf_ext
+    cmp x1, #IR_TRUNC
+    b.eq .Lcf_ext
     // Check if it's a foldable binary op (1-7, 10-15, 20-25)
     cmp x1, #IR_ADD
     b.lt .Lcf_fold_skip
     cmp x1, #IR_CMP_SGE
     b.gt .Lcf_fold_skip
-    // Skip non-binary ranges
+    // Skip unary NEG/NOT (folding them exposes a latent regalloc bug where a
+    // literal carries an invalid IR_TYPE; see the chapter notes).
     cmp x1, #IR_NEG
     b.eq .Lcf_fold_skip
     cmp x1, #IR_NOT
@@ -266,6 +277,50 @@ fold counter.
     cmp x2, x3
     cset x4, gt
     b .Lcf_replace
+
+.Lcf_ext:
+    // Fold a width cast of a constant.  SEXT/ZEXT read the source width from
+    // SRC2; TRUNC reads the target width from its result type.  The folded
+    // value is the constant sign- or zero-adjusted to that width.
+    ldr x2, [x26, #IR_SRC1]
+    cmp x2, x20
+    b.ge .Lcf_fold_skip
+    ldr x3, [x22, x2, lsl #3]   // valid[src1]?
+    cbz x3, .Lcf_fold_skip
+    ldr x2, [x21, x2, lsl #3]   // val
+    ldr x1, [x26, #IR_OP]
+    cmp x1, #IR_TRUNC
+    b.eq .Lcf_ext_trunc
+    ldr x5, [x26, #IR_SRC2]     // source width (bytes)
+    cbz x5, .Lcf_fold_skip
+    cmp x5, #8
+    b.hs .Lcf_ext_id
+    cmp x1, #IR_ZEXT
+    b.eq .Lcf_ext_mask
+    // SEXT: sign-extend from width*8 bits
+    lsl x6, x5, #3
+    mov x7, #64
+    sub x7, x7, x6
+    lsl x4, x2, x7
+    asr x4, x4, x7
+    b .Lcf_replace
+.Lcf_ext_trunc:
+    ldr x5, [x26, #IR_TYPE]
+    cbz x5, .Lcf_fold_skip
+    ldr x5, [x5, #TY_SIZE]      // target width
+    cbz x5, .Lcf_fold_skip
+    cmp x5, #8
+    b.hs .Lcf_ext_id
+.Lcf_ext_mask:
+    // ZEXT / TRUNC: keep the low width*8 bits, zero the rest
+    lsl x6, x5, #3
+    mov x7, #1
+    lsl x7, x7, x6
+    sub x7, x7, #1
+    and x4, x2, x7
+    b .Lcf_replace
+.Lcf_ext_id:
+    mov x4, x2                  // width >= 8: value unchanged
 
 .Lcf_replace:
     // Replace instruction with IR_CONST

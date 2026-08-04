@@ -964,11 +964,18 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       while a function with a back-edge gives each escaping value a
       callee-saved register for the whole function---correct across the loop
       without liveness because every vreg is single-def (${\sim}36\%$ fewer
-      frame accesses on a loopy corpus).  What remains is quality, not
-      enablement: a tighter loop reservation (real liveness), promoting
-      \texttt{alloca} locals to vregs (\emph{mem2reg}, the larger loop win),
-      floating-point allocation, and the classic IR passes (CSE, copy
-      propagation, strength reduction).
+      frame accesses on a loopy corpus).  On the IR side, constant folding now
+      folds through the \texttt{SEXT}/\texttt{ZEXT}/\texttt{TRUNC} width casts
+      the front end inserts on every integer operation, so a whole constant
+      expression collapses to one value instead of stalling at the first cast
+      (${\sim}55\%$ fewer instructions on a constant-expression corpus).  What
+      remains is quality, not enablement: a tighter loop reservation (real
+      liveness), floating-point allocation, and the classic IR passes (CSE,
+      copy propagation, strength reduction).  \emph{Mem2reg} (promoting
+      \texttt{alloca} locals to registers) was implemented and reverted---it
+      is correct but net-negative here, because the existing allocator already
+      covers loop values and mem2reg's whole-function reservation starves it;
+      a cost-based unified allocator would be needed to make it pay.
 \item \textbf{Tail C17 features---\_Generic, \texttt{long double},
       \texttt{volatile}} (Stage~9a).  Low frequency; they close the last of
       conformance but rarely block real code.
@@ -1411,7 +1418,7 @@ hardening, and a second target---rather than missing capability:
 Concern & Status & Note \\
 \hline
 register allocation          & \checkmark & linear-scan; cross-block in loop-free \& loopy functions \\
-optimizer / mem2reg / FP r.a. & $\circ$ & no IR passes yet; allocas \& FP still spill \\
+optimizer / CSE / FP r.a.    & $\circ$ & const-fold+DCE run; CSE/copy-prop/FP-alloc left \\
 $>8$ arguments on the stack  & \checkmark & self-consistent, 5 diff. tests \\
 AAPCS64 register convention  & \checkmark & FP/small+large struct/x8; interop 16/16 \\
 second target (x86-64/ELF)   &         & ARM64 + Mach-O only \\

@@ -69,9 +69,17 @@ _kcc_ir_build_expr:
     b.eq .Libe_member
     cmp x0, #AST_VA_ARG
     b.eq .Libe_va_arg
+    cmp x0, #AST_GENERIC
+    b.eq .Libe_generic
 
     // Unhandled expression — return 0
     b .Libe_zero
+
+.Libe_generic:
+    // Sema already chose the association; build its expression from AST_F2.
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    b .Libe_done
 
 .Libe_va_arg:
     mov x0, x19

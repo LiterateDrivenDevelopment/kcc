@@ -71,9 +71,16 @@ _kcc_sema_expr:
     b.eq .Lse_paren
     cmp x20, #AST_VA_ARG
     b.eq .Lse_va_arg
+    cmp x20, #AST_GENERIC
+    b.eq .Lse_generic
 
     // Default: int
     b .Lse_default_int
+
+.Lse_generic:
+    mov x0, x19
+    bl _kcc_sema_expr_generic
+    b .Lse_store
 
 .Lse_va_arg:
     // Type the va_list operand; the va_arg node's type is the requested type.
@@ -182,6 +189,97 @@ _kcc_sema_expr:
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_sema_expr
+@}
+
+\paragraph{Generic selection.}
+A \texttt{\_Generic} expression (\stdref{6.5.1.1}) is resolved entirely here, at
+type-check time: the controlling expression is \emph{typed but never
+evaluated}, and its type chooses one association's expression, which alone is
+kept.  The pass types the controlling expression (decaying an array to a
+pointer, as lvalue conversion requires), then walks the association list; the
+first association whose named type is compatible with the controlling type
+wins, and a \texttt{default} association is remembered as the fallback.  Because
+\texttt{\_kcc\_type\_compatible} matches on kind and signedness and ignores
+qualifiers, a \texttt{volatile int} controlling expression still selects the
+\texttt{int} association, as the Standard's lvalue conversion demands.  The
+chosen expression is stashed in the node's spare field so the IR builder emits
+\emph{only} it---never the controlling expression or the discarded arms---and
+its type becomes the type of the whole selection.  A selection that matches
+nothing and has no default is a diagnosed error.
+
+@d Sema: check expression @{
+// -- kcc_sema_expr_generic ------------------------------------------------
+// uint64_t kcc_sema_expr_generic(node *generic)
+// Resolve a _Generic selection: type the (unevaluated) controlling expression,
+// pick the association whose type is compatible with it---or the default---and
+// stash the chosen expression in AST_F2 for the IR builder.  Returns the chosen
+// expression's type.
+.text
+.p2align 2
+_kcc_sema_expr_generic:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                   // generic node
+
+    // The controlling expression is not evaluated; type it only.  An array or
+    // function type decays before the match---handle the common array case.
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_expr
+    mov x20, x0                   // controlling type
+    cbz x20, .Lseg_walk
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lseg_walk
+    ldr x0, [x20, #TY_F0]        // element type
+    bl _kcc_type_ptr
+    mov x20, x0
+.Lseg_walk:
+    ldr x21, [x19, #AST_F1]      // current association
+    mov x22, #0                    // remembered default expression (0 = none)
+.Lseg_loop:
+    cbz x21, .Lseg_use_default
+    ldr x0, [x21, #AST_F0]        // association type node (0 = default)
+    cbz x0, .Lseg_default
+    bl _kcc_sema_resolve_type     // x0 = association type descriptor
+    mov x1, x20
+    bl _kcc_type_compatible
+    cbz x0, .Lseg_next
+    ldr x0, [x21, #AST_F1]        // compatible → this association's expression
+    b .Lseg_select
+.Lseg_default:
+    ldr x22, [x21, #AST_F1]
+.Lseg_next:
+    ldr x21, [x21, #AST_F4]       // next association
+    b .Lseg_loop
+.Lseg_use_default:
+    cbz x22, .Lseg_error
+    mov x0, x22
+.Lseg_select:
+    str x0, [x19, #AST_F2]       // chosen expression, for the IR builder
+    bl _kcc_sema_expr             // type-check it
+    b .Lseg_done
+.Lseg_error:
+    ldr x0, [x19, #AST_LINE]
+    mov x1, #0
+    adrp x2, .Lseg_errmsg@@PAGE
+    add  x2, x2, .Lseg_errmsg@@PAGEOFF
+    bl _kcc_diag_error
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+.Lseg_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.section __TEXT,__cstring,cstring_literals
+.Lseg_errmsg:
+    .asciz "_Generic: no association compatible with the controlling type"
+.text
+@| _kcc_sema_expr_generic
 @}
 
 \subsection{Identifier Expression}

@@ -992,8 +992,13 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       and struct/union member (only volatile bit-fields remain)---a soundness
       requirement once the optimizer was added: it must not merge or drop a
       volatile load.  The qualifier reaches the IR at each access and CSE/DCE
-      respect it.  \texttt{\_Generic} and \texttt{long double} remain---low
-      frequency, closing the last of conformance but rarely blocking real code.
+      respect it.  \texttt{\_Generic} is now selected at type-check time---the
+      controlling expression is typed but not evaluated, and the compatible
+      association's expression is the one lowered.  \texttt{long double} and
+      honouring integer-literal suffixes (\texttt{3L} still types as
+      \texttt{int}, which limits \texttt{\_Generic} on literal operands) remain
+      ---low frequency, closing the last of conformance but rarely blocking
+      real code.
 \item \textbf{A second target} (new).  Retargeting to x86-64 or Linux/ELF is
       a strategic multiplier but an entire new backend or object writer;
       undertake it only if cross-platform support becomes an explicit goal.
@@ -1404,7 +1409,7 @@ bit-fields                       & \checkmark & LSB-first packing; 7 diff. tests
 designated initialisers          & $\circ$    & single-level \texttt{[i]=}/\texttt{.f=}; nested TODO \\
 \texttt{volatile} semantics      & \checkmark & honoured for every lvalue access (bit-fields aside) \\
 variadic \emph{definitions}      & \checkmark & \texttt{va\_arg} builtins, 3 diff. tests \\
-\texttt{\_Generic} lowering      & $\circ$    & parsed, not selected \\
+\texttt{\_Generic} lowering      & \checkmark & selected at type-check time (kind+signedness match) \\
 \hline
 \end{tabular}
 \end{center}

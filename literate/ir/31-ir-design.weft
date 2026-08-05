@@ -146,6 +146,20 @@ _kcc_ir_init:
     add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
     str xzr, [x0]
 
+    // Reset module-init state.  The driver compiles every source file in one
+    // process, so these must clear per translation unit---otherwise a later
+    // unit inherits an earlier one's flag and emits a stray __mod_init_func
+    // pointer bound to whatever symbol happens to share that stale index.
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_modinit_sym@@PAGE
+    add  x0, x0, _kcc_modinit_sym@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_modinit_fileoff@@PAGE
+    add  x0, x0, _kcc_modinit_fileoff@@PAGEOFF
+    str xzr, [x0]
+
     // Initialize function list vector (8 bytes per pointer, cap 16)
     mov x0, #VEC_SIZE
     bl _kcc_arena_alloc
@@ -504,6 +518,12 @@ _kcc_ir_labels:      .quad 0     // hash table: label name → target basic bloc
 _kcc_ir_loop_stack:  .quad 0     // vec of (continue_bb, break_bb) pairs
 .globl _kcc_ir_bb_counter
 _kcc_ir_bb_counter:  .quad 0     // global BB id counter
+.globl _kcc_modinit_present
+_kcc_modinit_present: .quad 0    // 1 if this TU synthesised a module-init function
+.globl _kcc_modinit_sym
+_kcc_modinit_sym:    .quad 0     // module-init symbol index + 1 (0 = none), set by codegen
+.globl _kcc_modinit_fileoff
+_kcc_modinit_fileoff: .quad 0    // file offset of the __mod_init_func pointer, set by the writer
 @| _kcc_ir_cur_func
 @| _kcc_ir_cur_bb
 @| _kcc_ir_funcs
@@ -513,4 +533,5 @@ _kcc_ir_bb_counter:  .quad 0     // global BB id counter
 @| _kcc_ir_labels
 @| _kcc_ir_loop_stack
 @| _kcc_ir_bb_counter
+@| _kcc_modinit_present _kcc_modinit_sym _kcc_modinit_fileoff
 @}

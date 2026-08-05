@@ -592,7 +592,15 @@ two codegen bugs now fixed.
       set feeding the \texttt{IR\_GLOBAL\_REF} handler's choice between
       \texttt{linker\_global\_sym} and \texttt{linker\_extern}), so two
       objects can share a global without colliding.  Automatic linking
-      (invoking \texttt{ld}) is left to Phase~9.
+      (invoking \texttt{ld}) is left to Phase~9.  A later refinement
+      (Phase~9) closed the one hole this left: a translation unit that
+      does not define \texttt{main} now initialises its own file-scope
+      globals through a synthesised \texttt{kcc.module\_init} function
+      registered in \texttt{(\_\_DATA,\_\_mod\_init\_func)}, which
+      \texttt{dyld} runs before \texttt{main}
+      (\S\ref{sec:global-inits},~\S\ref{sec:macho-modinit}); previously
+      such a unit's initializers, being emitted as stores injected into
+      \texttt{main}, never ran.
 \item[\checkmark] 201 codegen tests covering all features
       (11 Phase~8 test groups: nested structs, struct arrays,
       global init, pointer arithmetic, pointer arrays, initializer

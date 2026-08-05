@@ -48,8 +48,10 @@ All values are for the 64-bit ARM64 object file format
 
 // Section types/attributes
 .equ S_REGULAR,               0x00
+.equ S_MOD_INIT_FUNC_POINTERS, 0x09
 .equ S_ATTR_PURE_INSTRUCTIONS, 0x80000000
 .equ S_ATTR_SOME_INSTRUCTIONS, 0x00000400
+.equ ARM64_RELOC_UNSIGNED,    0x00
 
 // Relocation info bit packing
 // r_info = r_symbolnum(24) | r_pcrel(1) | r_length(2) | r_extern(1) | r_type(4)
@@ -434,8 +436,16 @@ _kcc_macho_finalize:
 
     // Compute load commands size:
     // LC_SEGMENT_64 (72 + 80*2 = 232) + LC_BUILD_VERSION (24) + LC_SYMTAB (24) + LC_DYSYMTAB (80) = 360
-    // Always emit 2 sections: __text + __DATA,__common (zerofill)
+    // Base layout: 2 sections (__text + __DATA,__common zerofill).
     mov x22, #(232 + 24 + 24 + 80)  // = 360
+    // A module-init unit adds a third section (__DATA,__mod_init_func), i.e.
+    // one more 80-byte section_64 inside the same segment (no extra command).
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_modinit_lc
+    add  x22, x22, #80
+.Lmf_no_modinit_lc:
     // Under -g, reserve a __DWARF LC_SEGMENT_64 (72 + 80*3 sections = 312).
     // Adding it to x22 here auto-shifts every downstream file offset.
     adrp x0, _kcc_dwarf_enabled@@PAGE
@@ -460,6 +470,19 @@ _kcc_macho_finalize:
     bl   _kcc_dwarf_total_len
     add  x24, x24, x0
 .Lmf_no_dw_reserve:
+    // Reserve the 8-byte __mod_init_func pointer (8-aligned) between the code
+    // (and any DWARF blob) and the LINKEDIT tables, and remember its offset.
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_modinit_off
+    add x24, x24, #7
+    bic x24, x24, #7             // 8-align → pointer file offset
+    adrp x0, _kcc_modinit_fileoff@@PAGE
+    add  x0, x0, _kcc_modinit_fileoff@@PAGEOFF
+    str x24, [x0]
+    add x24, x24, #8             // reserve the pointer's 8 bytes
+.Lmf_no_modinit_off:
     add x24, x24, #3
     bic x24, x24, #3              // x24 = reloc_offset (4-byte aligned)
 
@@ -467,6 +490,13 @@ _kcc_macho_finalize:
     mov x25, #RELOC_INFO_SIZE
     mul x25, x21, x25
     add x25, x24, x25             // x25 = symtab_offset
+    // A module-init unit appends one extra relocation (the pointer's UNSIGNED).
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_modinit_reloc_sz
+    add x25, x25, #RELOC_INFO_SIZE
+.Lmf_no_modinit_reloc_sz:
 
     // String table offset = symtab_offset + nsyms * 16
     mov x26, #NLIST_64_SIZE
@@ -593,8 +623,14 @@ versions.
     // cmd
     mov w0, #LC_SEGMENT_64
     bl _kcc_macho_write32
-    // cmdsize = 72 + 80*2 = 232
+    // cmdsize = 72 + 80*nsects (232 for 2, 312 when __mod_init_func is present)
     mov w0, #232
+    adrp x1, _kcc_modinit_present@@PAGE
+    add  x1, x1, _kcc_modinit_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_seg_cmdsize
+    mov w0, #312
+.Lmf_seg_cmdsize:
     bl _kcc_macho_write32
     // segname (16 bytes, empty for object files)
     mov x0, #0
@@ -604,15 +640,34 @@ versions.
     // vmaddr
     mov x0, #0
     bl _kcc_macho_write64
-    // vmsize = code_size + globals_size
+    // vmsize = code_size + globals_size (+ the aligned 8-byte modinit pointer)
     ldr x0, [sp, #112]            // globals_size
     add x0, x0, x19               // + code_size
+    adrp x1, _kcc_modinit_present@@PAGE
+    add  x1, x1, _kcc_modinit_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_seg_vmsize
+    add x0, x0, #7
+    bic x0, x0, #7               // 8-align the pointer's VM address
+    add x0, x0, #8               // + 8 bytes for the pointer
+.Lmf_seg_vmsize:
     bl _kcc_macho_write64
     // fileoff = text_offset
     mov x0, x23
     bl _kcc_macho_write64
-    // filesize = code_size (zerofill doesn't occupy file space)
+    // filesize = code_size (zerofill doesn't occupy file space); when a
+    // __mod_init_func pointer follows the code, extend to cover its 8 bytes.
     mov x0, x19
+    adrp x1, _kcc_modinit_present@@PAGE
+    add  x1, x1, _kcc_modinit_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_seg_filesize
+    adrp x0, _kcc_modinit_fileoff@@PAGE
+    add  x0, x0, _kcc_modinit_fileoff@@PAGEOFF
+    ldr x0, [x0]
+    add x0, x0, #8               // end of the pointer
+    sub x0, x0, x23              // relative to the segment's fileoff
+.Lmf_seg_filesize:
     bl _kcc_macho_write64
     // maxprot = 7 (rwx)
     mov w0, #7
@@ -620,8 +675,14 @@ versions.
     // initprot = 7
     mov w0, #7
     bl _kcc_macho_write32
-    // nsects = 2
+    // nsects = 2 (3 when the __mod_init_func section is present)
     mov w0, #2
+    adrp x1, _kcc_modinit_present@@PAGE
+    add  x1, x1, _kcc_modinit_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_seg_nsects
+    mov w0, #3
+.Lmf_seg_nsects:
     bl _kcc_macho_write32
     // flags = 0
     mov w0, #0
@@ -641,6 +702,19 @@ occupies virtual address space immediately after the text section but
 requires no file storage---the \texttt{offset} and \texttt{reloff}
 fields are both zero.  Section and segment names are written as
 inline immediate constants to avoid linker dead-stripping issues.
+
+\label{sec:macho-modinit}
+A module-init unit (\S\ref{sec:global-inits}) contributes a third
+section, \texttt{\_\_DATA,\_\_mod\_init\_func}, whose 8-byte body is a
+single pointer to the local \texttt{kcc.module\_init} function.  Its
+\texttt{S\_MOD\_INIT\_FUNC\_POINTERS} flag tells \texttt{dyld} to call
+every pointer in the section before \texttt{main}.  Unlike
+\texttt{\_\_common} it carries real file data, so it has a non-zero
+\texttt{offset}; the pointer's value is supplied by a single
+\texttt{ARM64\_RELOC\_UNSIGNED} relocation against the function symbol,
+so the eight bytes on disk are zero.  This whole section header is
+emitted only when \texttt{\_kcc\_modinit\_present} is set, leaving the
+common two-section object byte-for-byte unchanged.
 
 @d MachO: finalize @{
     // ---- Section: __text ----
@@ -736,6 +810,66 @@ inline immediate constants to avoid linker dead-stripping issues.
     bl _kcc_macho_write32
     mov w0, #0
     bl _kcc_macho_write32
+
+    // ---- Section: __DATA,__mod_init_func (only for a module-init unit) ----
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_modinit_sect
+    // sectname (16 bytes): "__mod_init_func" (15 chars) + 1 NUL, fills all 16
+    mov x0, #0x5F5F
+    movk x0, #0x6F6D, lsl #16
+    movk x0, #0x5F64, lsl #32
+    movk x0, #0x6E69, lsl #48     // "__mod_in"
+    bl _kcc_macho_write64
+    mov x0, #0x7469
+    movk x0, #0x665F, lsl #16
+    movk x0, #0x6E75, lsl #32
+    movk x0, #0x0063, lsl #48     // "it_func\0"
+    bl _kcc_macho_write64
+    // segname (16 bytes): "__DATA" + 10 null bytes
+    mov x0, #0x5F5F
+    movk x0, #0x4144, lsl #16
+    movk x0, #0x4154, lsl #32
+    bl _kcc_macho_write64
+    mov x0, #0
+    bl _kcc_macho_write64
+    // addr = 8-aligned VM address after __common
+    ldr x0, [sp, #112]           // globals_size
+    add x0, x0, x19              // + code_size
+    add x0, x0, #7
+    bic x0, x0, #7
+    bl _kcc_macho_write64
+    // size = 8 (one pointer)
+    mov x0, #8
+    bl _kcc_macho_write64
+    // offset = file offset of the pointer
+    adrp x0, _kcc_modinit_fileoff@@PAGE
+    add  x0, x0, _kcc_modinit_fileoff@@PAGEOFF
+    ldr w0, [x0]
+    bl _kcc_macho_write32
+    // align = 3 (8-byte aligned)
+    mov w0, #3
+    bl _kcc_macho_write32
+    // reloff = reloc_offset + nrelocs*8 (the modinit reloc trails the text relocs)
+    mov x0, #RELOC_INFO_SIZE
+    mul x0, x21, x0
+    add x0, x24, x0
+    bl _kcc_macho_write32
+    // nreloc = 1
+    mov w0, #1
+    bl _kcc_macho_write32
+    // flags = S_MOD_INIT_FUNC_POINTERS
+    mov w0, #S_MOD_INIT_FUNC_POINTERS
+    bl _kcc_macho_write32
+    // reserved1, reserved2, reserved3
+    mov w0, #0
+    bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+.Lmf_no_modinit_sect:
 @}
 
 \paragraph{Auxiliary Load Commands}
@@ -899,6 +1033,18 @@ and relocation type.
     bl   _kcc_dwarf_append_blob
 .Lmf_dw_blob_done:
 
+    // ---- Write the __mod_init_func pointer (8 zero bytes; value from reloc) ----
+    // Aligning to 8 lands the file position exactly on the reserved slot.
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_modinit_data
+    mov x0, #8
+    bl _kcc_macho_pad_to
+    mov x0, #0
+    bl _kcc_macho_write64
+.Lmf_no_modinit_data:
+
     // Pad to reloc_offset
     mov x0, #4
     bl _kcc_macho_pad_to
@@ -965,11 +1111,15 @@ vector and write one 8-byte \texttt{relocation\_info} record per
 entry.  The first word is the section-relative \texttt{r\_address};
 the second packs the (remapped) symbol index into bits~0--23,
 followed by the \texttt{r\_pcrel} flag (bit~24), \texttt{r\_length}
-(bits~25--26, always~2 for 4-byte instructions),
+(bits~25--26, 2 for the 4-byte instruction fixups in this loop),
 \texttt{r\_extern} (bit~27, always~1), and the relocation type
 (bits~28--31).  \texttt{ARM64\_RELOC\_BRANCH26} and
 \texttt{ARM64\_RELOC\_PAGE21} are PC-relative; \texttt{PAGEOFF12}
-is not, so the \texttt{pcrel} bit is cleared for that case.
+is not, so the \texttt{pcrel} bit is cleared for that case.  The
+lone exception, emitted just after this loop, is the
+\texttt{\_\_mod\_init\_func} pointer's \texttt{ARM64\_RELOC\_UNSIGNED}:
+an 8-byte, non-PC-relative fixup (\texttt{r\_length}~=~3) against the
+module-init function symbol.
 
 @d MachO: finalize @{
     // ---- Write relocations ----
@@ -1018,6 +1168,31 @@ is not, so the \texttt{pcrel} bit is cleared for that case.
     add x28, x28, #1
     b .Lmf_reloc_loop
 .Lmf_reloc_done:
+
+    // ---- Module-init pointer relocation ----
+    // One ARM64_RELOC_UNSIGNED (length 3 = 8 bytes, not pc-relative) binding the
+    // __mod_init_func pointer to the local kcc.module_init symbol.  It trails the
+    // text relocations, matching the reloff recorded in that section header.
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_modinit_reloc_emit
+    // r_address = 0 (pointer sits at the start of __mod_init_func)
+    mov w0, #0
+    bl _kcc_macho_write32
+    // r_symbolnum = remap[modinit sym index]
+    adrp x0, _kcc_modinit_sym@@PAGE
+    add  x0, x0, _kcc_modinit_sym@@PAGEOFF
+    ldr x0, [x0]
+    sub x0, x0, #1               // stored index + 1 → original index
+    ldr x5, [sp, #120]           // remap array
+    ldr x3, [x5, x0, lsl #3]    // remapped output index
+    and w0, w3, #0xFFFFFF          // r_symbolnum
+    orr w0, w0, #(3 << 25)        // r_length = 3 (8-byte pointer)
+    orr w0, w0, #(1 << 27)        // r_extern = 1
+    // r_pcrel = 0, r_type = ARM64_RELOC_UNSIGNED (0)
+    bl _kcc_macho_write32
+.Lmf_no_modinit_reloc_emit:
 @}
 
 \subsection{Symbol Table and String Table}

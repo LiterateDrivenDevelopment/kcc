@@ -388,6 +388,12 @@ runtime start-up---the link line is
 from \texttt{\$SDKROOT} or, failing that, the two standard SDK locations.  After
 a successful link the intermediate object files are removed.
 
+Because this path compiles each source inline as it scans the arguments, it
+first makes a preliminary pass to honour \texttt{-Wall} and \texttt{-g}
+wherever they appear, so a warning or debug-info request applies to every
+source regardless of its position on the command line; the compile pass then
+skips those flags rather than mistaking them for source files.
+
 @d Driver: link @{
 // -- kcc_getenv ---------------------------------------------------------------
 // char *kcc_getenv(const char *name, uint64_t namelen)
@@ -556,6 +562,41 @@ _kcc_driver_link_all:
     mov x19, x0                  // argc
     mov x20, x1                  // argv
 
+    // Pass 1: honour -Wall and -g wherever they appear on the command line,
+    // so every source is compiled with them active regardless of position
+    // (the compile-and-link loop below processes sources inline, in one pass).
+    mov x21, #1
+.Lla_pre:
+    cmp x21, x19
+    b.ge .Lla_pre_done
+    ldr x0, [x20, x21, lsl #3]
+    adrp x1, _kcc_opt_wall@@PAGE
+    add  x1, x1, _kcc_opt_wall@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_pre_wall
+    ldr x0, [x20, x21, lsl #3]
+    adrp x1, _kcc_opt_g@@PAGE
+    add  x1, x1, _kcc_opt_g@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_pre_g
+    add x21, x21, #1
+    b .Lla_pre
+.Lla_pre_wall:
+    adrp x0, _kcc_warn_all@@PAGE
+    add  x0, x0, _kcc_warn_all@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x21, x21, #1
+    b .Lla_pre
+.Lla_pre_g:
+    adrp x0, _kcc_dwarf_enabled@@PAGE
+    add  x0, x0, _kcc_dwarf_enabled@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x21, x21, #1
+    b .Lla_pre
+.Lla_pre_done:
+
     // Linker argv: at most argc + 12 pointers.
     add x0, x19, #12
     lsl x0, x0, #3
@@ -580,6 +621,17 @@ _kcc_driver_link_all:
     add  x1, x1, _kcc_opt_o@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lla_o
+    // -Wall / -g were consumed in pass 1; skip them here (not source files).
+    mov x0, x27
+    adrp x1, _kcc_opt_wall@@PAGE
+    add  x1, x1, _kcc_opt_wall@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_skipopt
+    mov x0, x27
+    adrp x1, _kcc_opt_g@@PAGE
+    add  x1, x1, _kcc_opt_g@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_skipopt
     // A source file: derive its object name, record it, compile it.
     mov x0, x27
     bl _kcc_driver_obj_name
@@ -590,6 +642,9 @@ _kcc_driver_link_all:
     orr x25, x25, x0
     add x22, x22, #1
     add x26, x26, #1
+    add x24, x24, #1
+    b .Lla_loop
+.Lla_skipopt:
     add x24, x24, #1
     b .Lla_loop
 .Lla_o:

@@ -1,0 +1,298 @@
+% A-user-manual.weft — User Manual: installing, configuring and running kcc
+%
+% Pure prose. A practical, end-user guide to obtaining, building and using
+% the compiler. No code is emitted here.
+
+\chapter{User Manual}
+\label{ch:user-manual}
+
+This appendix is the practical guide to \emph{using} \kcc{}: how to obtain
+and build it, how to compile and run a program, what every command-line
+option does, how to read its diagnostics, and what it does and does not yet
+support.  It assumes only that you are comfortable at a terminal; it does
+not assume you have read the rest of this book.
+
+\section{What \kcc{} Is}
+\label{sec:um-what}
+
+\kcc{} is a C compiler for the C17 language.  It takes C source files and
+produces native machine code---either a relocatable object file
+(\texttt{.o}) or a finished executable that you can run directly.  It is
+built from scratch: it has its own preprocessor, parser, type checker,
+optimizer, register allocator, and code generator, and it emits Mach-O
+object code itself rather than delegating to another assembler.  Its target
+is \textbf{Apple silicon}: 64-bit ARM (AArch64) running macOS.  The compiler
+produced by this book, and every example in this manual, runs on that
+platform.
+
+\section{Requirements}
+\label{sec:um-requirements}
+
+To \emph{build} \kcc{} from source you need:
+
+\begin{itemize}
+\item A Mac with Apple silicon (an M-series processor) running macOS.
+\item The Xcode Command Line Tools, which provide the system assembler,
+      the linker \texttt{ld}, and the macOS SDK.  Install them with
+      \texttt{xcode-select~-{}-install} if you have not already.
+\item \texttt{weft}, the literate-programming tool that turns the
+      \texttt{.weft} sources into assembly.
+\item \texttt{just}, the command runner used by the project's recipes.
+\item Optionally, \texttt{lualatex}, only if you want to typeset this book
+      itself into a PDF.  It is not needed to build or use the compiler.
+\end{itemize}
+
+To \emph{use} the compiler once it is built you need only the Mac and the
+Xcode Command Line Tools: \kcc{} invokes the system linker to produce
+executables and reads the SDK to find the C runtime startup, so the Command
+Line Tools must be present.
+
+\section{Building \kcc{}}
+\label{sec:um-building}
+
+From the top of the project, a single command builds the compiler:
+
+\begin{verbatim}
+just build
+\end{verbatim}
+
+This tangles the literate sources into assembly, assembles each into an
+object file, and links them into the compiler binary at
+\texttt{tmp/kcc}.  That path is the compiler; everything below refers to it
+as \texttt{kcc} for brevity.  To run it from anywhere, either use the full
+path \texttt{tmp/kcc} or copy the binary onto your \texttt{PATH}, for
+example:
+
+\begin{verbatim}
+cp tmp/kcc /usr/local/bin/kcc
+\end{verbatim}
+
+There is nothing to configure: \kcc{} has no configuration file and no
+environment variables to set.  Its entire behaviour is controlled by the
+command-line options described in \S\ref{sec:um-commands}.
+
+\section{Your First Program}
+\label{sec:um-first}
+
+Create a file \texttt{hello.c}:
+
+\begin{verbatim}
+int printf(const char *fmt, ...);
+
+int main(void) {
+    printf("Hello from kcc!\n");
+    return 0;
+}
+\end{verbatim}
+
+Compile and link it into an executable, then run it:
+
+\begin{verbatim}
+kcc hello.c -o hello
+./hello
+\end{verbatim}
+
+You should see \texttt{Hello from kcc!}.  With no \texttt{-o} option the
+executable is named \texttt{a.out}, following long tradition:
+
+\begin{verbatim}
+kcc hello.c
+./a.out
+\end{verbatim}
+
+That is the whole workflow for a simple program: one command to build, one
+to run.
+
+\section{Command Reference}
+\label{sec:um-commands}
+
+\kcc{} is invoked as \texttt{kcc [mode] source.c ... [options]}.  The first
+argument selects what the compiler does with the source; if it is not one
+of the recognised mode flags, \kcc{} performs the default action---compile
+and link into an executable.  Each mode and option is listed below.
+
+\paragraph{Modes.}
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Invocation & What it does \\
+\hline
+\texttt{kcc a.c ... [options]}     & compile \emph{and link} into an executable (default) \\
+\texttt{kcc -c a.c ... [options]}  & compile to object file(s) (\texttt{.o}), no linking \\
+\texttt{kcc -E a.c}                & run only the preprocessor; print the result \\
+\texttt{kcc -{}-check a.c}          & parse and type-check only; report errors, produce nothing \\
+\texttt{kcc -{}-dump-tokens a.c}    & print the token stream from the lexer \\
+\texttt{kcc -{}-dump-ast a.c}       & print the abstract syntax tree from the parser \\
+\texttt{kcc -{}-dump-types a.c}     & print the resolved types \\
+\texttt{kcc -{}-dump-ir a.c}        & print the optimized intermediate representation \\
+\hline
+\end{tabular}
+\end{center}
+
+The default mode and the \texttt{-c} mode both accept several source files
+at once and compile each; the default mode then links all of the resulting
+objects together.  The inspection modes (\texttt{-E} and the
+\texttt{-{}-dump} family, and \texttt{-{}-check}) take a single source file
+and print their result to standard output, which makes them convenient to
+pipe into a pager or a file.
+
+\paragraph{Options.}
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Option & Effect \\
+\hline
+\texttt{-o \emph{name}} & name the output; default \texttt{a.out} when linking, \\
+                        & or the object name when compiling with \texttt{-c} \\
+\texttt{-Wall}          & enable the warning family (\S\ref{sec:um-warnings}) \\
+\texttt{-g}             & emit DWARF debug information for a debugger \\
+\hline
+\end{tabular}
+\end{center}
+
+Options may appear in any order relative to the source files.  A word that
+is not an option and not a mode flag is treated as a source file.
+
+\section{Compiling and Linking in Separate Steps}
+\label{sec:um-separate}
+
+For a project of more than one file you can compile each translation unit to
+an object and link them later, exactly as with any C compiler:
+
+\begin{verbatim}
+kcc -c util.c   -o util.o
+kcc -c main.c   -o main.o
+kcc util.o main.o -o program
+./program
+\end{verbatim}
+
+Or you can let \kcc{} do it all in one step by naming every source on the
+command line:
+
+\begin{verbatim}
+kcc util.c main.c -o program
+\end{verbatim}
+
+\section{Warnings}
+\label{sec:um-warnings}
+
+By default \kcc{} reports only errors---conditions that make a program
+ill-formed.  Passing \texttt{-Wall} additionally enables a family of
+warnings for suspicious but legal code: calling a function with no visible
+declaration, a local variable that is never used, a non-\texttt{void}
+function that can fall off its end without returning, a comparison that
+mixes signed and unsigned operands, and an implicit conversion between an
+integer and a pointer.  Warnings do not stop compilation; they are advice.
+
+\section{Debug Information}
+\label{sec:um-debug}
+
+The \texttt{-g} option makes \kcc{} emit DWARF debugging information
+alongside the code, so that a debugger can map machine addresses back to
+functions and source lines.  The information is function-granular: it
+records where each function begins, which is enough for a backtrace to name
+the right functions.
+
+\section{Reading Diagnostics}
+\label{sec:um-diagnostics}
+
+When \kcc{} rejects a program it prints a diagnostic that names the file,
+the line and column, the nature of the problem, and---like a modern
+compiler---a caret pointing at the offending token in a copy of the source
+line.  It does not stop at the first error: it recovers and continues so
+that a single run reports as many independent problems as it can find, which
+saves the edit-compile cycle of fixing them one at a time.  A run that
+prints diagnostics and produces no output has failed; a run that prints
+nothing (or only warnings, under \texttt{-Wall}) and produces the requested
+file has succeeded.
+
+\section{Looking Inside the Compiler}
+\label{sec:um-inspect}
+
+The inspection modes are there for the curious and for anyone debugging a
+surprising result.  \texttt{-E} shows exactly what the preprocessor
+produced---useful when a macro does not expand as expected.
+\texttt{-{}-dump-ast} shows how the parser understood the program's
+structure.  \texttt{-{}-dump-ir} shows the optimized intermediate
+representation, the form on which the optimizer and code generator work; it
+is the clearest window on what code \kcc{} will actually generate, and on
+what the optimizer did or did not simplify.  None of these modes produces an
+object file; they print and exit.
+
+\section{What \kcc{} Supports}
+\label{sec:um-scope}
+
+\kcc{} implements the C17 language broadly: the full expression and
+statement grammar, the complete type system with structs, unions, enums,
+bit-fields and function pointers, the preprocessor with macros and
+conditional inclusion, and the harder corners of the standard such as
+designated initializers, \texttt{\_Generic} selection, \texttt{\_Bool}
+normalization, \texttt{volatile} semantics, and correctly typed integer
+constants.  It provides a small set of freestanding standard headers so that
+ordinary programs using \texttt{printf} and friends compile without an
+external installation.  It optimizes---constant folding, dead-code
+elimination, common-subexpression elimination, and keeping locals in
+registers---and allocates both integer and floating values to registers.
+
+Its current limits are worth stating plainly so you are not surprised.  It
+targets Apple silicon only; there is no cross-compilation to other
+processors or operating systems yet (the framework for adding one is
+described in Chapter~\ref{ch:retargeting}).  A few tail corners of C17 remain:
+\texttt{volatile} bit-fields, arbitrarily nested designator chains, and
+per-operation single-precision rounding for \texttt{float} arithmetic
+(intermediate results are computed in \texttt{double} and rounded at the
+boundaries).  Appendix~\ref{ch:roadmap} tracks the state of every feature in
+detail.
+
+\section{Building This Book}
+\label{sec:um-docs}
+
+If you have \texttt{lualatex} installed and want the typeset PDF of this
+literate program, run:
+
+\begin{verbatim}
+just weave
+\end{verbatim}
+
+This is purely optional and unrelated to using the compiler.
+
+\section{For Contributors}
+\label{sec:um-contributors}
+
+The project's \texttt{just} recipes cover the full development loop.  The
+most useful are \texttt{just build} (produce the compiler), \texttt{just
+test} (build and run the unit tests), and the conformance suites that guard
+against regressions: \texttt{just test-codegen} (end-to-end code-generation
+tests), \texttt{just difftest} (compile a corpus with both \kcc{} and the
+reference compiler and compare their output), \texttt{just selfhost}
+(compile a piece of \kcc{}'s own C with \kcc{} and check the result),
+\texttt{just diagtest} and \texttt{just warntest} (check that invalid
+programs are rejected and that warnings fire as expected), \texttt{just
+interop} (validate the calling convention against the reference compiler),
+and \texttt{just e2e} (the one-step compile-and-run path).  All changes go
+through the \texttt{.weft} sources; the tangled assembly under \texttt{tmp}
+is generated and must never be edited by hand.
+
+\section{Troubleshooting}
+\label{sec:um-troubleshooting}
+
+\begin{itemize}
+\item \textbf{Linking fails, or the executable will not run.}  \kcc{} calls
+      the system linker and needs the macOS SDK.  Confirm the Xcode Command
+      Line Tools are installed (\texttt{xcode-select~-p} should print a
+      path) and that \texttt{xcrun~-{}-show-sdk-path} prints a valid SDK
+      location.
+\item \textbf{A program compiles but behaves unexpectedly.}  Use
+      \texttt{-{}-dump-ir} to see the code \kcc{} generated, and check the
+      feature against the limits in \S\ref{sec:um-scope}; a divergence from
+      another compiler on a corner feature is more likely a known gap than a
+      miscompilation of ordinary code, which the difference suite guards
+      closely.
+\item \textbf{A macro does not expand as you expect.}  Run \texttt{kcc -E}
+      on the file to see the preprocessed text.
+\item \textbf{\texttt{kcc} is not found.}  The built compiler lives at
+      \texttt{tmp/kcc}; invoke it by that path, or copy it onto your
+      \texttt{PATH} as shown in \S\ref{sec:um-building}.
+\end{itemize}

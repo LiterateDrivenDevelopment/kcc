@@ -1,0 +1,326 @@
+% 36e-retargeting.weft — The Porting Playbook: adding an architecture
+%
+% Pure prose. This chapter is the design rationale AND the step-by-step
+% recipe for retargeting kcc to a new architecture. No code is emitted
+% here; the concrete target modules are written when a target is added.
+
+\chapter{Retargeting \kcc{}: The Porting Playbook}
+\label{ch:retargeting}
+
+This chapter is a promise to a future contributor.  When a new
+architecture is to be supported---x86-64, RISC-V, a second ARM ABI, a
+future ISA that does not yet exist---this is the document to read first.
+It explains \emph{why} \kcc{} is organised so that a new back end is cheap,
+\emph{what} exactly must be supplied, and \emph{in what order} to build it
+so that every step is small and testable.  The intent is blunt: after
+reading this chapter, a competent implementer should be able to open a
+processor manual and an ABI document and start writing the new target the
+same afternoon.  Breadth---supporting as many architectures as
+possible---is a first-class goal, and the only way to reach it is to make
+each additional architecture a matter of \emph{filling in a form}, not
+inventing a compiler.
+
+\section{The Principle: One Front End, Many Back Ends}
+\label{sec:one-front-many-back}
+
+Everything in \kcc{} is arranged around a single dividing line: the
+intermediate representation (Chapter~\ref{ch:ir-design}).  Above that line
+the compiler is \emph{target-neutral}; below it, target-specific.  This is
+not an accident of style---it is the entire strategy for portability.
+
+Above the IR sits the whole language: the lexer, the preprocessor, the
+parser, semantic analysis, and IR construction.  None of it knows or cares
+what machine will eventually run the program.  It is written once and never
+touched again when a target is added.  So is the optimizer
+(Chapters~\ref{ch:ir-passes}--\ref{sec:dce}): constant folding, dead-code
+elimination, common-subexpression elimination, and scalar-local promotion
+all operate on the IR, and are therefore shared by every target for free.
+So, crucially, is the \emph{logic} of register allocation
+(\S\ref{sec:regalloc-portable} below): linear scan, liveness, the loop and
+call analyses, the mem2reg reinterpretation---all of it is neutral, and
+only the \emph{register banks} it draws from are target data.
+
+Below the IR sits exactly what differs between machines: how an IR
+operation becomes instructions, which registers exist and how they are
+partitioned, how arguments are passed, how a stack frame is laid out, and
+how the result is turned into an object file the platform's linker
+accepts.  A new target supplies these---and nothing else.
+
+\begin{center}
+\begin{tabular}{ll}
+\hline
+Written once (target-neutral) & Written per target \\
+\hline
+lexer, preprocessor, parser & instruction selection (IR op $\to$ asm) \\
+semantic analysis, type system & register banks (names, counts, roles) \\
+IR construction and validation & ABI (argument/return, alignment) \\
+optimizer (fold, DCE, CSE, mem2reg) & prologue/epilogue and frame layout \\
+register-allocation \emph{logic} & assembler and linker invocation \\
+diagnostics, driver skeleton & runtime (syscalls, \texttt{\_start}) \\
+\hline
+\end{tabular}
+\end{center}
+
+The left column is roughly seventy percent of the compiler and never grows
+when architectures are added.  The right column is what this chapter is
+about.
+
+\section{Two Ways to Reach Metal}
+\label{sec:two-ways}
+
+There are two honest ways to turn a stream of instructions into an object
+file, and \kcc{} deliberately supports both.
+
+The first is \emph{direct emission}: the back end computes the exact bytes
+of each instruction and writes the object file itself.  This is what the
+ARM64 back end does---Chapter~\ref{ch:emit-arm64} encodes every instruction
+class into its 32-bit word, and Chapter~\ref{ch:emit-macho} lays out the
+Mach-O container by hand.  It owns everything down to the last bit, depends
+on nothing but the system linker, and is the truest expression of \kcc{}'s
+``build your own floor'' character.  Its price is that each instruction-set
+needs a full encoder---an intricate, error-prone module---and each object
+format needs its own writer.
+
+The second is \emph{assembly emission}: the back end prints textual
+assembly (\texttt{.s}) and hands it to the platform's assembler, which
+produces the object file.  The assembler does the encoding \emph{and} emits
+the native object format---ELF on Linux, Mach-O on macOS, COFF on
+Windows---so a target that emits assembly needs \emph{neither} an
+instruction encoder \emph{nor} an object writer.  What remains is only the
+interesting, machine-defining work: choosing which instructions to emit,
+allocating registers, and obeying the ABI.
+
+For \emph{growing to many architectures}, the second way is decisively more
+economical, and the reason is structural, not merely a matter of typing
+less.  An instruction encoder is the part of a back end most likely to
+harbour subtle, hard-to-find bugs (a wrong bit in a rarely-used addressing
+mode), and it must be written and hardened \emph{per instruction set}.  An
+object writer must be written \emph{per object format}.  Delegating both to
+the system assembler means inheriting decades of hardened correctness
+instead of maintaining a new bug surface for every ISA and every format.
+That is not a compromise for a production tool; it is the sensible choice.
+Many production compilers emit assembly for exactly this reason.
+
+It is worth being precise about what is delegated and what is kept, because
+the distinction is the whole argument.  \kcc{} keeps everything that makes
+it a compiler: the front end, the IR, the optimizer, register allocation,
+instruction \emph{selection}, and the ABI.  It delegates only the two most
+mechanical, most target-multiplied, least conceptually interesting steps:
+turning chosen instructions into bytes, and packing bytes into an object
+file.  A target built this way is not ``a front end to the assembler''---it
+is a complete compiler that uses the platform assembler as its code-object
+back end, which is a respectable and common architecture.
+
+The flagship ARM64 target remains direct: it already exists, it is the
+proof that \kcc{} can go all the way to the metal from scratch, and it is
+what makes the self-hosting build byte-identical.  We do not rewrite it.
+The target interface (\S\ref{sec:target-interface}) is what lets the two
+coexist: each target chooses its own emission in its own \emph{emit}
+operation.  ARM64 emits bytes and a Mach-O; a new target emits text and
+invokes \texttt{as}.  Nothing above the emit operation knows the
+difference.  Should a direct encoder for a new ISA ever be wanted (for the
+same from-scratch pride, or to drop the assembler dependency), it can be
+added later as a different \emph{emit} without disturbing selection, the
+allocator, or the ABI---so choosing assembly now forecloses nothing.
+
+\section{The Target Interface}
+\label{sec:target-interface}
+
+A target is a \emph{descriptor} plus a set of \emph{operations}.  The
+descriptor is data; the operations are the code a new back end supplies.
+Adding an architecture means creating one target module that provides all
+of them, and registering it so that \texttt{--target} can select it.
+
+\paragraph{Identity and toolchain.}  The descriptor first fixes the basics:
+a name (\texttt{arm64}, \texttt{x86\_64}, \ldots), the pointer width and
+endianness, the symbol-name convention (the Mach-O world prefixes an
+underscore; ELF does not), the assembler command and flags to run on the
+emitted \texttt{.s}, the object format it produces, and the linker command
+and startup files used to produce an executable.  For a direct target the
+assembler command is empty and the object writer is used instead.
+
+\paragraph{Register banks.}  For each class of register---general-purpose
+and floating-point---the target declares, as plain data: the register
+names (or numbers) available for allocation, how many there are, which are
+\emph{caller-saved} (free across a call only if the value is dead there)
+versus \emph{callee-saved} (preserved across calls, but must be spilled and
+restored by the prologue/epilogue), and which are reserved by the ABI or
+used as fixed scratch by the emitter (the stack pointer, the frame pointer,
+the argument registers during a call, any hardwired zero register).  These
+banks are the \emph{only} machine-specific input the register allocator
+needs; see \S\ref{sec:regalloc-portable}.
+
+\paragraph{The calling convention (ABI).}  The target supplies the rules
+for passing and returning values: which registers carry the first several
+integer and pointer arguments, which carry floating arguments, how an
+argument too large for a register or beyond the register budget is passed
+on the stack, how an aggregate is classified (the System V AMD64
+eightbyte rules; the AArch64 homogeneous-aggregate and by-reference rules),
+where the return value lands, the required stack alignment at a call, and
+any red zone.  In \kcc{} this is expressed as a small classification
+routine plus a table---not scattered through the code---so that a new ABI
+is read out of its specification and transcribed in one place.
+
+\paragraph{Instruction selection.}  This is the heart of a new target: for
+each IR operation the emitter produces the equivalent instruction or short
+sequence for this machine.  A constant becomes a move-immediate; an
+\texttt{IR\_ADD} becomes the machine's add; a \texttt{IR\_LOAD} becomes a
+load from the addressing mode the target favours; a comparison plus
+conditional branch becomes the machine's compare-and-branch idiom; a call
+becomes the argument marshaling from the ABI followed by the call
+instruction.  For an assembly target each case simply prints the mnemonic
+and operands; for a direct target it encodes the bytes.  Selection is where
+the bulk of a new target's lines live, but each case is small, local, and
+independently testable.
+
+\paragraph{Prologue, epilogue, and frame.}  The target lays out the stack
+frame (spill slots for un-allocated virtual registers, \texttt{alloca}
+storage, the callee-saved save area, incoming stack arguments) and emits
+the entry sequence that establishes it and the exit sequence that tears it
+down and returns.  The frame \emph{shape} is target-specific; the
+\emph{contents} (how many vreg slots, which callee-saved registers were
+claimed) come from the shared register allocator.
+
+\paragraph{Emission.}  Finally the target says how assembly text is spelled
+for this machine---the operand syntax, the directives that open the code
+and data sections, how a label and a global symbol are declared---and how
+to drive the assembler and linker.  A direct target instead encodes bytes
+and writes the object; either way, the operation above it is the same
+``produce an object file from this function's instructions.''
+
+\section{The Register Allocator Is Already Portable}
+\label{sec:regalloc-portable}
+
+The most valuable thing to understand before porting is that register
+allocation does \emph{not} need to be rewritten per target.  The allocator
+of Chapter~\ref{ch:codegen} (\S\ref{sec:regalloc}) is a linear scan over
+virtual-register live ranges; its liveness computation, its back-edge and
+call analyses, its loop-carried reservation, and the mem2reg
+reinterpretation of scalar-local allocas are all expressed in terms of the
+IR and of \emph{abstract} register slots, not of any particular machine's
+registers.  What differs between machines is purely the \emph{banks}: how
+many caller-saved and callee-saved integer registers exist, the same for
+floating-point, and which physical register each abstract slot maps to.
+
+A new target therefore does not touch the allocator.  It supplies its bank
+descriptors---``these four registers are caller-saved scratch, these nine
+are callee-saved, the floating bank is these''---and the allocator's
+existing machinery produces a map from virtual register to physical
+register for that bank.  The two banks (integer and floating) are allocated
+by the same logic run over different descriptors, exactly as the ARM64
+back end already does with its general and \texttt{d}-register banks.  This
+is the single largest reason a new architecture is cheap: the hardest part
+of a back end to get right is written once and reused.
+
+\section{The Porting Playbook}
+\label{sec:porting-playbook}
+
+The recipe below is ordered so that each step ends at a running program
+that does slightly more than the last.  Never build the whole target before
+testing any of it; build the smallest thing that runs, confirm it against
+the reference compiler, and grow.
+
+\begin{enumerate}
+
+\item \textbf{Register the target and its \texttt{--target} dispatch.}
+Create the target descriptor with its identity and toolchain fields, and
+wire \texttt{--target=\emph{name}} in the driver to select it while leaving
+ARM64/Mach-O the default and untouched.  \emph{Milestone:}
+\texttt{kcc --target=\emph{name}} runs and reaches the (still empty) back
+end without disturbing the existing target.
+
+\item \textbf{Declare the register banks.}  Read the ABI's register roles
+and transcribe them: the caller-saved and callee-saved general registers,
+the floating registers, and the reserved ones (stack pointer, frame
+pointer, the argument registers, any zero register).  Nothing runs yet;
+this is data the allocator will consume.
+
+\item \textbf{Stand up emission.}  Emit the assembly-file preamble---the
+directives for the code and data sections, the symbol syntax, the
+label-and-global declarations---and wire the call to the assembler and
+linker.  \emph{Milestone:} \kcc{} emits a syntactically valid, empty
+\texttt{.s} that the platform assembler accepts and the linker turns into
+an (empty) object.
+
+\item \textbf{Select the minimal instruction set.}  Implement just enough
+selection to compile \texttt{int main()\{ return N; \}}: materialise an
+integer constant, and the function return.  Add the prologue/epilogue in
+its simplest form.  \emph{Milestone:} the program builds, runs (under the
+chosen execution method---\S\ref{sec:testing-cross}), and exits with
+\texttt{N}.  This is the moment the whole framework is proven end to end.
+
+\item \textbf{Grow selection, one IR opcode at a time.}  Add integer
+arithmetic and bitwise operations, then loads and stores, then comparisons
+and branches, then unconditional jumps.  After each opcode, compile a small
+program exercising it and difftest it against the reference compiler.  A
+divergence now is localised to the one opcode just added, which is why the
+order matters.
+
+\item \textbf{Implement the calling convention.}  Marshal arguments into
+their registers and stack slots, and read the return value from its
+register, per the ABI declared in step~2.  \emph{Milestone:} multi-argument
+calls work, and \texttt{printf} produces correct output---the first
+programs that look like real code.
+
+\item \textbf{Complete the frame and the wide cases.}  Handle \texttt{alloca}
+storage, spilled virtual registers, more than the register budget of
+arguments (stack arguments), and large frames.  \emph{Milestone:} functions
+with many locals and deep expressions match the reference compiler.
+
+\item \textbf{Add floating point.}  Declare the floating register bank (the
+allocator handles it with the same logic), select the floating arithmetic
+and conversion instructions, and implement the floating half of the ABI.
+\emph{Milestone:} the floating-point programs in the difference corpus
+pass.
+
+\item \textbf{Provide the runtime and finish the toolchain.}  Supply the
+target's system-call convention and \texttt{\_start} for freestanding
+programs, and the exact linker invocation (startup files, libraries) for
+the platform.  \emph{Milestone:} \texttt{kcc file.c -o out} produces a
+runnable executable in one step, as on the flagship target.
+
+\end{enumerate}
+
+At the end of this ladder the new target passes the same difference corpus
+the flagship does.  Each rung was small, and each was verified before the
+next was begun.
+
+\section{Testing a Cross Target}
+\label{sec:testing-cross}
+
+\kcc{} itself is an ARM64 executable; a new target's output runs somewhere
+else, so testing is cross-compilation checked against an oracle.  The
+oracle is the reference compiler (\texttt{clang}) asked to cross-compile the
+same source for the same target; the difference harness compiles a program
+with both \kcc{} and the oracle, runs both outputs, and compares.  Only the
+\emph{execution} of the output differs from the native flow: an x86-64
+Mach-O output runs directly under the Apple-silicon binary translator; an
+x86-64 Linux/ELF output runs under a user-mode emulator or on real
+hardware.  Choosing a first target whose output can be executed on the
+development machine---so the existing difference harness applies with only
+the execution command changed---removes an entire category of friction from
+the initial bring-up and is strongly preferred for the first new target.
+
+The milestone ladder doubles as the test plan: return value, then
+arithmetic, then \texttt{printf}, then loops, then aggregates, then the full
+corpus.  Because the front end, IR, and optimizer are shared and already
+verified, a divergence on a new target is almost always in the one back-end
+step most recently added---which is exactly why the playbook adds one thing
+at a time.
+
+\section{What Stays Owned, What Is Borrowed}
+\label{sec:owned-borrowed}
+
+To close, the boundary restated, because it is the point of the whole
+design.  \kcc{} owns the compiler: the front end that turns C into an IR,
+the optimizer that improves the IR, the allocator that places values in
+registers, the selection that chooses instructions, and the ABI that makes
+functions interoperate.  For non-flagship targets it borrows two things
+from the platform assembler---the encoding of instructions into bytes and
+the layout of the object file---because those are the parts that multiply
+per architecture and per format and that the system toolchain already does
+perfectly.  The flagship target owns even those, and stands as the proof
+that \kcc{} can build the whole floor when it chooses to.  This split keeps
+the from-scratch claim exactly where it is most meaningful and makes breadth
+across architectures a matter of transcription rather than invention---which
+is what a compiler meant for the present and the future needs.

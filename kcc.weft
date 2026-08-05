@@ -484,6 +484,8 @@ generation, and the compilation driver
 (Chapter~\ref{ch:compile-driver}) orchestrates the full pipeline from
 source file to \texttt{.o}.
 
+@i literate/backend/36e-retargeting.weft
+
 \begin{multicols}{2}
 @i literate/backend/37-codegen.weft
 @i literate/backend/37a-codegen-regalloc.weft
@@ -606,6 +608,9 @@ the binaries, and verify that the exit code matches the expected value.
 % ═══════════════════════════════════════════════════════════════════
 \appendix
 \end{multicols}
+\newpage
+
+@i literate/appendices/A-user-manual.weft
 \newpage
 
 \begin{multicols}{2}

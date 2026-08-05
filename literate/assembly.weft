@@ -6,11 +6,38 @@
 % When adding a new .s file to kcc, add its output directive HERE.
 % Fragment definitions go in the appropriate chapter .weft file.
 
-\chapter*{Output Routing}
-\addcontentsline{toc}{chapter}{Output Routing}
+\chapter*{The Assembly of the Program}
+\addcontentsline{toc}{chapter}{The Assembly of the Program}
 
-The following output directives route code fragments to their
-physical assembly files under \texttt{tmp/src/}.
+Throughout this book each idea is told as its own story, and its code is
+introduced as a \emph{named fragment} wherever the narrative is clearest---the
+lexer's fragments in the lexer chapter, the register allocator's in the backend,
+and so on, in the order that best serves a reader rather than a machine.  This
+chapter is where those scattered fragments are finally \emph{assembled}: it is
+the single place that says, for each physical file the computer requires, which
+fragments compose it and in what order.
+
+The word ``assembly'' carries both of its meanings here.  These are the
+\emph{assembly-language} files---one \texttt{.s} per module---that the system
+assembler turns into object code; and this chapter is the \emph{assembling} of
+the program from its parts, the bill of materials that gathers a book's worth of
+prose-embedded fragments into the concrete artifacts a build produces.  Reading
+a single entry below tells you exactly what a given output file is made of: its
+components, listed by name, resolved (through the fragment definitions in the
+chapters) down to the last instruction.
+
+Because a literate program separates \emph{where a fragment is explained} from
+\emph{where it is emitted}, this is the only file in \kcc{} that uses output
+directives (\texttt{@@o}); every other file merely \emph{defines} fragments
+(\texttt{@@d}).  That separation is what lets the narrative flow by concept while
+the build still receives well-formed, correctly ordered assembly files.  It also
+makes the manifest a practical checklist: to add a new module to the compiler,
+add its output directive here and its fragments to the appropriate chapter---the
+two never drift, because the file the machine consumes is generated from exactly
+these lists.
+
+The directives below route code fragments to their physical assembly files under
+\texttt{tmp/src/}.
 
 \bigskip
 

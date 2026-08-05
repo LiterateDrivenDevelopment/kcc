@@ -1,0 +1,116 @@
+% 00-preface.weft — Preface: kcc, AI-assisted literate programming, and
+% Literate Driven Development. Placed before the table of contents.
+%
+% Pure prose. No code is emitted here.
+
+\chapter*{Preface}
+\addcontentsline{toc}{chapter}{Preface}
+
+\kcc{} is a C compiler.  It is also an argument.
+
+The compiler is real.  It reads C17, checks it against the Standard,
+optimises it, allocates its registers, and emits native ARM64 machine code
+and a Mach-O object that Apple's linker accepts; it compiles itself to a
+byte-identical binary; it passes an exhaustive battery of conformance tests
+against a reference compiler.  The argument is this: that literate
+programming, practised with an artificial-intelligence collaborator, is a
+way of building software that is at once more \emph{certain}, more
+\emph{tractable}, \emph{faster}, and \emph{cheaper} than the way most
+software is built today---and that the result can aspire to be not merely
+correct but beautiful.
+
+\section*{Literate Programming, and its Unpaid Cost}
+
+Donald Knuth's literate programming inverted the relationship between a
+program and its explanation.  A literate program is not code with comments;
+it is an essay---a human narrative---with code woven into it, presented in
+whatever order best serves understanding and mechanically extracted into
+something a machine can run.  Knuth's aim was frankly aesthetic: to produce
+``works of literature,'' programs that could be read for pleasure and
+understood as a whole rather than reverse-engineered a function at a time.
+
+For all its beauty, literate programming stayed a minority practice, and the
+reason was economic.  Writing the narrative is real work.  Keeping it in step
+with the code as the code changes is more work still.  And the discipline it
+demands---explaining a thing clearly \emph{before} implementing it---is
+expensive when a single human bears the whole of that cost.  The method was
+admired and seldom used.
+
+\section*{Literate Driven Development}
+
+A capable AI collaborator changes that arithmetic.  When the narrative and
+the code can be authored, revised, and kept synchronised \emph{together}---the
+prose stating the intent, the code realising it, each continually checked
+against the other and against the world---the cost of the literate discipline
+collapses while its benefits compound.  We call this practice \textbf{Literate
+Driven Development}: literate programming as the medium, an AI as the
+co-author, and the woven document as the single source of truth from which
+both the understanding and the executable follow.  The prose is not
+documentation bolted onto a finished program; it is the place the program is
+thought, and a change is not finished until the story and the code agree.
+
+\section*{Four Things It Did}
+
+This book is the demonstration.  In building \kcc{}, Literate Driven
+Development did four things, and the reader can check each of them against the
+chapters that follow.
+
+\paragraph{It eliminated uncertainty.}  Every decision is written down before
+it is coded, in prose that must name the clause of the Standard it obeys.
+Every change is then verified three ways: against the ISO standard the prose
+cites, against a reference compiler run over a large corpus of programs, and
+against the compiler's own ability to recompile itself unchanged.  Nothing is
+taken on faith.  The document records \emph{why}; the test suites record
+\emph{that}; and when the two disagree, the disagreement is visible instead of
+latent.
+
+\paragraph{It managed complexity.}  A compiler is a large machine of
+interlocking parts---lexer, preprocessor, parser, type system, intermediate
+representation, optimiser, register allocator, code generator, object
+writer---and the classic failure mode is that no one can hold the whole of it
+in mind at once.  The literate web dissolves that: each concept is told as its
+own story, at its own natural size, while the narrative keeps the whole in
+view.  More than once a defect here spanned three of those layers at the same
+time; the way to it was to \emph{read the story}, not to grep the code.
+
+\paragraph{It was fast and cheap.}  Work that would occupy a team for weeks
+landed in hours: an optimiser with constant folding, dead-code and
+common-subexpression elimination, and the promotion of local variables into
+registers; a full register allocator with a dedicated floating-point bank; the
+difficult tail corners of C17---\texttt{\_Generic}, correctly typed integer
+constants, \texttt{volatile} semantics, \texttt{long double}.  The AI moves
+through the literate structure---its machine-readable map of fragments, its
+reverse mapping from a line of generated assembly back to the prose that
+produced it---so that each change stays local, and each local change stays
+testable.
+
+\paragraph{It produced something useful.}  What you hold is not a toy.  \kcc{}
+self-hosts.  It passes its full suite.  It ships with a user manual for the
+person who wants to \emph{use} it and a porting playbook for the person who
+wants to \emph{extend} it to a new architecture.  It is documentation and
+program at once, and---this is the point---neither is free to drift from the
+other.
+
+\section*{Toward Works of Art}
+
+Knuth wanted programs that were works of literature.  Literate Driven
+Development lets us reach for that ambition again, and reach further.  The
+union of the literate ideal with an AI's tireless attention to \emph{both} the
+prose and the proof makes it possible to build real, production-grade software
+that reads like a book and behaves like an engineering artifact---to stop
+treating correctness and beauty as a trade-off and to pursue them at once.
+That is the thesis of this book, and \kcc{} is offered as its proof.
+
+\section*{How to Read This Book}
+
+The chapters immediately after the table of contents are arranged for the
+reader who wants to arrive quickly.  A \emph{user manual}
+(Chapter~\ref{ch:user-manual}) explains how to obtain, build, and run the
+compiler.  A \emph{porting playbook} (Chapter~\ref{ch:retargeting}) explains
+how to add a new target architecture, so that the effort of supporting many
+machines becomes transcription rather than invention.  And the
+\emph{output-routing} chapter---the ``assembly'' of the program---shows how
+the fragments told throughout the book are finally gathered into the physical
+files the machine requires.  After this orientation the book proper begins, and
+proceeds, chapter by chapter, from the language standard down to the running
+binary.

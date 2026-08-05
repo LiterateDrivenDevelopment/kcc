@@ -149,6 +149,19 @@ with at least one non-constant source are skipped untouched.
     cbz x0, .Lcf_fold_next_bb
     mov x26, x0
 
+    // A floating operation must never be folded with integer arithmetic: the
+    // fold below negates/adds the raw 64-bit pattern, which is meaningless for a
+    // double.  Skip any FP-typed instruction and let the back end materialise
+    // the constant and compute with FADD/FNEG at run time.
+    ldr x1, [x26, #IR_TYPE]
+    cmp x1, #0x1000
+    b.lo .Lcf_check_op
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #8                   // FLOAT
+    b.lo .Lcf_check_op
+    cmp x2, #10                  // ..LDOUBLE
+    b.ls .Lcf_fold_skip
+.Lcf_check_op:
     ldr x1, [x26, #IR_OP]
     // Width casts of a constant fold too: the front end inserts SEXT/ZEXT/TRUNC
     // on nearly every integer operation, and without folding through them a

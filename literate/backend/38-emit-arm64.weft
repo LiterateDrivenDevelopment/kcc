@@ -768,6 +768,19 @@ _kcc_enc_fmov_d_d:
     mov w0, w2
     ret
 
+// -- kcc_enc_fneg_d -----------------------------------------------------------
+// FNEG Dd, Dn — negate a double (flips the sign bit in the FP unit).  x0=Rd, x1=Rn.
+.text
+.globl _kcc_enc_fneg_d
+.p2align 2
+_kcc_enc_fneg_d:
+    movz w2, #0x4000
+    movk w2, #0x1E61, lsl #16     // FNEG Dd, Dn = 0x1E614000
+    orr w2, w2, w1, lsl #5        // Rn (double)
+    orr w2, w2, w0                // Rd (double)
+    mov w0, w2
+    ret
+
 // -- kcc_enc_fcmp -------------------------------------------------------------
 // FCMP Dn, Dm — set NZCV from a double comparison.  x0=Rn, x1=Rm
 .text

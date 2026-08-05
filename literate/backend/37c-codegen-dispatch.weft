@@ -456,7 +456,28 @@ with logical-class encoders.
     b .Lcgi_done
 
 .Lcgi_neg:
-    // NEG x11, x9 → SUB x11, xzr, x9
+    // A floating NEG negates in the FP unit (FNEG d2, d0); an integer NEG is
+    // SUB x11, xzr, x9.
+    ldr x0, [x19, #IR_TYPE]
+    cmp x0, #0x1000
+    b.lo .Lcgi_neg_int
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #8                     // FLOAT
+    b.lo .Lcgi_neg_int
+    cmp x0, #10                    // ..LDOUBLE
+    b.hi .Lcgi_neg_int
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #0                     // d0
+    bl _kcc_cg_load_vreg_fp
+    mov x0, #2                     // Rd = d2
+    mov x1, #0                     // Rn = d0
+    bl _kcc_enc_fneg_d
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #2                     // d2
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+.Lcgi_neg_int:
     ldr x0, [x19, #IR_SRC1]
     mov x1, #CG_REG_SRC1
     bl _kcc_cg_load_vreg

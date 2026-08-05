@@ -1697,6 +1697,86 @@ _kcc_ir_emit_binop_typed:
     ldp x29, x30, [sp], #48
     ret
 
+// -- kcc_ir_compound_apply ----------------------------------------------------
+// uint64_t kcc_ir_compound_apply(op x0, old x1, L x2, rhs x3, R x4)
+// Compute `old OP rhs` for a compound assignment E1 op= E2 under the usual
+// arithmetic conversions.  When either operand is floating the operation is
+// done in the floating (common) type and its result converted back to the
+// lvalue type L; a purely integer operation keeps the previous behaviour (a
+// long_u binop followed by width normalisation).  Returns the result vreg,
+// typed L, ready to store.  This is what makes `d += n` (n an int) add in
+// double and `i += x` (x a double) add in double then truncate to int, exactly
+// as the equivalent `E1 = E1 OP E2` would.
+.text
+.globl _kcc_ir_compound_apply
+.p2align 2
+_kcc_ir_compound_apply:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // op (IR opcode)
+    mov x20, x1                  // old vreg
+    mov x21, x2                  // L (lvalue type)
+    mov x22, x3                  // rhs vreg
+    mov x23, x4                  // R (rhs type)
+
+    mov x0, x21
+    bl _kcc_ir_type_is_fp
+    mov x24, x0                  // L_is_fp
+    mov x0, x23
+    bl _kcc_ir_type_is_fp
+    orr x1, x0, x24
+    cbnz x1, .Lca_fp
+
+    // Integer path (unchanged): long_u binop then normalise to L's width.
+    mov x0, x19
+    mov x1, x20
+    mov x2, x22
+    adrp x3, _kcc_type_long_u@@PAGE
+    add  x3, x3, _kcc_type_long_u@@PAGEOFF
+    ldr x3, [x3]
+    bl _kcc_ir_emit_binop_typed
+    mov x1, x19                  // op
+    mov x2, x21                  // L
+    mov x3, x21
+    bl _kcc_ir_norm32
+    b .Lca_ret
+
+.Lca_fp:
+    // Common type C = L when it is floating, else the (floating) rhs type R.
+    cbz x24, .Lca_C_from_R
+    mov x24, x21                 // C = L
+    b .Lca_conv
+.Lca_C_from_R:
+    mov x24, x23                 // C = R
+.Lca_conv:
+    mov x0, x20                  // old
+    mov x1, x21                  // from L
+    mov x2, x24                  // to C
+    bl _kcc_ir_convert
+    mov x20, x0                  // old_c
+    mov x0, x22                  // rhs
+    mov x1, x23                  // from R
+    mov x2, x24                  // to C
+    bl _kcc_ir_convert
+    mov x22, x0                  // rhs_c
+    mov x0, x19                  // op
+    mov x1, x20
+    mov x2, x22
+    mov x3, x24                  // C
+    bl _kcc_ir_emit_binop_typed
+    mov x1, x24                  // from C
+    mov x2, x21                  // to L
+    bl _kcc_ir_convert           // result back to lvalue type
+.Lca_ret:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // -- kcc_ir_bf_code -------------------------------------------------------
 // int kcc_ir_bf_code(uint64_t container_bytes) → access-size override
 // (unsigned): 8→0 (full 64-bit), 4→4, 2→2, 1→1.
@@ -2156,7 +2236,8 @@ _kcc_ir_assign_through:
     mov x20, x1                  // rhs (later reused for the value to store)
     mov x21, x2                  // op token
     mov x22, x3                  // field decl (0 if none)
-    mov x23, x4                  // scalar type
+    mov x23, x4                  // scalar type (lvalue type L)
+    str x5, [sp, #72]            // rhs type R (for compound-assign conversions)
     mov x24, #0                  // is-bit-field?
     cbz x22, .Lat_op
     ldr x0, [x22, #AST_F2]
@@ -2195,25 +2276,13 @@ _kcc_ir_assign_through:
     bl _kcc_ir_bitfield_load
 .Lat_haveold:
     str x0, [sp, #64]            // stash old value vreg
-    mov x0, x21
+    mov x0, x21                  // op token
     bl _kcc_ir_tok_to_binop     // x0 = IR opcode
-    // Result type: the lvalue type when floating (so the op lowers to
-    // FADD/FSUB/FMUL/FDIV), else long_u (integer/pointer arithmetic, unchanged).
-    mov x3, x23                  // lvalue scalar type
-    cbz x23, .Lat_binop_long
-    ldr x4, [x23]                // TY_KIND
-    cmp x4, #8                   // FLOAT
-    b.lo .Lat_binop_long
-    cmp x4, #10                  // ..LDOUBLE
-    b.ls .Lat_binop_go           // floating → keep x3 = lvalue type
-.Lat_binop_long:
-    adrp x3, _kcc_type_long_u@@PAGE
-    add  x3, x3, _kcc_type_long_u@@PAGEOFF
-    ldr x3, [x3]
-.Lat_binop_go:
     ldr x1, [sp, #64]           // old
-    mov x2, x20                  // rhs
-    bl _kcc_ir_emit_binop_typed  // new = old op rhs
+    mov x2, x23                  // L (lvalue type)
+    mov x3, x20                  // rhs
+    ldr x4, [sp, #72]           // R (rhs type)
+    bl _kcc_ir_compound_apply    // new = old OP rhs, under usual conversions
     mov x20, x0                  // value to store = new
     cbnz x24, .Lat_store_bf
     mov x0, x23
@@ -3443,6 +3512,36 @@ _kcc_ir_build_unary:
     b .Libu_done
 
 .Libu_neg:
+    // A floating operand negates in the FP unit (FNEG), typed with the operand
+    // type so the back end and the optimizer both treat it as floating; an
+    // integer operand keeps the integer path (and its width normalisation).
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libu_neg_int
+    ldr x0, [x0, #AST_F3]        // operand type
+    cbz x0, .Libu_neg_int
+    cmp x0, #0x1000
+    b.lo .Libu_neg_int
+    ldr x1, [x0]                 // TY_KIND
+    cmp x1, #8                   // FLOAT
+    b.lo .Libu_neg_int
+    cmp x1, #10                  // ..LDOUBLE
+    b.hi .Libu_neg_int
+    // floating negation
+    mov x0, #IR_NEG
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x19, #AST_F1]      // reload operand type (x19 preserved across alloc)
+    ldr x1, [x1, #AST_F3]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x0, x20                  // no integer width normalization for a float
+    b .Libu_done
+.Libu_neg_int:
     mov x0, #IR_NEG
     bl _kcc_ir_alloc_instr
     adrp x1, _kcc_type_int_s@@PAGE

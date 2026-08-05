@@ -182,40 +182,16 @@ _kcc_ir_build_assign:
     b .Liba_store
 
 .Liba_compound:
-    // Emit binop: result = current_val op rhs.  Typing it with the lvalue type
-    // is what makes a floating compound assignment lower to a floating
-    // operation (the opcode is the same IR_ADD/... — the back end dispatches on
-    // the type).
-    mov x0, x24
-    bl _kcc_ir_alloc_instr
-    ldr x1, [sp, #64]           // lvalue (LHS) type
-    str x1, [x0, #IR_TYPE]
-    str x23, [x0, #IR_SRC1]
-    str x21, [x0, #IR_SRC2]
-    mov x19, x0
-    bl _kcc_ir_next_vreg
-    str x0, [x19, #IR_DEST]
-    mov x21, x0                  // new rhs = result vreg
-    mov x0, x19
-    bl _kcc_ir_emit
-
-    // Truncate the compound result to the destination's declared width.  This
-    // applies only to integers; a floating result must not be masked, so skip
-    // it for a floating lvalue.
-    ldr x2, [sp, #64]           // LHS type
-    cbz x2, .Liba_store
-    ldr x3, [x2]                // TY_KIND
-    cmp x3, #8                   // FLOAT..LDOUBLE → floating: no truncation
-    b.lo .Liba_norm
-    cmp x3, #10
-    b.ls .Liba_store
-.Liba_norm:
-    mov x0, x21                  // result vreg
-    mov x1, x24                  // opcode
-    ldr x2, [sp, #64]            // LHS type
-    mov x3, x2
-    bl _kcc_ir_norm32
-    mov x21, x0
+    // Apply the compound operation under the usual arithmetic conversions: the
+    // shared helper computes in the common type (floating when either operand
+    // is) and converts the result back to the lvalue type.
+    mov x0, x24                  // op (IR opcode)
+    mov x1, x23                  // old value
+    ldr x2, [sp, #64]           // L (lvalue type)
+    mov x3, x21                  // rhs value
+    ldr x4, [sp, #72]           // R (rhs type)
+    bl _kcc_ir_compound_apply
+    mov x21, x0                  // value to store
 
 .Liba_store:
     // Emit store
@@ -317,36 +293,15 @@ _kcc_ir_build_assign:
     b .Liba_global_simple
 
 .Liba_global_compound:
-    // Emit binop: result = current_val op rhs, typed by the lvalue so a
-    // floating global lowers to a floating operation.
-    mov x0, x24
-    bl _kcc_ir_alloc_instr
-    ldr x1, [sp, #64]           // lvalue (LHS) type
-    str x1, [x0, #IR_TYPE]
-    str x23, [x0, #IR_SRC1]     // current value
-    str x21, [x0, #IR_SRC2]     // rhs
-    mov x19, x0
-    bl _kcc_ir_next_vreg
-    str x0, [x19, #IR_DEST]
-    mov x21, x0                  // x21 = compound result vreg
-    mov x0, x19
-    bl _kcc_ir_emit
-
-    // Integer results are truncated to the declared width; floating ones are not.
-    ldr x2, [sp, #64]
-    cbz x2, .Liba_global_simple
-    ldr x3, [x2]
-    cmp x3, #8
-    b.lo .Liba_global_norm
-    cmp x3, #10
-    b.ls .Liba_global_simple
-.Liba_global_norm:
-    mov x0, x21
-    mov x1, x24                  // opcode
-    ldr x2, [sp, #64]            // LHS type
-    mov x3, x2
-    bl _kcc_ir_norm32
-    mov x21, x0
+    // Same shared helper as the local path: compute under the usual arithmetic
+    // conversions and convert the result back to the lvalue type.
+    mov x0, x24                  // op (IR opcode)
+    mov x1, x23                  // current value
+    ldr x2, [sp, #64]           // L (lvalue type)
+    mov x3, x21                  // rhs
+    ldr x4, [sp, #72]           // R (rhs type)
+    bl _kcc_ir_compound_apply
+    mov x21, x0                  // value to store
 
 .Liba_global_simple:
     // Store value to global address
@@ -372,7 +327,8 @@ _kcc_ir_build_assign:
     mov x1, x21                  // rhs
     mov x2, x20                  // op token
     mov x3, #0                   // not a bit-field
-    ldr x4, [x23, #AST_F3]      // element type → access width
+    ldr x4, [x23, #AST_F3]      // element type → access width (lvalue type L)
+    ldr x5, [sp, #72]           // rhs type R (for compound conversions)
     bl _kcc_ir_assign_through
     b .Liba_done
 
@@ -390,7 +346,8 @@ _kcc_ir_build_assign:
     mov x1, x21                  // rhs
     mov x2, x20                  // op token
     mov x3, x24                  // field (bit-field metadata)
-    ldr x4, [x23, #AST_F3]      // member's resolved type → access width
+    ldr x4, [x23, #AST_F3]      // member's resolved type → access width (L)
+    ldr x5, [sp, #72]           // rhs type R (for compound conversions)
     bl _kcc_ir_assign_through
     b .Liba_done
 
@@ -410,7 +367,8 @@ _kcc_ir_build_assign:
     mov x1, x21                  // rhs
     mov x2, x20                  // op token
     mov x3, #0                   // not a bit-field
-    mov x4, x23                  // pointed-to type → access width
+    mov x4, x23                  // pointed-to type → access width (lvalue type L)
+    ldr x5, [sp, #72]           // rhs type R (for compound conversions)
     bl _kcc_ir_assign_through
     b .Liba_done
 

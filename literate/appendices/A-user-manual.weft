@@ -37,7 +37,8 @@ To \emph{build} \kcc{} from source you need:
       \texttt{xcode-select~-{}-install} if you have not already.
 \item \texttt{weft}, the literate-programming tool that turns the
       \texttt{.weft} sources into assembly.
-\item \texttt{just}, the command runner used by the project's recipes.
+\item \texttt{make}, which drives the project's build recipes; it comes with
+      the Xcode Command Line Tools listed above.
 \item Optionally, \texttt{lualatex}, only if you want to typeset this book
       itself into a PDF.  It is not needed to build or use the compiler.
 \end{itemize}
@@ -53,7 +54,7 @@ Line Tools must be present.
 From the top of the project, a single command builds the compiler:
 
 \begin{verbatim}
-just build
+make build
 \end{verbatim}
 
 This tangles the literate sources into assembly, assembles each into an
@@ -253,7 +254,7 @@ If you have \texttt{lualatex} installed and want the typeset PDF of this
 literate program, run:
 
 \begin{verbatim}
-just weave
+make weave
 \end{verbatim}
 
 This is purely optional and unrelated to using the compiler.
@@ -261,17 +262,17 @@ This is purely optional and unrelated to using the compiler.
 \section{For Contributors}
 \label{sec:um-contributors}
 
-The project's \texttt{just} recipes cover the full development loop.  The
-most useful are \texttt{just build} (produce the compiler), \texttt{just
+The project's \texttt{make} recipes cover the full development loop.  The
+most useful are \texttt{make build} (produce the compiler), \texttt{make
 test} (build and run the unit tests), and the conformance suites that guard
-against regressions: \texttt{just test-codegen} (end-to-end code-generation
-tests), \texttt{just difftest} (compile a corpus with both \kcc{} and the
-reference compiler and compare their output), \texttt{just selfhost}
+against regressions: \texttt{make test-codegen} (end-to-end code-generation
+tests), \texttt{make difftest} (compile a corpus with both \kcc{} and the
+reference compiler and compare their output), \texttt{make selfhost}
 (compile a piece of \kcc{}'s own C with \kcc{} and check the result),
-\texttt{just diagtest} and \texttt{just warntest} (check that invalid
-programs are rejected and that warnings fire as expected), \texttt{just
+\texttt{make diagtest} and \texttt{make warntest} (check that invalid
+programs are rejected and that warnings fire as expected), \texttt{make
 interop} (validate the calling convention against the reference compiler),
-and \texttt{just e2e} (the one-step compile-and-run path).  All changes go
+and \texttt{make e2e} (the one-step compile-and-run path).  All changes go
 through the \texttt{.weft} sources; the tangled assembly under \texttt{tmp}
 is generated and must never be edited by hand.
 

@@ -556,7 +556,7 @@ in an \texttt{alarm} so a runaway recovery loop fails loudly instead of
 stalling the suite.  A final ``clean'' case guards the other direction: an
 implicit \texttt{printf} call must still compile without an
 undeclared-identifier error, so the leniency the call path depends on is not
-lost.  \texttt{just diagtest} runs it.
+lost.  \texttt{make diagtest} runs it.
 
 @d Diag: tests @{
 #!/bin/bash
@@ -654,7 +654,7 @@ compile succeeds, that the expected warning text appears, and, in the
 \texttt{gated} cases, that the very same program is \emph{silent}
 without \texttt{-Wall}.  That last check is the load-bearing one: it is
 what proves the whole warning family stays behind its flag and leaves
-the default build byte-for-byte as it was.  \texttt{just warntest} runs
+the default build byte-for-byte as it was.  \texttt{make warntest} runs
 it.
 
 @d Warn: tests @{

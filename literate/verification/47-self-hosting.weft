@@ -131,7 +131,7 @@ void *kcc_arena_alloc(long size) {
 
 The three fragments compose into one C translation unit, routed by the
 assembly file to \texttt{tmp/selfhost/arena.c}.  This is the file
-\texttt{just selfhost} feeds to \kcc{}.
+\texttt{make selfhost} feeds to \kcc{}.
 
 @l c
 @d Selfhost: arena @{
@@ -143,7 +143,7 @@ assembly file to \texttt{tmp/selfhost/arena.c}.  This is the file
 \section{Verification}
 \label{sec:selfhost-verify}
 
-The \texttt{just selfhost} recipe performs the whole loop.  It compiles
+The \texttt{make selfhost} recipe performs the whole loop.  It compiles
 \texttt{tmp/selfhost/arena.c} with the assembly-built \kcc{}
 (\texttt{kcc -c arena.c -o arena\_c.o}), then relinks a second compiler
 binary, \texttt{tmp/kcc\_selfhost}, from all the usual objects but with
@@ -161,7 +161,7 @@ path and all.
 
 @d Selfhost: verify @{
 #!/usr/bin/env bash
-# just selfhost — compile kcc's arena in C with kcc, relink, run the suite.
+# make selfhost — compile kcc's arena in C with kcc, relink, run the suite.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)

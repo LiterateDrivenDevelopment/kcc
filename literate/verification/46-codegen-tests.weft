@@ -4,7 +4,7 @@
 % program compiled by kcc, linked by the system linker, and executed.
 % The test passes if the exit code matches the expected value.
 % The shell script is tangled to tmp/tests/test_codegen.sh and run
-% by 'just test-codegen'.
+% by 'make test-codegen'.
 
 \chapter{Code Generation Tests}
 \label{ch:codegen-tests}

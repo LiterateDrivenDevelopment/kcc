@@ -22,11 +22,9 @@ register precisely when \emph{both} of these hold:
 
 \begin{itemize}
 \item Its defining instruction produces a scalar---integer, pointer, or
-      floating.  A floating value is allocated to a \emph{general} register: the
-      \texttt{load\_vreg\_fp}/\texttt{store\_vreg\_fp} helpers already bridge a
-      general register to the FP unit with an \textsc{fmov} on each side, so a
-      floating value simply lives as its 64-bit pattern in a general register
-      and is moved into a \texttt{d} register only for the arithmetic itself.
+      floating.  Integer and pointer values take a general register; floating
+      values take a \emph{floating} register from a dedicated bank (a separate
+      scan described below), keeping the two kinds out of each other's way.
       Aggregate values are never allocated---they are addressed by pointer.
 \item Its live range can be reasoned about with the linear instruction
       numbering.  This is always true for a value confined to a
@@ -118,6 +116,25 @@ publishes \texttt{\_kcc\_cg\_promoted[v]}, the physical register the load, store
 and alloca handlers read to route a promoted local's accesses through a register
 (and to emit nothing for its now-storage-less \texttt{ALLOCA}).
 
+\paragraph{The floating register bank.}
+Floating values get their own linear scan over a dedicated bank so they never
+compete with integer values for the general registers and so an FP chain no
+longer round-trips through \textsc{fmov} on every access.  The bank is
+\texttt{d16}--\texttt{d31} (caller-saved, no prologue cost) for a value whose
+range crosses no call, and \texttt{d8}--\texttt{d15} (callee-saved) for a
+call-crossing or loop-carried one; \texttt{d0}--\texttt{d7} stay reserved for
+argument passing and the FP scratch.  The scan is an exact mirror of the
+integer one---same liveness, same single-block/loop-free/loop-carried rules,
+same call-decides-the-bank logic---running over its own \texttt{reg\_end}
+array and writing \texttt{\_kcc\_cg\_fpregmap} and a floating callee-saved mask.
+A floating candidate is tagged in pass~1 (flag bit \texttt{0x8}) so the integer
+scan skips it.  The \texttt{load\_vreg}/\texttt{store\_vreg} family consults the
+FP map first: a value homed in a \texttt{d} register is moved with \textsc{fmov}
+(d-to-d for the FP paths, or bridged to a general register for the integer
+paths that materialise a constant or spill a double to memory), and the
+prologue saves exactly the \texttt{d8}--\texttt{d15} the scan claimed just above
+the general callee-saved area.
+
 @d CodeGen: register allocation @{
 // -- kcc_ra_use ---------------------------------------------------------------
 // Record one vreg use during pass 1.  x0=vreg, x1=cur_bb, x2=pos, x3=calls.
@@ -168,12 +185,13 @@ _kcc_ra_disq:
 // void kcc_cg_regalloc(ir_func *func)
 // Computes the per-function vreg→physreg map and publishes it in
 // _kcc_cg_regmap (0 for an unallocated vreg).
-//   Stack frame (192 bytes): x29/x30 + x19..x28 saved; locals from #96.
+//   Stack frame (512 bytes): x29/x30 + x19..x28 saved; locals from #96;
+//   integer reg_end[13] at #152, FP reg_end_fp[24] at #256.
 .text
 .globl _kcc_cg_regalloc
 .p2align 2
 _kcc_cg_regalloc:
-    stp x29, x30, [sp, #-256]!
+    stp x29, x30, [sp, #-496]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -197,14 +215,24 @@ _kcc_cg_regalloc:
     adrp x0, _kcc_cg_save_count@@PAGE
     add  x0, x0, _kcc_cg_save_count@@PAGEOFF
     str xzr, [x0]
+    adrp x0, _kcc_cg_fpregmap@@PAGE
+    add  x0, x0, _kcc_cg_fpregmap@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_cg_fp_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_fp_callee_mask@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_cg_fp_save_count@@PAGE
+    add  x0, x0, _kcc_cg_fp_save_count@@PAGEOFF
+    str xzr, [x0]
     cbz x20, .Lra_done             // no vregs
 
-    // Allocate one zeroed block of six vreg_n-entry arrays (8 bytes each):
-    // lastuse, defbb, calldef, flags, map, promoted.  The sixth (promoted)
-    // becomes the alloca-vreg → contents-physreg map for mem2reg.
+    // Allocate one zeroed block of seven vreg_n-entry arrays (8 bytes each):
+    // lastuse, defbb, calldef, flags, map, promoted, fpmap.  promoted is the
+    // alloca-vreg → contents-physreg map for mem2reg; fpmap is the floating
+    // vreg → d-register map.
     lsl x9, x20, #3               // vreg_n * 8  (one array's byte size)
-    mov x11, #6
-    mul x0, x9, x11               // vreg_n*8 * 6 = total bytes
+    mov x11, #7
+    mul x0, x9, x11               // vreg_n*8 * 7 = total bytes
     bl _kcc_arena_alloc
     mov x21, x0                    // lastuse base (also block base)
     lsl x9, x20, #3
@@ -213,10 +241,11 @@ _kcc_cg_regalloc:
     add x24, x23, x9               // flags    = block + vreg_n*24
     add x25, x24, x9               // map      = block + vreg_n*32
     //                                promoted = block + vreg_n*40 (= map + n*8)
+    //                                fpmap    = block + vreg_n*48 (= map + n*16)
 
-    // Zero the whole block (6*vreg_n entries).
-    mov x11, #6
-    mul x9, x20, x11             // 6 * vreg_n entries
+    // Zero the whole block (7*vreg_n entries).
+    mov x11, #7
+    mul x9, x20, x11             // 7 * vreg_n entries
     mov x10, x21
 .Lra_zero:
     cbz x9, .Lra_zeroed
@@ -325,6 +354,9 @@ _kcc_cg_regalloc:
     b.eq .Lp1_next
     cmp x9, #IR_RET
     b.eq .Lp1_next
+    cmp x9, #IR_ALLOCA
+    b.eq .Lp1_defok              // an alloca's result is an address (integer bank),
+                                 // regardless of the element type it points at
     ldr x10, [x26, #IR_TYPE]
     cbz x10, .Lp1_next
     ldr x11, [x10]               // TY_KIND
@@ -332,14 +364,23 @@ _kcc_cg_regalloc:
     b.lo .Lp1_next
     cmp x11, #7                   // BOOL..LLONG
     b.ls .Lp1_defok
-    cmp x11, #10                  // FLOAT..LDOUBLE: a floating value is held in a
-    b.ls .Lp1_defok              //   general register, bridged to the FP unit by
-                                 //   the FMOV in load_vreg_fp/store_vreg_fp
+    cmp x11, #10                  // FLOAT..LDOUBLE → allocated to the FP bank
+    b.ls .Lp1_defok_fp
     cmp x11, #11                  // PTR
     b.eq .Lp1_defok
     cmp x11, #16                  // ENUM
     b.eq .Lp1_defok
     b .Lp1_next
+.Lp1_defok_fp:
+    // A floating candidate is tagged with an extra bit (0x8) so the integer
+    // linear scan skips it and the dedicated FP scan claims a d-register.
+    ldr x0, [x26, #IR_DEST]
+    cmp x0, x20
+    b.hs .Lp1_next
+    ldr x2, [x24, x0, lsl #3]
+    orr x2, x2, #0x8             // FP candidate
+    str x2, [x24, x0, lsl #3]
+    // fall through to record defbb/calldef and the candidate bit
 .Lp1_defok:
     ldr x0, [x26, #IR_DEST]
     cmp x0, x20
@@ -620,6 +661,8 @@ _kcc_cg_regalloc:
     cmp x11, #13                  // callee-saved pool exhausted?
     b.hs .Lp2_scan_start
     ldr x12, [x24, x10, lsl #3]   // flags[v]
+    tst x12, #0x8                  // FP candidate → handled by the FP scan
+    b.ne .Lp2_wf_next
     and x13, x12, #3
     cmp x13, #3                   // candidate AND escapes its block?
     b.ne .Lp2_wf_next
@@ -676,6 +719,8 @@ _kcc_cg_regalloc:
     ldr x1, [x24, x0, lsl #3]     // flags[dest]
     tst x1, #1                    // candidate def?
     b.eq .Lp2_next
+    tst x1, #0x8                  // FP candidate → the FP scan handles it
+    b.ne .Lp2_next
     tst x1, #2                    // escapes its defining block?
     b.eq .Lp2_gate_ok             // no: a single-block value is always eligible
     ldr x9, [sp, #120]           // yes: allocate across blocks only when loop-free
@@ -735,6 +780,173 @@ _kcc_cg_regalloc:
     b .Lp2_bb
 .Lp2_done:
 
+    // ---- FP linear scan (dedicated d-register bank) ----
+    // Floating candidates (flag bit 0x8) are allocated to a floating register
+    // instead of riding in a general register: this frees the general bank for
+    // integer values and drops the fmov round-trip on FP-only chains.  The bank
+    // is d16..d31 (caller-saved, no prologue cost) for call-free values and
+    // d8..d15 (callee-saved, spilled by the prologue) for call-crossing and
+    // loop-carried ones.  The scan mirrors the integer one exactly, over its own
+    // reg_end_fp[24] at [sp,#256] (slots 0..15 → d16..d31, 16..23 → d8..d15).
+    add x1, sp, #256
+    mov x9, #-1
+    mov x10, #0
+.Lpf_rinit:
+    cmp x10, #24
+    b.ge .Lpf_rinit_done
+    str x9, [x1, x10, lsl #3]
+    add x10, x10, #1
+    b .Lpf_rinit
+.Lpf_rinit_done:
+
+    // Loop-carried FP reservation: an escaping floating value in a loopy
+    // function gets a callee-saved d-register (d8..d15) for the whole function,
+    // correct across the back-edge because every vreg is single-def.
+    ldr x9, [sp, #120]            // has_loop?
+    cbz x9, .Lpf_scan_start
+    mov x10, #0
+    mov x11, #16                   // next callee FP slot (16 → d8)
+.Lpf_wf:
+    cmp x10, x20
+    b.hs .Lpf_scan_start
+    cmp x11, #24                   // d8..d15 pool exhausted?
+    b.hs .Lpf_scan_start
+    ldr x12, [x24, x10, lsl #3]   // flags[v]
+    tst x12, #0x8                  // FP candidate?
+    b.eq .Lpf_wf_next
+    and x13, x12, #3
+    cmp x13, #3                   // candidate AND escapes its block?
+    b.ne .Lpf_wf_next
+    ldr x13, [x21, x10, lsl #3]   // lastuse[v]
+    cbz x13, .Lpf_wf_next
+    sub x14, x11, #8              // d-reg = slot-8 (slot 16 → d8)
+    add x6, x25, x20, lsl #4      // fpmap base = map + vreg_n*16
+    str x14, [x6, x10, lsl #3]     // fpmap[v] = d-reg
+    add x6, sp, #256
+    mov x7, #0x40000000           // pin reg_end_fp[slot] for the whole scan
+    str x7, [x6, x11, lsl #3]
+    sub x7, x14, #8              // fp_callee_mask bit index (d8 → 0)
+    mov x8, #1
+    lsl x8, x8, x7
+    adrp x6, _kcc_cg_fp_callee_mask@@PAGE
+    add  x6, x6, _kcc_cg_fp_callee_mask@@PAGEOFF
+    ldr x9, [x6]
+    orr x9, x9, x8
+    str x9, [x6]
+    add x11, x11, #1
+.Lpf_wf_next:
+    add x10, x10, #1
+    b .Lpf_wf
+
+.Lpf_scan_start:
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [x0, #VEC_COUNT]
+    str x1, [sp, #112]
+    str xzr, [sp, #104]
+    mov x27, #0                    // pos
+.Lpf_bb:
+    ldr x0, [sp, #104]
+    ldr x1, [sp, #112]
+    cmp x0, x1
+    b.hs .Lpf_done
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [sp, #104]
+    bl _kcc_vec_get
+    ldr x26, [x0]
+    ldr x26, [x26, #BB_FIRST]
+.Lpf_instr:
+    cbz x26, .Lpf_next_bb
+    ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_BR
+    b.eq .Lpf_next
+    cmp x9, #IR_BR_COND
+    b.eq .Lpf_next
+    cmp x9, #IR_STORE
+    b.eq .Lpf_next
+    cmp x9, #IR_RET
+    b.eq .Lpf_next
+    ldr x0, [x26, #IR_DEST]
+    cmp x0, x20
+    b.hs .Lpf_next
+    ldr x1, [x24, x0, lsl #3]     // flags[dest]
+    tst x1, #0x8                  // FP candidate?
+    b.eq .Lpf_next
+    tst x1, #2                    // escapes its defining block?
+    b.eq .Lpf_gate_ok
+    ldr x9, [sp, #120]           // escaping → allocate only when loop-free
+    cbnz x9, .Lpf_next
+.Lpf_gate_ok:
+    and x4, x1, #4               // crossed-a-call bit
+    ldr x3, [x21, x0, lsl #3]     // lastuse[dest]
+    cmp x3, x27
+    b.ls .Lpf_next                // no later use
+    // Call-crossing → callee d8..d15 only (slot >=16); call-free prefers the
+    // caller-saved d16..d31 (slots 0..15) to spare a prologue save.
+    mov x5, #0
+    cbz x4, .Lpf_findreg
+    mov x5, #16
+.Lpf_findreg:
+    cmp x5, #24
+    b.ge .Lpf_next                // no free d-register → spill
+    add x6, sp, #256
+    ldr x7, [x6, x5, lsl #3]      // reg_end_fp[slot]
+    cmp x7, x27
+    b.ge .Lpf_findreg_next
+    cmp x5, #16
+    b.lo .Lpf_caller
+    sub x8, x5, #8               // callee: slot 16 → d8
+    b .Lpf_assign
+.Lpf_caller:
+    add x8, x5, #16              // caller: slot 0 → d16
+.Lpf_assign:
+    add x6, x25, x20, lsl #4      // fpmap base
+    str x8, [x6, x0, lsl #3]     // fpmap[dest] = d-reg
+    add x6, sp, #256
+    str x3, [x6, x5, lsl #3]      // reg_end_fp[slot] = lastuse[dest]
+    cmp x5, #16
+    b.lo .Lpf_next                // caller-saved d: no prologue save
+    sub x9, x8, #8              // callee-saved d8..d15: record in the FP mask
+    mov x10, #1
+    lsl x10, x10, x9
+    adrp x6, _kcc_cg_fp_callee_mask@@PAGE
+    add  x6, x6, _kcc_cg_fp_callee_mask@@PAGEOFF
+    ldr x7, [x6]
+    orr x7, x7, x10
+    str x7, [x6]
+    b .Lpf_next
+.Lpf_findreg_next:
+    add x5, x5, #1
+    b .Lpf_findreg
+.Lpf_next:
+    add x27, x27, #1
+    ldr x26, [x26, #IR_NEXT]
+    b .Lpf_instr
+.Lpf_next_bb:
+    ldr x0, [sp, #104]
+    add x0, x0, #1
+    str x0, [sp, #104]
+    b .Lpf_bb
+.Lpf_done:
+    // Publish the FP map and its callee-saved save count.
+    add x6, x25, x20, lsl #4      // fpmap base
+    adrp x0, _kcc_cg_fpregmap@@PAGE
+    add  x0, x0, _kcc_cg_fpregmap@@PAGEOFF
+    str x6, [x0]
+    adrp x0, _kcc_cg_fp_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_fp_callee_mask@@PAGEOFF
+    ldr x1, [x0]
+    mov x2, #0
+.Lpf_pop:
+    cbz x1, .Lpf_pop_done
+    and x3, x1, #1
+    add x2, x2, x3
+    lsr x1, x1, #1
+    b .Lpf_pop
+.Lpf_pop_done:
+    adrp x0, _kcc_cg_fp_save_count@@PAGE
+    add  x0, x0, _kcc_cg_fp_save_count@@PAGEOFF
+    str x2, [x0]
+
     // Build the promotion map: promoted[v] = map[v] for every alloca vreg the
     // scan actually placed in a register (map[v] != 0) that survived the
     // escape scan (flags bit 0x100).  The register the allocator handed the
@@ -788,8 +1000,8 @@ _kcc_cg_regalloc:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #256
+    ldp x29, x30, [sp], #496
     ret
-@| _kcc_cg_regalloc _kcc_ra_use
+@| _kcc_cg_regalloc _kcc_ra_use _kcc_ra_disq
 @}
 

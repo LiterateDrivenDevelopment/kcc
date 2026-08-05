@@ -869,8 +869,20 @@ _kcc_cg_callee_mask: .quad 0     // bitmask of callee-saved regs used (bit r-19)
 _kcc_cg_save_count:  .quad 0     // number of callee-saved regs to save
 .globl _kcc_cg_save_base
 _kcc_cg_save_base:   .quad 0     // byte offset of the callee-save area from x29
+.globl _kcc_cg_fpregmap
+_kcc_cg_fpregmap:    .quad 0     // per-function FP vreg→d-register map (0 = spill)
+.globl _kcc_cg_fp_callee_mask
+_kcc_cg_fp_callee_mask: .quad 0  // bitmask of callee-saved d-regs used (bit d-8)
+.globl _kcc_cg_fp_save_count
+_kcc_cg_fp_save_count:  .quad 0  // number of callee-saved d-regs to save
+.globl _kcc_cg_fp_save_base
+_kcc_cg_fp_save_base:   .quad 0  // byte offset of the FP callee-save area from x29
 @| _kcc_cg_frame_size
 @| _kcc_cg_promoted
+@| _kcc_cg_fpregmap
+@| _kcc_cg_fp_callee_mask
+@| _kcc_cg_fp_save_count
+@| _kcc_cg_fp_save_base
 @| _kcc_cg_vreg_count
 @| _kcc_cstr_buf
 @| _kcc_cstr_pos

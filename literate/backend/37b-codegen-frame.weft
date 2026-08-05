@@ -150,9 +150,19 @@ _kcc_codegen_func:
     str x0, [x1]
     mov x2, x0                     // save_base
 
-    // frame_size = align16(save_base + save_count*8)
+    // fp_save_base = save_base + gp_save_count*8 — the callee-saved d-registers
+    // are spilled just above the general callee-saved area.
     adrp x1, _kcc_cg_save_count@@PAGE
     add  x1, x1, _kcc_cg_save_count@@PAGEOFF
+    ldr x1, [x1]
+    add x2, x2, x1, lsl #3        // x2 = fp_save_base = save_base + gp_saves*8
+    adrp x1, _kcc_cg_fp_save_base@@PAGE
+    add  x1, x1, _kcc_cg_fp_save_base@@PAGEOFF
+    str x2, [x1]
+
+    // frame_size = align16(fp_save_base + fp_save_count*8)
+    adrp x1, _kcc_cg_fp_save_count@@PAGE
+    add  x1, x1, _kcc_cg_fp_save_count@@PAGEOFF
     ldr x1, [x1]
     add x0, x2, x1, lsl #3
     add x0, x0, #15
@@ -765,6 +775,21 @@ _kcc_cg_load_vreg:
     mov x19, x0                    // vreg
     mov x20, x1                    // target reg
 
+    // A floating vreg lives in a d-register; move its 64-bit pattern into the
+    // requested general register with FMOV so the integer paths (a double
+    // stored to memory, say) see the right bits.
+    adrp x0, _kcc_cg_fpregmap@@PAGE
+    add  x0, x0, _kcc_cg_fpregmap@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Llv_gp
+    ldr x0, [x0, x19, lsl #3]      // home d-reg (0 = not FP-allocated)
+    cbz x0, .Llv_gp
+    mov x1, x0                     // Rn = home d-reg
+    mov x0, x20                    // Rd = target general reg
+    bl _kcc_enc_fmov_x_d           // FMOV x<target>, d<home>
+    bl _kcc_code_emit32
+    b .Llv_done
+.Llv_gp:
     adrp x0, _kcc_cg_regmap@@PAGE
     add  x0, x0, _kcc_cg_regmap@@PAGEOFF
     ldr x0, [x0]
@@ -805,6 +830,21 @@ _kcc_cg_store_vreg:
     mov x19, x0                    // vreg
     mov x20, x1                    // source reg
 
+    // A floating vreg lives in a d-register; write the general-register value
+    // (e.g. a materialised double constant, or a double loaded from memory)
+    // into its home d-register with FMOV.
+    adrp x0, _kcc_cg_fpregmap@@PAGE
+    add  x0, x0, _kcc_cg_fpregmap@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lsv_gp
+    ldr x0, [x0, x19, lsl #3]      // home d-reg (0 = not FP-allocated)
+    cbz x0, .Lsv_gp
+    mov x1, x20                    // Rn = source general reg
+    // x0 = home d-reg = Rd
+    bl _kcc_enc_fmov_d_x           // FMOV d<home>, x<source>
+    bl _kcc_code_emit32
+    b .Lsv_done
+.Lsv_gp:
     adrp x0, _kcc_cg_regmap@@PAGE
     add  x0, x0, _kcc_cg_regmap@@PAGEOFF
     ldr x0, [x0]
@@ -867,6 +907,22 @@ _kcc_cg_load_vreg_fp:
     mov x19, x0                    // vreg
     mov x20, x1                    // fp reg
 
+    // Allocated to a d-register?  The value already lives in the FP bank; move
+    // it d-to-d (or nothing when it is already the target register).
+    adrp x0, _kcc_cg_fpregmap@@PAGE
+    add  x0, x0, _kcc_cg_fpregmap@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Llvf_gp
+    ldr x0, [x0, x19, lsl #3]      // home d-reg (0 = not FP-allocated)
+    cbz x0, .Llvf_gp
+    cmp x20, x0
+    b.eq .Llvf_done               // already in the target d-register
+    mov x1, x0                     // Rn = home d-reg
+    mov x0, x20                    // Rd = target d-reg
+    bl _kcc_enc_fmov_d_d
+    bl _kcc_code_emit32
+    b .Llvf_done
+.Llvf_gp:
     adrp x0, _kcc_cg_regmap@@PAGE
     add  x0, x0, _kcc_cg_regmap@@PAGEOFF
     ldr x0, [x0]
@@ -899,6 +955,21 @@ _kcc_cg_store_vreg_fp:
     mov x19, x0                    // vreg
     mov x20, x1                    // fp reg
 
+    // Allocated to a d-register?  Write the value into its home d-register.
+    adrp x0, _kcc_cg_fpregmap@@PAGE
+    add  x0, x0, _kcc_cg_fpregmap@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lsvf_gp
+    ldr x0, [x0, x19, lsl #3]      // home d-reg (0 = not FP-allocated)
+    cbz x0, .Lsvf_gp
+    cmp x20, x0
+    b.eq .Lsvf_done               // source already is the home d-register
+    mov x1, x20                    // Rn = source d-reg
+    // x0 = home d-reg = Rd
+    bl _kcc_enc_fmov_d_d
+    bl _kcc_code_emit32
+    b .Lsvf_done
+.Lsvf_gp:
     adrp x0, _kcc_cg_regmap@@PAGE
     add  x0, x0, _kcc_cg_regmap@@PAGEOFF
     ldr x0, [x0]
@@ -940,7 +1011,7 @@ _kcc_cg_callee_transfer:
     adrp x0, _kcc_cg_callee_mask@@PAGE
     add  x0, x0, _kcc_cg_callee_mask@@PAGEOFF
     ldr x20, [x0]                  // mask
-    cbz x20, .Lct_done
+    cbz x20, .Lct_fp
     adrp x0, _kcc_cg_save_base@@PAGE
     add  x0, x0, _kcc_cg_save_base@@PAGEOFF
     ldr x0, [x0]
@@ -949,7 +1020,7 @@ _kcc_cg_callee_transfer:
     mov x23, #0                    // k = save-slot index
 .Lct_loop:
     cmp x22, #29
-    b.ge .Lct_done
+    b.ge .Lct_fp
     sub x0, x22, #19
     lsr x1, x20, x0
     tst x1, #1
@@ -966,6 +1037,38 @@ _kcc_cg_callee_transfer:
 .Lct_next:
     add x22, x22, #1
     b .Lct_loop
+.Lct_fp:
+    // Save/restore the callee-saved d-registers (d8..d15) the FP scan claimed,
+    // at [x29, #fp_save_base + k*8], with the FP transfer kinds (LDR/STR fp).
+    adrp x0, _kcc_cg_fp_callee_mask@@PAGE
+    add  x0, x0, _kcc_cg_fp_callee_mask@@PAGEOFF
+    ldr x20, [x0]                  // fp mask
+    cbz x20, .Lct_done
+    adrp x0, _kcc_cg_fp_save_base@@PAGE
+    add  x0, x0, _kcc_cg_fp_save_base@@PAGEOFF
+    ldr x0, [x0]
+    lsr x21, x0, #3               // fp_save_base scaled by 8
+    mov x22, #8                    // current d-register number
+    mov x23, #0                    // k = fp-save-slot index
+.Lct_fp_loop:
+    cmp x22, #16
+    b.ge .Lct_done
+    sub x0, x22, #8
+    lsr x1, x20, x0
+    tst x1, #1
+    b.eq .Lct_fp_next
+    add x1, x21, x23
+    lsl x1, x1, #3
+    mov x0, x22                   // rt = d-register
+    mov x2, #2                    // kind = LDR fp (restore)
+    cbnz x19, .Lct_fp_kind
+    mov x2, #3                    // kind = STR fp (save)
+.Lct_fp_kind:
+    bl _kcc_cg_emit_frame_ldst
+    add x23, x23, #1
+.Lct_fp_next:
+    add x22, x22, #1
+    b .Lct_fp_loop
 .Lct_done:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]

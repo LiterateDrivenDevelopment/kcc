@@ -250,12 +250,95 @@ _kcc_ht_get:
 
 \subsection{Insertion}
 
-\texttt{kcc\_ht\_put} inserts a key-value pair.  If the key already
-exists, the value is updated.  No resizing is performed --- the caller
-must ensure the table has sufficient capacity.  For the keyword table
-(44~entries in a 128-slot table, 34\% load factor), this is always safe.
+\texttt{kcc\_ht\_put} inserts a key-value pair, updating the value if the key
+already exists.  Because the table uses open addressing, its performance
+collapses as it fills---probe chains lengthen, and a table that fills
+completely would loop forever hunting for an empty slot.  A fixed capacity is
+therefore only safe for a table with a known, bounded population (the keyword
+table's 44~entries in 128~slots).  Tables whose size tracks the input---the
+string interner, the symbol tables, the per-function local and label
+maps---must grow, or a large translation unit degrades to $O(n^2)$ and then
+hangs.  So \texttt{kcc\_ht\_put} first calls \texttt{kcc\_ht\_grow}, which
+doubles the capacity and rehashes every entry once the load factor would exceed
+three-quarters.  Growth mutates the header's entries pointer and capacity in
+place, so every caller's handle to the table stays valid; keeping the load
+factor bounded turns insertion and lookup back into amortised~$O(1)$.
 
 @d Hash: put @{
+// -- kcc_ht_grow ----------------------------------------------------
+// void kcc_ht_grow(void *ht)
+// Double the table's capacity and rehash all entries into the new array,
+// updating HT_ENTRIES/HT_CAP in the header.  Keys are already unique, so each
+// rehash insertion only needs to find the first empty slot.
+.globl _kcc_ht_grow
+.p2align 2
+_kcc_ht_grow:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                  // x19 = ht header
+    ldr x20, [x19, #HT_ENTRIES] // x20 = old entries
+    ldr x21, [x19, #HT_CAP]    // x21 = old capacity
+    lsl x22, x21, #1            // x22 = new capacity = old * 2
+
+    // Allocate and zero the new entries array.
+    mov x0, x22
+    mov x1, #HTE_SIZE
+    mul x0, x0, x1
+    mov x24, x0                  // x24 = new byte size
+    bl _kcc_arena_alloc
+    mov x23, x0                  // x23 = new entries base
+    mov x1, #0
+    mov x2, x24
+    bl _kcc_memset
+
+    // Rehash: walk the old entries, reinsert each occupied one.
+    mov x24, #0                  // x24 = old index
+.Lht_grow_scan:
+    cmp x24, x21
+    b.hs .Lht_grow_publish
+    mov x0, #HTE_SIZE
+    mul x1, x24, x0
+    add x1, x20, x1             // x1 = old entry ptr
+    ldr x2, [x1, #HTE_KEY]
+    cbz x2, .Lht_grow_next      // empty slot → skip
+    // Probe the new array from hash & (new_cap-1) for the first empty slot.
+    ldr x3, [x1, #HTE_HASH]
+    sub x4, x22, #1            // new mask
+    and x5, x3, x4             // start index
+.Lht_grow_probe:
+    mov x0, #HTE_SIZE
+    mul x6, x5, x0
+    add x6, x23, x6            // new entry ptr
+    ldr x7, [x6, #HTE_KEY]
+    cbz x7, .Lht_grow_place
+    add x5, x5, #1
+    and x5, x5, x4
+    b .Lht_grow_probe
+.Lht_grow_place:
+    ldr x7, [x1, #HTE_HASH]
+    str x7, [x6, #HTE_HASH]
+    ldr x7, [x1, #HTE_KEY]
+    str x7, [x6, #HTE_KEY]
+    ldr x7, [x1, #HTE_KEYLEN]
+    str x7, [x6, #HTE_KEYLEN]
+    ldr x7, [x1, #HTE_VALUE]
+    str x7, [x6, #HTE_VALUE]
+.Lht_grow_next:
+    add x24, x24, #1
+    b .Lht_grow_scan
+.Lht_grow_publish:
+    str x23, [x19, #HT_ENTRIES]
+    str x22, [x19, #HT_CAP]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // -- kcc_ht_put -----------------------------------------------------
 // void kcc_ht_put(void *ht, const void *key, uint64_t keylen, uint64_t value)
 //   x0 = hash table pointer
@@ -279,9 +362,23 @@ _kcc_ht_put:
     mov x21, x2                  // x21 = keylen
     mov x25, x3                  // x25 = value
 
+    // Grow before inserting if the load factor would exceed 3/4.  A pure update
+    // grows a touch early, which is harmless.  The header pointer is unchanged,
+    // so x19 stays valid; the entries/capacity are reloaded below.
+    ldr x0, [x19, #HT_COUNT]
+    add x0, x0, #1
+    lsl x0, x0, #2             // (count + 1) * 4
+    ldr x1, [x19, #HT_CAP]
+    add x2, x1, x1, lsl #1     // capacity * 3
+    cmp x0, x2
+    b.le .Lht_put_nogrow
+    mov x0, x19
+    bl _kcc_ht_grow
+.Lht_put_nogrow:
+
     // Hash the key
-    mov x0, x1
-    mov x1, x2
+    mov x0, x20
+    mov x1, x21
     bl _kcc_fnv1a
     mov x22, x0                  // x22 = hash
 

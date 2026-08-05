@@ -1477,7 +1477,7 @@ freestanding sys.\ headers   & \checkmark & built-in \texttt{<stdio.h>} etc.; GO
 multi-error recovery         & \checkmark & reports every error; carets; \texttt{just diagtest} \\
 warnings (\texttt{-Wall})    & \checkmark & 5 canonical warnings; \texttt{just warntest} \\
 debug info (DWARF)           & \checkmark & \texttt{-g}; func-granularity; verify-clean + links \\
-harden vs.\ malformed input  & $\circ$ & crash classes fixed (lexer/output/frame); large-symbol perf left \\
+harden vs.\ malformed input  & \checkmark & crash classes fixed; hash-table resize kills the large-symbol $O(n^2)$/hang \\
 full \texttt{-O}/\texttt{-I}/\texttt{-D} CLI & $\circ$ & partial \\
 \hline
 \end{tabular}

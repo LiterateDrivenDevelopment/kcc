@@ -791,7 +791,13 @@ must \emph{not} load from it (that would misinterpret element data as
 a pointer).  The builder detects global arrays by looking up the
 symbol table for the pre-decay type (\texttt{TY\_ARRAY}), emits a
 \texttt{GLOBAL\_REF}, and feeds the resulting address vreg into the
-GEP index path.
+GEP index path.  A \texttt{static} local array is handled the same way,
+but its block scope is gone by code-generation time, so the base is
+recognised through the \texttt{\_kcc\_ir\_statics}/%
+\texttt{\_kcc\_ir\_static\_types} tables instead of the symbol table:
+if the subscript base names a static of array type, the builder emits a
+\texttt{GLOBAL\_REF} for its \emph{mangled} symbol and feeds that address
+into the same GEP path.
 
 \paragraph{Slots per type.}
 Aggregates are laid out byte-accurately (see \texttt{\_kcc\_type\_layout}),
@@ -1025,8 +1031,56 @@ _kcc_ir_build_subscript_addr:
     cmp x1, #AST_IDENT_EXPR
     b.ne .Libsa_ptr
 
+    ldr x22, [x0, #AST_F0]      // name ptr (source name)
+
+    // A static local array behaves like a file-scope global array here, but the
+    // block scope is popped so the symbol table cannot see it.  Consult the
+    // static tables: if the name is a static local of array type, use its
+    // mangled global address as the GEP base (no load).
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libsa_expr_symtab
+    mov x0, x22
+    bl _kcc_strlen
+    mov x23, x0                  // namelen
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22
+    mov x2, x23
+    bl _kcc_ht_get
+    cbz x0, .Libsa_expr_symtab   // not a static → symtab-based detection
+    mov x20, x0                  // x20 = mangled name
+    adrp x0, _kcc_ir_static_types@@PAGE
+    add  x0, x0, _kcc_ir_static_types@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libsa_ptr
+    mov x1, x22
+    mov x2, x23
+    bl _kcc_ht_get
+    cbz x0, .Libsa_ptr
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Libsa_ptr             // static pointer/scalar subscript → ptr path
+    // Static array: GLOBAL_REF(mangled) IS the element-0 address; feed the GEP.
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x20, [x0, #IR_SRC1]     // mangled name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x23, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x23, #IR_DEST]
+    mov x20, x0                  // x20 = base address vreg
+    mov x0, x23
+    bl _kcc_ir_emit
+    b .Libsa_index
+
+.Libsa_expr_symtab:
     // Look up in symbol table for pre-decay type
-    ldr x22, [x0, #AST_F0]      // name ptr
     mov x0, x22
     bl _kcc_strlen
     mov x1, x0
@@ -1396,12 +1450,16 @@ _kcc_ir_build_member_addr:
     mov x1, x20
     bl _kcc_ht_get
     cbz x0, .Libma_global
-    bic x0, x0, #0x8000000000000000
-    sub x20, x0, #1              // alloca vreg
 
-    // Arrow access: load the pointer value from the alloca
+    // Arrow access loads the pointer value from the alloca---but only for a
+    // pointer variable (bit 63 set).  An array base (`T a[1]; a->m`) decays to
+    // its own address, so its alloca already IS the pointer; loading from it
+    // would read the array's first bytes as a bogus pointer.
     ldr x1, [x19, #AST_F2]
-    cbz x1, .Libma_find_index    // dot access → alloca IS struct base
+    cbz x1, .Libma_local_noload  // dot access → alloca IS struct base
+    tbz x0, #63, .Libma_local_noload  // arrow on a non-pointer (array) → no load
+    bic x0, x0, #0x8000000000000000
+    sub x20, x0, #1              // pointer alloca vreg
     // alloca holds a pointer — emit load to get the actual pointer
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
@@ -1416,6 +1474,13 @@ _kcc_ir_build_member_addr:
     mov x20, x0                  // now x20 = loaded pointer value
     mov x0, x22
     bl _kcc_ir_emit
+    b .Libma_find_index
+
+.Libma_local_noload:
+    // Dot access, or arrow on an array: the alloca vreg is already the base
+    // address of the struct.
+    bic x0, x0, #0x8000000000000000
+    sub x20, x0, #1
     b .Libma_find_index
 
 .Libma_global:
@@ -2524,8 +2589,30 @@ _kcc_ir_build_ident:
     mov x2, x21                  // keylen
     bl _kcc_ht_get
     cbz x0, .Libi_global_notstatic
-    mov x20, x0                  // x20 = mangled name ptr
+    mov x22, x0                  // x22 = mangled name (source name stays in x20)
+
+    // A static local array (or function) decays to its address, not a load.
+    // Consult the parallel type table (the block scope is gone, so AST_F3's
+    // decayed type is not reliable here) to route arrays through the array path.
+    adrp x0, _kcc_ir_static_types@@PAGE
+    add  x0, x0, _kcc_ir_static_types@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libi_gstat_scalar
+    mov x1, x20                  // source name
+    mov x2, x21                  // keylen
+    bl _kcc_ht_get
+    cbz x0, .Libi_gstat_scalar
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.eq .Libi_gstat_array
+    cmp x1, #TY_FUNC
+    b.eq .Libi_gstat_array
+.Libi_gstat_scalar:
+    mov x20, x22                 // mangled name → x20
     b .Libi_global_scalar
+.Libi_gstat_array:
+    mov x20, x22                 // mangled name → x20
+    b .Libi_global_array
 
 .Libi_global_notstatic:
     // Not a local — check if it's an array (address = decayed pointer)
@@ -3708,7 +3795,17 @@ _kcc_ir_build_unary:
     // Address-of: dispatch on the operand's shape.
     ldr x21, [x19, #AST_F1]      // operand node
     cbz x21, .Libu_addr_zero
+.Libu_addr_unwrap:
+    // Parentheses are transparent to `&`: `&(p->m)` is `&p->m`.  Unwrap any
+    // AST_PAREN_EXPR wrappers before dispatching, otherwise the operand looked
+    // "unsupported" and address-of yielded 0 (dropping the base pointer).
     ldr x0, [x21, #AST_TAG]
+    cmp x0, #AST_PAREN_EXPR
+    b.ne .Libu_addr_dispatch
+    ldr x21, [x21, #AST_F0]      // inner expression
+    cbz x21, .Libu_addr_zero
+    b .Libu_addr_unwrap
+.Libu_addr_dispatch:
     cmp x0, #AST_SUBSCRIPT
     b.eq .Libu_addr_subscript
     cmp x0, #AST_MEMBER
@@ -3875,10 +3972,18 @@ _kcc_ir_build_inc_dec:
     ldr x20, [x19, #AST_F0]     // op (TOK_INC or TOK_DEC)
     ldr x21, [x19, #AST_F2]     // prefix flag (1=prefix, 0=postfix)
 
-    // Operand must be an identifier (lvalue)
+    // Operand is an lvalue: a plain identifier, a member (`p->m++`, `s.m++`),
+    // or a subscript (`a[i]++`).  For the last two the load/store go through the
+    // member/subscript address; without them `p->m++` was a no-op (it returned
+    // 0 and never advanced the object)---which, for `input_buffer->offset++` in
+    // a recursive-descent parser, spun forever.
     ldr x0, [x19, #AST_F1]
     cbz x0, .Libid_zero
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_MEMBER
+    b.eq .Libid_member
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Libid_subscript
     cmp x1, #AST_IDENT_EXPR
     b.ne .Libid_zero
 
@@ -3899,15 +4004,51 @@ _kcc_ir_build_inc_dec:
     bic x0, x0, #0x8000000000000000
     sub x22, x0, #1              // x22 = alloca vreg
     b .Libid_load
+
+.Libid_member:
+    // Member lvalue (`p->m++` / `s.m++`): its GEP address is what we modify.
+    bl _kcc_ir_build_member_addr
+    mov x22, x0
+    b .Libid_load
+
+.Libid_subscript:
+    // Subscript lvalue (`a[i]++`): its element address is what we modify.
+    bl _kcc_ir_build_subscript_addr
+    mov x22, x0
+    b .Libid_load
 @| _kcc_ir_build_inc_dec
 @}
 
 For global variables, the builder first emits an \texttt{IR\_GLOBAL\_REF}
 to materialise the address into a vreg, then continues with the same
-load-modify-store sequence.
+load-modify-store sequence.  When the name is a \texttt{static} local, it is
+first redirected onto its mangled hoisted-global symbol---exactly as the read
+and compound-assignment paths do---so that \texttt{static int x; x++;} targets
+the hoisted storage rather than emitting a reference to an undefined external
+\texttt{\_x}.
 
 @d IR: build increment/decrement @{
 .Libid_global:
+    // A static local is hoisted to a mangled global; redirect the name onto
+    // that symbol so ++/-- target the hoisted storage rather than an undefined
+    // external `_x`.  Read and compound-assign already do this---increment did
+    // not, so `static int x; x++;` failed to link.
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libid_global_ref
+    mov x0, x22
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x22                  // key = source name
+    bl _kcc_ht_get
+    cbz x0, .Libid_global_ref
+    mov x22, x0                  // x22 = mangled name
+
+.Libid_global_ref:
     // Emit GLOBAL_REF to get address vreg
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr

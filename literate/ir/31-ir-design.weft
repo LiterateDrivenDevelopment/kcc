@@ -496,6 +496,8 @@ _kcc_ir_funcs:       .quad 0     // vec of all IR functions
 _kcc_ir_locals:      .quad 0     // hash table: name → alloca vreg
 .globl _kcc_ir_statics
 _kcc_ir_statics:     .quad 0     // hash table: name → mangled static-local symbol
+.globl _kcc_ir_static_types
+_kcc_ir_static_types: .quad 0    // hash table: name → static local's declared type
 .globl _kcc_ir_labels
 _kcc_ir_labels:      .quad 0     // hash table: label name → target basic block
 .globl _kcc_ir_loop_stack
@@ -507,6 +509,7 @@ _kcc_ir_bb_counter:  .quad 0     // global BB id counter
 @| _kcc_ir_funcs
 @| _kcc_ir_locals
 @| _kcc_ir_statics
+@| _kcc_ir_static_types
 @| _kcc_ir_labels
 @| _kcc_ir_loop_stack
 @| _kcc_ir_bb_counter

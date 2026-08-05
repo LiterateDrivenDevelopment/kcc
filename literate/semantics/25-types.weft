@@ -414,6 +414,16 @@ indicates an incomplete array type (\stdref{6.2.5}).  The total size is
 computed as element size multiplied by length, and alignment is inherited
 directly from the element type.
 
+Aggregate element types are sized \emph{lazily}: \texttt{kcc\_type\_struct}
+leaves \texttt{TY\_SIZE} at zero until \texttt{kcc\_type\_layout} runs.  If we
+read the element size before that layout happens---as when a local
+\texttt{struct~S~a[3]} is declared before \texttt{S} is otherwise
+referenced---the multiplication captures a stale zero and the whole array
+appears to have size zero (so \texttt{sizeof~a} is wrong and
+\texttt{memset(a,0,sizeof~a)} clears nothing).  We therefore lay the element
+out first; layout is idempotent, so this is safe for scalar elements too and
+merely returns their already-known size.
+
 @d Types: make array @{
 // -- kcc_type_array -------------------------------------------------------
 // type_desc *kcc_type_array(type_desc *elem, uint64_t len)
@@ -423,29 +433,35 @@ directly from the element type.
 .globl _kcc_type_array
 .p2align 2
 _kcc_type_array:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
 
     mov x19, x0                     // elem type
     mov x20, x1                     // length
 
     mov x0, #TY_DESC_SIZE
     bl _kcc_arena_alloc
+    mov x21, x0                     // array descriptor
     mov x1, #TY_ARRAY
-    str x1, [x0, #TY_KIND]
-    // size = elem_size * length
-    ldr x2, [x19, #TY_SIZE]
-    mul x2, x2, x20
-    str x2, [x0, #TY_SIZE]
+    str x1, [x21, #TY_KIND]
+    // Ensure the element is laid out so aggregate sizes are known, then
+    // size = elem_size * length.
+    mov x0, x19
+    bl _kcc_type_layout            // x0 = element size
+    mul x0, x0, x20
+    str x0, [x21, #TY_SIZE]
     ldr x2, [x19, #TY_ALIGN]
-    str x2, [x0, #TY_ALIGN]
-    str xzr, [x0, #TY_QUALS]
-    str x19, [x0, #TY_F0]          // element type
-    str x20, [x0, #TY_F1]          // length
+    str x2, [x21, #TY_ALIGN]
+    str xzr, [x21, #TY_QUALS]
+    str x19, [x21, #TY_F0]         // element type
+    str x20, [x21, #TY_F1]         // length
 
+    mov x0, x21
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 @| _kcc_type_array
 @}

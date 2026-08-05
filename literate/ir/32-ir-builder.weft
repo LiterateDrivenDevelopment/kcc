@@ -435,6 +435,15 @@ _kcc_ir_build_func:
     add  x1, x1, _kcc_ir_statics@@PAGEOFF
     str x0, [x1]
 
+    // Parallel table: static local name → its declared type, so the subscript
+    // and identifier-decay paths can tell an array from a pointer once the
+    // symbol table's block scope has been popped.
+    mov x0, #16
+    bl _kcc_ht_init
+    adrp x1, _kcc_ir_static_types@@PAGE
+    add  x1, x1, _kcc_ir_static_types@@PAGEOFF
+    str x0, [x1]
+
     // Reset label table (label names visible only in this function)
     mov x0, #16
     bl _kcc_ht_init

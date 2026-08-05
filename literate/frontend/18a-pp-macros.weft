@@ -365,6 +365,18 @@ the substitution engine replaces each parameter name in the replacement
 body with the corresponding argument text before pushing the result
 onto the context stack.
 
+The depth counter must survive the argument loop's own calls.  Each
+iteration invokes \texttt{\_kcc\_lex\_next}, which for an identifier
+argument calls \texttt{\_kcc\_ht\_get} to test it against the keyword
+table---and any such call is free to clobber the caller-saved scratch
+registers.  A depth kept in a scratch register therefore held only by
+luck for numeric arguments and was corrupted the moment an argument was
+an identifier or keyword, so a call like \verb|FOO(int)| or
+\verb|CJSON_PUBLIC(cJSON *)| never found its closing parenthesis and
+reported an ``unterminated macro argument list.''  The depth lives in a
+callee-saved register (\texttt{x20}, dead in this path once the macro has
+been looked up), which the called routines are obliged to preserve.
+
 @d PP: expand @{
 .Lexp_funclike:
     // Function-like: peek for '(' after identifier
@@ -409,9 +421,10 @@ onto the context stack.
     bl _kcc_arena_alloc
     mov  x23, x0              // x23 = arg array
 
-    // Collect arguments: track paren depth
+    // Collect arguments: track paren depth in a callee-saved register (x20,
+    // dead here) so _kcc_lex_next's calls cannot clobber it.
     mov  x24, #0              // arg count
-    mov  x3, #1               // paren depth (we already consumed '(')
+    mov  x20, #1             // paren depth (we already consumed '(')
 
     // Mark start of first argument
     adrp x0, _kcc_lex_cursor@@PAGE
@@ -434,20 +447,20 @@ onto the context stack.
 
     cmp  x0, #TOK_LPAREN
     b.ne .Lexp_arg_not_lp
-    add  x3, x3, #1           // depth++
+    add  x20, x20, #1         // depth++
     b .Lexp_arg_loop
 
 .Lexp_arg_not_lp:
     cmp  x0, #TOK_RPAREN
     b.ne .Lexp_arg_not_rp
-    sub  x3, x3, #1           // depth--
-    cbz  x3, .Lexp_arg_end    // matched → done
+    sub  x20, x20, #1         // depth--
+    cbz  x20, .Lexp_arg_end   // matched → done
     b .Lexp_arg_loop
 
 .Lexp_arg_not_rp:
     cmp  x0, #TOK_COMMA
     b.ne .Lexp_arg_loop
-    cmp  x3, #1
+    cmp  x20, #1
     b.ne .Lexp_arg_loop        // comma inside nested parens
 
     // End of argument: compute length

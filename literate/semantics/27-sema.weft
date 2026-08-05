@@ -144,14 +144,19 @@ _kcc_sema_resolve_type:
     b .Lsrt_done
 
 .Lsrt_func:
-    // F0 = return type node, F1 = params (linked list)
+    // F0 = return type node, F1 = params (linked list; bit 0 = variadic flag)
     ldr x0, [x19, #AST_F0]
     bl _kcc_sema_resolve_type
     mov x20, x0                     // return type
 
-    // For now, create function type without resolving params
+    // Carry the parameter declaration list (masked of the variadic bit) as the
+    // function type's param vec, so the call site can convert and classify each
+    // argument by its parameter's type---e.g. an integer argument to a
+    // \texttt{double} parameter needs an int-to-double conversion and an
+    // SSE-class register, neither of which the argument's own type would give.
+    ldr x1, [x19, #AST_F1]          // params list
+    bic x1, x1, #1                  // strip the variadic flag
     mov x0, x20                     // return type
-    mov x1, #0                      // no param vec
     bl _kcc_type_func
     b .Lsrt_done
 

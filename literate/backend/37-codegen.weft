@@ -271,6 +271,30 @@ _kcc_preregister_globals:
     mov x0, x20
     bl _kcc_ir_static_name
     mov x21, x0                  // mangled name
+
+    // Reserve the static's backing storage at its real type size (floored at 8,
+    // rounded to a whole 8-byte slot), as the file-scope pass does; otherwise
+    // the IR_GLOBAL_REF handler falls back to a scalar 8 bytes and a static
+    // array or struct larger than that is under-allocated.
+    ldr x0, [x20, #AST_F0]       // declared type node
+    cbz x0, .Lprg_st_size8
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lprg_st_size8
+    bl _kcc_type_layout          // x0 = real TY_SIZE (arrays/structs included)
+    mov x22, x0
+    cmp x22, #8
+    b.lt .Lprg_st_size8
+    add x22, x22, #7
+    bic x22, x22, #7             // round up to a whole 8-byte slot
+    b .Lprg_st_reserve
+.Lprg_st_size8:
+    mov x22, #8
+.Lprg_st_reserve:
+    mov x0, x21                  // mangled name
+    mov x1, x22                  // byte size
+    bl _kcc_linker_global_sym
+
+    mov x0, x21
     bl _kcc_strlen
     mov x2, x0                   // keylen
     adrp x0, _kcc_cg_defined_globals@@PAGE
@@ -576,10 +600,12 @@ With the string bytes safely buffered, the next step is to give
 the literal a linker-visible identity.  The code mints a local
 symbol name of the form \texttt{l\_.str.\textit{N}} by
 incrementing a monotonic counter and converting it to decimal
-with a digit-reversal loop.  It then registers the symbol
-(\texttt{N\_SECT\,|\,N\_EXT}, section~1, value~0 as a
-placeholder), records a fixup pair $(\mathit{sym\_index},
-\mathit{cstr\_offset})$, and emits the
+with a digit-reversal loop.  It then registers the symbol as
+\emph{local} (\texttt{N\_SECT} without \texttt{N\_EXT}: a string literal
+belongs to its own translation unit, so it must not be exported---else two
+objects that each mint \texttt{l\_.str.0} collide at link time), in
+section~1 with value~0 as a placeholder, records a fixup pair
+$(\mathit{sym\_index}, \mathit{cstr\_offset})$, and emits the
 \textsc{adrp}\,+\,\textsc{add} relocation sequence that will let
 the linker resolve the pointer at link time.
 
@@ -645,11 +671,13 @@ the linker resolve the pointer at link time.
     strb wzr, [x0, #1]
 
 .Lcgsl_named:
-    // 6. Add symbol: section 1, value 0 (fixed up later)
+    // 6. Add symbol: section 1, value 0 (fixed up later).  A string literal is
+    // private to its translation unit, so its symbol is LOCAL (N_SECT, no
+    // N_EXT); otherwise two objects that both mint `l_.str.0` collide at link.
     mov x0, x25
     mov x1, #1                    // section = 1 (__text)
     mov x2, #0                    // value = 0 (placeholder)
-    mov x3, #(N_SECT | N_EXT)
+    mov x3, #N_SECT
     bl _kcc_linker_add_sym
     mov x26, x0                    // x26 = sym_index
 

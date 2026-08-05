@@ -1024,9 +1024,15 @@ is not, so the \texttt{pcrel} bit is cleared for that case.
 
 The symbol table consists of \texttt{nlist\_64} entries (16~bytes
 each): a 32-bit string-table index, an 8-bit type, an 8-bit
-section number, a 16-bit description, and a 64-bit value.  Defined
-symbols get \texttt{n\_type\,=\,0x0F} (\texttt{N\_SECT\textbar N\_EXT})
-and their value is the offset within the section.  Section~2
+section number, a 16-bit description, and a 64-bit value.  A defined
+symbol's type is \texttt{N\_SECT} (\texttt{0x0E}) with the \texttt{N\_EXT}
+bit added only when the symbol carries it---so an external function or
+global is \texttt{0x0F} while a translation-unit-private symbol such as a
+string literal stays \texttt{0x0E} and is not exported.  The bit is read
+from the symbol's own flags rather than assumed, which is what keeps a
+local \texttt{l\_.str.\textit{N}} from colliding with the same name in
+another object.  A defined symbol's value is the offset within the
+section.  Section~2
 symbols (global variables in \texttt{\_\_DATA,\_\_common}) have
 their value adjusted by adding \texttt{code\_size}---the
 \texttt{S\_ZEROFILL} section's virtual start follows the text
@@ -1068,8 +1074,13 @@ file is closed.
     ldr w0, [sp, #96]
     bl _kcc_macho_write32
 
-    // n_type = N_SECT | N_EXT = 0x0F
-    mov w0, #0x0F
+    // n_type = N_SECT, plus N_EXT only for an external (non-local) symbol.
+    // Local defined symbols (string literals) get 0x0E so they are not exported
+    // and cannot collide across objects.
+    ldr x2, [sp, #112]            // reload sym entry ptr
+    ldr x3, [x2, #SYM_FLAGS]
+    and w3, w3, #N_EXT
+    orr w0, w3, #N_SECT
     bl _kcc_macho_write8
 
     // n_sect = section number from sym entry

@@ -560,6 +560,19 @@ independently, with no shared table.  The symbol itself is created
 lazily by the code generator when it lowers the first
 \texttt{IR\_GLOBAL\_REF} that names it.
 
+The declaration builder records \emph{two} things about a static local: the
+name-to-mangled mapping in \texttt{\_kcc\_ir\_statics}, and, in the parallel
+\texttt{\_kcc\_ir\_static\_types}, the declared type.  The type is needed
+because an \emph{array} static must decay to its address (like a file-scope
+global array) rather than be loaded as a scalar, and the block scope that
+would tell the symbol table so is popped once semantic analysis finishes.  The
+identifier-decay and subscript-address builders consult this table to route a
+static array through the address path.  The code generator's static
+pre-registration then reserves the array's real byte size, not the scalar
+eight bytes the lazy \texttt{IR\_GLOBAL\_REF} fallback would give, so a static
+array larger than a slot has correct storage.  (A brace initialiser on a
+static \emph{aggregate} is still stored as a scalar and remains a gap.)
+
 @d IR: static local helper @{
 // -- kcc_ir_static_name ---------------------------------------------------
 // char *kcc_ir_static_name(node *decl)
@@ -953,12 +966,27 @@ _kcc_ir_build_var_decl:
 
     mov x0, x20
     bl _kcc_strlen
-    mov x2, x0                   // keylen
+    mov x2, x0                   // keylen (kept in x24 for the type table too)
+    mov x24, x0
     adrp x0, _kcc_ir_statics@@PAGE
     add  x0, x0, _kcc_ir_statics@@PAGEOFF
     ldr x0, [x0]
     mov x1, x20                  // key = source name
     mov x3, x21                  // value = mangled name ptr
+    bl _kcc_ht_put
+
+    // Also record the declared type so the array-vs-pointer decision survives
+    // the popped block scope (used by identifier decay and subscript).
+    ldr x0, [x19, #AST_F0]      // declared type node
+    cbz x0, .Libvd_done
+    bl _kcc_sema_resolve_type
+    cbz x0, .Libvd_done
+    mov x3, x0                   // value = type descriptor
+    adrp x0, _kcc_ir_static_types@@PAGE
+    add  x0, x0, _kcc_ir_static_types@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20                  // key = source name
+    mov x2, x24                  // keylen
     bl _kcc_ht_put
 
 .Libvd_done:

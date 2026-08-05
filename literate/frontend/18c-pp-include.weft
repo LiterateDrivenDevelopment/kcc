@@ -686,10 +686,20 @@ void exit(int status);
 void abort(void);
 int atoi(char *s);
 long atol(char *s);
+double atof(char *s);
+double strtod(char *s, char **end);
+float strtof(char *s, char **end);
+long strtol(char *s, char **end, int base);
+unsigned long strtoul(char *s, char **end, int base);
+long long strtoll(char *s, char **end, int base);
+unsigned long long strtoull(char *s, char **end, int base);
 int abs(int x);
 long labs(long x);
 int rand(void);
 void srand(unsigned int seed);
+void qsort(void *base, unsigned long n, unsigned long size, int (*cmp)(void *, void *));
+char *getenv(char *name);
+int system(char *cmd);
 #endif
 @}
 

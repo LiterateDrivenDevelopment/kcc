@@ -30,8 +30,17 @@ function-decay produces the wrong kind of pointer---the call handler
 then falls back to \texttt{int}, corrupting pointer return values.
 After registration the checker pushes a scope for parameters and body,
 then checks the body statements.  Typedef declarations register
-\texttt{SYM\_TYPEDEF}.  Struct and union declarations register the
-tag in the tag namespace via \texttt{\_kcc\_symtab\_declare\_tag}.
+\texttt{SYM\_TYPEDEF}---and, crucially, when the typedef names a
+struct, union, or enum \emph{definition} (\texttt{typedef struct S
+\{\dots\} S;}), the checker also runs the ordinary tag-registration path
+on the underlying type node.  Such a declaration introduces two names,
+the tag \texttt{struct S} and the typedef \texttt{S}, and registering
+only the latter left the tag undeclared: a later \texttt{struct S} would
+fall back to \texttt{int}---fatally so for a self-referential member like
+\texttt{struct S *next}, whose forward reference to the tag from inside
+the body would then chain-access a non-struct.  Struct and union
+declarations register the tag in the tag namespace via
+\texttt{\_kcc\_symtab\_declare\_tag}.
 After creating the type descriptor, the checker counts the struct's
 fields and sets \texttt{TY\_SIZE} to $\mathit{nfields}\times 8$,
 matching the all-spill backend's slot size.  This size is essential
@@ -139,8 +148,11 @@ _kcc_sema_check_decl:
     // Resolve return type
     ldr x0, [x19, #AST_F0]         // type node
     bl _kcc_sema_resolve_type
-    // Wrap in TY_FUNC so callers see a proper function type
-    mov x1, #0                     // no param vec for now
+    // Wrap in TY_FUNC, carrying the parameter declaration list (masked of the
+    // variadic bit) so a call site can convert and classify each argument by
+    // its parameter's type.
+    ldr x1, [x19, #AST_F2]         // params pointer (bit 0 = variadic)
+    bic x1, x1, #1
     bl _kcc_type_func
     mov x21, x0                     // TY_FUNC descriptor
 
@@ -502,7 +514,7 @@ mixed-type packing and zero-width separators are not yet modelled.
     mov x21, x0
 
     ldr x0, [x19, #AST_F1]         // name_ptr
-    cbz x0, .Lscd_done
+    cbz x0, .Lscd_td_tag           // nameless (invalid): still register any tag
     mov x22, x0
     bl _kcc_strlen
     mov x1, x0
@@ -510,6 +522,24 @@ mixed-type packing and zero-width separators are not yet modelled.
     mov x2, #SYM_TYPEDEF
     mov x3, x21
     bl _kcc_symtab_declare
+
+.Lscd_td_tag:
+    // `typedef struct S {...} S;` introduces the tag `struct S` as well as the
+    // typedef name.  When the typedef's type is a struct/union/enum definition,
+    // run the ordinary tag-registration path on that type node so `struct S`
+    // resolves for later references---above all a self-referential member such
+    // as `struct S *next`, which forward-references the tag from inside the body.
+    ldr x0, [x19, #AST_F0]         // type node
+    cbz x0, .Lscd_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_STRUCT
+    b.eq .Lscd_td_tag_reg
+    cmp x1, #AST_TYPE_UNION
+    b.eq .Lscd_td_tag_reg
+    cmp x1, #AST_TYPE_ENUM
+    b.ne .Lscd_done
+.Lscd_td_tag_reg:
+    bl _kcc_sema_check_decl        // x0 = struct/union/enum type node → declares tag
     b .Lscd_done
 
 .Lscd_type_struct:

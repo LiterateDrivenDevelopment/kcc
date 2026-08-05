@@ -377,8 +377,13 @@ _kcc_ir_build_assign:
     // x0 = LHS node (from check above), x1 = struct type
     mov x21, x1                  // x21 = struct type
 
-    // Get LHS base address (must be identifier)
+    // Get LHS base address: a plain identifier's alloca, or---when the
+    // destination is a struct-typed member (`s.m = rhs`)---the member's own
+    // address.  Without the member case a struct assignment to a member emitted
+    // no copy at all, leaving the member uninitialised.
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_MEMBER
+    b.eq .Liba_sc_dst_member
     cmp x1, #AST_IDENT_EXPR
     b.ne .Liba_done
 
@@ -411,6 +416,12 @@ _kcc_ir_build_assign:
     mov x23, x0                  // x23 = dst global ref vreg
     mov x0, x22
     bl _kcc_ir_emit
+    b .Liba_sc_get_src
+
+.Liba_sc_dst_member:
+    // LHS is a struct-typed member: its GEP address is the copy destination.
+    bl _kcc_ir_build_member_addr
+    mov x23, x0                  // x23 = dst member address vreg
 
 .Liba_sc_get_src:
     // Get RHS base address: an identifier's alloca, or a struct-returning
@@ -420,6 +431,10 @@ _kcc_ir_build_assign:
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_CALL_EXPR
     b.eq .Liba_sc_src_call
+    cmp x1, #AST_MEMBER
+    b.eq .Liba_sc_src_member
+    cmp x1, #AST_UNARY_EXPR
+    b.eq .Liba_sc_src_deref
     cmp x1, #AST_IDENT_EXPR
     b.ne .Liba_done
 
@@ -452,6 +467,24 @@ _kcc_ir_build_assign:
     mov x24, x0                  // x24 = src global ref vreg
     mov x0, x22
     bl _kcc_ir_emit
+    b .Liba_sc_do_copy
+
+.Liba_sc_src_member:
+    // RHS is a struct-typed member (`dst = a.m`): its GEP address is the source.
+    bl _kcc_ir_build_member_addr
+    mov x24, x0
+    b .Liba_sc_do_copy
+
+.Liba_sc_src_deref:
+    // RHS is `*p` (a dereferenced pointer to a struct): the pointer's value IS
+    // the source struct's address, so building the pointer operand suffices.
+    ldr x1, [x0, #AST_F0]       // unary op
+    cmp x1, #TOK_STAR
+    b.ne .Liba_done
+    ldr x0, [x0, #AST_F1]       // pointer operand
+    bl _kcc_ir_build_expr
+    mov x24, x0
+    b .Liba_sc_do_copy
 
 .Liba_sc_src_call:
     // RHS is a struct-returning call: its value is the result buffer address.
@@ -555,6 +588,21 @@ The \texttt{IR\_CALL} instruction stores the callee name in
 \texttt{SRC1} and the argument array pointer in \texttt{SRC2}; the
 destination vreg receives the return value.
 
+When the callee has a prototype, each argument is converted to its
+\emph{parameter's} type before being stored (\stdref{6.5.2.2}).  We walk a
+parameter cursor (\texttt{x25}) alongside the argument list, reading the
+parameter declaration's resolved type into \texttt{x26}; the function type
+carries this list because a plain \texttt{TY\_FUNC} would otherwise forget
+it.  An integer argument passed to a \texttt{double} parameter is what makes
+this load-bearing: without the conversion the value would be marshalled in an
+integer register and reinterpreted as raw bits, so \texttt{f(42)} against
+\texttt{double~d} would pass garbage.  The conversion also drives register
+classification---once we know the parameter is \texttt{double}, the argument
+is placed in an SSE register \texttt{d0}--\texttt{d7} rather than
+\texttt{x0}--\texttt{x7}.  The cursor stops once we run past the fixed
+parameters (an unprototyped or variadic tail), where each argument keeps its
+own promoted type.
+
 The callee decides direct versus indirect dispatch.  A bare name that
 is not a local variable is a direct \texttt{IR\_CALL} by symbol.
 Anything else---a function-pointer variable, or \emph{any} other
@@ -574,11 +622,12 @@ function pointer stored in a \texttt{struct} field be called.
 .globl _kcc_ir_build_call
 .p2align 2
 _kcc_ir_build_call:
-    stp x29, x30, [sp, #-112]!
+    stp x29, x30, [sp, #-128]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #112]     // x25 = param cursor, x26 = param type
 
     str xzr, [sp, #80]            // sret result-buffer vreg (0 = none)
     mov x19, x0                   // x19 = AST_CALL_EXPR node
@@ -703,17 +752,56 @@ _kcc_ir_build_call:
     orr x0, x0, x2, lsl #32
     str x0, [x23]                // args[0] = count | (first_stack_idx << 32)
 
+    // Parameter cursor for prototyped conversion/classification.  The callee's
+    // resolved type carries the param declaration list in TY_F1 (0 when
+    // unprototyped or once variadic overflow begins); a function-pointer callee
+    // is dereferenced one level to reach the function type.
+    mov x25, #0
+    ldr x0, [sp, #72]            // callee expr node
+    cbz x0, .Libc_params_ready
+    ldr x0, [x0, #AST_F3]        // callee resolved type
+    cbz x0, .Libc_params_ready
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_FUNC
+    b.eq .Libc_params_func
+    cmp x1, #TY_PTR
+    b.ne .Libc_params_ready
+    ldr x0, [x0, #TY_F0]        // pointee
+    cbz x0, .Libc_params_ready
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_FUNC
+    b.ne .Libc_params_ready
+.Libc_params_func:
+    ldr x25, [x0, #TY_F1]       // param list
+.Libc_params_ready:
+
     // Evaluate each argument expression: store its vreg and AAPCS64 class.
     mov x24, x21                   // x24 = current arg node
     mov x21, #0                    // x21 = arg index
 .Libc_eval_args:
     cmp x21, x22
     b.ge .Libc_eval_done
-    // Classify the argument; a struct/union (class >= ST1) is passed as the
-    // address of the object, scalars/doubles by value.
-    ldr x0, [x24, #AST_F3]        // argument's resolved type
+    // Resolve this position's parameter type (x26 = 0 for variadic overflow or
+    // an unprototyped callee), advancing the param cursor.
+    mov x26, #0
+    cbz x25, .Libc_ptype_done
+    ldr x0, [x25, #AST_F0]      // param type node
+    cbz x0, .Libc_ptype_adv
+    bl _kcc_sema_resolve_type
+    mov x26, x0                 // x26 = parameter type
+.Libc_ptype_adv:
+    ldr x25, [x25, #AST_F4]     // advance param cursor
+.Libc_ptype_done:
+    // Classify by the parameter type when known (so an int passed to a double
+    // parameter lands in an SSE register), else by the argument's own type.
+    cbnz x26, .Libc_classify_param
+    ldr x0, [x24, #AST_F3]      // argument's resolved type
+    b .Libc_classify_go
+.Libc_classify_param:
+    mov x0, x26
+.Libc_classify_go:
     bl _kcc_ir_classify_type
-    str x0, [sp, #104]           // stash class (total count no longer needed)
+    str x0, [sp, #104]           // stash class
     cmp x0, #2
     b.lt .Libc_eval_scalar
     mov x0, x24
@@ -722,6 +810,11 @@ _kcc_ir_build_call:
 .Libc_eval_scalar:
     mov x0, x24
     bl _kcc_ir_build_expr          // returns vreg in x0
+    // Convert the argument to the parameter type (int<->double) when prototyped.
+    cbz x26, .Libc_eval_store
+    ldr x1, [x24, #AST_F3]      // from = argument type
+    mov x2, x26                 // to = parameter type
+    bl _kcc_ir_convert
 .Libc_eval_store:
     lsl x1, x21, #1              // index*2
     add x1, x1, #1             // 1 + index*2
@@ -833,10 +926,11 @@ _kcc_ir_build_call:
     cbz x1, .Libc_epilogue
     sub x0, x1, #1              // recover real buffer vreg
 .Libc_epilogue:
+    ldp x25, x26, [sp, #112]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #112
+    ldp x29, x30, [sp], #128
     ret
 @| _kcc_ir_build_call
 @}

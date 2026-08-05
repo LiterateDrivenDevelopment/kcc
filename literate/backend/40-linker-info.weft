@@ -393,7 +393,7 @@ _kcc_linker_global_sym:
     mov x0, x19                   // name
     mov x1, #2                    // section = 2 (DATA)
     mov x2, x21                   // value = offset in data section
-    mov x3, #0                    // flags
+    mov x3, #(N_SECT | N_EXT)     // flags = defined + external (so other TUs link)
     bl _kcc_linker_add_sym
     mov x21, x0                   // sym_index
 

@@ -650,6 +650,126 @@ fall-through branches between consecutive labels when the preceding
 block is not yet terminated.
 
 @d IR: build switch @{
+// -- kcc_eval_const_int ---------------------------------------------------
+// int64_t kcc_eval_const_int(node *n)
+//   Evaluate an integer constant expression (\stdref{6.6}) far enough for a
+//   switch case value: literals, parentheses, casts, and the common unary and
+//   binary integer operators.  A case value like `1 << 5` or `cJSON_True` is
+//   not a bare AST_INT_LIT, so reading its value field directly gave the wrong
+//   number and the case never matched.  Unsupported shapes evaluate to 0.
+.text
+.p2align 2
+_kcc_eval_const_int:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    cbz x0, .Lec_zero
+    mov x19, x0
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_INT_LIT
+    b.eq .Lec_lit
+    cmp x0, #AST_CHAR_LIT
+    b.eq .Lec_lit
+    cmp x0, #AST_PAREN_EXPR
+    b.eq .Lec_paren
+    cmp x0, #AST_CAST_EXPR
+    b.eq .Lec_cast
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Lec_unary
+    cmp x0, #AST_BINARY_EXPR
+    b.eq .Lec_binary
+.Lec_zero:
+    mov x0, #0
+    b .Lec_ret
+.Lec_lit:
+    ldr x0, [x19, #AST_F0]
+    b .Lec_ret
+.Lec_paren:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_eval_const_int
+    b .Lec_ret
+.Lec_cast:
+    ldr x0, [x19, #AST_F1]      // value of the cast operand (type ignored)
+    bl _kcc_eval_const_int
+    b .Lec_ret
+.Lec_unary:
+    ldr x20, [x19, #AST_F0]     // op
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_eval_const_int
+    cmp x20, #TOK_MINUS
+    b.ne .Lec_un_tilde
+    neg x0, x0
+    b .Lec_ret
+.Lec_un_tilde:
+    cmp x20, #TOK_TILDE
+    b.ne .Lec_un_bang
+    mvn x0, x0
+    b .Lec_ret
+.Lec_un_bang:
+    cmp x20, #TOK_BANG
+    b.ne .Lec_ret               // +x, *x, &x → value unchanged
+    cmp x0, #0
+    cset x0, eq
+    b .Lec_ret
+.Lec_binary:
+    ldr x20, [x19, #AST_F0]     // op
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_eval_const_int
+    mov x21, x0                 // lhs value
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_eval_const_int
+    mov x1, x0                  // rhs value
+    mov x0, x21                 // lhs value
+    cmp x20, #TOK_PLUS
+    b.eq .Lec_add
+    cmp x20, #TOK_MINUS
+    b.eq .Lec_sub
+    cmp x20, #TOK_STAR
+    b.eq .Lec_mul
+    cmp x20, #TOK_SLASH
+    b.eq .Lec_div
+    cmp x20, #TOK_PERCENT
+    b.eq .Lec_mod
+    cmp x20, #TOK_SHL
+    b.eq .Lec_shl
+    cmp x20, #TOK_SHR
+    b.eq .Lec_shr
+    cmp x20, #TOK_AMP
+    b.eq .Lec_and
+    cmp x20, #TOK_PIPE
+    b.eq .Lec_or
+    cmp x20, #TOK_CARET
+    b.eq .Lec_xor
+    b .Lec_zero
+.Lec_add:  add x0, x0, x1
+    b .Lec_ret
+.Lec_sub:  sub x0, x0, x1
+    b .Lec_ret
+.Lec_mul:  mul x0, x0, x1
+    b .Lec_ret
+.Lec_div:  cbz x1, .Lec_zero
+    sdiv x0, x0, x1
+    b .Lec_ret
+.Lec_mod:  cbz x1, .Lec_zero
+    sdiv x2, x0, x1
+    msub x0, x2, x1, x0
+    b .Lec_ret
+.Lec_shl:  lsl x0, x0, x1
+    b .Lec_ret
+.Lec_shr:  asr x0, x0, x1
+    b .Lec_ret
+.Lec_and:  and x0, x0, x1
+    b .Lec_ret
+.Lec_or:   orr x0, x0, x1
+    b .Lec_ret
+.Lec_xor:  eor x0, x0, x1
+.Lec_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- kcc_ir_build_switch --------------------------------------------------
 // void kcc_ir_build_switch(node *stmt)
 //   x0 = AST_SWITCH_STMT (F0=expr, F1=compound body)
@@ -683,6 +803,52 @@ _kcc_ir_build_switch:
 
     mov x22, #0                  // x22 = default_bb (null)
 
+    // -- Pass 0: flatten stacked labels --
+    // `case A: case B: body` nests B inside A's statement field (the parser
+    // makes the label's statement the next label), but the passes below walk
+    // only the F4 sibling chain.  Splice each nested case/default out as a
+    // sibling---its own empty, fall-through label---so every stacked label gets
+    // a dispatch entry.  Without this only the outermost label matched.
+    mov x24, x23
+.Lsw_flat:
+    cbz x24, .Lsw_flat_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.eq .Lsw_flat_case
+    cmp x0, #AST_DEFAULT_STMT
+    b.eq .Lsw_flat_default
+    b .Lsw_flat_next
+.Lsw_flat_case:
+    ldr x1, [x24, #AST_F1]      // case body statement
+    b .Lsw_flat_check
+.Lsw_flat_default:
+    ldr x1, [x24, #AST_F0]      // default body statement
+.Lsw_flat_check:
+    cbz x1, .Lsw_flat_next
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_CASE_STMT
+    b.eq .Lsw_flat_splice
+    cmp x2, #AST_DEFAULT_STMT
+    b.ne .Lsw_flat_next
+.Lsw_flat_splice:
+    ldr x2, [x24, #AST_F4]      // outer label's current next sibling
+    str x2, [x1, #AST_F4]       // nested.F4 = outer.F4
+    str x1, [x24, #AST_F4]      // outer.F4 = nested
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_CASE_STMT
+    b.ne .Lsw_flat_clr_default
+    str xzr, [x24, #AST_F1]     // outer case now an empty fall-through label
+    b .Lsw_flat_advance
+.Lsw_flat_clr_default:
+    str xzr, [x24, #AST_F0]
+.Lsw_flat_advance:
+    mov x24, x1                 // reprocess the spliced label (may nest further)
+    b .Lsw_flat
+.Lsw_flat_next:
+    ldr x24, [x24, #AST_F4]
+    b .Lsw_flat
+.Lsw_flat_done:
+
     // -- Pass 1: create BBs for each case/default --
     mov x24, x23
 .Lsw_scan:
@@ -714,9 +880,10 @@ _kcc_ir_build_switch:
     cmp x0, #AST_CASE_STMT
     b.ne .Lsw_disp_next
 
-    // Get case constant value
-    ldr x0, [x24, #AST_F0]      // case expr (AST_INT_LIT)
-    ldr x25, [x0, #AST_F0]      // integer value
+    // Get case constant value (evaluate: it may be `1 << 5`, not a bare literal)
+    ldr x0, [x24, #AST_F0]      // case expr
+    bl _kcc_eval_const_int
+    mov x25, x0                 // integer value
 
     // Emit IR_CONST for case value
     mov x0, #IR_CONST
@@ -915,7 +1082,7 @@ _kcc_ir_build_switch:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #96
     ret
-@| _kcc_ir_build_switch
+@| _kcc_ir_build_switch _kcc_eval_const_int
 @}
 
 \paragraph{End-to-end tests.}

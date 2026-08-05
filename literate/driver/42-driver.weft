@@ -179,6 +179,68 @@ in semantic analysis switch on; the second pass simply skips it.  Because
 the flag is matched before the source-file fall-through, it may appear
 anywhere in the argument list without being mistaken for an input.
 
+\paragraph{The \texttt{-I} flag.}
+An include directory arrives in either of two shapes: attached,
+\texttt{-Idir}, or separated, \texttt{-I dir}.  \texttt{\_kcc\_driver\_I}
+recognises both from a two-byte \texttt{-I} prefix and reports how many
+argument slots the option occupies---one for the attached form, two for the
+separated form---so each parsing loop can register or skip it uniformly.  The
+\texttt{do\_register} argument distinguishes the roles: the counting pre-pass
+calls it with registration \emph{on} (adding the directory to the search path
+via \texttt{\_kcc\_pp\_add\_include\_dir}), while the compile pass calls it with
+registration \emph{off}, using only the returned slot count to step over the
+option.  This keeps a directory from being registered twice and localises the
+attached-vs-separated logic to one place.
+
+@d Driver: compile @{
+// -- kcc_driver_I -------------------------------------------------------------
+// uint64_t kcc_driver_I(const char *arg, const char *next, uint64_t do_register)
+//   Detect a -I option: attached "-Idir" or separated "-I dir".
+//   Returns slots consumed: 0 = not -I, 1 = attached, 2 = separated.
+//   When do_register != 0, registers the directory with the preprocessor.
+.text
+.p2align 2
+_kcc_driver_I:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                    // arg
+    mov x20, x1                    // next
+    mov x21, x2                    // do_register
+    mov x0, x19
+    adrp x1, _kcc_opt_incdir@@PAGE
+    add  x1, x1, _kcc_opt_incdir@@PAGEOFF
+    mov  x2, #2
+    bl _kcc_memcmp
+    cbnz x0, .LdI_no               // arg does not start with "-I"
+    ldrb w0, [x19, #2]
+    cbz  w0, .LdI_sep              // exactly "-I": separated form
+    // Attached "-Idir": directory is arg+2
+    cbz  x21, .LdI_att_ret
+    add  x0, x19, #2
+    bl _kcc_pp_add_include_dir
+.LdI_att_ret:
+    mov  x0, #1
+    b .LdI_ret
+.LdI_sep:
+    cbz  x21, .LdI_sep_ret
+    cbz  x20, .LdI_sep_ret         // no following argument to register
+    mov  x0, x20
+    bl _kcc_pp_add_include_dir
+.LdI_sep_ret:
+    mov  x0, #2
+    b .LdI_ret
+.LdI_no:
+    mov  x0, #0
+.LdI_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_driver_I
+@}
+
 @d Driver: compile @{
 // -- kcc_driver_obj_name ------------------------------------------------------
 // char *kcc_driver_obj_name(const char *src)
@@ -282,6 +344,22 @@ _kcc_driver_compile_all:
     add  x1, x1, _kcc_opt_o@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lca_scan_o
+    // -Idir / -I dir: register the include directory; not a source
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
+    add x1, x23, #1
+    cmp x1, x19
+    b.ge .Lca_scan_I_nonext
+    ldr x1, [x20, x1, lsl #3]      // argv[i+1]
+    b .Lca_scan_I_call
+.Lca_scan_I_nonext:
+    mov x1, #0
+.Lca_scan_I_call:
+    mov x2, #1                     // register the directory
+    bl _kcc_driver_I
+    cbz x0, .Lca_scan_src
+    add x23, x23, x0               // consumed 1 or 2 slots
+    b .Lca_scan
+.Lca_scan_src:
     add x22, x22, #1               // a source
     add x23, x23, #1
     b .Lca_scan
@@ -333,6 +411,15 @@ _kcc_driver_compile_all:
     add  x1, x1, _kcc_opt_o@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lca_skip_o
+    // -Idir / -I dir: skip (registered in pass 1)
+    mov x0, x25
+    mov x1, #0
+    mov x2, #0                     // do not register again
+    bl _kcc_driver_I
+    cbz x0, .Lca_compile_src
+    add x23, x23, x0
+    b .Lca_loop
+.Lca_compile_src:
 
     // Output name: explicit only when there is a single source
     cmp x22, #1
@@ -579,6 +666,22 @@ _kcc_driver_link_all:
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lla_pre_g
+    // -Idir / -I dir: register the include directory
+    ldr x0, [x20, x21, lsl #3]
+    add x1, x21, #1
+    cmp x1, x19
+    b.ge .Lla_pre_I_nonext
+    ldr x1, [x20, x1, lsl #3]
+    b .Lla_pre_I_call
+.Lla_pre_I_nonext:
+    mov x1, #0
+.Lla_pre_I_call:
+    mov x2, #1                   // register the directory
+    bl _kcc_driver_I
+    cbz x0, .Lla_pre_next
+    add x21, x21, x0
+    b .Lla_pre
+.Lla_pre_next:
     add x21, x21, #1
     b .Lla_pre
 .Lla_pre_wall:
@@ -632,6 +735,15 @@ _kcc_driver_link_all:
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lla_skipopt
+    // -Idir / -I dir: skip (registered in pass 1)
+    mov x0, x27
+    mov x1, #0
+    mov x2, #0                   // do not register again
+    bl _kcc_driver_I
+    cbz x0, .Lla_src
+    add x24, x24, x0
+    b .Lla_loop
+.Lla_src:
     // A source file: derive its object name, record it, compile it.
     mov x0, x27
     bl _kcc_driver_obj_name
@@ -744,6 +856,8 @@ _kcc_opt_wall:
     .asciz "-Wall"
 _kcc_opt_g:
     .asciz "-g"
+_kcc_opt_incdir:
+    .asciz "-I"
 _kcc_driver_err_noinput:
     .asciz "kcc: error: no input files\n"
 _kcc_str_ld_argv0:

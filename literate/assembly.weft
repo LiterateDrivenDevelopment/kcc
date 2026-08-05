@@ -201,6 +201,7 @@ The directives below route code fragments to their physical assembly files under
 @<PP: undef@>
 @<PP: conditional@>
 @<PP: resolve include@>
+@<PP: include path@>
 @<PP: include@>
 @<Preprocessor: builtin headers@>
 @<PP: error directive@>
@@ -540,6 +541,77 @@ The directives below route code fragments to their physical assembly files under
 @<Driver: compile@>
 @<Driver: link@>
 @<Driver: data@>
+@}
+
+\bigskip
+\noindent\textbf{include/*.h} --- hosted library header bridges.  Unlike every
+other \texttt{@@o} target these are not assembly: they are C headers tangled to
+\texttt{tmp/include/} beside the compiler binary, where the default include
+directory finds them (\S\ref{sec:hosted-headers}).  Section markers are
+suppressed (\texttt{-s}) so the shipped headers read cleanly:
+
+@o tmp/include/stdio.h -s @{
+@<Header: stdio@>
+@}
+
+@o tmp/include/stdlib.h -s @{
+@<Header: stdlib@>
+@}
+
+@o tmp/include/string.h -s @{
+@<Header: string@>
+@}
+
+@o tmp/include/ctype.h -s @{
+@<Header: ctype@>
+@}
+
+@o tmp/include/math.h -s @{
+@<Header: math@>
+@}
+
+@o tmp/include/assert.h -s @{
+@<Header: assert@>
+@}
+
+@o tmp/include/time.h -s @{
+@<Header: time@>
+@}
+
+@o tmp/include/errno.h -s @{
+@<Header: errno@>
+@}
+
+@o tmp/include/inttypes.h -s @{
+@<Header: inttypes@>
+@}
+
+@o tmp/include/signal.h -s @{
+@<Header: signal@>
+@}
+
+@o tmp/include/setjmp.h -s @{
+@<Header: setjmp@>
+@}
+
+@o tmp/include/locale.h -s @{
+@<Header: locale@>
+@}
+
+@o tmp/include/fenv.h -s @{
+@<Header: fenv@>
+@}
+
+@o tmp/include/wchar.h -s @{
+@<Header: wchar@>
+@}
+
+@o tmp/include/wctype.h -s @{
+@<Header: wctype@>
+@}
+
+@o tmp/include/uchar.h -s @{
+@<Header: uchar@>
 @}
 
 \bigskip

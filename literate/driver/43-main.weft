@@ -52,6 +52,13 @@ _main:
     bl _kcc_arena_init
     bl _kcc_lex_kw_init
 
+    // Register the compiler's default include directory (dirname(argv[0]) +
+    // "include") once, before any file is processed and outliving the per-file
+    // preprocessor state, so the shipped hosted headers resolve with no -I.
+    // Uses the arena, so it must follow arena initialisation.
+    ldr x0, [x20]                 // argv[0] = program path
+    bl _kcc_pp_add_default_includes
+
     // Print banner
     adrp x0, _kcc_banner@@PAGE
     add  x0, x0, _kcc_banner@@PAGEOFF

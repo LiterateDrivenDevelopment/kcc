@@ -760,9 +760,23 @@ verbatim.
 
 ISO C17 requires several predefined macros (\stdref{6.10.8}).  We
 define \texttt{\_\_STDC\_\_} (1), \texttt{\_\_STDC\_VERSION\_\_}
-(201710L), and create entries for \texttt{\_\_FILE\_\_} and
-\texttt{\_\_LINE\_\_} whose expansion is handled specially by the
-preprocessor.
+(201710L), \texttt{\_\_STDC\_HOSTED\_\_} (1), and create entries for
+\texttt{\_\_FILE\_\_} and \texttt{\_\_LINE\_\_} whose expansion is handled
+specially by the preprocessor.
+
+Four further macros advertise the \emph{conditional features}
+(\stdref{6.10.8.3}) kcc does not implement.  Atomics, threads, complex
+arithmetic, and variable-length arrays are the only optional parts of the
+language; an implementation that omits one must say so by defining the
+matching \texttt{\_\_STDC\_NO\_*} macro, so that a program can test for the
+feature with \verb|#ifdef| and choose a fallback rather than fail at a missing
+header or type.  Declaring the absence is what makes the omission
+\emph{conforming} rather than a gap: kcc defines
+\texttt{\_\_STDC\_NO\_ATOMICS\_\_}, \texttt{\_\_STDC\_NO\_THREADS\_\_},
+\texttt{\_\_STDC\_NO\_COMPLEX\_\_}, and \texttt{\_\_STDC\_NO\_VLA\_\_}, each to
+\texttt{1}.  With them the compiler is fully conforming in the freestanding
+sense without ever supplying \verb|<stdatomic.h>|, \verb|<threads.h>|,
+\verb|<complex.h>|, or \verb|<tgmath.h>|.
 
 @d PP: predefined @{
 .text
@@ -796,6 +810,41 @@ _kcc_pp_predefine:
     adrp x0, _kcc_pp_pre_hosted@@PAGE
     add  x0, x0, _kcc_pp_pre_hosted@@PAGEOFF
     mov  x1, #15               // len("__STDC_HOSTED__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    // Conditional-feature macros (\stdref{6.10.8.3}): kcc supports none of
+    // atomics, threads, complex arithmetic, or variable-length arrays, so it
+    // declares each absent (= 1) rather than leaving it undefined.
+    adrp x0, _kcc_pp_pre_no_atomics@@PAGE
+    add  x0, x0, _kcc_pp_pre_no_atomics@@PAGEOFF
+    mov  x1, #19               // len("__STDC_NO_ATOMICS__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_no_threads@@PAGE
+    add  x0, x0, _kcc_pp_pre_no_threads@@PAGEOFF
+    mov  x1, #19               // len("__STDC_NO_THREADS__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_no_complex@@PAGE
+    add  x0, x0, _kcc_pp_pre_no_complex@@PAGEOFF
+    mov  x1, #19               // len("__STDC_NO_COMPLEX__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_no_vla@@PAGE
+    add  x0, x0, _kcc_pp_pre_no_vla@@PAGEOFF
+    mov  x1, #15               // len("__STDC_NO_VLA__")
     adrp x2, _kcc_pp_pre_one@@PAGE
     add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
     mov  x3, #1

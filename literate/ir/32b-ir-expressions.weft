@@ -63,6 +63,8 @@ _kcc_ir_build_expr:
     b.eq .Libe_string_lit
     cmp x0, #AST_SIZEOF_EXPR
     b.eq .Libe_sizeof
+    cmp x0, #AST_ALIGNOF_EXPR
+    b.eq .Libe_alignof
     cmp x0, #AST_SUBSCRIPT
     b.eq .Libe_subscript
     cmp x0, #AST_MEMBER
@@ -158,6 +160,11 @@ _kcc_ir_build_expr:
 .Libe_sizeof:
     mov x0, x19
     bl _kcc_ir_build_sizeof
+    b .Libe_done
+
+.Libe_alignof:
+    mov x0, x19
+    bl _kcc_ir_build_alignof
     b .Libe_done
 
 .Libe_subscript:
@@ -643,7 +650,51 @@ _kcc_ir_build_sizeof:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_ir_build_sizeof
+
+// -- kcc_ir_build_alignof -------------------------------------------------
+// uint64_t kcc_ir_build_alignof(node *expr)
+//   x0 = AST_ALIGNOF_EXPR (F0 = type node)
+// The _Alignof operator (\stdref{6.5.3.4}) mirrors sizeof but yields the
+// type's alignment: it resolves the type and emits an IR_CONST of its
+// TY_ALIGN, typed unsigned long (size_t).
+.text
+.globl _kcc_ir_build_alignof
+.p2align 2
+_kcc_ir_build_alignof:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                  // x19 = alignof node
+    ldr x0, [x19, #AST_F0]      // type node
+    bl _kcc_sema_resolve_type
+    ldr x20, [x0, #TY_ALIGN]    // x20 = alignment in bytes
+
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x21, x0
+
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x21, #IR_TYPE]     // _Alignof yields unsigned long
+
+    str x20, [x21, #IR_SRC1]    // immediate = alignment
+
+    bl _kcc_ir_next_vreg
+    str x0, [x21, #IR_DEST]
+    mov x20, x0
+
+    mov x0, x21
+    bl _kcc_ir_emit
+
+    mov x0, x20
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_sizeof _kcc_ir_build_alignof
 @}
 
 \paragraph{End-to-end tests.}

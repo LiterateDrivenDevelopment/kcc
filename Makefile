@@ -33,7 +33,7 @@ all default: build
 
 # Tangle: extract .s files from .weft literate sources
 tangle:
-	mkdir -p tmp/src tmp/tests tmp/docs tmp/selfhost
+	mkdir -p tmp/src tmp/tests tmp/docs tmp/selfhost tmp/include
 	weft kcc.weft
 
 # Assemble: compile each .s to .o

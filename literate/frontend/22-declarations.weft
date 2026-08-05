@@ -252,6 +252,19 @@ recovery with synchronisation to the next semicolon.
 and storage class keywords that precede a declarator.  It accumulates
 type information and returns both the type node and the storage class.
 
+The alignment specifier \verb|_Alignas| (\stdref{6.7.5}) may also appear
+here.  It takes a parenthesised argument---either a constant expression or a
+type name---so, unlike the bare function specifiers, the loop cannot simply
+consume a single token.  \texttt{.Ldecl\_alignas} accepts the keyword, then
+skips its argument by counting parentheses (\texttt{x24}, a callee-saved
+register the loop leaves free, holds the nesting depth across the intervening
+calls) until the matching close paren.  The requested alignment is thus
+accepted syntactically---which is what makes \verb|<stdalign.h>|'s
+\verb|alignas| usable---but honouring an over-alignment beyond the frame's
+natural guarantee would require aligning the affected stack slot and, for
+alignments past sixteen, dynamically realigning the stack pointer; that
+refinement is deferred.
+
 @d Decl: parse specifiers @{
 // -- kcc_parse_decl_specs ----------------------------------------------
 // (node*, uint64_t) kcc_parse_decl_specs(void)
@@ -305,6 +318,10 @@ _kcc_parse_decl_specs:
     b.eq .Ldecl_skip_spec
     cmp x0, #TOK__NORETURN
     b.eq .Ldecl_skip_spec
+
+    // Alignment specifier: _Alignas ( constant-expr | type-name )
+    cmp x0, #TOK__ALIGNAS
+    b.eq .Ldecl_alignas
 
     // Type specifiers
     cmp x0, #TOK_VOID
@@ -397,6 +414,37 @@ _kcc_parse_decl_specs:
 .Ldecl_skip_spec:
     // Consume and ignore (inline, _Noreturn, _Thread_local)
     bl _kcc_pp_next
+    b .Ldecl_specs_loop
+
+.Ldecl_alignas:
+    // _Alignas ( constant-expr | type-name ): accept the specifier and consume
+    // its parenthesised argument by skipping balanced tokens (x24 = paren
+    // depth; x24 is unused by the loop and preserved across the calls below).
+    // The requested alignment is accepted syntactically; enforcing over-aligned
+    // storage beyond the frame's natural guarantee is a separate refinement.
+    bl _kcc_pp_next               // consume '_Alignas'
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect          // consume '('
+    mov x24, #1                   // paren depth
+.Ldecl_alignas_skip:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Ldecl_specs_loop    // TOK_EOF (0): malformed → bail to the loop
+    cmp  x0, #TOK_LPAREN
+    b.ne .Ldecl_alignas_notlp
+    add  x24, x24, #1
+    b    .Ldecl_alignas_adv
+.Ldecl_alignas_notlp:
+    cmp  x0, #TOK_RPAREN
+    b.ne .Ldecl_alignas_adv
+    subs x24, x24, #1
+    b.eq .Ldecl_alignas_close
+.Ldecl_alignas_adv:
+    bl _kcc_pp_next
+    b .Ldecl_alignas_skip
+.Ldecl_alignas_close:
+    bl _kcc_pp_next               // consume the matching ')'
     b .Ldecl_specs_loop
 @| _kcc_parse_decl_specs
 @}

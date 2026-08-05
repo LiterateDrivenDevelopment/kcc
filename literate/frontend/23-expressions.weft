@@ -1070,27 +1070,12 @@ _kcc_parse_primary_expr:
     b .Lprimary_done
 
 .Lprimary_string:
-    // Store string pointer and length
-    adrp x0, _kcc_tok_start@@PAGE
-    add  x0, x0, _kcc_tok_start@@PAGEOFF
-    ldr  x19, [x0]               // x19 = string ptr (includes quotes)
-    adrp x0, _kcc_tok_len@@PAGE
-    add  x0, x0, _kcc_tok_len@@PAGEOFF
-    ldr  x20, [x0]               // x20 = string len
-
-    // Strip quotes: skip first char, reduce length by 2
-    add  x19, x19, #1
-    sub  x20, x20, #2
-
-    // Process escape sequences (\n → 0x0A, etc.)
-    mov x0, x19
-    mov x1, x20
-    bl _kcc_strlit_process
-    mov x19, x0
-    mov x20, x1
-
-    // Consume string
-    bl _kcc_pp_next
+    // Gather this literal and any adjacent ones (phase 6), with escapes
+    // processed; the gather consumes every string token and leaves the next
+    // token current.
+    bl _kcc_strlit_gather
+    mov x19, x0                  // concatenated ptr
+    mov x20, x1                  // total len
 
     mov x0, #AST_STR_LIT
     bl _kcc_ast_alloc

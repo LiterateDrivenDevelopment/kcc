@@ -65,6 +65,8 @@ _kcc_sema_expr:
     b.eq .Lse_cast
     cmp x20, #AST_SIZEOF_EXPR
     b.eq .Lse_sizeof
+    cmp x20, #AST_ALIGNOF_EXPR
+    b.eq .Lse_alignof
     cmp x20, #AST_COMMA_EXPR
     b.eq .Lse_comma
     cmp x20, #AST_PAREN_EXPR
@@ -155,6 +157,14 @@ _kcc_sema_expr:
     b .Lse_store
 .Lse_sizeof:
     bl _kcc_sema_expr_sizeof
+    b .Lse_store
+.Lse_alignof:
+    // _Alignof(type): validate the type; the result type is size_t.
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr  x0, [x0]
     b .Lse_store
 .Lse_comma:
     // Evaluate LHS, result is type of RHS

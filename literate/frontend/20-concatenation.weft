@@ -16,106 +16,101 @@ After Phase~5 has processed escape sequences, any sequence of adjacent
 
 \section{Algorithm}
 
-The concatenation algorithm is straightforward: when we encounter a
-string literal token, we peek ahead.  If the next token is also a
-string literal, we concatenate their contents into a new arena buffer.
-We repeat until the next token is not a string literal.
-
-The caller's token globals (\texttt{\_kcc\_tok\_start},
-\texttt{\_kcc\_tok\_len}) are updated to point at the concatenated result.
+The gather runs where the parser reduces a primary expression to a string
+literal (\S\ref{ch:expressions}).  The current token is a
+\texttt{TOK\_STRING\_LIT}; \texttt{\_kcc\_strlit\_gather} processes its escapes,
+copies the result into a growable arena buffer, then advances with
+\texttt{\_kcc\_pp\_next} and, so long as the next token is another string
+literal, appends it too.  Two points make this the right seam rather than a
+lexer-level pass.  First, using \texttt{\_kcc\_pp\_next} means an adjacent
+literal produced by a \emph{macro}---\verb|"%" PRId64 "\n"|, where
+\texttt{PRId64} expands to \texttt{"ld"}---is seen and concatenated like any
+other, which a raw lexer peek would miss.  Second, the accumulation buffer
+doubles on demand, so a concatenation of any size is handled without a fixed
+ceiling.  The loop leaves the first non-string token current, exactly as a
+plain single-literal parse would, so the caller continues unchanged.
 
 @d Concat: adjacent strings @{
-// -- Adjacent string literal concatenation -----------------------------
-// kcc_concat_strings()
-// After the preprocessor produces a token, check if the current token
-// is a string literal.  If so, peek for adjacent string literals and
-// concatenate them.
-//
-// This function is designed to be called by the parser when it sees
-// a TOK_STRING_LIT.  It consumes all adjacent string literals.
-//
-// Input:  current token globals set to a TOK_STRING_LIT
-//         x0 = pointer to start of string content (past opening quote)
-//         x1 = length of string content (excluding quotes)
-// Output: x0 = pointer to concatenated result
-//         x1 = total length
+// -- Adjacent string literal concatenation (translation phase 6) -------
+// char *_kcc_strlit_gather(uint64_t *out_len)  [x1 returned, not by pointer]
+//   On entry the current token is a TOK_STRING_LIT.  Processes it and every
+//   adjacent string literal (through macro expansion, via _kcc_pp_next),
+//   accumulating the escaped contents into one growable arena buffer.
+//   Output: x0 = buffer, x1 = total length.  The next non-string token is
+//   left current.
 .text
-.globl _kcc_concat_strings
+.globl _kcc_strlit_gather
 .p2align 2
-_kcc_concat_strings:
-    stp x29, x30, [sp, #-64]!
+_kcc_strlit_gather:
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
 
-    mov x19, x0                   // x19 = current content ptr
-    mov x20, x1                   // x20 = current content len
-
-    // Allocate a concatenation buffer — start with current content
-    // We use a generous initial size; grow via arena if needed
-    mov x0, #4096
+    mov x0, #256
     bl _kcc_arena_alloc
-    mov x21, x0                   // x21 = concat buffer base
-    mov x22, x0                   // x22 = concat cursor
+    mov x21, x0                   // buffer base
+    mov x22, #0                   // used length
+    mov x23, #256                 // capacity
 
-    // Copy first string's content
-    mov x0, x22                   // dst
-    mov x1, x19                   // src
-    mov x2, x20                   // len
+.Lgather_one:
+    // Process this literal's escapes into a fresh buffer (x24=ptr, x25=len)
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    add  x0, x0, #1               // skip opening quote
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    sub  x1, x1, #2               // content length (drop quotes)
+    bl _kcc_strlit_process
+    mov  x24, x0                  // processed ptr
+    mov  x25, x1                  // processed len
+
+    // Grow the buffer if used + len would overflow the capacity
+    add  x0, x22, x25             // need
+    cmp  x0, x23
+    b.ls .Lgather_fits
+    mov  x20, x23                 // newcap
+.Lgather_grow:
+    lsl  x20, x20, #1
+    cmp  x20, x0
+    b.lo .Lgather_grow
+    mov  x0, x20
+    bl _kcc_arena_alloc
+    mov  x19, x0                  // new base
+    mov  x0, x19
+    mov  x1, x21
+    mov  x2, x22
+    bl _kcc_memcpy               // copy the bytes so far
+    mov  x21, x19                // base = new
+    mov  x23, x20                // cap = newcap
+.Lgather_fits:
+    add  x0, x21, x22            // dst = base + used
+    mov  x1, x24                 // src = processed content
+    mov  x2, x25                 // len
     bl _kcc_memcpy
-    add x22, x22, x20            // advance cursor
+    add  x22, x22, x25           // used += len
 
-.Lconcat_peek:
-    // Save lexer state so we can un-peek if next isn't a string
-    adrp x23, _kcc_lex_cursor@@PAGE
-    add  x23, x23, _kcc_lex_cursor@@PAGEOFF
-    ldr  x24, [x23]              // x24 = saved cursor position
-
-    // Get next token
-    bl _kcc_lex_next
-
-    // Check if it's a string literal
+    // Consume this literal; continue while the next token is a string literal
+    bl _kcc_pp_next
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
-    cmp x0, #4                   // TOK_STRING_LIT = 4
-    b.ne .Lconcat_unpeek
+    cmp  x0, #TOK_STRING_LIT
+    b.eq .Lgather_one
 
-    // It's another string literal — get its content (skip opening quote)
-    adrp x0, _kcc_tok_start@@PAGE
-    add  x0, x0, _kcc_tok_start@@PAGEOFF
-    ldr  x0, [x0]                // token start (includes quote)
-    add x19, x0, #1              // skip opening "
-
-    adrp x0, _kcc_tok_len@@PAGE
-    add  x0, x0, _kcc_tok_len@@PAGEOFF
-    ldr  x20, [x0]               // token length (includes both quotes)
-    sub x20, x20, #2             // content length
-
-    // Copy this string's content
-    mov x0, x22                   // dst = cursor
-    mov x1, x19                   // src = content
-    mov x2, x20                   // len
-    bl _kcc_memcpy
-    add x22, x22, x20
-
-    b .Lconcat_peek               // check for more
-
-.Lconcat_unpeek:
-    // Restore lexer cursor — we consumed a non-string token
-    str x24, [x23]
-
-    // Return the concatenated result
-    mov x0, x21                   // buffer base
-    sub x1, x22, x21             // total length
-
+    mov  x0, x21                  // buffer base
+    mov  x1, x22                  // total length
+    ldr x25, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
-@| _kcc_concat_strings
+@| _kcc_strlit_gather
 @}
 
 \section{Data}

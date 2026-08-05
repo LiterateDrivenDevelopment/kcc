@@ -1026,6 +1026,92 @@ already in hand, so the leverage now is in usability and coverage, not speed.
       undertake it only if cross-platform support becomes an explicit goal.
 \end{enumerate}
 
+\subsection{Optional Features --- The Four Conditional Headers}
+\label{sec:conditional-features}
+
+Of the twenty-nine standard headers, \kcc{} now supplies twenty-five: the nine
+\emph{freestanding} headers embedded in the compiler and sixteen \emph{hosted}
+bridges shipped as files under \texttt{include/} and found on the \texttt{-I}
+search path (\S\ref{sec:builtin-headers}).  The four that remain absent are not
+an oversight and not a matter of writing more headers.  They are the language's
+only \emph{conditional features} (\stdref{6.10.8.3}), which the Standard
+expressly permits an implementation to omit \emph{provided it says so}---and
+\kcc{} does, predefining \texttt{\_\_STDC\_NO\_ATOMICS\_\_},
+\texttt{\_\_STDC\_NO\_THREADS\_\_}, \texttt{\_\_STDC\_NO\_COMPLEX\_\_}, and
+\texttt{\_\_STDC\_NO\_VLA\_\_}.  The compiler is therefore fully conforming in
+the freestanding sense without them.  What each would \emph{cost}, should
+hosted-complete C17 ever become a goal, is a question of compiler and runtime
+work, not header text---each is a language or library subsystem.
+
+\begin{center}
+\small
+\begin{tabular}{@@{}lll@@{}}
+\hline
+\textbf{Feature} & \textbf{What it requires} & \textbf{Effort}\\
+\hline
+\texttt{tgmath.h} (real-only) & \_Generic header \(+\) libm \texttt{f}/\texttt{l} protos & low\\
+\texttt{threads.h}            & pthreads shim \(+\) TLS (\texttt{\_Thread\_local}) & medium\\
+\texttt{stdatomic.h}          & \_Atomic type \(+\) LSE/LL-SC selection            & medium--high\\
+\texttt{complex.h}            & complex type class \(+\) conversions \(+\) ABI      & high\\
+\hline
+\end{tabular}
+\end{center}
+
+\paragraph{\texttt{<complex.h>} and \_Complex --- the largest.}
+A complex value is a pair of floats with its own arithmetic.  It needs a new
+type class in the type system (\texttt{float}/\texttt{double\ \_Complex}) and
+an extension of the usual arithmetic conversions (\stdref{6.3.1.8}) so that a
+real operand promotes to complex; a parser specifier and the \texttt{I} macro;
+codegen for addition and subtraction (componentwise, easy), multiplication
+(\(ac-bd\) and \(ad+bc\)), and division with the NaN/infinity rules of
+\stdref{Annex\ G} (hard); and the AAPCS64 mapping, under which
+\texttt{double\ \_Complex} travels as a two-member aggregate in
+\texttt{v0}/\texttt{v1} and returns there.  The library functions
+(\texttt{cabs}, \texttt{csqrt}, \texttt{cexp}) then bridge to
+\texttt{libSystem}, but only once the type matches that ABI exactly.  This is
+weeks of work, and it is the prerequisite for a \emph{conforming}
+\texttt{<tgmath.h>}.
+
+\paragraph{\texttt{<tgmath.h>} --- the cheapest, with an asterisk.}
+Type-generic macros dispatch \texttt{sqrt(x)} to \texttt{sqrtf}/\texttt{sqrt}/%
+\texttt{sqrtl} by argument type.  Because \kcc{} already has \texttt{\_Generic},
+a \emph{real-only} \texttt{<tgmath.h>} is nearly free: a header of
+\texttt{\_Generic} macros plus prototypes for the \texttt{f}/\texttt{l}
+variants in \texttt{libm}.  A \emph{conforming} \texttt{<tgmath.h>}, however,
+must also dispatch to the complex variants, so full support depends on
+\texttt{<complex.h>}.
+
+\paragraph{\texttt{<stdatomic.h>} and \_Atomic --- medium to high.}
+The \texttt{\_Atomic} qualifier and specifier form (\texttt{\_Atomic\ T} and
+\texttt{\_Atomic(T)}) enter the type system, and---the real work---codegen must
+emit genuine atomic instructions.  Apple Silicon offers the LSE atomics
+(\texttt{CAS}, \texttt{LDADD}, \texttt{SWP}) alongside the load/store-exclusive
+(\texttt{LDXR}/\texttt{STXR}) loop, and each memory order
+(acquire/release/seq\_cst) selects the matching barrier variant.  The header
+(\texttt{atomic\_*}, \texttt{memory\_order}, \texttt{atomic\_flag}, the
+\texttt{..\_LOCK\_FREE} macros) is the small part; a new family of ordered
+atomic operations in the instruction selector is the large one.  Faking them as
+plain operations would be a lie the moment real concurrency appears.
+
+\paragraph{\texttt{<threads.h>} --- mostly a runtime shim.}
+The subtlety here is that macOS never shipped the C11 threads library---only
+pthreads---so there is no \texttt{libSystem} symbol to bridge to (the system
+\texttt{clang} likewise lacks \texttt{<threads.h>}, exactly as it lacks
+\texttt{<uchar.h>}).  Support therefore means \emph{writing an
+implementation}: wrapping \texttt{thrd\_create} onto \texttt{pthread\_create},
+\texttt{mtx\_*} onto \texttt{pthread\_mutex\_*}, and so on---real code, not a
+header---plus \texttt{\_Thread\_local}/TLS, which \kcc{} does not yet model.
+
+\paragraph{Recommendation.}
+None of the four is required, and none should be stubbed: a stub would falsely
+advertise support the \texttt{\_\_STDC\_NO\_*} macros correctly deny.  Were
+\kcc{} to pursue hosted completeness, the order by value is \texttt{complex}
+first (the most C-language-like, and it unlocks \texttt{tgmath}), then
+\texttt{stdatomic} (real concurrency); \texttt{threads} is largely glue to
+pthreads, and a real-only \texttt{tgmath} is a quick, non-conforming
+convenience.  All of it is orthogonal to, and lower priority than, the second
+target (\S\ref{sec:goforward}, item~10).
+
 \subsection{Stage 9a --- Complete Type System}
 
 The backend began with integer types only; \texttt{double} floating

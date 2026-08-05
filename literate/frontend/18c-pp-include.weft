@@ -14,19 +14,23 @@ processing continues in the including file.
 \paragraph{Locating the file.}
 A quoted include is resolved (\stdref{6.10.2}) relative to the
 directory of the file that contains the directive, then---failing
-that---by the name as given, which the operating system interprets
-against the current working directory.  This is what allows a project
+that---by the name as given (which the operating system interprets
+against the current working directory), and finally along an ordered
+list of \emph{include directories}.  This is what allows a project
 header to sit beside the \texttt{.c} file that includes it regardless
-of where the compiler was invoked.  \texttt{\_kcc\_pp\_resolve\_include}
-performs the search: it splices the directory prefix of the current
-source path onto the include name, probes that candidate with a
-throwaway \texttt{open}, and returns the first path that exists (or the
-bare name as a last resort).  A \texttt{\_kcc\_pp\_file\_exists} helper
-wraps the probe, relying on \texttt{\_kcc\_sys\_open} returning $-1$ for
-a file that cannot be opened.  Angle-bracket includes are resolved the
-same way for now; a dedicated system search path (\texttt{-I}
-directories) is left to Phase~9.  A quoted include that resolves nowhere
-is a hard error, but a missing \emph{system} header
+of where the compiler was invoked, while library headers are found on
+the search path.  \texttt{\_kcc\_pp\_resolve\_include} performs the
+search: it splices the directory prefix of the current source path onto
+the include name, probes that candidate with a throwaway \texttt{open},
+and---failing the including directory and the bare name---walks the
+include-directory list, joining each directory to the name and probing
+in turn, returning the first path that exists.  A
+\texttt{\_kcc\_pp\_file\_exists} helper wraps the probe, relying on
+\texttt{\_kcc\_sys\_open} returning $-1$ for a file that cannot be
+opened.  Angle-bracket includes are resolved the same way; the list is
+populated by \texttt{-I} directories and by the compiler's own default
+directory (\S\ref{sec:include-path}).  A quoted include that resolves
+nowhere is a hard error, but a missing \emph{system} header
 (\texttt{\#include <\dots>}) is silently skipped: \kcc{} is freestanding
 and supplies what such headers would declare---for instance the
 \texttt{va\_*} variadic built-ins---directly, so a program that writes
@@ -115,9 +119,48 @@ _kcc_pp_resolve_include:
 .Lri_raw:
     mov x0, x19
     bl _kcc_pp_file_exists
-    cbz x0, .Lri_none
+    cbz x0, .Lri_search
     mov x0, x19
     b .Lri_done
+
+.Lri_search:
+    // Walk the include-directory list: join each dir (stored with a trailing
+    // '/') to the name and probe.  x19=name, x20=namelen are still live.
+    mov x22, #0                  // i
+.Lri_search_loop:
+    adrp x0, _kcc_inc_ndirs@@PAGE
+    add  x0, x0, _kcc_inc_ndirs@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x22, x0
+    b.hs .Lri_none
+    adrp x0, _kcc_inc_dirs@@PAGE
+    add  x0, x0, _kcc_inc_dirs@@PAGEOFF
+    ldr  x23, [x0, x22, lsl #3]  // dir[i]
+    mov  x0, x23
+    bl _kcc_strlen
+    mov  x21, x0                 // dirlen
+    add  x0, x21, x20
+    add  x0, x0, #1
+    bl _kcc_arena_alloc
+    mov  x24, x0                 // candidate = dir + name + null
+    mov  x0, x24
+    mov  x1, x23
+    mov  x2, x21
+    bl _kcc_memcpy
+    add  x0, x24, x21
+    mov  x1, x19
+    mov  x2, x20
+    bl _kcc_memcpy
+    add  x0, x24, x21
+    strb wzr, [x0, x20]
+    mov  x0, x24
+    bl _kcc_pp_file_exists
+    cbz  x0, .Lri_search_next
+    mov  x0, x24
+    b .Lri_done
+.Lri_search_next:
+    add  x22, x22, #1
+    b .Lri_search_loop
 
 .Lri_none:
     mov x0, #0
@@ -129,6 +172,128 @@ _kcc_pp_resolve_include:
     ldp x29, x30, [sp], #64
     ret
 @}
+
+\subsection{The include search path}
+\label{sec:include-path}
+
+The list that \texttt{\_kcc\_pp\_resolve\_include} walks is a fixed-capacity
+array of directory strings, each normalised to carry a trailing slash so a
+candidate path is a plain concatenation.  Two entry points populate it.
+\texttt{\_kcc\_pp\_add\_include\_dir} appends one directory, appending the
+slash if the caller's string lacks it; the driver calls it for every
+\texttt{-I} argument.  \texttt{\_kcc\_pp\_add\_default\_includes} registers the
+compiler's \emph{own} directory: given \texttt{argv[0]} it takes the prefix up
+to the last slash---the directory the \texttt{kcc} binary was run from---and
+appends \texttt{include}, yielding the sibling \texttt{include/} folder that
+ships beside the executable.  This is where the hosted library headers
+(\S\ref{sec:builtin-headers}) live as ordinary files, so
+\verb|#include <stdio.h>| resolves with no configuration.  Because both
+functions write to a driver-lifetime global rather than to per-file
+preprocessor state, the path is registered once at startup and survives every
+translation unit.  The default directory is added last, after any \texttt{-I}
+directories, so a user's \texttt{-I} always takes precedence over the shipped
+headers.
+
+@d PP: include path @{
+.text
+// -- _kcc_pp_add_include_dir ----------------------------------------
+// void _kcc_pp_add_include_dir(const char *dir)
+//   Appends dir (normalised with a trailing '/') to the include search list.
+//   Silently ignored once the fixed-size list is full.
+.globl _kcc_pp_add_include_dir
+.p2align 2
+_kcc_pp_add_include_dir:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // dir
+    adrp x0, _kcc_inc_ndirs@@PAGE
+    add  x0, x0, _kcc_inc_ndirs@@PAGEOFF
+    ldr  x22, [x0]               // count
+    cmp  x22, #64
+    b.hs .Ladd_done
+    mov  x0, x19
+    bl _kcc_strlen
+    mov  x21, x0                 // dirlen
+    add  x0, x21, #2             // '/' + null
+    bl _kcc_arena_alloc
+    mov  x20, x0                 // buf
+    mov  x0, x20
+    mov  x1, x19
+    mov  x2, x21
+    bl _kcc_memcpy
+    mov  w0, #'/'
+    strb w0, [x20, x21]
+    add  x0, x21, #1
+    strb wzr, [x20, x0]
+    adrp x0, _kcc_inc_dirs@@PAGE
+    add  x0, x0, _kcc_inc_dirs@@PAGEOFF
+    str  x20, [x0, x22, lsl #3]
+    add  x22, x22, #1
+    adrp x0, _kcc_inc_ndirs@@PAGE
+    add  x0, x0, _kcc_inc_ndirs@@PAGEOFF
+    str  x22, [x0]
+.Ladd_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- _kcc_pp_add_default_includes -----------------------------------
+// void _kcc_pp_add_default_includes(const char *argv0)
+//   Derives the compiler's own include directory as dirname(argv0) +
+//   "include" and registers it.  With no directory prefix in argv0 the bare
+//   name "include" (relative to the working directory) is used.
+.globl _kcc_pp_add_default_includes
+.p2align 2
+_kcc_pp_add_default_includes:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                  // argv0
+    mov x20, #0                  // prefixlen (through last '/')
+    mov x21, #0                  // i
+.Ladi_scan:
+    ldrb w0, [x19, x21]
+    cbz  w0, .Ladi_done
+    cmp  w0, #'/'
+    b.ne .Ladi_next
+    add  x20, x21, #1
+.Ladi_next:
+    add  x21, x21, #1
+    b .Ladi_scan
+.Ladi_done:
+    add  x0, x20, #8             // prefix + "include"(7) + null
+    bl _kcc_arena_alloc
+    mov  x22, x0                 // buf
+    mov  x0, x22
+    mov  x1, x19
+    mov  x2, x20
+    bl _kcc_memcpy              // copy dir prefix
+    add  x0, x22, x20
+    adrp x1, _kcc_str_include@@PAGE
+    add  x1, x1, _kcc_str_include@@PAGEOFF
+    mov  x2, #7
+    bl _kcc_memcpy             // append "include"
+    add  x0, x22, x20
+    strb wzr, [x0, #7]
+    mov  x0, x22
+    bl _kcc_pp_add_include_dir
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.data
+.p2align 3
+_kcc_inc_dirs:  .space 8*64      // up to 64 include directories
+_kcc_inc_ndirs: .quad 0
+.section __TEXT,__cstring
+_kcc_str_include: .asciz "include"
+.text
+@| _kcc_pp_add_include_dir _kcc_pp_add_default_includes @}
 
 @d PP: include @{
 .text
@@ -325,22 +490,54 @@ _kcc_pp_do_include:
 A freestanding compiler that simply skips \verb|#include <stdio.h>| forces
 every program to hand-declare \texttt{printf}, \texttt{malloc}, and friends.
 That is tolerable for the compiler's own bootstrap sources but hostile to
-ordinary C.  Rather than ship header \emph{files} and a search path, kcc
-embeds a small set of standard headers directly in the compiler: when the
-include machinery is asked for a recognised name it hands back a
-compiler-resident C snippet and lexes it in place of a file (the hook in
-\texttt{.Lincl\_open} above).  The snippets carry real prototypes, so the
-front end learns each function's arity and argument classes---enough to
-marshal a call correctly---and the linker resolves the symbols against
-\texttt{libSystem}.
+ordinary C.  kcc answers this in two ways, along the fault line the Standard
+itself draws.  The \emph{freestanding} headers are embedded directly in the
+compiler: when the include machinery is asked for a recognised name it hands
+back a compiler-resident C snippet and lexes it in place of a file (the hook in
+\texttt{.Lincl\_open} above).  The \emph{hosted} headers are shipped as ordinary
+files in the \texttt{include/} directory beside the binary
+(\S\ref{sec:include-path}), found on the search path like any other header.
+Either way the text carries real prototypes, so the front end learns each
+function's arity and argument classes---enough to marshal a call
+correctly---and the linker resolves the symbols against \texttt{libSystem}.
 
 The prototypes are deliberately spare: parameters are named (kcc's declarator
 parser wants a name), qualifiers are dropped (they do not affect the calling
 convention), and \texttt{size\_t}-shaped arguments are written as
 \texttt{unsigned long} so no cross-header \texttt{typedef} collides.  Each
 header carries an \verb|#ifndef| guard so double inclusion is a no-op.  The
-lookup is a linear scan of a name/text table---ten entries, so nothing
-fancier is warranted.
+embedded lookup is a linear scan of a name/text table---nine entries, one per
+freestanding header, so nothing fancier is warranted.
+
+A distinction from the Standard shapes which of these headers kcc truly
+\emph{owns}.  The \emph{freestanding} headers (\stdref{4.6})---\verb|<float.h>|,
+\verb|<iso646.h>|, \verb|<limits.h>|, \verb|<stdalign.h>|, \verb|<stdarg.h>|,
+\verb|<stdbool.h>|, \verb|<stddef.h>|, \verb|<stdint.h>|, and
+\verb|<stdnoreturn.h>|---declare no library functions; they define properties of
+the \emph{compiler} itself: type limits, \texttt{size\_t}, \texttt{va\_list},
+\texttt{offsetof}, the boolean and character macros.  A conforming
+implementation, even a freestanding one, must supply these, and it is the
+compiler---which alone knows \texttt{INT\_MAX}, \texttt{DBL\_MAX}, and the
+widths of the integer types on its target---that is obliged to.  kcc therefore
+provides all nine directly: \verb|<limits.h>| and \verb|<float.h>|
+enumerate the target's integer and floating limits (an LP64 target where
+\texttt{long} is 64~bits and \texttt{long double} equals \texttt{double}),
+\verb|<iso646.h>| the alternative operator spellings, \verb|<stdnoreturn.h>|
+the \verb|noreturn| macro, and \verb|<stdalign.h>| the \verb|alignas| and
+\verb|alignof| aliases for the \verb|_Alignas| and \verb|_Alignof| operators,
+which the front end now accepts (\verb|_Alignof| yields the type's alignment as
+an \texttt{unsigned long} constant; \verb|_Alignas| is consumed as a declaration
+specifier and its argument accepted, though over-aligning storage beyond the
+frame's natural guarantee is not yet enforced).  The remaining standard
+headers---\verb|<stdio.h>|, \verb|<stdlib.h>|, \verb|<string.h>|,
+\verb|<math.h>|, \verb|<ctype.h>|, \verb|<assert.h>|---are \emph{hosted} headers
+that properly belong to the C library, not the compiler.  kcc supplies spare
+prototypes for them only as a convenience bridge so the symbols resolve against
+\texttt{libSystem} at link time; rather than bake them into the binary, it
+ships them as the ordinary \texttt{.h} files below, tangled to
+\texttt{include/}.  Adding another hosted bridge---\verb|<time.h>|,
+\verb|<errno.h>|---is then a matter of writing a file, not editing the
+compiler: a new header fragment and its \texttt{@@o} route, no assembly.
 
 The standard streams \texttt{stdin}, \texttt{stdout}, and \texttt{stderr} are
 included.  They are not functions but \emph{data} objects imported from
@@ -382,16 +579,15 @@ _kcc_pp_builtin_header:
     ret
 
 .section __TEXT,__cstring
-_kcc_hdr_n_stdio:   .asciz "stdio.h"
-_kcc_hdr_n_stdlib:  .asciz "stdlib.h"
-_kcc_hdr_n_string:  .asciz "string.h"
 _kcc_hdr_n_stddef:  .asciz "stddef.h"
 _kcc_hdr_n_stdbool: .asciz "stdbool.h"
 _kcc_hdr_n_stdarg:  .asciz "stdarg.h"
 _kcc_hdr_n_stdint:  .asciz "stdint.h"
-_kcc_hdr_n_ctype:   .asciz "ctype.h"
-_kcc_hdr_n_math:    .asciz "math.h"
-_kcc_hdr_n_assert:  .asciz "assert.h"
+_kcc_hdr_n_limits:  .asciz "limits.h"
+_kcc_hdr_n_float:   .asciz "float.h"
+_kcc_hdr_n_iso646:  .asciz "iso646.h"
+_kcc_hdr_n_stdnoreturn: .asciz "stdnoreturn.h"
+_kcc_hdr_n_stdalign: .asciz "stdalign.h"
 
 _kcc_hdr_stddef: .asciz "#ifndef _STDDEF_H\n#define _STDDEF_H\ntypedef unsigned long size_t;\ntypedef long ptrdiff_t;\n#define NULL ((void*)0)\n#endif\n"
 
@@ -401,33 +597,411 @@ _kcc_hdr_stdarg: .asciz "#ifndef _STDARG_H\n#define _STDARG_H\n#endif\n"
 
 _kcc_hdr_stdint: .asciz "#ifndef _STDINT_H\n#define _STDINT_H\ntypedef signed char int8_t;\ntypedef unsigned char uint8_t;\ntypedef short int16_t;\ntypedef unsigned short uint16_t;\ntypedef int int32_t;\ntypedef unsigned int uint32_t;\ntypedef long int64_t;\ntypedef unsigned long uint64_t;\ntypedef long intptr_t;\ntypedef unsigned long uintptr_t;\n#endif\n"
 
-_kcc_hdr_assert: .asciz "#ifndef _ASSERT_H\n#define _ASSERT_H\n#define assert(x) ((void)0)\n#endif\n"
+_kcc_hdr_limits: .asciz "#ifndef _LIMITS_H\n#define _LIMITS_H\n#define CHAR_BIT 8\n#define SCHAR_MIN (-128)\n#define SCHAR_MAX 127\n#define UCHAR_MAX 255\n#define CHAR_MIN (-128)\n#define CHAR_MAX 127\n#define MB_LEN_MAX 6\n#define SHRT_MIN (-32768)\n#define SHRT_MAX 32767\n#define USHRT_MAX 65535\n#define INT_MIN (-2147483647 - 1)\n#define INT_MAX 2147483647\n#define UINT_MAX 4294967295U\n#define LONG_MIN (-9223372036854775807L - 1)\n#define LONG_MAX 9223372036854775807L\n#define ULONG_MAX 18446744073709551615UL\n#define LLONG_MIN (-9223372036854775807LL - 1)\n#define LLONG_MAX 9223372036854775807LL\n#define ULLONG_MAX 18446744073709551615ULL\n#endif\n"
 
-_kcc_hdr_ctype: .asciz "#ifndef _CTYPE_H\n#define _CTYPE_H\nint isalpha(int c);\nint isdigit(int c);\nint isalnum(int c);\nint isspace(int c);\nint isupper(int c);\nint islower(int c);\nint ispunct(int c);\nint toupper(int c);\nint tolower(int c);\n#endif\n"
+_kcc_hdr_float: .asciz "#ifndef _FLOAT_H\n#define _FLOAT_H\n#define FLT_RADIX 2\n#define FLT_MANT_DIG 24\n#define DBL_MANT_DIG 53\n#define LDBL_MANT_DIG 53\n#define FLT_DIG 6\n#define DBL_DIG 15\n#define LDBL_DIG 15\n#define FLT_MIN_EXP (-125)\n#define DBL_MIN_EXP (-1021)\n#define LDBL_MIN_EXP (-1021)\n#define FLT_MAX_EXP 128\n#define DBL_MAX_EXP 1024\n#define LDBL_MAX_EXP 1024\n#define FLT_EPSILON 1.19209290e-7F\n#define DBL_EPSILON 2.2204460492503131e-16\n#define LDBL_EPSILON 2.2204460492503131e-16\n#define FLT_MIN 1.17549435e-38F\n#define DBL_MIN 2.2250738585072014e-308\n#define LDBL_MIN 2.2250738585072014e-308\n#define FLT_MAX 3.40282347e+38F\n#define DBL_MAX 1.7976931348623157e+308\n#define LDBL_MAX 1.7976931348623157e+308\n#define DECIMAL_DIG 17\n#endif\n"
 
-_kcc_hdr_math: .asciz "#ifndef _MATH_H\n#define _MATH_H\ndouble sqrt(double x);\ndouble pow(double x, double y);\ndouble sin(double x);\ndouble cos(double x);\ndouble tan(double x);\ndouble exp(double x);\ndouble log(double x);\ndouble fabs(double x);\ndouble floor(double x);\ndouble ceil(double x);\ndouble fmod(double x, double y);\n#endif\n"
+_kcc_hdr_iso646: .asciz "#ifndef _ISO646_H\n#define _ISO646_H\n#define and &&\n#define and_eq &=\n#define bitand &\n#define bitor |\n#define compl ~\n#define not !\n#define not_eq !=\n#define or ||\n#define or_eq |=\n#define xor ^\n#define xor_eq ^=\n#endif\n"
 
-_kcc_hdr_string: .asciz "#ifndef _STRING_H\n#define _STRING_H\nunsigned long strlen(char *s);\nint strcmp(char *a, char *b);\nint strncmp(char *a, char *b, unsigned long n);\nchar *strcpy(char *d, char *s);\nchar *strncpy(char *d, char *s, unsigned long n);\nchar *strcat(char *d, char *s);\nchar *strncat(char *d, char *s, unsigned long n);\nchar *strchr(char *s, int c);\nchar *strrchr(char *s, int c);\nchar *strstr(char *h, char *n);\nvoid *memcpy(void *d, void *s, unsigned long n);\nvoid *memmove(void *d, void *s, unsigned long n);\nvoid *memset(void *d, int c, unsigned long n);\nint memcmp(void *a, void *b, unsigned long n);\n#endif\n"
+_kcc_hdr_stdnoreturn: .asciz "#ifndef _STDNORETURN_H\n#define _STDNORETURN_H\n#define noreturn _Noreturn\n#define __noreturn_is_defined 1\n#endif\n"
 
-_kcc_hdr_stdlib: .asciz "#ifndef _STDLIB_H\n#define _STDLIB_H\nvoid *malloc(unsigned long size);\nvoid *calloc(unsigned long n, unsigned long size);\nvoid *realloc(void *ptr, unsigned long size);\nvoid free(void *ptr);\nvoid exit(int status);\nvoid abort(void);\nint atoi(char *s);\nlong atol(char *s);\nint abs(int x);\nlong labs(long x);\nint rand(void);\nvoid srand(unsigned int seed);\n#endif\n"
-
-_kcc_hdr_stdio: .asciz "#ifndef _STDIO_H\n#define _STDIO_H\ntypedef void FILE;\nextern FILE *__stdinp;\nextern FILE *__stdoutp;\nextern FILE *__stderrp;\n#define stdin __stdinp\n#define stdout __stdoutp\n#define stderr __stderrp\nint printf(char *fmt, ...);\nint fprintf(FILE *stream, char *fmt, ...);\nint sprintf(char *str, char *fmt, ...);\nint snprintf(char *str, unsigned long size, char *fmt, ...);\nint puts(char *s);\nint putchar(int c);\nint fputs(char *s, FILE *stream);\nint fputc(int c, FILE *stream);\nint getchar(void);\nint scanf(char *fmt, ...);\nint sscanf(char *str, char *fmt, ...);\nFILE *fopen(char *path, char *mode);\nint fclose(FILE *stream);\nunsigned long fread(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nunsigned long fwrite(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nint fflush(FILE *stream);\nint fgetc(FILE *stream);\nchar *fgets(char *s, int n, FILE *stream);\nint remove(char *path);\n#endif\n"
+_kcc_hdr_stdalign: .asciz "#ifndef _STDALIGN_H\n#define _STDALIGN_H\n#define alignas _Alignas\n#define alignof _Alignof\n#define __alignas_is_defined 1\n#define __alignof_is_defined 1\n#endif\n"
 
 .data
 .align 3
 _kcc_pp_builtin_table:
-    .quad _kcc_hdr_n_stdio,   _kcc_hdr_stdio
-    .quad _kcc_hdr_n_stdlib,  _kcc_hdr_stdlib
-    .quad _kcc_hdr_n_string,  _kcc_hdr_string
     .quad _kcc_hdr_n_stddef,  _kcc_hdr_stddef
     .quad _kcc_hdr_n_stdbool, _kcc_hdr_stdbool
     .quad _kcc_hdr_n_stdarg,  _kcc_hdr_stdarg
     .quad _kcc_hdr_n_stdint,  _kcc_hdr_stdint
-    .quad _kcc_hdr_n_ctype,   _kcc_hdr_ctype
-    .quad _kcc_hdr_n_math,    _kcc_hdr_math
-    .quad _kcc_hdr_n_assert,  _kcc_hdr_assert
+    .quad _kcc_hdr_n_limits,  _kcc_hdr_limits
+    .quad _kcc_hdr_n_float,   _kcc_hdr_float
+    .quad _kcc_hdr_n_iso646,  _kcc_hdr_iso646
+    .quad _kcc_hdr_n_stdnoreturn, _kcc_hdr_stdnoreturn
+    .quad _kcc_hdr_n_stdalign, _kcc_hdr_stdalign
     .quad 0, 0
 .text
+@}
+
+\subsection{Hosted library headers (shipped as files)}
+\label{sec:hosted-headers}
+
+These are the convenience bridges the compiler no longer embeds.  Each is
+a plain header fragment routed to \texttt{include/} by \texttt{assembly.weft},
+so it lands on disk beside the binary and resolves through the default include
+directory.  They read as the C they are---no escape counting, no
+\texttt{.asciz}---which is the whole point: a hosted header is data the library
+owns, and treating it as a file rather than a string baked into the
+preprocessor makes it trivial to correct or extend.  The prototypes remain
+spare bridges, not faithful copies of the platform headers: enough for the
+front end to type each call and for the linker to bind it to \texttt{libSystem}.
+
+\verb|<stdio.h>| additionally exposes the standard streams
+\texttt{stdin}/\texttt{stdout}/\texttt{stderr} as \texttt{extern} data objects
+imported from \texttt{libSystem} (\verb|__stdinp| and friends) with the usual
+macro aliases; the back end's \texttt{IR\_GLOBAL\_REF} handler loads such a
+dylib-imported datum through the global offset table, so
+\texttt{fprintf(stderr, \ldots)} links and runs.
+
+@d Header: stdio @{
+#ifndef _STDIO_H
+#define _STDIO_H
+typedef void FILE;
+extern FILE *__stdinp;
+extern FILE *__stdoutp;
+extern FILE *__stderrp;
+#define stdin  __stdinp
+#define stdout __stdoutp
+#define stderr __stderrp
+int printf(char *fmt, ...);
+int fprintf(FILE *stream, char *fmt, ...);
+int sprintf(char *str, char *fmt, ...);
+int snprintf(char *str, unsigned long size, char *fmt, ...);
+int puts(char *s);
+int putchar(int c);
+int fputs(char *s, FILE *stream);
+int fputc(int c, FILE *stream);
+int getchar(void);
+int scanf(char *fmt, ...);
+int sscanf(char *str, char *fmt, ...);
+FILE *fopen(char *path, char *mode);
+int fclose(FILE *stream);
+unsigned long fread(void *ptr, unsigned long size, unsigned long n, FILE *stream);
+unsigned long fwrite(void *ptr, unsigned long size, unsigned long n, FILE *stream);
+int fflush(FILE *stream);
+int fgetc(FILE *stream);
+char *fgets(char *s, int n, FILE *stream);
+int remove(char *path);
+#endif
+@}
+
+@d Header: stdlib @{
+#ifndef _STDLIB_H
+#define _STDLIB_H
+void *malloc(unsigned long size);
+void *calloc(unsigned long n, unsigned long size);
+void *realloc(void *ptr, unsigned long size);
+void free(void *ptr);
+void exit(int status);
+void abort(void);
+int atoi(char *s);
+long atol(char *s);
+int abs(int x);
+long labs(long x);
+int rand(void);
+void srand(unsigned int seed);
+#endif
+@}
+
+@d Header: string @{
+#ifndef _STRING_H
+#define _STRING_H
+unsigned long strlen(char *s);
+int strcmp(char *a, char *b);
+int strncmp(char *a, char *b, unsigned long n);
+char *strcpy(char *d, char *s);
+char *strncpy(char *d, char *s, unsigned long n);
+char *strcat(char *d, char *s);
+char *strncat(char *d, char *s, unsigned long n);
+char *strchr(char *s, int c);
+char *strrchr(char *s, int c);
+char *strstr(char *h, char *n);
+void *memcpy(void *d, void *s, unsigned long n);
+void *memmove(void *d, void *s, unsigned long n);
+void *memset(void *d, int c, unsigned long n);
+int memcmp(void *a, void *b, unsigned long n);
+#endif
+@}
+
+@d Header: ctype @{
+#ifndef _CTYPE_H
+#define _CTYPE_H
+int isalpha(int c);
+int isdigit(int c);
+int isalnum(int c);
+int isspace(int c);
+int isupper(int c);
+int islower(int c);
+int ispunct(int c);
+int toupper(int c);
+int tolower(int c);
+#endif
+@}
+
+@d Header: math @{
+#ifndef _MATH_H
+#define _MATH_H
+double sqrt(double x);
+double pow(double x, double y);
+double sin(double x);
+double cos(double x);
+double tan(double x);
+double exp(double x);
+double log(double x);
+double fabs(double x);
+double floor(double x);
+double ceil(double x);
+double fmod(double x, double y);
+#endif
+@}
+
+@d Header: assert @{
+#ifndef _ASSERT_H
+#define _ASSERT_H
+#define assert(x) ((void)0)
+#endif
+@}
+
+The last two bridges show how cheap a new hosted header now is---each is a file
+and nothing else.  \verb|<errno.h>| is the interesting case on this platform:
+\texttt{errno} is not a global but a thread-local accessed through a function,
+so the macro expands to \verb|(*__error())| and the bridge declares
+\texttt{\_\_error} returning \texttt{int *}, exactly as \texttt{libSystem}
+provides it; the \texttt{E*} constants carry the BSD values macOS uses.
+\verb|<time.h>| gives \texttt{time\_t} (a \texttt{long}) and a \texttt{struct
+tm} laid out to match the platform's, including the \texttt{tm\_gmtoff} and
+\texttt{tm\_zone} tail fields so a program that reads them sees the real thing.
+
+@d Header: time @{
+#ifndef _TIME_H
+#define _TIME_H
+typedef long time_t;
+typedef long clock_t;
+struct tm {
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
+    long tm_gmtoff;
+    char *tm_zone;
+};
+time_t time(time_t *t);
+double difftime(time_t end, time_t begin);
+clock_t clock(void);
+struct tm *localtime(time_t *t);
+struct tm *gmtime(time_t *t);
+time_t mktime(struct tm *tm);
+char *asctime(struct tm *tm);
+char *ctime(time_t *t);
+unsigned long strftime(char *s, unsigned long max, char *fmt, struct tm *tm);
+#define CLOCKS_PER_SEC 1000000
+#endif
+@}
+
+@d Header: errno @{
+#ifndef _ERRNO_H
+#define _ERRNO_H
+int *__error(void);
+#define errno (*__error())
+#define EPERM 1
+#define ENOENT 2
+#define ESRCH 3
+#define EINTR 4
+#define EIO 5
+#define ENXIO 6
+#define EBADF 9
+#define ENOMEM 12
+#define EACCES 13
+#define EFAULT 14
+#define EBUSY 16
+#define EEXIST 17
+#define ENOTDIR 20
+#define EISDIR 21
+#define EINVAL 22
+#define ENOSPC 28
+#define EPIPE 32
+#define ERANGE 34
+#endif
+@}
+
+The remaining hosted headers round out the C library surface.  None is required
+of a freestanding compiler; each is a spare bridge to \texttt{libSystem}, added
+because it costs only a file.  \verb|<inttypes.h>| pulls in \verb|<stdint.h>|
+and adds the \texttt{PRI}/\texttt{SCN} format-string macros (the \texttt{ld}
+family, since this is an LP64 target) with \texttt{imaxabs} and the
+\texttt{strtoimax} pair.  \verb|<signal.h>| and \verb|<setjmp.h>| carry the
+usual handlers; the \texttt{jmp\_buf} is generously sized so \texttt{setjmp}
+never overruns it.  A caution on \verb|<setjmp.h>|: a non-\texttt{volatile}
+local modified between \texttt{setjmp} and \texttt{longjmp} has an indeterminate
+value after the long jump (\stdref{7.13.2.1})---the program must mark such
+variables \texttt{volatile}, and kcc inserts no barrier of its own.
+\verb|<locale.h>|, \verb|<fenv.h>|, and the wide-character trio
+(\verb|<wchar.h>|, \verb|<wctype.h>|, \verb|<uchar.h>|) supply the platform
+\texttt{struct}s and constants; \texttt{wint\_t} carries a private guard so the
+wide headers compose without a duplicate typedef.
+
+@d Header: inttypes @{
+#ifndef _INTTYPES_H
+#define _INTTYPES_H
+#include <stdint.h>
+typedef struct { long quot; long rem; } imaxdiv_t;
+long imaxabs(long n);
+imaxdiv_t imaxdiv(long num, long den);
+long strtoimax(char *s, char **end, int base);
+unsigned long strtoumax(char *s, char **end, int base);
+#define PRId8  "d"
+#define PRId16 "d"
+#define PRId32 "d"
+#define PRId64 "ld"
+#define PRIi64 "li"
+#define PRIu8  "u"
+#define PRIu16 "u"
+#define PRIu32 "u"
+#define PRIu64 "lu"
+#define PRIx64 "lx"
+#define PRIX64 "lX"
+#define PRIo64 "lo"
+#define PRIdPTR "ld"
+#define PRIuPTR "lu"
+#define PRIxPTR "lx"
+#endif
+@}
+
+@d Header: signal @{
+#ifndef _SIGNAL_H
+#define _SIGNAL_H
+typedef int sig_atomic_t;
+typedef void (*sig_handler_t)(int);
+sig_handler_t signal(int sig, sig_handler_t handler);
+int raise(int sig);
+#define SIG_DFL ((sig_handler_t)0)
+#define SIG_IGN ((sig_handler_t)1)
+#define SIG_ERR ((sig_handler_t)-1)
+#define SIGINT  2
+#define SIGILL  4
+#define SIGABRT 6
+#define SIGFPE  8
+#define SIGSEGV 11
+#define SIGTERM 15
+#endif
+@}
+
+@d Header: setjmp @{
+#ifndef _SETJMP_H
+#define _SETJMP_H
+typedef long jmp_buf[48];
+int setjmp(jmp_buf env);
+void longjmp(jmp_buf env, int val);
+#endif
+@}
+
+@d Header: locale @{
+#ifndef _LOCALE_H
+#define _LOCALE_H
+struct lconv {
+    char *decimal_point;
+    char *thousands_sep;
+    char *grouping;
+    char *int_curr_symbol;
+    char *currency_symbol;
+    char *mon_decimal_point;
+    char *mon_thousands_sep;
+    char *mon_grouping;
+    char *positive_sign;
+    char *negative_sign;
+    char int_frac_digits;
+    char frac_digits;
+    char p_cs_precedes;
+    char p_sep_by_space;
+    char n_cs_precedes;
+    char n_sep_by_space;
+    char p_sign_posn;
+    char n_sign_posn;
+    char int_p_cs_precedes;
+    char int_n_cs_precedes;
+    char int_p_sep_by_space;
+    char int_n_sep_by_space;
+    char int_p_sign_posn;
+    char int_n_sign_posn;
+};
+char *setlocale(int category, char *locale);
+struct lconv *localeconv(void);
+#define LC_ALL      0
+#define LC_COLLATE  1
+#define LC_CTYPE    2
+#define LC_MONETARY 3
+#define LC_NUMERIC  4
+#define LC_TIME     5
+#endif
+@}
+
+@d Header: fenv @{
+#ifndef _FENV_H
+#define _FENV_H
+typedef struct { unsigned long __fpsr; unsigned long __fpcr; } fenv_t;
+typedef unsigned long fexcept_t;
+int feclearexcept(int excepts);
+int fetestexcept(int excepts);
+int feraiseexcept(int excepts);
+int fegetround(void);
+int fesetround(int round);
+int fegetenv(fenv_t *envp);
+int fesetenv(fenv_t *envp);
+#define FE_INEXACT    0x10
+#define FE_UNDERFLOW  0x08
+#define FE_OVERFLOW   0x04
+#define FE_DIVBYZERO  0x02
+#define FE_INVALID    0x01
+#define FE_ALL_EXCEPT 0x1F
+#define FE_TONEAREST  0x00
+#define FE_UPWARD     0x01
+#define FE_DOWNWARD   0x02
+#define FE_TOWARDZERO 0x03
+#endif
+@}
+
+@d Header: wchar @{
+#ifndef _WCHAR_H
+#define _WCHAR_H
+typedef int wchar_t;
+#ifndef _WINT_T
+#define _WINT_T
+typedef int wint_t;
+#endif
+unsigned long wcslen(wchar_t *s);
+int wcscmp(wchar_t *a, wchar_t *b);
+wchar_t *wcscpy(wchar_t *d, wchar_t *s);
+wchar_t *wcscat(wchar_t *d, wchar_t *s);
+wchar_t *wcschr(wchar_t *s, wchar_t c);
+#define WEOF (-1)
+#endif
+@}
+
+@d Header: wctype @{
+#ifndef _WCTYPE_H
+#define _WCTYPE_H
+#ifndef _WINT_T
+#define _WINT_T
+typedef int wint_t;
+#endif
+typedef unsigned long wctype_t;
+int iswalpha(wint_t c);
+int iswdigit(wint_t c);
+int iswalnum(wint_t c);
+int iswspace(wint_t c);
+int iswupper(wint_t c);
+int iswlower(wint_t c);
+int iswpunct(wint_t c);
+wint_t towupper(wint_t c);
+wint_t towlower(wint_t c);
+#endif
+@}
+
+@d Header: uchar @{
+#ifndef _UCHAR_H
+#define _UCHAR_H
+typedef unsigned short char16_t;
+typedef unsigned int char32_t;
+unsigned long mbrtoc16(char16_t *pc16, char *s, unsigned long n, void *ps);
+unsigned long c16rtomb(char *s, char16_t c16, void *ps);
+unsigned long mbrtoc32(char32_t *pc32, char *s, unsigned long n, void *ps);
+unsigned long c32rtomb(char *s, char32_t c32, void *ps);
+#endif
 @}
 
 \paragraph{End-to-end tests.}

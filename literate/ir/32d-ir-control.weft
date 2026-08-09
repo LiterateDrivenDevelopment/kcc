@@ -652,12 +652,18 @@ block is not yet terminated.
 @d IR: build switch @{
 // -- kcc_eval_const_int ---------------------------------------------------
 // int64_t kcc_eval_const_int(node *n)
-//   Evaluate an integer constant expression (\stdref{6.6}) far enough for a
-//   switch case value: literals, parentheses, casts, and the common unary and
-//   binary integer operators.  A case value like `1 << 5` or `cJSON_True` is
-//   not a bare AST_INT_LIT, so reading its value field directly gave the wrong
-//   number and the case never matched.  Unsupported shapes evaluate to 0.
+//   Evaluate an integer constant expression (\stdref{6.6}): literals,
+//   parentheses, casts, sizeof, an enum-constant identifier, and the common
+//   unary and binary integer operators.  Used both for a switch case value
+//   (`1 << 5`, `cJSON_True`) and for an array declarator's size
+//   (`a[MAXABITS + 1]`, or `tmname[TM_N]` where TM_N is an enumerator); a size
+//   that is not a bare AST_INT_LIT must still be folded, or the array is sized
+//   zero and its storage collides with whatever the frame---or the enclosing
+//   struct---packs next.  An identifier is resolved through the symbol table
+//   and yields its value only when it names an enum constant; every other
+//   unsupported shape evaluates to 0.
 .text
+.globl _kcc_eval_const_int
 .p2align 2
 _kcc_eval_const_int:
     stp x29, x30, [sp, #-48]!
@@ -679,11 +685,62 @@ _kcc_eval_const_int:
     b.eq .Lec_unary
     cmp x0, #AST_BINARY_EXPR
     b.eq .Lec_binary
+    cmp x0, #AST_SIZEOF_EXPR
+    b.eq .Lec_sizeof
+    cmp x0, #AST_IDENT_EXPR
+    b.eq .Lec_ident
 .Lec_zero:
     mov x0, #0
     b .Lec_ret
 .Lec_lit:
     ldr x0, [x19, #AST_F0]
+    b .Lec_ret
+
+.Lec_ident:
+    // An identifier in an integer constant expression must name an enum
+    // constant (§6.6): look it up and yield its value.  Without this, an
+    // array size or enum initializer written in terms of an enumerator---
+    // e.g. `TString *tmname[TM_N]`---folded to 0, giving the array zero
+    // length and silently shifting every later struct field.
+    ldr x21, [x19, #AST_F0]     // name ptr
+    cbz x21, .Lec_zero
+    mov x0, x21
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x21
+    bl _kcc_symtab_lookup
+    cbz x0, .Lec_zero
+    ldr x1, [x0, #SYM_KIND]
+    cmp x1, #SYM_ENUM_CONST
+    b.ne .Lec_zero
+    ldr x0, [x0, #SYM_VALUE]
+    b .Lec_ret
+
+.Lec_sizeof:
+    // sizeof(T) → the type's byte size; sizeof(expr) → the operand's type size.
+    // F1 flags a type operand; F0 is the type node or the expression.
+    ldr x1, [x19, #AST_F1]      // is_type?
+    ldr x0, [x19, #AST_F0]      // operand
+    cbz x0, .Lec_zero
+    cbz x1, .Lec_sizeof_expr
+    bl _kcc_sema_resolve_type   // sizeof(type)
+    b .Lec_sizeof_size
+.Lec_sizeof_expr:
+    // sizeof(expr): the operand's resolved type in AST_F3.  Folding an array
+    // bound (\stdref{6.7.6.2}) runs during declaration resolution, before sema
+    // has visited the operand, so its AST_F3 may still be null; type-check it
+    // now.  Without this `unsigned int buf[sizeof(x)/sizeof(int)]` folded to a
+    // zero-length array whose under-sized alloca overran the frame's
+    // callee-save area---exactly the corruption in Lua's `l_randomizePivot`.
+    ldr x1, [x0, #AST_F3]
+    cbnz x1, .Lec_sizeof_have
+    bl _kcc_sema_expr           // resolve operand type; returns it in x0
+    b .Lec_sizeof_size
+.Lec_sizeof_have:
+    mov x0, x1
+.Lec_sizeof_size:
+    cbz x0, .Lec_zero
+    bl _kcc_type_layout         // x0 = byte size
     b .Lec_ret
 .Lec_paren:
     ldr x0, [x19, #AST_F0]

@@ -549,6 +549,7 @@ _kcc_ir_fill_param_classes:
     cbz x0, .Lfpc_next
     ldr x0, [x24, #AST_F0]       // param type spec
     bl _kcc_sema_resolve_type
+    bl _kcc_type_param_adjust     // array/function param → pointer (\stdref{6.7.6.3})
     bl _kcc_ir_classify_type
     str x0, [x22, x21, lsl #3]
     add x21, x21, #1
@@ -622,8 +623,12 @@ _kcc_ir_build_sizeof:
     bl _kcc_sema_resolve_type
 
 .Libs_sizeof_emit:
-    // x0 = type descriptor → read TY_SIZE
-    ldr x20, [x0, #TY_SIZE]     // x20 = size in bytes
+    // x0 = type descriptor.  Lay it out first: an aggregate whose size is
+    // computed lazily reports zero until kcc_type_layout runs, and nothing
+    // else triggers that when the operand is a bare type name with no object
+    // of it declared (e.g. sizeof(TValue) in a header).  Layout is idempotent.
+    bl _kcc_type_layout         // returns TY_SIZE, populating it on the way
+    mov x20, x0                 // x20 = size in bytes
 
     // Emit IR_CONST with the size value
     mov x0, #IR_CONST
@@ -669,7 +674,9 @@ _kcc_ir_build_alignof:
     mov x19, x0                  // x19 = alignof node
     ldr x0, [x19, #AST_F0]      // type node
     bl _kcc_sema_resolve_type
-    ldr x20, [x0, #TY_ALIGN]    // x20 = alignment in bytes
+    mov x20, x0                  // save the descriptor
+    bl _kcc_type_layout         // lay it out so TY_ALIGN is populated (idempotent)
+    ldr x20, [x20, #TY_ALIGN]   // x20 = alignment in bytes
 
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
@@ -867,6 +874,8 @@ $-1$ rather than $2^{32}-1$.
 _kcc_ir_store_width:
     cbz x0, .Lsw_default
     ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_FLOAT           // single precision: 4-byte FP store (code 8)
+    b.eq .Lsw_float
     cmp x1, #TY_BOOL
     b.eq .Lsw_one
     cmp x1, #TY_ENUM
@@ -890,6 +899,9 @@ _kcc_ir_store_width:
 .Lsw_one:
     mov x0, #1
     ret
+.Lsw_float:
+    mov x0, #8
+    ret
 .Lsw_default:
     mov x0, #0
     ret
@@ -904,6 +916,8 @@ _kcc_ir_load_width:
     cbz x0, .Llw_default
     ldr x1, [x0, #TY_KIND]
     ldr x2, [x0, #TY_SIZE]
+    cmp x1, #TY_FLOAT           // single precision: 4-byte FP load (code 8)
+    b.eq .Llw_float
     cmp x1, #TY_BOOL
     b.eq .Llw_unsigned
     cmp x1, #TY_ENUM
@@ -947,6 +961,9 @@ _kcc_ir_load_width:
     ret
 .Llw_u32:
     mov x0, #4
+    ret
+.Llw_float:
+    mov x0, #8
     ret
 .Llw_default:
     mov x0, #0
@@ -1004,10 +1021,26 @@ _kcc_ir_build_subscript_addr:
     b .Libsa_ptr
 
 .Libsa_nested_base:
-    // base is a[i] of a multi-dimensional array: its ADDRESS is the sub-array
-    // base (contiguous), so recurse for the address rather than loading it.
-    ldr x0, [x19, #AST_F0]
-    bl _kcc_ir_build_subscript_addr
+    // The base is itself a subscript, `X[i][...]`.  Two very different shapes
+    // share this syntax: a multi-dimensional array, where `X[i]` is a
+    // contiguous sub-array whose ADDRESS is the base; and an array/pointer of
+    // pointers, where `X[i]` is a pointer VALUE that must be loaded before the
+    // second index (`char **argv; argv[1][0]`).  Distinguish on the inner
+    // subscript's resolved type: an array decays to its address, a pointer is
+    // loaded.  Getting this wrong made `argv[i][j]` read a char through the
+    // sub-array address instead of through the stored pointer.
+    ldr x0, [x19, #AST_F0]      // inner subscript node
+    ldr x1, [x0, #AST_F3]       // its resolved type
+    cbz x1, .Libsa_nested_addr
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.ne .Libsa_nested_load
+.Libsa_nested_addr:
+    bl _kcc_ir_build_subscript_addr   // sub-array: its address is the base
+    mov x20, x0
+    b .Libsa_index
+.Libsa_nested_load:
+    bl _kcc_ir_build_expr             // pointer element: load the pointer value
     mov x20, x0
     b .Libsa_index
 
@@ -1252,11 +1285,27 @@ _kcc_ir_build_subscript_addr:
 @| _kcc_ir_build_subscript_addr
 @}
 
+Reading a subscript is the element address followed by a load---except
+when the element is itself an \emph{array} (or function).  In a
+multi-dimensional array a partial subscript, such as \texttt{g->cache[i]}
+where \texttt{cache} has type \texttt{T\,[N][M]}, denotes the $i$-th
+\emph{row}: an array \texttt{T\,[M]} that decays to a pointer to its
+first element (\stdref{6.3.2.1}) rather than being loaded.  The full
+subscript \texttt{g->cache[i][j]} never trips on this---it lowers through
+\texttt{\_kcc\_ir\_build\_subscript\_addr}, which chains the two index
+computations without an intervening load---but a partial subscript used
+as a value must return the row \emph{address}.  Loading it instead reads
+the first element as if it were a pointer and dereferences that: Lua's
+\texttt{luaS\_init} fills \texttt{g->strcache[i][j]} by first taking the
+row \texttt{g->strcache[i]}, so a load there scribbled the cache with
+garbage and \texttt{luaS\_new} later dereferenced a null slot.
+
 @d IR: build subscript @{
 // -- kcc_ir_build_subscript -----------------------------------------------
 // uint64_t kcc_ir_build_subscript(node *subscript)
 //   x0 = AST_SUBSCRIPT (F0=array, F1=index)
-// Returns vreg holding the loaded value.
+// Returns vreg holding the loaded value (or the element address for an
+// array/function element, which decays rather than loading).
 .text
 .globl _kcc_ir_build_subscript
 .p2align 2
@@ -1272,6 +1321,24 @@ _kcc_ir_build_subscript:
     bl _kcc_ir_build_subscript_addr
     mov x19, x0                  // address vreg
 
+    // Array/function element: decays to its address, no load.  A partial
+    // subscript of a multi-dim array (`g->cache[i]` → row `T[M]`) is this case.
+    ldr x1, [x20, #AST_F3]      // element type
+    cmp x1, #0x1000
+    b.lo .Libs_scalar
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.eq .Libs_decay
+    cmp x2, #TY_FUNC
+    b.ne .Libs_scalar
+.Libs_decay:
+    mov x0, x19                  // element address (array/function decay)
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Libs_scalar:
     // Element load width+sign from the subscript result (element) type —
     // covers both array and pointer element sizes now that they are packed.
     ldr x0, [x20, #AST_F3]
@@ -1413,6 +1480,19 @@ For dot access, this address is the base for \texttt{IR\_GEP}
 directly.  For arrow access on a global pointer, an additional
 \texttt{IR\_LOAD} fetches the pointer value before the GEP.
 
+Parentheses around the object are transparent: \texttt{(p->m).f} is
+\texttt{p->m.f}.  Because the object is inspected by tag to choose the
+address path (identifier, nested member, subscript) from the
+value path, a stray \texttt{AST\_PAREN\_EXPR} wrapper would slip past the
+nested-member case and fall to \texttt{build\_expr}, which \emph{loads}
+the inner aggregate and dereferences that value as if it were a pointer.
+That is exactly how \texttt{lobject.h}'s \texttt{val\_(io).i = x}---which
+expands to \texttt{((io)->value\_).i = x}---corrupted a \texttt{TValue}:
+the assignment wrote through the union's first eight bytes instead of into
+them.  So we peel any parenthesis wrappers off the object up front,
+rewriting the member node's object field to the bare inner expression
+(the parens carry no runtime meaning) before dispatching.
+
 @d IR: build member @{
 // -- kcc_ir_build_member_addr ---------------------------------------------
 // uint64_t kcc_ir_build_member_addr(node *member)
@@ -1432,6 +1512,22 @@ _kcc_ir_build_member_addr:
     str x25, [sp, #64]
 
     mov x19, x0                  // x19 = member node
+
+    // Parentheses are transparent to a member address: `(p->m).f` is `p->m.f`.
+    // Peel any AST_PAREN_EXPR off the object and rewrite the member node's
+    // object field in place, so the tag-dispatch below sees the real object
+    // (identifier / nested member / subscript) rather than a wrapper that
+    // would wrongly take the value path and load the aggregate.
+    ldr x0, [x19, #AST_F0]      // object expression
+.Libma_unparen:
+    cbz x0, .Libma_obj_ready
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Libma_obj_ready
+    ldr x0, [x0, #AST_F0]       // inner expression
+    str x0, [x19, #AST_F0]      // rewrite object → inner (parens dropped)
+    b .Libma_unparen
+.Libma_obj_ready:
 
     // Get object (struct variable) — must be an identifier
     ldr x0, [x19, #AST_F0]      // object expression
@@ -1643,11 +1739,26 @@ _kcc_ir_build_member_addr:
 @| _kcc_ir_build_member_addr
 @}
 
+Reading a member value is the address computation followed by a load:
+\texttt{\_kcc\_ir\_build\_member} calls
+\texttt{\_kcc\_ir\_build\_member\_addr} for the field's address, then
+emits an \texttt{IR\_LOAD} (or the shift-and-mask sequence for a
+bit-field).  One case must \emph{not} load, though: an \emph{array} or
+\emph{function} member decays to a pointer to its first element rather
+than being read (\stdref{6.3.2.1}).  So \texttt{s.a}, or \texttt{p->a}
+with \texttt{a} an array, yields the field address itself---the same
+value \texttt{\&s.a[0]} would.  Missing this turned \texttt{setjmp((c)->b)}
+in \texttt{luaD\_rawrunprotected}---where \texttt{b} is a \texttt{jmp\_buf}
+array member---into a load of the buffer's first eight bytes, which
+\texttt{setjmp} then used as the save area, faulting on a truncated
+address.
+
 @d IR: build member @{
 // -- kcc_ir_build_member --------------------------------------------------
 // uint64_t kcc_ir_build_member(node *member)
 //   x0 = AST_MEMBER (F0=object, F1=name_ptr, F3=field_index)
-// Returns vreg holding the loaded value.
+// Returns vreg holding the loaded value (or the field address for an
+// array/function member, which decays rather than loading).
 .text
 .globl _kcc_ir_build_member
 .p2align 2
@@ -1663,6 +1774,24 @@ _kcc_ir_build_member:
     bl _kcc_ir_build_member_addr
     mov x20, x0                  // GEP vreg (field address)
 
+    // Array/function member: decays to its address, no load (`c->b` with b a
+    // jmp_buf[] yields &c->b[0]).  Return the GEP result directly.
+    ldr x1, [x19, #AST_F3]      // field type
+    cmp x1, #0x1000
+    b.lo .Libm_bitfield_check
+    ldr x2, [x1, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.eq .Libm_decay
+    cmp x2, #TY_FUNC
+    b.ne .Libm_bitfield_check
+.Libm_decay:
+    mov x0, x20                  // field address (array/function decay)
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+.Libm_bitfield_check:
     // Bit-field?  _kcc_ir_build_member_addr published the matched field decl;
     // a non-zero packed AST_F2 means a bit-field, read by shift-and-mask.
     adrp x0, _kcc_ir_member_field@@PAGE
@@ -1822,7 +1951,10 @@ _kcc_ir_emit_binop_typed:
 // long_u binop followed by width normalisation).  Returns the result vreg,
 // typed L, ready to store.  This is what makes `d += n` (n an int) add in
 // double and `i += x` (x a double) add in double then truncate to int, exactly
-// as the equivalent `E1 = E1 OP E2` would.
+// as the equivalent `E1 = E1 OP E2` would.  When the lvalue is a pointer and
+// the operator is `+`/`-`, the right operand is first scaled by
+// \texttt{sizeof(*p)}, so `p += n` advances by whole elements exactly as
+// `p = p + n` does.
 .text
 .globl _kcc_ir_compound_apply
 .p2align 2
@@ -1837,6 +1969,59 @@ _kcc_ir_compound_apply:
     mov x21, x2                  // L (lvalue type)
     mov x22, x3                  // rhs vreg
     mov x23, x4                  // R (rhs type)
+
+    // Pointer `+=`/`-=`: scale the right operand by sizeof(pointee) so the
+    // step counts elements, not bytes (`p += n` == `p = p + n`).
+    cmp x19, #IR_ADD
+    b.eq .Lca_ptr
+    cmp x19, #IR_SUB
+    b.ne .Lca_notptr
+.Lca_ptr:
+    cmp x21, #0x1000
+    b.lo .Lca_notptr
+    ldr x0, [x21, #TY_KIND]
+    cmp x0, #TY_PTR
+    b.ne .Lca_notptr
+    ldr x0, [x21, #TY_F0]        // pointee type
+    cbz x0, .Lca_notptr
+    bl _kcc_type_layout          // x0 = sizeof(pointee)
+    cmp x0, #1
+    b.le .Lca_notptr             // stride 1 → nothing to scale
+    bl _kcc_ir_emit_const        // const stride vreg (value in x0)
+    mov x2, x0                   // stride vreg
+    mov x0, #IR_MUL
+    mov x1, x22                  // rhs
+    bl _kcc_ir_emit_binop        // rhs * stride (long_u)
+    mov x22, x0                  // scaled rhs
+.Lca_notptr:
+    // The compound-op table hands us the SIGNED opcode (SDIV/SMOD/ASHR).  For an
+    // unsigned integer lvalue the unsigned form is required: SDIV→UDIV,
+    // SMOD→UMOD, ASHR→LSHR.  Without this, `count /= (unsigned)step` in Lua's
+    // integer `forprep` ran a signed divide, so a full-range unsigned count read
+    // as −1 and the loop's trip count collapsed (`for i=mini,maxi,maxi` ran once
+    // instead of three times).  Only plain integer kinds are remapped; enum,
+    // floating, and the pointer path handled above keep the table default.
+    ldr x9, [x21, #TY_KIND]
+    cmp x9, #TY_BOOL             // 2
+    b.lo .Lca_signdone
+    cmp x9, #TY_LLONG            // 7
+    b.hi .Lca_signdone          // enum/float/aggregate → keep default
+    ldr x9, [x21, #TY_F0]       // 1 = signed, 0 = unsigned
+    cbnz x9, .Lca_signdone
+    cmp x19, #IR_SDIV
+    b.ne .Lca_chk_smod
+    mov x19, #IR_UDIV
+    b .Lca_signdone
+.Lca_chk_smod:
+    cmp x19, #IR_SMOD
+    b.ne .Lca_chk_ashr
+    mov x19, #IR_UMOD
+    b .Lca_signdone
+.Lca_chk_ashr:
+    cmp x19, #IR_ASHR
+    b.ne .Lca_signdone
+    mov x19, #IR_LSHR
+.Lca_signdone:
 
     mov x0, x21
     bl _kcc_ir_type_is_fp
@@ -2620,6 +2805,12 @@ _kcc_ir_build_ident:
     mov x1, x21                  // len
     bl _kcc_symtab_lookup
     cbz x0, .Libi_global_scalar
+    // An enumeration constant reaches here as a bare identifier (sema folds
+    // enumerators in scalar contexts but not inside an aggregate initializer's
+    // element list); emit its value as an IR_CONST, never a symbol reference.
+    ldr x2, [x0, #SYM_KIND]
+    cmp x2, #SYM_ENUM_CONST
+    b.eq .Libi_enum_const
     ldr x1, [x0, #SYM_TYPE]
     cbz x1, .Libi_global_scalar
     ldr x2, [x1, #TY_KIND]
@@ -2627,6 +2818,25 @@ _kcc_ir_build_ident:
     b.eq .Libi_global_array
     cmp x2, #TY_FUNC
     b.eq .Libi_global_array
+    b .Libi_global_scalar
+
+.Libi_enum_const:
+    ldr x22, [x0, #SYM_VALUE]    // enumerator value
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x19, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x19, #IR_TYPE]
+    str x22, [x19, #IR_SRC1]     // value
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x20, x0
+    mov x0, x19
+    bl _kcc_ir_emit
+    mov x0, x20
+    b .Libi_done
 
 .Libi_global_scalar:
     // Scalar/pointer global: emit global_ref + load.  Capture the variable's
@@ -3065,6 +3275,12 @@ _kcc_ir_build_binary:
     b.eq .Libb_u_lt
     cmp x23, #IR_CMP_SLE
     b.eq .Libb_u_le
+    cmp x23, #IR_CMP_SGT
+    b.eq .Libb_u_gt
+    cmp x23, #IR_CMP_SGE
+    b.eq .Libb_u_ge
+    cmp x23, #IR_ASHR
+    b.eq .Libb_u_shr
     b .Libb_emit_alloc
 
 .Libb_u_div:
@@ -3078,6 +3294,29 @@ _kcc_ir_build_binary:
     b .Libb_emit_alloc
 .Libb_u_le:
     mov x23, #IR_CMP_ULE
+    b .Libb_emit_alloc
+.Libb_u_gt:
+    // No unsigned-greater opcode: `a > b` (unsigned) is `b < a`, so swap the
+    // operands and emit CMP_ULT.  Without this, a size_t compare with the high
+    // bit set (e.g. near SIZE_MAX) used a signed condition and read backwards.
+    mov x0, x21
+    mov x21, x22
+    mov x22, x0
+    mov x23, #IR_CMP_ULT
+    b .Libb_emit_alloc
+.Libb_u_ge:
+    // `a >= b` (unsigned) is `b <= a`: swap operands, emit CMP_ULE.
+    mov x0, x21
+    mov x21, x22
+    mov x22, x0
+    mov x23, #IR_CMP_ULE
+    b .Libb_emit_alloc
+.Libb_u_shr:
+    // Unsigned `>>` is a LOGICAL shift (zero-fill), not arithmetic (sign-fill).
+    // A 32-bit unsigned value works either way (zero-extended, bit 63 clear),
+    // but a 64-bit unsigned with the high bit set (e.g. a hash or size_t)
+    // sign-extends wrongly under ASHR.
+    mov x23, #IR_LSHR
     b .Libb_emit_alloc
 
 .Libb_emit_alloc:
@@ -3596,7 +3835,13 @@ Address-of (\texttt{\&e}) dispatches on the shape of its operand
 rather than assuming a bare variable.  For an identifier it returns the
 storage address directly---the vreg produced by \texttt{IR\_ALLOCA}
 already holds the stack address, or a file-scope name yields an
-\texttt{IR\_GLOBAL\_REF}---so no load is needed.  For a subscript
+\texttt{IR\_GLOBAL\_REF}---so no load is needed.  When the name is not a
+local it may be a \emph{static} local hoisted to a mangled global (a
+\texttt{static const} whose address escapes, as in
+\texttt{static const T x=\ldots; return \&x;}); the global path consults
+\texttt{\_kcc\_ir\_statics} and, on a hit, emits the reference against the
+mangled symbol so the taken address resolves to the hoisted storage rather
+than a phantom unmangled \texttt{\_x}.  For a subscript
 \texttt{\&a[i]} or a member \texttt{\&s.f} it reuses the very address
 computation the assignment and load paths use
 (\texttt{build\_subscript\_addr}, \texttt{build\_member\_addr}),
@@ -3843,6 +4088,20 @@ _kcc_ir_build_unary:
     b .Libu_done
 
 .Libu_addr_global:
+    // Not a local: it may be a static local hoisted to a mangled global.
+    // Redirect the reference name onto that mangled symbol so `&x` resolves
+    // to the hoisted storage instead of a phantom unmangled `_x`.
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libu_addr_global_emit
+    mov x1, x20                  // key = source name
+    mov x2, x21                  // keylen
+    bl _kcc_ht_get
+    cbz x0, .Libu_addr_global_emit
+    mov x20, x0                  // x20 = mangled name
+
+.Libu_addr_global_emit:
     // Global: emit global_ref, return address vreg
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
@@ -3952,6 +4211,25 @@ alloca vreg.  If the identifier is not a local, it falls back to
 carries the prefix/postfix flag (1 for prefix, 0 for postfix),
 set by the parser.
 
+The \texttt{i32} in that sketch is only the \emph{default}.  The
+load-modify-store must run in the operand's own type, for two separate
+reasons.  A \emph{pointer} lvalue steps by \texttt{sizeof(pointee)} rather
+than one, and must compute in the 64-bit pointer type or the address is
+truncated.  A narrow \emph{integer} lvalue---a \texttt{char},
+\texttt{short}, or a \texttt{lu\_byte} bitcount field---must load and store
+at its real width: reading a one-byte field as a four-byte \texttt{int}
+returns the value byte glued to whatever three bytes follow it (so
+\texttt{n++} evaluates to garbage) and writing four bytes back scribbles
+the neighbours.  That is precisely what stalled Lua: its \texttt{FuncState}
+packs \texttt{nups}, \texttt{nactvar}, and \texttt{freereg} as adjacent
+\texttt{lu\_byte} counters, and \texttt{allocupvalue}'s
+\texttt{\&f->upvalues[fs->nups++]} indexed with a garbage subscript, so the
+\texttt{\_ENV} upvalue landed a megabyte away and every global read as
+\texttt{nil}.  So the builder reads the operand's resolved type and works in
+it: a pointer (stepping by the pointee size), or an integer/enum (stepping
+by one, at the true width).  Only a floating or otherwise unranked operand
+keeps the \texttt{int} default.
+
 @d IR: build increment/decrement @{
 // -- kcc_ir_build_inc_dec -------------------------------------------------
 // uint64_t kcc_ir_build_inc_dec(node *expr)
@@ -3962,21 +4240,44 @@ set by the parser.
 .globl _kcc_ir_build_inc_dec
 .p2align 2
 _kcc_ir_build_inc_dec:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
 
     mov x19, x0                  // AST node
+
+    // Parentheses are transparent to `++`/`--`: `((b)->n)++` is `(b->n)++`.
+    // This matters because macros parenthesise lvalues---Lua's
+    // `luaZ_bufflen(b)` expands to `((b)->n)`, so `luaZ_bufflen(b)++` is
+    // `((b)->n)++`.  Peel any AST_PAREN_EXPR off the operand and rewrite it in
+    // place; otherwise the operand matches no lvalue shape below and the whole
+    // operator collapses to 0 (returning vreg~0---the first parameter---which,
+    // used as `b->buffer[...]`'s index, scribbled the token buffer).
+    ldr x0, [x19, #AST_F1]
+.Libid_unparen:
+    cbz x0, .Libid_unp_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Libid_unp_done
+    ldr x0, [x0, #AST_F0]       // inner expression
+    str x0, [x19, #AST_F1]      // rewrite operand → inner (parens dropped)
+    b .Libid_unparen
+.Libid_unp_done:
+
     ldr x20, [x19, #AST_F0]     // op (TOK_INC or TOK_DEC)
     ldr x21, [x19, #AST_F2]     // prefix flag (1=prefix, 0=postfix)
 
     // Operand is an lvalue: a plain identifier, a member (`p->m++`, `s.m++`),
-    // or a subscript (`a[i]++`).  For the last two the load/store go through the
-    // member/subscript address; without them `p->m++` was a no-op (it returned
-    // 0 and never advanced the object)---which, for `input_buffer->offset++` in
-    // a recursive-descent parser, spun forever.
+    // a subscript (`a[i]++`), a dereference (`(*p)++`), or any of these wrapped
+    // in parentheses (unwrapped just above).  For member/subscript/deref the
+    // load/store go through the computed address; without them `p->m++` was a
+    // no-op (it returned 0 and never advanced the object)---which, for
+    // `input_buffer->offset++` in a recursive-descent parser, spun forever, and
+    // for `*((*fmt)++)` in Lua's `string.pack` option scanner never advanced the
+    // format pointer.
     ldr x0, [x19, #AST_F1]
     cbz x0, .Libid_zero
     ldr x1, [x0, #AST_TAG]
@@ -3984,6 +4285,8 @@ _kcc_ir_build_inc_dec:
     b.eq .Libid_member
     cmp x1, #AST_SUBSCRIPT
     b.eq .Libid_subscript
+    cmp x1, #AST_UNARY_EXPR
+    b.eq .Libid_deref
     cmp x1, #AST_IDENT_EXPR
     b.ne .Libid_zero
 
@@ -4015,6 +4318,23 @@ _kcc_ir_build_inc_dec:
     // Subscript lvalue (`a[i]++`): its element address is what we modify.
     bl _kcc_ir_build_subscript_addr
     mov x22, x0
+    b .Libid_load
+
+.Libid_deref:
+    // Dereference lvalue (`(*p)++`): the object modified is `*p`, whose address
+    // is simply the VALUE of `p`.  Build the pointer operand and use it as the
+    // load/store address---exactly as the member/subscript paths use their
+    // computed address.  Only `*` is an lvalue here; any other unary operator
+    // (`-x`, `!x`, `&x`) is not, so it falls through to the no-op.  Without this
+    // case `(*p)++` matched no shape and collapsed to 0, never writing the
+    // incremented pointer back---so a `char **fmt` walk (Lua's `string.pack`
+    // option scanner, `*((*fmt)++)`) never advanced and spun on the first byte.
+    ldr x1, [x0, #AST_F0]       // unary op token
+    cmp x1, #TOK_STAR
+    b.ne .Libid_zero
+    ldr x0, [x0, #AST_F1]       // pointer operand
+    bl _kcc_ir_build_expr
+    mov x22, x0                  // x22 = address vreg (the pointer's value)
     b .Libid_load
 @| _kcc_ir_build_inc_dec
 @}
@@ -4066,39 +4386,86 @@ the hoisted storage rather than emitting a reference to an undefined external
 @}
 
 The core read-modify-write sequence is shared by both local and global
-operands.  The four steps---load, constant~1, add or subtract, and
-store---follow directly.
+operands.  The four steps---load, constant step, add or subtract, and
+store---follow directly.  The step is \emph{one} for a scalar but
+\texttt{sizeof(*p)} for a pointer: \texttt{p++} advances by a whole
+element, exactly as \texttt{p\,+\,1} does (\stdref{6.5.6}).  For a pointer
+lvalue the whole sequence also runs in the pointer's 64-bit type, since a
+32-bit add would lop the top half off the address---the defect that made
+\texttt{L->top.p++} (Lua's per-push \texttt{api\_incr\_top}) crawl one byte
+at a time and scribble the value stack.
 
 @d IR: build increment/decrement @{
 .Libid_load:
-    // Step 1: load current value
+    // For a pointer lvalue, `++`/`--` steps by sizeof(pointee), not 1, and the
+    // load/add/store must run in the pointer's 64-bit type or a 32-bit add would
+    // truncate the address.  x26 = working type (the pointer type, else int);
+    // x25 = step amount (sizeof(pointee), else 1).  x19 is still the AST node
+    // here (Step 1 clobbers it), so read the operand type now.
+    adrp x26, _kcc_type_int_s@@PAGE
+    add  x26, x26, _kcc_type_int_s@@PAGEOFF
+    ldr  x26, [x26]              // default working type = int
+    mov  x25, #1                 // default step = 1
+    ldr  x9, [x19, #AST_F1]     // operand node
+    cbz  x9, .Libid_typed
+    ldr  x9, [x9, #AST_F3]      // operand resolved type
+    cmp  x9, #0x1000
+    b.lo .Libid_typed
+    ldr  x10, [x9, #TY_KIND]
+    cmp  x10, #TY_PTR
+    b.eq .Libid_ptr_step
+    // Integer or enum lvalue: work in the operand's OWN type so the load and
+    // store use its real width.  Hardcoding int here read four bytes from a
+    // `char`/`short` (or eight from a `long`), so a byte field's `n++`
+    // returned garbage (the value byte plus its neighbours) and clobbered the
+    // adjacent bytes on store---which broke Lua's parser, whose `lu_byte nups`,
+    // `nactvar`, and `freereg` counters all advance with `++`.
+    cmp  x10, #TY_BOOL          // 2
+    b.lo .Libid_typed          // void/invalid → keep int default
+    cmp  x10, #TY_LLONG         // 7
+    b.ls .Libid_int_width      // 2..7 = bool/char/short/int/long/llong
+    cmp  x10, #TY_ENUM          // 16
+    b.eq .Libid_int_width
+    b .Libid_typed              // float/double/aggregate → keep int default
+.Libid_int_width:
+    mov  x26, x9                 // work in the operand's integer type; step = 1
+    b .Libid_typed
+.Libid_ptr_step:
+    mov  x26, x9                 // pointer lvalue → work in the pointer type
+    ldr  x0, [x9, #TY_F0]       // pointee type
+    cbz  x0, .Libid_typed
+    bl   _kcc_type_layout        // x0 = sizeof(pointee)
+    cbz  x0, .Libid_typed
+    mov  x25, x0                 // step = sizeof(pointee)
+.Libid_typed:
+
+    // Step 1: load current value, at the operand's own width.  IR_SRC2 carries
+    // the access-size code (1/2/4 unsigned, 5/6/7 signed, 0 = 8-byte); the load
+    // codegen reads it, not IR_TYPE.  Without it a `char`/`short` field loaded
+    // as a full word and the old value dragged in the neighbouring bytes.
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x22, [x0, #IR_SRC1]     // address vreg
-    mov x19, x0
+    mov x19, x0                  // x19 = load instr (survives the calls below)
+    str x26, [x19, #IR_TYPE]
+    str x22, [x19, #IR_SRC1]     // address vreg
+    mov x0, x26
+    bl _kcc_ir_load_width        // x0 = access-size code for the working type
+    str x0, [x19, #IR_SRC2]      // access-size override
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
     mov x23, x0                  // x23 = old value vreg
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Step 2: constant 1
+    // Step 2: constant step (1, or sizeof(pointee))
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    mov x2, #1
-    str x2, [x0, #IR_SRC1]
+    str x26, [x0, #IR_TYPE]
+    str x25, [x0, #IR_SRC1]     // step amount
     mov x19, x0
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
-    mov x24, x0                  // x24 = const 1 vreg
+    mov x24, x0                  // x24 = step vreg
     mov x0, x19
     bl _kcc_ir_emit
 
@@ -4109,12 +4476,9 @@ store---follow directly.
     mov x0, #IR_SUB
 .Libid_binop:
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
+    str x26, [x0, #IR_TYPE]
     str x23, [x0, #IR_SRC1]     // old value
-    str x24, [x0, #IR_SRC2]     // const 1
+    str x24, [x0, #IR_SRC2]     // step
     mov x19, x0
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
@@ -4122,15 +4486,19 @@ store---follow directly.
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Step 4: store new value back
+    // Step 4: store new value back, at the operand's own width.  For a store
+    // the access-size code lives in IR_DEST (SRC1/SRC2 are value/address); a
+    // wide store would scribble the fields packed next to a narrow one.
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x24, [x0, #IR_SRC1]     // new value
-    str x22, [x0, #IR_SRC2]     // address
+    mov x19, x0                  // x19 = store instr
+    str x26, [x19, #IR_TYPE]
+    str x24, [x19, #IR_SRC1]     // new value
+    str x22, [x19, #IR_SRC2]     // address
+    mov x0, x26
+    bl _kcc_ir_store_width       // x0 = access-size code
+    str x0, [x19, #IR_DEST]      // access-size override
+    mov x0, x19
     bl _kcc_ir_emit
 
     // Return old (postfix) or new (prefix)
@@ -4145,10 +4513,11 @@ store---follow directly.
     mov x0, #0
 
 .Libid_done:
+    ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
 @}
 

@@ -500,6 +500,7 @@ The directives below route code fragments to their physical assembly files under
 @<CodeGen: preregister globals@>
 @<CodeGen: compile all@>
 @<CodeGen: register allocation@>
+@<CodeGen: slot colouring@>
 @<CodeGen: compile function@>
 @<CodeGen: large immediate adjust@>
 @<CodeGen: vreg slot offset@>

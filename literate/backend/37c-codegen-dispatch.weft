@@ -946,11 +946,17 @@ operands through the FP register file.  A double lives in the same
 eight-byte spill slot as any other value, so \texttt{\_kcc\_cg\_load\_vreg\_fp}
 reloads it into \texttt{d0}/\texttt{d1}, the two-source op computes into
 \texttt{d2}, and \texttt{\_kcc\_cg\_store\_vreg\_fp} spills it back.
-Comparisons reuse the integer comparison tail: after \textsc{fcmp}
-sets the flags, the very same inverted condition codes drive
-\textsc{cset}, because an \emph{ordered} floating comparison leaves
-\texttt{N}, \texttt{Z}, and \texttt{V} in exactly the arrangement the
-signed integer conditions already test.  The conversions bridge the two
+Comparisons share the \textsc{fcmp}\,+\,\textsc{cset} tail with the integer
+path, but \emph{not} the same condition codes.  A quiet \texttt{NaN} makes
+\textsc{fcmp} \emph{unordered} (\texttt{C=1, V=1}), and every IEEE comparison
+against it must yield false.  The signed-integer conditions do not honour that:
+\texttt{GE}/\texttt{GT} (used for \texttt{<}/\texttt{<=}) both fire on the
+unordered flags, so \texttt{NaN < x} and \texttt{NaN <= x} wrongly came out
+true.  The floating relations therefore use the \emph{unordered-false}
+conditions---\texttt{<} tests \texttt{MI} (via inverted \texttt{PL}) and
+\texttt{<=} tests \texttt{LS} (via inverted \texttt{HI}); \texttt{>} and
+\texttt{>=} already map to \texttt{GT}/\texttt{GE}, which reject the unordered
+case, so they were correct.  The conversions bridge the two
 register files---\textsc{scvtf} reads an integer slot and writes a
 double slot, \textsc{fcvtzs} does the reverse with round-toward-zero,
 matching C's truncating cast.
@@ -995,16 +1001,16 @@ matching C's truncating cast.
     mov x23, #0                    // NE  → inv EQ (0)
     cmp x22, #IR_CMP_NE
     b.eq .Lcgi_fcmp_do
-    mov x23, #10                   // SLT → inv GE (10)
+    mov x23, #5                    // SLT → inv PL (5): 1 iff MI (ordered a<b)
     cmp x22, #IR_CMP_SLT
     b.eq .Lcgi_fcmp_do
-    mov x23, #12                   // SLE → inv GT (12)
+    mov x23, #8                    // SLE → inv HI (8): 1 iff LS (ordered a<=b)
     cmp x22, #IR_CMP_SLE
     b.eq .Lcgi_fcmp_do
-    mov x23, #13                   // SGT → inv LE (13)
+    mov x23, #13                   // SGT → inv LE (13): 1 iff GT (ordered a>b)
     cmp x22, #IR_CMP_SGT
     b.eq .Lcgi_fcmp_do
-    mov x23, #11                   // SGE → inv LT (11)
+    mov x23, #11                   // SGE → inv LT (11): 1 iff GE (ordered a>=b)
 
 .Lcgi_fcmp_do:
     ldr x0, [x19, #IR_SRC1]
@@ -1124,8 +1130,11 @@ addressed correctly.
     bl _kcc_cg_load_vreg
 
     // Check for a narrow access (IR_SRC2 = access size override).
-    // 1/2/4 = unsigned byte/half/word; 5/6/7 = signed byte/half/word.
+    // 1/2/4 = unsigned byte/half/word; 5/6/7 = signed byte/half/word;
+    // 8 = single-precision float (4-byte FP load widened to double).
     ldr x23, [x19, #IR_SRC2]
+    cmp x23, #8
+    b.eq .Lcgi_load_float
     cmp x23, #1
     b.eq .Lcgi_load_8
     cmp x23, #2
@@ -1200,6 +1209,27 @@ addressed correctly.
     mov x3, #4
     bl _kcc_enc_ldr_imm
     bl _kcc_code_emit32
+    b .Lcgi_load_done
+
+.Lcgi_load_float:
+    // Loading a `float` lvalue: read the 4-byte single into s0 and widen it to
+    // the double working format with FCVT, then home it in the destination FP
+    // vreg.  The pointer is in CG_REG_SRC1.  This is the exact inverse of the
+    // float store, so a `float` round-trips through memory at single precision.
+    mov x0, #0                     // Rt = s0
+    mov x1, #CG_REG_SRC1           // Rn = pointer
+    mov x2, #0                     // imm12 = 0
+    bl _kcc_enc_ldr_fp_s           // LDR s0, [ptr]
+    bl _kcc_code_emit32
+    mov x0, #0                     // Dd = d0
+    mov x1, #0                     // Sn = s0
+    bl _kcc_enc_fcvt_d_s           // FCVT d0, s0
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]        // destination vreg
+    mov x1, #0                     // from fp reg d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+
 .Lcgi_load_done:
     ldr x0, [x19, #IR_DEST]
     mov x1, #CG_REG_DST
@@ -1299,6 +1329,8 @@ addressed correctly.
     bl _kcc_cg_load_vreg
 
     ldr x23, [x19, #IR_DEST]
+    cmp x23, #8
+    b.eq .Lcgi_store_float
     cmp x23, #1
     b.eq .Lcgi_store_8
     cmp x23, #2
@@ -1342,6 +1374,25 @@ addressed correctly.
     bl _kcc_code_emit32
     b .Lcgi_done
 
+.Lcgi_store_float:
+    // Storing to a `float` lvalue.  The value vreg carries a double-format FP
+    // number (arithmetic runs in double); narrow it to single with FCVT and
+    // store the 4-byte single so the memory image is a true IEEE-754 float.
+    // The pointer is already in CG_REG_SRC2; reload the value into d0.
+    ldr x0, [x19, #IR_SRC1]       // value vreg
+    mov x1, #0                     // fp scratch d0
+    bl _kcc_cg_load_vreg_fp        // d0 = value (double format)
+    mov x0, #0                     // Sd = s0
+    mov x1, #0                     // Dn = d0
+    bl _kcc_enc_fcvt_s_d           // FCVT s0, d0
+    bl _kcc_code_emit32
+    mov x0, #0                     // Rt = s0
+    mov x1, #CG_REG_SRC2           // Rn = pointer
+    mov x2, #0                     // imm12 = 0
+    bl _kcc_enc_str_fp_s           // STR s0, [ptr]
+    bl _kcc_code_emit32
+    b .Lcgi_done
+
 .Lcgi_store_promoted:
     // x0 = the local's home register.  Load the value into x9 and move it there.
     mov x23, x0                    // x23 = contents reg
@@ -1364,21 +1415,22 @@ addressed correctly.
 
     // Alloca: compute address of storage past the vreg value slots.
     // Pre-scan stored the running offset in SRC2.
-    // Address = x29 + 16 + vreg_count*8 + SRC2*8
+    // Address = x29 + 16 + max_slot*8 + SRC2*8
     ldr x24, [x19, #IR_DEST]      // dest vreg
     ldr x25, [x19, #IR_SRC2]      // alloca offset (from pre-scan)
 
     ldr x0, [x19, #IR_SRC1]       // slot count (for frame calc verification)
 
-    // Get vreg_count from ir_func
-    adrp x0, _kcc_cg_vreg_count@@PAGE
-    add  x0, x0, _kcc_cg_vreg_count@@PAGEOFF
+    // The alloca storage begins just past the vreg value slots, whose count is
+    // the colouring pass's max_slot (equals vreg_count when colouring is off).
+    adrp x0, _kcc_cg_max_slot@@PAGE
+    add  x0, x0, _kcc_cg_max_slot@@PAGEOFF
     ldr x0, [x0]
 
-    // Storage address = x29 + (16 + vreg_count*8 + offset*8).  The offset can
+    // Storage address = x29 + (16 + max_slot*8 + offset*8).  The offset can
     // exceed the 12-bit immediate on a large frame, so route through the
     // splitting helper rather than the raw encoder.
-    lsl x1, x0, #3                // vreg_count * 8
+    lsl x1, x0, #3                // max_slot * 8
     lsl x2, x25, #3               // offset * 8
     add x2, x2, x1
     add x2, x2, #16               // imm = 16 + vreg_count*8 + offset*8
@@ -1811,6 +1863,16 @@ described in \S\ref{sec:emit-strings}.
     cmp x0, #15                    // TY_UNION
     b.eq .Lcgi_call_ret_struct
 .Lcgi_call_ret_gp:
+    // Normalise the return to its declared width before homing it.  The AArch64
+    // procedure call standard defines only the low bits of a sub-word integer
+    // return: a function returning `int` sets w0 and leaves the top half of x0
+    // unspecified.  kcc's own callees happen to return a full sign-extended
+    // register, but an external libc call does not---so a return used directly
+    // as a value (`(c = getc(f)) != EOF`, where c's assignment yields the call
+    // result itself) compared 64 bits of which the top half was garbage, and
+    // the EOF test never fired---an infinite line-reading loop.
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_cg_normalize_ret
     mov x0, x24
     mov x1, #0                     // x0
     bl _kcc_cg_store_vreg
@@ -1900,6 +1962,11 @@ described in \S\ref{sec:emit-strings}.
     cmp x0, #15                    // TY_UNION
     b.eq .Lcgi_cind_ret_struct
 .Lcgi_cind_ret_gp:
+    // Same width normalisation as the direct path.  kcc lowers every
+    // global-function call to global_ref + call_ind, so this indirect path
+    // carries all of libc---getc, fgetc, and friends---and needs the fix too.
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_cg_normalize_ret
     mov x0, x24
     mov x1, #0
     bl _kcc_cg_store_vreg
@@ -1945,6 +2012,65 @@ described in \S\ref{sec:emit-strings}.
     bl _kcc_code_emit32
 
     b .Lcgi_done
+
+// -- kcc_cg_normalize_ret -----------------------------------------------------
+// void kcc_cg_normalize_ret(type_desc *ret_type)
+// Emits a sign/zero extension of the return register x0 to the declared width,
+// so a sub-word integer return (from an external function, which sets only w0)
+// is a valid full-register value.  Nothing is emitted for a void, 8-byte, or
+// pointer return.  Shared by the direct and indirect call return paths.
+.p2align 2
+_kcc_cg_normalize_ret:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    cbz x0, .Lnr_done
+    bl _kcc_ir_load_width          // 5/6/7 signed, 1/2/4 unsigned, else none
+    cmp x0, #5
+    b.eq .Lnr_sxtb
+    cmp x0, #6
+    b.eq .Lnr_sxth
+    cmp x0, #7
+    b.eq .Lnr_sxtw
+    cmp x0, #1
+    b.eq .Lnr_uxtb
+    cmp x0, #2
+    b.eq .Lnr_uxth
+    cmp x0, #4
+    b.eq .Lnr_uxtw
+    b .Lnr_done
+.Lnr_sxtb:
+    movz w0, #0x1C00
+    movk w0, #0x9340, lsl #16      // SXTB x0, w0
+    bl _kcc_code_emit32
+    b .Lnr_done
+.Lnr_sxth:
+    movz w0, #0x3C00
+    movk w0, #0x9340, lsl #16      // SXTH x0, w0
+    bl _kcc_code_emit32
+    b .Lnr_done
+.Lnr_sxtw:
+    movz w0, #0x7C00
+    movk w0, #0x9340, lsl #16      // SXTW x0, w0
+    bl _kcc_code_emit32
+    b .Lnr_done
+.Lnr_uxtb:
+    movz w0, #0x1C00
+    movk w0, #0x5300, lsl #16      // UXTB w0, w0
+    bl _kcc_code_emit32
+    b .Lnr_done
+.Lnr_uxth:
+    movz w0, #0x3C00
+    movk w0, #0x5300, lsl #16      // UXTH w0, w0
+    bl _kcc_code_emit32
+    b .Lnr_done
+.Lnr_uxtw:
+    movz w0, #0x03E0
+    movk w0, #0x2A00, lsl #16      // MOV w0, w0 (zero-extend to x0)
+    bl _kcc_code_emit32
+.Lnr_done:
+    ldp x29, x30, [sp], #16
+    ret
+@| _kcc_cg_normalize_ret
 @}
 
 \paragraph{Indirect Calls.}

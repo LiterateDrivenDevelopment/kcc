@@ -153,6 +153,7 @@
 \newcommand{\stdref}[1]{\S\,#1}
 \newcommand{\kcc}{\textsf{kcc}}
 \newcommand{\reg}[1]{\texttt{#1}}
+\newcommand{\meta}[1]{\textsf{#1}}
 
 % Title
 \title{\kcc\\[0.5em]

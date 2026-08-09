@@ -99,7 +99,7 @@ test-codegen: build
 
 # Weave: generate LaTeX source
 doc:
-	weft -w tex kcc.weft
+	weft -w tex -d -r kcc.weft
 
 # Weave + compile to PDF (lualatex for native Unicode)
 weave: doc

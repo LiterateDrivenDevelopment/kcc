@@ -125,14 +125,15 @@ _kcc_sema_resolve_type:
     bl _kcc_sema_resolve_type
     mov x20, x0                     // element type
 
-    // Array length: evaluate constant expr if present
+    // Array length: fold the size as an integer constant expression
+    // (\stdref{6.7.6.2}).  A bare literal, but equally `31 + 1` or
+    // `sizeof(int) * CHAR_BIT`, must reduce to its value; only a genuinely
+    // absent size (`a[]`) is an incomplete array.
     ldr x1, [x19, #AST_F1]
     cbz x1, .Lsrt_array_incomplete
-    // For now, if size_expr is INT_LIT, use its value
-    ldr x2, [x1, #AST_TAG]
-    cmp x2, #AST_INT_LIT
-    b.ne .Lsrt_array_incomplete
-    ldr x1, [x1, #AST_F0]          // literal value
+    mov x0, x1
+    bl _kcc_eval_const_int
+    mov x1, x0                     // folded length
     b .Lsrt_array_make
 
 .Lsrt_array_incomplete:
@@ -144,20 +145,47 @@ _kcc_sema_resolve_type:
     b .Lsrt_done
 
 .Lsrt_func:
-    // F0 = return type node, F1 = params (linked list; bit 0 = variadic flag)
+    // AST_TYPE_FUNC: F0 = return type node, F1 = params (linked list),
+    // F2 = variadic flag (0/1).  This node is produced by a grouped declarator
+    // `(name)(params, ...)` and by function pointers---note the variadic flag
+    // lives in F2 here, NOT in bit 0 of the params pointer (that packing is the
+    // AST_FUNC_DECL convention).
     ldr x0, [x19, #AST_F0]
     bl _kcc_sema_resolve_type
     mov x20, x0                     // return type
 
-    // Carry the parameter declaration list (masked of the variadic bit) as the
-    // function type's param vec, so the call site can convert and classify each
-    // argument by its parameter's type---e.g. an integer argument to a
-    // \texttt{double} parameter needs an int-to-double conversion and an
-    // SSE-class register, neither of which the argument's own type would give.
+    // Carry the parameter declaration list as the function type's param vec, so
+    // the call site can convert and classify each argument by its parameter's
+    // type---e.g. an integer argument to a \texttt{double} parameter needs an
+    // int-to-double conversion and an SSE-class register.
     ldr x1, [x19, #AST_F1]          // params list
-    bic x1, x1, #1                  // strip the variadic flag
+    bic x1, x1, #1                  // defensive: clear bit 0
     mov x0, x20                     // return type
     bl _kcc_type_func
+    mov x20, x0                     // reuse x20 (return type consumed) = TY_FUNC
+
+    // A variadic prototype records its fixed-parameter count in TY_QUALS (zero
+    // means non-variadic); the call lowering reads it to place the variadic
+    // tail on the stack.  Without this, EVERY variadic call through a grouped
+    // declarator---which is how Lua declares its whole API, e.g.
+    // `const char *(lua_pushfstring)(lua_State *, const char *, ...)`---was
+    // treated as non-variadic and passed its arguments in registers, so the
+    // callee read the stack and got garbage.  (Only x19/x20 are callee-saved
+    // here, so the fixed-param walk uses caller-saved temporaries and makes no
+    // calls.)
+    ldr x2, [x19, #AST_F2]          // variadic flag
+    cbz x2, .Lsrt_func_done
+    ldr x2, [x19, #AST_F1]          // params list (clean)
+    mov x3, #0                      // nfixed
+.Lsrt_func_nfixed:
+    cbz x2, .Lsrt_func_setq
+    add x3, x3, #1
+    ldr x2, [x2, #AST_F4]
+    b .Lsrt_func_nfixed
+.Lsrt_func_setq:
+    str x3, [x20, #TY_QUALS]
+.Lsrt_func_done:
+    mov x0, x20
     b .Lsrt_done
 
 .Lsrt_struct:

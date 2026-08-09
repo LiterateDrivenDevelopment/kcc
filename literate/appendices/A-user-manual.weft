@@ -147,6 +147,10 @@ Option & Effect \\
 \hline
 \texttt{-o \emph{name}} & name the output; default \texttt{a.out} when linking, \\
                         & or the object name when compiling with \texttt{-c} \\
+\texttt{-I\emph{dir}}   & add \emph{dir} to the \texttt{\#include} search path \\
+                        & (attached \texttt{-Idir} or separated \texttt{-I dir}) \\
+\texttt{-D\emph{name}}  & define \emph{name} as \texttt{1}; \texttt{-D\emph{name}=\emph{val}} \\
+                        & defines it as \emph{val} (also separated \texttt{-D \emph{name}}) \\
 \texttt{-Wall}          & enable the warning family (\S\ref{sec:um-warnings}) \\
 \texttt{-g}             & emit DWARF debug information for a debugger \\
 \hline

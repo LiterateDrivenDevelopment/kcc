@@ -78,6 +78,13 @@ _kcc_sema_check_stmt:
     b.eq .Lscs_decl
     cmp x20, #AST_TYPE_ENUM
     b.eq .Lscs_decl
+    // A bare `struct S { ... };` / `union U { ... };` at block scope is an
+    // AST_TYPE_STRUCT/UNION statement; route it to the declaration checker too,
+    // so its tag is registered for later `struct S` references in the block.
+    cmp x20, #AST_TYPE_STRUCT
+    b.eq .Lscs_decl
+    cmp x20, #AST_TYPE_UNION
+    b.eq .Lscs_decl
     cmp x20, #AST_STATIC_ASSERT
     b.eq .Lscs_done
 

@@ -192,6 +192,20 @@ registration \emph{off}, using only the returned slot count to step over the
 option.  This keeps a directory from being registered twice and localises the
 attached-vs-separated logic to one place.
 
+\paragraph{The \texttt{-D} flag.}
+\texttt{\_kcc\_driver\_D} is the exact analogue for command-line macro
+definitions, in the same two shapes: attached \texttt{-DNAME} or
+\texttt{-DNAME=VALUE}, and separated \texttt{-D NAME}.  A bare name takes the
+value~\texttt{1} (the convention \texttt{cc} follows), while an
+\texttt{=}-suffix supplies an explicit body.  Because the macro table is rebuilt
+for every translation unit, the scan pass merely \emph{records} each definition's
+payload (via \texttt{\_kcc\_pp\_add\_cmdline\_define}); the actual macros are
+(re)installed from that list at the end of \texttt{\_kcc\_pp\_predefine}, which
+runs on every preprocessor initialisation.  So each source sees the same
+command-line macros on top of the built-in predefines, and configuration
+switches such as \texttt{-DNDEBUG} or a library's \texttt{-DLUA\_USE\_POSIX}
+behave as they do under any C compiler.
+
 @d Driver: compile @{
 // -- kcc_driver_I -------------------------------------------------------------
 // uint64_t kcc_driver_I(const char *arg, const char *next, uint64_t do_register)
@@ -239,6 +253,56 @@ _kcc_driver_I:
     ldp x29, x30, [sp], #48
     ret
 @| _kcc_driver_I
+@}
+
+@d Driver: compile @{
+// -- kcc_driver_D -------------------------------------------------------------
+// uint64_t kcc_driver_D(const char *arg, const char *next, uint64_t do_register)
+//   Detect a -D option: attached "-DNAME"/"-DNAME=VALUE" or separated "-D NAME".
+//   Returns slots consumed: 0 = not -D, 1 = attached, 2 = separated.  With
+//   do_register != 0 the definition's payload is recorded for the preprocessor.
+//   Mirrors kcc_driver_I so every argument-parsing pass handles -D uniformly.
+.text
+.p2align 2
+_kcc_driver_D:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                    // arg
+    mov x20, x1                    // next
+    mov x21, x2                    // do_register
+    mov x0, x19
+    adrp x1, _kcc_opt_defmac@@PAGE
+    add  x1, x1, _kcc_opt_defmac@@PAGEOFF
+    mov  x2, #2
+    bl _kcc_memcmp
+    cbnz x0, .LdD_no               // arg does not start with "-D"
+    ldrb w0, [x19, #2]
+    cbz  w0, .LdD_sep              // exactly "-D": separated form
+    // Attached "-DNAME[=VALUE]": payload is arg+2
+    cbz  x21, .LdD_att_ret
+    add  x0, x19, #2
+    bl _kcc_pp_add_cmdline_define
+.LdD_att_ret:
+    mov  x0, #1
+    b .LdD_ret
+.LdD_sep:
+    cbz  x21, .LdD_sep_ret
+    cbz  x20, .LdD_sep_ret         // no following argument to record
+    mov  x0, x20
+    bl _kcc_pp_add_cmdline_define
+.LdD_sep_ret:
+    mov  x0, #2
+    b .LdD_ret
+.LdD_no:
+    mov  x0, #0
+.LdD_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_driver_D
 @}
 
 @d Driver: compile @{
@@ -356,8 +420,24 @@ _kcc_driver_compile_all:
 .Lca_scan_I_call:
     mov x2, #1                     // register the directory
     bl _kcc_driver_I
-    cbz x0, .Lca_scan_src
+    cbz x0, .Lca_scan_D
     add x23, x23, x0               // consumed 1 or 2 slots
+    b .Lca_scan
+.Lca_scan_D:
+    // -DNAME[=VALUE] / -D NAME: record a command-line macro; not a source
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
+    add x1, x23, #1
+    cmp x1, x19
+    b.ge .Lca_scan_D_nonext
+    ldr x1, [x20, x1, lsl #3]      // argv[i+1]
+    b .Lca_scan_D_call
+.Lca_scan_D_nonext:
+    mov x1, #0
+.Lca_scan_D_call:
+    mov x2, #1                     // register the macro
+    bl _kcc_driver_D
+    cbz x0, .Lca_scan_src
+    add x23, x23, x0
     b .Lca_scan
 .Lca_scan_src:
     add x22, x22, #1               // a source
@@ -416,6 +496,15 @@ _kcc_driver_compile_all:
     mov x1, #0
     mov x2, #0                     // do not register again
     bl _kcc_driver_I
+    cbz x0, .Lca_skip_D
+    add x23, x23, x0
+    b .Lca_loop
+.Lca_skip_D:
+    // -DNAME / -D NAME: skip (recorded in pass 1)
+    mov x0, x25
+    mov x1, #0
+    mov x2, #0
+    bl _kcc_driver_D
     cbz x0, .Lca_compile_src
     add x23, x23, x0
     b .Lca_loop
@@ -678,6 +767,22 @@ _kcc_driver_link_all:
 .Lla_pre_I_call:
     mov x2, #1                   // register the directory
     bl _kcc_driver_I
+    cbz x0, .Lla_pre_D
+    add x21, x21, x0
+    b .Lla_pre
+.Lla_pre_D:
+    // -DNAME[=VALUE] / -D NAME: record a command-line macro
+    ldr x0, [x20, x21, lsl #3]
+    add x1, x21, #1
+    cmp x1, x19
+    b.ge .Lla_pre_D_nonext
+    ldr x1, [x20, x1, lsl #3]
+    b .Lla_pre_D_call
+.Lla_pre_D_nonext:
+    mov x1, #0
+.Lla_pre_D_call:
+    mov x2, #1
+    bl _kcc_driver_D
     cbz x0, .Lla_pre_next
     add x21, x21, x0
     b .Lla_pre
@@ -740,6 +845,15 @@ _kcc_driver_link_all:
     mov x1, #0
     mov x2, #0                   // do not register again
     bl _kcc_driver_I
+    cbz x0, .Lla_skip_D
+    add x24, x24, x0
+    b .Lla_loop
+.Lla_skip_D:
+    // -DNAME / -D NAME: skip (recorded in pass 1)
+    mov x0, x27
+    mov x1, #0
+    mov x2, #0
+    bl _kcc_driver_D
     cbz x0, .Lla_src
     add x24, x24, x0
     b .Lla_loop
@@ -858,6 +972,8 @@ _kcc_opt_g:
     .asciz "-g"
 _kcc_opt_incdir:
     .asciz "-I"
+_kcc_opt_defmac:
+    .asciz "-D"
 _kcc_driver_err_noinput:
     .asciz "kcc: error: no input files\n"
 _kcc_str_ld_argv0:

@@ -783,6 +783,7 @@ _kcc_parse_direct_declarator:
 
 .Lddecl_no_name:
     // Check for array/function suffixes
+    mov x24, #0                  // innermost array node so far (multi-dim chain)
 .Lddecl_suffix_loop:
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
@@ -816,12 +817,26 @@ _kcc_parse_direct_declarator:
     mov x0, #TOK_RBRACKET
     bl _kcc_parse_expect
 
-    // Build array type
+    // Build array type.  For `a[N][M]` the FIRST bracket is the outermost
+    // array (\stdref{6.7.6.2}: array N of array M of T).  Reading brackets
+    // left-to-right, each later dimension must nest \emph{inside} the current
+    // innermost array (as its element), not wrap the whole type---otherwise the
+    // dimensions reverse and \texttt{a[i][j]} strides by the wrong extent.
     mov x0, #AST_TYPE_ARRAY
     bl _kcc_ast_alloc
-    str x19, [x0, #AST_F0]      // element type
     str x21, [x0, #AST_F1]      // size expr
-    mov x19, x0                  // update type
+    cbz x24, .Lddecl_array_first
+    // Later dimension: element = the base element (held in the innermost's F0),
+    // then splice this array in as that innermost array's element.
+    ldr x1, [x24, #AST_F0]      // base element type
+    str x1, [x0, #AST_F0]
+    str x0, [x24, #AST_F0]      // innermost.element = new inner array
+    mov x24, x0                  // new innermost
+    b .Lddecl_suffix_loop
+.Lddecl_array_first:
+    str x19, [x0, #AST_F0]      // first bracket: element = the declared type
+    mov x19, x0                  // top-level type = this array
+    mov x24, x0                  // innermost = this array
     b .Lddecl_suffix_loop
 @| _kcc_parse_direct_declarator
 @}
@@ -853,7 +868,9 @@ type---implementing C's inside-out declarator semantics.  For instance,
 
 @d Decl: parse direct declarator @{
 .Lddecl_function:
-    // Function: ( param-list )
+    // Function: ( param-list ).  A function suffix ends any array chain, so a
+    // subsequent bracket begins a fresh outermost array.
+    mov x24, #0
     bl _kcc_pp_next               // consume '('
 
     // Build function type

@@ -406,6 +406,42 @@ _kcc_type_ptr:
 @| _kcc_type_ptr
 @}
 
+\paragraph{Parameter type adjustment.}  A function parameter declared with
+array type is, per \stdref{6.7.6.3}, adjusted to a \emph{pointer} to the
+element type; likewise a function-typed parameter becomes a pointer to the
+function.  This matters because the callee never receives the array by
+value---it receives the address the array decayed to at the call site.  If
+the parameter kept its array type, the code generator would allocate inline
+array storage and index \emph{that} rather than loading the passed pointer,
+so \texttt{a[i]} would read the callee's own stack.  \texttt{kcc\_type\_param\_adjust}
+performs the adjustment; it is applied wherever a parameter's type is
+resolved (symbol registration, the alloca, and AAPCS64 classification).
+
+@d Types: make pointer @{
+// -- kcc_type_param_adjust ------------------------------------------------
+// type_desc *kcc_type_param_adjust(type_desc *t)
+//   x0 = resolved parameter type; returns the adjusted type: an array or
+//   function type becomes a pointer (to element / to function); any other
+//   type is returned unchanged (\stdref{6.7.6.3}).
+.text
+.globl _kcc_type_param_adjust
+.p2align 2
+_kcc_type_param_adjust:
+    cbz x0, .Ltpa_ret
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.eq .Ltpa_array
+    cmp x1, #TY_FUNC
+    b.eq _kcc_type_ptr          // function → pointer to function (x0 unchanged)
+    ret
+.Ltpa_array:
+    ldr x0, [x0, #TY_F0]        // element type
+    b _kcc_type_ptr             // pointer to element
+.Ltpa_ret:
+    ret
+@| _kcc_type_param_adjust
+@}
+
 \subsection{Array Type}
 
 Construct an array type descriptor.  The element type is saved in

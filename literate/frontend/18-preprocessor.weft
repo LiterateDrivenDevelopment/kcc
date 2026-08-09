@@ -274,6 +274,19 @@ _kcc_pp_next:
     ldr  x0, [x0]
     cbz  x0, .Lpp_real_eof
     bl _kcc_pp_ctx_pop
+    // Argument prescan boundary: if a drain floor is active and the stack has
+    // dropped below it, the argument being expanded is exhausted---return this
+    // TOK_EOF rather than reading on into the enclosing text (which would
+    // over-read, and could even expand an enclosing macro).
+    adrp x0, _kcc_pp_drain_floor@@PAGE
+    add  x0, x0, _kcc_pp_drain_floor@@PAGEOFF
+    ldr  x1, [x0]
+    cbz  x1, .Lpp_loop
+    adrp x0, _kcc_pp_ctx_depth@@PAGE
+    add  x0, x0, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, x1
+    b.lt .Lpp_return          // popped below the floor → stop at EOF
     b .Lpp_loop
 
 .Lpp_real_eof:
@@ -936,6 +949,8 @@ beginning-of-line detection for directive recognition.
 .p2align 3
 .globl _kcc_pp_macros
 _kcc_pp_macros:      .quad 0     // pointer to macro hash table
+_kcc_pp_eval_depth:  .quad 0     // #if-expression macro recursion guard
+_kcc_pp_drain_floor: .quad 0     // >0: pp_next stops when the ctx stack drops below it (argument prescan)
 .globl _kcc_pp_ctx_depth
 _kcc_pp_ctx_depth:   .quad 0     // context stack depth
 _kcc_pp_cond_depth:  .quad 0     // conditional stack depth

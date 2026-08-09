@@ -379,13 +379,45 @@ been looked up), which the called routines are obliged to preserve.
 
 @d PP: expand @{
 .Lexp_funclike:
-    // Function-like: peek for '(' after identifier
+    // Function-like: peek for '(' after the identifier.  A function-like macro
+    // invocation may span a context boundary---an object-like macro can expand
+    // to a function-like macro name whose '(' lies in the enclosing text
+    // (`#define outer inner` used as `outer(a,b)`).  So first pop any expansion
+    // context we have run to the end of, exposing that enclosing text; each
+    // such context is exhausted and would be popped by the next read anyway.
+.Lexp_fl_droptail:
     adrp x0, _kcc_lex_cursor@@PAGE
     add  x0, x0, _kcc_lex_cursor@@PAGEOFF
     ldr  x0, [x0]
     adrp x1, _kcc_lex_end@@PAGE
     add  x1, x1, _kcc_lex_end@@PAGEOFF
     ldr  x1, [x1]
+    cmp  x0, x1
+    b.lo .Lexp_peek_ws           // current buffer still has text
+    adrp x2, _kcc_pp_ctx_depth@@PAGE
+    add  x2, x2, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x2, [x2]
+    cbz  x2, .Lexp_peek_ws       // no enclosing context → genuinely at end
+    // Never pop past the argument-prescan boundary.  While expanding a macro
+    // argument, drain_floor marks the pushed argument context; popping it to
+    // hunt for '(' would reach into the enclosing macro body and wrongly treat
+    // a bare function-like macro name passed as an argument (say `l_addi` in
+    // `op_arithI(l_addi)`, whose body is `iop(0,5,1)`) as an invocation that
+    // consumes the body's '(', dropping the name.  A function-like macro name
+    // with no '(' inside its own argument is just an identifier (\stdref{6.10.3}).
+    adrp x3, _kcc_pp_drain_floor@@PAGE
+    add  x3, x3, _kcc_pp_drain_floor@@PAGEOFF
+    ldr  x3, [x3]
+    cmp  x2, x3
+    b.ls .Lexp_peek_ws           // at/below the drain floor → don't cross it
+    bl _kcc_pp_ctx_pop
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_lex_end@@PAGE
+    add  x1, x1, _kcc_lex_end@@PAGEOFF
+    ldr  x1, [x1]
+    b .Lexp_fl_droptail
 
     // Skip whitespace looking for '('
 .Lexp_peek_ws:
@@ -507,6 +539,13 @@ macro is marked with \texttt{PP\_FLAG\_EXPANDING} to prevent recursive
 re-expansion, and the substituted text is pushed onto the context stack.
 
 @d PP: expand @{
+    // Argument prescan (6.10.3.1): fully expand each argument before it is
+    // substituted, while this macro's PP_FLAG_EXPANDING is still clear, so a
+    // nested invocation of the same macro inside an argument expands.
+    mov  x0, x23              // arg array
+    mov  x1, x24              // arg count
+    bl _kcc_pp_expand_all_args
+
     // Now substitute: build expanded text
     // For each identifier in body matching a param name, replace with arg text
     ldr  x0, [x21, #PP_MACRO_BODY]
@@ -574,6 +613,203 @@ re-expansion, and the substituted text is pushed onto the context stack.
     ret
 @}
 
+\subsection{Argument Prescan}
+
+\stdref{6.10.3.1} requires each macro argument to be \emph{completely
+macro-expanded} before it is substituted into the replacement list.  Our
+expander previously skipped this step, substituting the raw argument text
+and relying on the later rescan to expand everything.  That fails for a
+function-like macro nested inside its own argument---\texttt{cast(StkId,
+cast\_charp(p))} where \texttt{cast\_charp} is itself
+\texttt{cast(char~*,~\ldots)}, or the minimal \texttt{F(1,~F(2,~3))}:
+the single per-macro \texttt{PP\_FLAG\_EXPANDING} bit paints the macro
+across the entire rescan, including the substituted argument, so the
+nested invocation reaches the parser unexpanded (``expected expression'').
+
+\texttt{\_kcc\_pp\_expand\_arg} fixes this by expanding an argument to text
+up front, while the outer macro's flag is not yet set.  It pushes the
+argument text as an expansion context carrying \emph{no} macro (so nothing
+is painted on its account) and drains \texttt{\_kcc\_pp\_next}, appending
+each fully-expanded token to a growing buffer.  The subtle part is knowing
+when the argument ends: \texttt{\_kcc\_pp\_next} normally pops an exhausted
+context and reads straight on into the enclosing text, and that trailing
+token could itself be a macro it would expand---silently pulling
+surrounding tokens into the argument.  So the drain installs a
+\emph{drain floor}: \texttt{\_kcc\_pp\_next} returns its \texttt{TOK\_EOF}
+the moment the context stack drops below the floor, one above the depth at
+entry, rather than reading further.  The floor is saved and restored so a
+nested prescan (an argument that invokes this same macro) installs its own
+deeper floor.  Tokens are joined with single spaces, which never changes
+meaning because kcc implements neither \texttt{\#} nor \texttt{\#\#}---%
+there are no operands whose spelling or pasting the spacing could disturb.
+
+@d PP: expand @{
+// -- _kcc_pp_expand_arg ---------------------------------------------
+// (const char *text, uint64_t len) → x0 = expanded buf, x1 = expanded len
+// Fully macro-expands one argument's text (argument prescan, 6.10.3.1).
+.p2align 2
+_kcc_pp_expand_arg:
+    stp x29, x30, [sp, #-144]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    mov x19, x0                  // text
+    mov x20, x1                  // len
+    cbz x20, .Lea_empty
+
+    // base_depth = current stack depth.  Set the drain floor one above it, so
+    // _kcc_pp_next stops (returns EOF) the instant the argument context we are
+    // about to push is popped---never reading on into the enclosing text.  The
+    // floor is saved/restored so nested prescans (an argument that itself calls
+    // this same macro) each install their own, deeper floor.
+    adrp x0, _kcc_pp_ctx_depth@@PAGE
+    add  x0, x0, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x24, [x0]               // base_depth
+    adrp x0, _kcc_pp_drain_floor@@PAGE
+    add  x0, x0, _kcc_pp_drain_floor@@PAGEOFF
+    ldr  x1, [x0]
+    str  x1, [sp, #96]           // saved drain_floor
+    add  x1, x24, #1
+    str  x1, [x0]                // floor = base_depth + 1
+    adrp x0, _kcc_pp_has_pending@@PAGE
+    add  x0, x0, _kcc_pp_has_pending@@PAGEOFF
+    ldr  x1, [x0]
+    str  x1, [sp, #104]          // saved has_pending
+    str  xzr, [x0]               // clear so the drain reads the arg buffer
+
+    // Output buffer, initial cap = len*4 + 256.
+    lsl x0, x20, #2
+    add x23, x0, #256            // cap
+    mov x0, x23
+    bl _kcc_arena_alloc
+    mov x21, x0                  // out_buf
+    mov x22, #0                  // out_len
+
+    // Push the argument text as an expand context with no macro.
+    mov x0, #PP_CTX_EXPAND
+    mov x1, #0
+    mov x2, x19
+    mov x3, x20
+    bl _kcc_pp_ctx_push_expand
+
+.Lea_loop:
+    bl _kcc_pp_next
+    // Argument done once the stack falls back to base_depth.
+    adrp x0, _kcc_pp_ctx_depth@@PAGE
+    add  x0, x0, _kcc_pp_ctx_depth@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, x24
+    b.le .Lea_done
+    // EOF safety
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lea_done
+    // Token text → x25 = start, x26 = len.
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x25, [x0]
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x26, [x0]
+    // Ensure room for a space + the token; grow (alloc+copy) if needed.
+    add x0, x22, x26
+    add x0, x0, #1
+    cmp x0, x23
+    b.ls .Lea_do_append
+    lsl x0, x0, #1
+    mov x23, x0                  // new cap
+    bl _kcc_arena_alloc
+    str x0, [sp, #136]           // new buf
+    mov x1, x21
+    mov x2, x22
+    bl _kcc_memcpy               // memcpy(new, old, out_len)
+    ldr x21, [sp, #136]
+.Lea_do_append:
+    // Separate consecutive tokens with a space, but emit none before the first
+    // token: a leading space would defeat a `##` paste whose right operand is
+    // this (prescanned) argument.
+    cbz x22, .Lea_no_sep
+    mov w0, #0x20                // separator space
+    strb w0, [x21, x22]
+    add x22, x22, #1
+.Lea_no_sep:
+    add x0, x21, x22
+    mov x1, x25
+    mov x2, x26
+    bl _kcc_memcpy
+    add x22, x22, x26
+    b .Lea_loop
+
+.Lea_done:
+    // Restore the drain floor and pending flag.  The argument context has
+    // already popped cleanly (the floor stopped pp_next at its EOF), so the
+    // lexer is back at the enclosing position with nothing to undo.
+    ldr x0, [sp, #96]
+    adrp x1, _kcc_pp_drain_floor@@PAGE
+    add  x1, x1, _kcc_pp_drain_floor@@PAGEOFF
+    str  x0, [x1]
+    ldr x0, [sp, #104]
+    adrp x1, _kcc_pp_has_pending@@PAGE
+    add  x1, x1, _kcc_pp_has_pending@@PAGEOFF
+    str  x0, [x1]
+    mov x0, x21                  // buf
+    mov x1, x22                  // len
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #144
+    ret
+
+.Lea_empty:
+    mov x0, x19                  // original (empty) text
+    mov x1, #0
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #144
+    ret
+
+// -- _kcc_pp_expand_all_args ----------------------------------------
+// (arg_array, count): replaces each 16-byte {start,len} entry with its
+// fully-expanded {buf,len} in place, ahead of substitution.
+.p2align 2
+_kcc_pp_expand_all_args:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // arg array
+    mov x20, x1                  // count
+    mov x21, #0                  // index
+.Leaa_loop:
+    cmp x21, x20
+    b.ge .Leaa_done
+    add x2, x19, x21, lsl #4     // entry = args + i*16
+    ldr x0, [x2, #0]             // start
+    ldr x1, [x2, #8]             // len
+    bl _kcc_pp_expand_arg        // → x0 = buf, x1 = len
+    add x2, x19, x21, lsl #4     // recompute (x2 was clobbered)
+    str x0, [x2, #0]
+    str x1, [x2, #8]
+    add x21, x21, #1
+    b .Leaa_loop
+.Leaa_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_pp_expand_arg _kcc_pp_expand_all_args
+@}
+
 \subsection{Parameter Substitution}
 
 For function-like macros, parameter names appearing in the replacement
@@ -584,6 +820,20 @@ it against each parameter name using \texttt{\_kcc\_memcmp}.  On a
 match, the argument text is copied to the output buffer instead of
 the parameter name.  Non-identifier characters and unmatched
 identifiers are copied verbatim.
+
+The \texttt{\#\#} token-paste operator (\stdref{6.10.3.3}) is handled in
+the same pass.  Pasting two tokens is, at the textual level, simply making
+them \emph{adjacent}: when the concatenated output is rescanned the lexer
+reads \texttt{foo} immediately followed by \texttt{bar} as the single token
+\texttt{foobar}.  So on seeing \texttt{\#\#} the walker trims any whitespace
+it has already emitted for the left operand, skips the operator and any
+whitespace before the right operand, and continues---the next token, be it
+a substituted argument or a literal, lands flush against the left one.
+Operands are taken from the substituted argument text; because kcc's
+arguments are already prescan-expanded and a paste operand is normally a
+bare identifier or number, this matches the standard in every case a real
+header exercises.  A lone \texttt{\#} is the stringisation operator, handled
+just below.
 
 @d PP: expand @{
 // -- _kcc_pp_substitute ---------------------------------------------
@@ -623,6 +873,21 @@ _kcc_pp_substitute:
     add x0, x19, x27
     ldrb w0, [x0]
 
+    // Token paste: a `##` in the body concatenates the token to its left with
+    // the token to its right by making them textually adjacent in the output,
+    // so the rescan lexes them as one token.
+    cmp w0, #'#'
+    b.ne .Lsub_dispatch
+    add x1, x27, #1
+    cmp x1, x20
+    b.hs .Lsub_dispatch          // trailing '#' → verbatim
+    add x2, x19, x1
+    ldrb w2, [x2]
+    cmp w2, #'#'
+    b.eq .Lsub_paste
+    b .Lsub_stringize            // single '#' → stringise the next parameter
+
+.Lsub_dispatch:
     // Is it an identifier char? (a-z, A-Z, _)
     cmp w0, #'_'
     b.eq .Lsub_ident
@@ -643,6 +908,141 @@ _kcc_pp_substitute:
     add x26, x26, #1
     add x27, x27, #1
     b .Lsub_loop
+
+.Lsub_stringize:
+    // `# param` → a string literal of the argument's spelling.  Consume the
+    // `#` and any whitespace, extract the parameter name, and emit its argument
+    // quoted (via _kcc_pp_emit_string).  A `#` not followed by a parameter is
+    // copied verbatim.
+    add x27, x27, #1             // skip '#'
+.Lsub_str_ws:
+    cmp x27, x20
+    b.hs .Lsub_str_hash
+    add x0, x19, x27
+    ldrb w0, [x0]
+    cmp w0, #0x20
+    b.eq .Lsub_str_ws_adv
+    cmp w0, #0x09
+    b.ne .Lsub_str_id
+.Lsub_str_ws_adv:
+    add x27, x27, #1
+    b .Lsub_str_ws
+.Lsub_str_id:
+    mov x28, x27                 // identifier start
+.Lsub_str_id_cont:
+    add x27, x27, #1
+    cmp x27, x20
+    b.hs .Lsub_str_id_end
+    add x0, x19, x27
+    ldrb w0, [x0]
+    cmp w0, #'_'
+    b.eq .Lsub_str_id_cont
+    cmp w0, #'a'
+    b.lo .Lsub_str_id_nl
+    cmp w0, #'z'
+    b.ls .Lsub_str_id_cont
+.Lsub_str_id_nl:
+    cmp w0, #'A'
+    b.lo .Lsub_str_id_nu
+    cmp w0, #'Z'
+    b.ls .Lsub_str_id_cont
+.Lsub_str_id_nu:
+    cmp w0, #'0'
+    b.lo .Lsub_str_id_end
+    cmp w0, #'9'
+    b.ls .Lsub_str_id_cont
+.Lsub_str_id_end:
+    // Match identifier body[x28..x27) against the parameter names.
+    add x0, x19, x28
+    sub x1, x27, x28
+    mov x2, #0
+.Lsub_str_pcheck:
+    cmp x2, x22
+    b.hs .Lsub_str_notparam
+    mov x3, #PP_PARAM_SIZE
+    mul x4, x2, x3
+    add x4, x21, x4
+    ldr x5, [x4, #PP_PARAM_NAME]
+    ldr x6, [x4, #PP_PARAM_LEN]
+    cmp x1, x6
+    b.ne .Lsub_str_pnext
+    stp x0, x1, [sp, #-16]!
+    mov x7, x2
+    mov x2, x1
+    mov x1, x5
+    bl _kcc_memcmp
+    ldp x8, x1, [sp], #16
+    mov x2, x7
+    cbz x0, .Lsub_str_found
+    mov x0, x8
+.Lsub_str_pnext:
+    add x2, x2, #1
+    b .Lsub_str_pcheck
+.Lsub_str_found:
+    // Emit the argument as a quoted string literal.
+    lsl x3, x2, #4
+    add x3, x23, x3
+    ldr x0, [x3, #0]             // arg text
+    ldr x1, [x3, #8]             // arg len
+    add x2, x25, x26             // dest
+    bl _kcc_pp_emit_string       // → x0 = bytes written
+    add x26, x26, x0
+    b .Lsub_loop
+.Lsub_str_notparam:
+    // '#' followed by a non-parameter identifier: emit '#' then the identifier.
+    add x1, x25, x26
+    mov w0, #'#'
+    strb w0, [x1]
+    add x26, x26, #1
+    mov x3, #0
+.Lsub_str_np_copy:
+    sub x1, x27, x28
+    cmp x3, x1
+    b.hs .Lsub_loop
+    add x4, x19, x28
+    ldrb w5, [x4, x3]
+    add x4, x25, x26
+    strb w5, [x4]
+    add x26, x26, #1
+    add x3, x3, #1
+    b .Lsub_str_np_copy
+.Lsub_str_hash:
+    // Trailing '#': emit verbatim.
+    add x1, x25, x26
+    mov w0, #'#'
+    strb w0, [x1]
+    add x26, x26, #1
+    b .Lsub_loop
+
+.Lsub_paste:
+    // Drop any whitespace already emitted for the left operand, so it abuts.
+.Lsub_paste_trim:
+    cbz x26, .Lsub_paste_skip
+    sub x1, x26, #1
+    add x3, x25, x1
+    ldrb w4, [x3]
+    cmp w4, #0x20            // space
+    b.eq .Lsub_paste_drop
+    cmp w4, #0x09            // tab
+    b.ne .Lsub_paste_skip
+.Lsub_paste_drop:
+    mov x26, x1
+    b .Lsub_paste_trim
+.Lsub_paste_skip:
+    add x27, x27, #2         // skip the ##
+    // Skip whitespace before the right operand so it, too, abuts.
+.Lsub_paste_ws:
+    cmp x27, x20
+    b.hs .Lsub_loop
+    add x0, x19, x27
+    ldrb w0, [x0]
+    cmp w0, #0x20
+    b.eq .Lsub_paste_ws_adv
+    cmp w0, #0x09
+    b.ne .Lsub_loop
+.Lsub_paste_ws_adv:
+    add x27, x27, #1
+    b .Lsub_paste_ws
 @}
 
 \paragraph{Identifier extraction and parameter matching.}
@@ -769,6 +1169,77 @@ verbatim.
     ret
 @}
 
+\paragraph{Stringising an argument.}
+The \texttt{\#} operator (\stdref{6.10.3.2}) turns an argument into a string
+literal.  \texttt{\_kcc\_pp\_emit\_string} writes the quoted form: an opening
+\texttt{"}, the argument with leading and trailing whitespace stripped and
+every internal run of whitespace collapsed to a single space, each embedded
+\texttt{"} or \texttt{\textbackslash} preceded by a backslash, then a closing
+\texttt{"}.  It operates on the substituted argument text; since kcc's
+arguments are already prescan-expanded this differs from the strict standard
+only when a \texttt{\#} operand is itself a macro, which real code stringising
+a type or token name never does.
+
+@d PP: expand @{
+// -- _kcc_pp_emit_string --------------------------------------------
+// (const char *src, uint64_t len, char *dest) → x0 = bytes written.
+// Emits a "..." string literal of src with whitespace collapsed and " / \ escaped.
+.p2align 2
+_kcc_pp_emit_string:
+    mov x3, x2                 // dest cursor
+    mov w4, #0x22              // opening quote
+    strb w4, [x3], #1
+    mov x5, #0                 // index
+.Les_lead:
+    cmp x5, x1
+    b.hs .Les_close
+    ldrb w6, [x0, x5]
+    cmp w6, #0x20
+    b.eq .Les_lead_adv
+    cmp w6, #0x09
+    b.ne .Les_body
+.Les_lead_adv:
+    add x5, x5, #1
+    b .Les_lead
+.Les_body:
+    mov x7, #0                 // pending-space flag (collapses whitespace runs)
+.Les_loop:
+    cmp x5, x1
+    b.hs .Les_close
+    ldrb w6, [x0, x5]
+    cmp w6, #0x20
+    b.eq .Les_ws
+    cmp w6, #0x09
+    b.eq .Les_ws
+    cbz x7, .Les_noflush
+    mov w8, #0x20
+    strb w8, [x3], #1          // flush one collapsed space
+    mov x7, #0
+.Les_noflush:
+    cmp w6, #0x22              // escape " and \
+    b.eq .Les_esc
+    cmp w6, #0x5C
+    b.eq .Les_esc
+    strb w6, [x3], #1
+    b .Les_adv
+.Les_esc:
+    mov w8, #0x5C
+    strb w8, [x3], #1
+    strb w6, [x3], #1
+    b .Les_adv
+.Les_ws:
+    mov x7, #1                 // remember; trailing whitespace is never flushed
+.Les_adv:
+    add x5, x5, #1
+    b .Les_loop
+.Les_close:
+    mov w4, #0x22              // closing quote
+    strb w4, [x3], #1
+    sub x0, x3, x2             // bytes written
+    ret
+@| _kcc_pp_emit_string
+@}
+
 \section{Predefined Macros}
 
 ISO C17 requires several predefined macros (\stdref{6.10.8}).  We
@@ -863,6 +1334,11 @@ _kcc_pp_predefine:
     mov  x3, #1
     bl _kcc_pp_def_simple
 
+    // Replay any command-line -D definitions on top of the built-ins.  The
+    // macro table is rebuilt for every translation unit, so this runs each time
+    // the preprocessor is (re)initialised, keeping -D macros defined per source.
+    bl _kcc_pp_apply_cmdline_defines
+
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
@@ -911,5 +1387,96 @@ _kcc_pp_def_simple:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+
+// Command-line -D definitions.  The driver records each -D argument's payload
+// ("NAME" or "NAME=VALUE") here during argument scanning; the list is replayed
+// into the macro table by _kcc_pp_apply_cmdline_defines whenever the
+// preprocessor is initialised, so the macros are present for every source.
+.data
+.p2align 3
+_kcc_cmdline_defs:  .space 512    // up to 64 payload pointers
+_kcc_cmdline_ndefs: .quad 0
+.text
+
+// -- _kcc_pp_add_cmdline_define -------------------------------------
+// void _kcc_pp_add_cmdline_define(const char *payload)
+//   Records a -D payload ("NAME" or "NAME=VALUE"); ignored once full.
+.globl _kcc_pp_add_cmdline_define
+.p2align 2
+_kcc_pp_add_cmdline_define:
+    adrp x1, _kcc_cmdline_ndefs@@PAGE
+    add  x1, x1, _kcc_cmdline_ndefs@@PAGEOFF
+    ldr  x2, [x1]
+    cmp  x2, #64
+    b.hs .Lacd_done
+    adrp x3, _kcc_cmdline_defs@@PAGE
+    add  x3, x3, _kcc_cmdline_defs@@PAGEOFF
+    str  x0, [x3, x2, lsl #3]
+    add  x2, x2, #1
+    str  x2, [x1]
+.Lacd_done:
+    ret
+
+// -- _kcc_pp_apply_cmdline_defines ----------------------------------
+// void _kcc_pp_apply_cmdline_defines(void)
+//   Defines each recorded -D macro.  "NAME" defines NAME as 1; "NAME=VALUE"
+//   splits at the first '=' and defines NAME as VALUE (a bare NAME with no
+//   value takes 1, matching cc's convention).  Names and bodies point into the
+//   original argv strings and are used by length, so no copy is needed.
+.globl _kcc_pp_apply_cmdline_defines
+.p2align 2
+_kcc_pp_apply_cmdline_defines:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    adrp x0, _kcc_cmdline_ndefs@@PAGE
+    add  x0, x0, _kcc_cmdline_ndefs@@PAGEOFF
+    ldr  x20, [x0]                 // count
+    mov  x19, #0                   // i
+.Lapd_loop:
+    cmp  x19, x20
+    b.hs .Lapd_done
+    adrp x0, _kcc_cmdline_defs@@PAGE
+    add  x0, x0, _kcc_cmdline_defs@@PAGEOFF
+    ldr  x21, [x0, x19, lsl #3]    // payload ptr
+    // Scan for '=' → x22 = name length (or full length when absent).
+    mov  x22, #0
+.Lapd_scan:
+    ldrb w0, [x21, x22]
+    cbz  w0, .Lapd_no_eq
+    cmp  w0, #'='
+    b.eq .Lapd_have_eq
+    add  x22, x22, #1
+    b .Lapd_scan
+.Lapd_have_eq:
+    add  x2, x21, x22
+    add  x2, x2, #1               // value = payload + namelen + 1
+    mov  x0, x2
+    bl _kcc_strlen                 // x0 = value length
+    mov  x3, x0
+    add  x2, x21, x22
+    add  x2, x2, #1               // value ptr (recompute; strlen clobbers)
+    mov  x0, x21                   // name
+    mov  x1, x22                   // namelen
+    bl _kcc_pp_def_simple
+    b .Lapd_next
+.Lapd_no_eq:
+    // Bare NAME: define as 1.
+    mov  x0, x21                   // name
+    mov  x1, x22                   // namelen
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+.Lapd_next:
+    add  x19, x19, #1
+    b .Lapd_loop
+.Lapd_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_pp_add_cmdline_define _kcc_pp_apply_cmdline_defines
 @}
 

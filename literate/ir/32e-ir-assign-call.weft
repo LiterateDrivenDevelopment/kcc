@@ -35,17 +35,47 @@ what makes \texttt{s.f\;+=\;v}, \texttt{a[i]\;*=\;v}, and
 bit-field primitives, a compound assignment to a bit-field member folds
 out for free.
 
-When the LHS has type \texttt{TY\_STRUCT}, a single store would only
-copy the first field.  Instead, the builder resolves both the LHS
-and RHS struct base addresses (alloca vreg or global ref) and calls
-\texttt{\_kcc\_ir\_emit\_struct\_copy} for a field-by-field copy,
-identical to the struct initialisation path described above.
+When the LHS has an aggregate type---\texttt{TY\_STRUCT} \emph{or}
+\texttt{TY\_UNION}---a single store would only copy the first eight bytes.
+A union is easy to overlook here: syntactically \texttt{*dst = *src} looks
+like a scalar assignment, and if the union is not recognised the store
+copies one word and leaves the rest of the object stale.  This is exactly
+how Lua's hash table corrupted itself: \texttt{luaH\_newkey} moves a
+colliding \texttt{Node} (a union) with \texttt{*f = *mp}, and a one-word
+copy left the moved node's \texttt{next} link garbage, so the collision
+chain no longer reached its own main position and \texttt{luaH\_newkey}
+spun forever walking it.  So both aggregate kinds take the copy path.
+
+The builder resolves both the LHS and RHS base addresses (alloca vreg or
+global ref) and calls \texttt{\_kcc\_ir\_emit\_struct\_copy}, which copies
+whole 8-byte slots.  The slot count is \texttt{ceil(TY\_SIZE/8)} of the
+aggregate---\emph{not} the number of fields, which for a union (a handful
+of overlapping members) or a struct with sub-word fields bears no relation
+to its size, and copying the wrong count either truncates the object or
+runs off its end into the neighbour.  Both sides accept the same lvalue
+shapes: a plain variable, an aggregate-typed member, an array element
+\texttt{a[i]}, or a dereferenced pointer \texttt{*p}, whose pointer
+\emph{value} is the aggregate's address.  The destination must recognise
+each of these just as the source does---otherwise the copy is silently
+dropped, leaving the target uninitialised.
 
 The compound path uses callee-saved registers \texttt{x23} (current
 value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
 bytes to save \texttt{x19}--\texttt{x24}.  In all cases the returned
 vreg is the stored value, matching the C semantics where assignment
 is an expression (\stdref{6.5.16}).
+
+Parentheses around the target are transparent: \texttt{(x) = v} is
+\texttt{x = v}.  The lvalue dispatch keys on the target's node tag
+(identifier, member, subscript, dereference); a stray
+\texttt{AST\_PAREN\_EXPR} matches none of them and the store is silently
+dropped.  This is not a rare corner: the macro
+\texttt{\#define G(L) (L->l\_G)} makes \texttt{G(L) = g} expand to
+\texttt{(L->l\_G) = g}, so \texttt{preinit\_thread}'s wiring of the
+global-state pointer vanished, leaving \texttt{L->l\_G} null and crashing
+the first allocation through it.  So we peel any parenthesis wrappers off
+the target first, rewriting the assignment node's LHS field to the bare
+lvalue before dispatching.
 
 @d IR: build assign @{
 // -- kcc_ir_build_assign --------------------------------------------------
@@ -63,6 +93,22 @@ _kcc_ir_build_assign:
     stp x23, x24, [sp, #48]
 
     mov x19, x0
+
+    // Parentheses are transparent to an assignment target: `(x) = v` is
+    // `x = v`.  Peel any AST_PAREN_EXPR off the LHS and rewrite it in place,
+    // so the lvalue dispatch below sees the real target instead of dropping
+    // the store (as `G(L) = g`, i.e. `(L->l_G) = g`, otherwise would).
+    ldr x0, [x19, #AST_F1]      // LHS node
+.Liba_unparen:
+    cbz x0, .Liba_unparen_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Liba_unparen_done
+    ldr x0, [x0, #AST_F0]       // inner expression
+    str x0, [x19, #AST_F1]      // rewrite LHS → inner (parens dropped)
+    b .Liba_unparen
+.Liba_unparen_done:
+
     ldr x0, [x19, #AST_F3]      // assignment result type (= LHS type)
     str x0, [sp, #64]           // stashed for compound-assign width normalisation
     ldr x20, [x19, #AST_F0]     // op token
@@ -76,6 +122,8 @@ _kcc_ir_build_assign:
     cbz x1, .Liba_normal_rhs
     ldr x2, [x1, #TY_KIND]
     cmp x2, #TY_STRUCT
+    b.eq .Liba_struct_copy
+    cmp x2, #TY_UNION
     b.eq .Liba_struct_copy
 
 .Liba_normal_rhs:
@@ -194,15 +242,23 @@ _kcc_ir_build_assign:
     mov x21, x0                  // value to store
 
 .Liba_store:
-    // Emit store
+    // Emit store.  The access-size code comes from the lvalue type (stashed at
+    // [sp,#64]) so a narrow scalar---especially a `float`, whose 4-byte single
+    // representation differs from the double working format---is written at its
+    // true width rather than as a 64-bit default.
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
+    mov x23, x0                  // store instr
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]     // value
-    str x22, [x0, #IR_SRC2]     // alloca
+    str x1, [x23, #IR_TYPE]
+    str x21, [x23, #IR_SRC1]     // value
+    str x22, [x23, #IR_SRC2]     // alloca
+    ldr x0, [sp, #64]           // lvalue type → access-size code
+    bl _kcc_ir_store_width
+    str x0, [x23, #IR_DEST]
+    mov x0, x23
     bl _kcc_ir_emit
 
     mov x0, x21                  // return the stored value's vreg
@@ -304,15 +360,21 @@ _kcc_ir_build_assign:
     mov x21, x0                  // value to store
 
 .Liba_global_simple:
-    // Store value to global address
+    // Store value to global address, at the lvalue type's access width (so a
+    // global `float` is written as a 4-byte single, not a 64-bit double).
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
+    mov x23, x0                  // store instr
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]     // value (rhs or compound result)
-    str x22, [x0, #IR_SRC2]     // global addr
+    str x1, [x23, #IR_TYPE]
+    str x21, [x23, #IR_SRC1]     // value (rhs or compound result)
+    str x22, [x23, #IR_SRC2]     // global addr
+    ldr x0, [sp, #64]           // lvalue type → access-size code
+    bl _kcc_ir_store_width
+    str x0, [x23, #IR_DEST]
+    mov x0, x23
     bl _kcc_ir_emit
     mov x0, x21
     b .Liba_done
@@ -384,6 +446,10 @@ _kcc_ir_build_assign:
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_MEMBER
     b.eq .Liba_sc_dst_member
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Liba_sc_dst_subscript
+    cmp x1, #AST_UNARY_EXPR
+    b.eq .Liba_sc_dst_deref
     cmp x1, #AST_IDENT_EXPR
     b.ne .Liba_done
 
@@ -422,6 +488,23 @@ _kcc_ir_build_assign:
     // LHS is a struct-typed member: its GEP address is the copy destination.
     bl _kcc_ir_build_member_addr
     mov x23, x0                  // x23 = dst member address vreg
+    b .Liba_sc_get_src
+
+.Liba_sc_dst_subscript:
+    // LHS is an array element `a[i]`: its computed address is the destination.
+    bl _kcc_ir_build_subscript_addr
+    mov x23, x0                  // x23 = dst element address vreg
+    b .Liba_sc_get_src
+
+.Liba_sc_dst_deref:
+    // LHS is `*p` (pointer to a struct): the pointer's value IS the destination
+    // struct's address, so building the pointer operand yields the dst base.
+    ldr x1, [x0, #AST_F0]       // unary op
+    cmp x1, #TOK_STAR
+    b.ne .Liba_done
+    ldr x0, [x0, #AST_F1]       // pointer operand
+    bl _kcc_ir_build_expr
+    mov x23, x0                  // x23 = dst base address vreg
 
 .Liba_sc_get_src:
     // Get RHS base address: an identifier's alloca, or a struct-returning
@@ -433,6 +516,8 @@ _kcc_ir_build_assign:
     b.eq .Liba_sc_src_call
     cmp x1, #AST_MEMBER
     b.eq .Liba_sc_src_member
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Liba_sc_src_subscript
     cmp x1, #AST_UNARY_EXPR
     b.eq .Liba_sc_src_deref
     cmp x1, #AST_IDENT_EXPR
@@ -475,6 +560,12 @@ _kcc_ir_build_assign:
     mov x24, x0
     b .Liba_sc_do_copy
 
+.Liba_sc_src_subscript:
+    // RHS is an array element (`dst = a[i]`): its computed address is the source.
+    bl _kcc_ir_build_subscript_addr
+    mov x24, x0
+    b .Liba_sc_do_copy
+
 .Liba_sc_src_deref:
     // RHS is `*p` (a dereferenced pointer to a struct): the pointer's value IS
     // the source struct's address, so building the pointer operand suffices.
@@ -493,16 +584,14 @@ _kcc_ir_build_assign:
     b .Liba_sc_do_copy
 
 .Liba_sc_do_copy:
-    // x24 = src, x23 = dst, x21 = struct type
-    ldr x0, [x21, #TY_F0]       // AST_STRUCT_DECL
-    ldr x0, [x0, #AST_F1]       // first field
-    mov x2, #0
-.Liba_sc_count:
-    cbz x0, .Liba_sc_go
-    add x2, x2, #1
-    ldr x0, [x0, #AST_F4]
-    b .Liba_sc_count
-.Liba_sc_go:
+    // x24 = src, x23 = dst, x21 = aggregate type.  Copy ceil(TY_SIZE/8)
+    // whole 8-byte slots; the field count is wrong for a union or a struct
+    // with sub-word fields.  _kcc_type_layout is idempotent, so it just
+    // returns the (already-computed) byte size.
+    mov x0, x21
+    bl _kcc_type_layout         // x0 = aggregate byte size
+    add x0, x0, #7
+    lsr x2, x0, #3              // slot count = ceil(size / 8)
     mov x0, x24                  // src
     mov x1, x23                  // dst
     bl _kcc_ir_emit_struct_copy
@@ -619,6 +708,20 @@ symbol and call through it.  A name with no resolved type---an implicit
 declaration---is assumed to be a function and called directly.  Routing
 every indirect callee to one path is what lets a function pointer stored in
 a \texttt{struct} field, or in a file-scope variable, be called.
+
+One subtlety on the indirect path: a \emph{dereferenced} function pointer
+\texttt{(*f)(\ldots)} must not lower to a load.  In C a function
+designator---which \texttt{*f} is, when \texttt{f} points to a
+function---decays straight back to the function's address (\stdref{6.3.2.1}),
+so \texttt{(*f)}, \texttt{(**f)}, and \texttt{f} all call the same code.  Were
+we to build \texttt{(*f)} as an ordinary expression it would emit
+\texttt{IR\_LOAD} of the pointer's target---reading the first eight bytes of
+the callee's \emph{machine code} as if they were an address and branching
+there (an \texttt{EXC\_BAD\_ACCESS}, exactly what \texttt{lua\_newstate}'s
+\texttt{(*f)(ud,\ldots)} allocator call triggered).  So before evaluating the
+indirect callee we peel any parentheses and any \texttt{*} whose result type
+is \texttt{TY\_FUNC}, leaving the bare pointer expression to build into the
+function-pointer vreg directly.
 
 @d IR: build call @{
 // -- kcc_ir_build_call ----------------------------------------------------
@@ -900,8 +1003,36 @@ _kcc_ir_build_call:
     b .Libc_done
 
 .Libc_indirect:
-    // Indirect call: build callee expression to get function pointer vreg
-    ldr x0, [sp, #72]            // callee expr node
+    // Indirect call: build callee expression to get function pointer vreg.
+    // First peel parentheses and any dereference of a function pointer:
+    // `(*f)` is a function designator identical to `f`, so building it as a
+    // plain expression would wrongly LOAD through the pointer.
+    ldr x1, [sp, #72]            // callee expr node
+.Libc_ind_unwrap:
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_PAREN_EXPR
+    b.ne .Libc_ind_chkderef
+    ldr x3, [x1, #AST_F0]        // inner expression
+    cbz x3, .Libc_ind_build
+    mov x1, x3
+    b .Libc_ind_unwrap
+.Libc_ind_chkderef:
+    cmp x2, #AST_UNARY_EXPR
+    b.ne .Libc_ind_build
+    ldr x3, [x1, #AST_F0]        // unary op
+    cmp x3, #TOK_STAR
+    b.ne .Libc_ind_build
+    ldr x3, [x1, #AST_F3]        // deref result type
+    cbz x3, .Libc_ind_build
+    ldr x3, [x3, #TY_KIND]
+    cmp x3, #TY_FUNC             // *f where f -> function: designator, no load
+    b.ne .Libc_ind_build
+    ldr x3, [x1, #AST_F1]        // operand (the function pointer expression)
+    cbz x3, .Libc_ind_build
+    mov x1, x3
+    b .Libc_ind_unwrap
+.Libc_ind_build:
+    mov x0, x1
     bl _kcc_ir_build_expr          // returns fn-ptr vreg in x0
     mov x24, x0                    // x24 = fn-ptr vreg
 
@@ -1472,13 +1603,29 @@ run_test "ternary-false-path" \
 \section{Building Cast Expressions}
 
 An explicit cast \texttt{(T)e} compares the target type~\texttt{T}
-with the source type of the inner expression.  When the target is
-strictly narrower (by \texttt{TY\_SIZE}), the builder emits
-\texttt{IR\_TRUNC} to mask the result to the target width.
-When the target is wider, it emits \texttt{IR\_SEXT} for signed
-source types and \texttt{IR\_ZEXT} for unsigned ones; the source
-width is passed in \texttt{IR\_SRC2}.  Same-width casts return the
-inner vreg unchanged.
+with the source type of the inner expression.  Any cast that touches a
+floating type is delegated to \texttt{\_kcc\_ir\_convert}; the two
+\texttt{\_kcc\_ir\_type\_is\_fp} probes are branched on \emph{immediately}
+rather than OR-ed together, because \texttt{is\_fp} uses \texttt{x1} as
+scratch and a stale target result would poison the decision --- an early
+version held \texttt{target\_is\_fp} in \texttt{x1} across the second call,
+so every integer cast saw a non-zero type kind there and was misrouted into
+the FP path (which no-ops integer resizes), silently dropping the conversion.
+
+For integer targets, when the target is strictly narrower (by
+\texttt{TY\_SIZE}) the builder emits \texttt{IR\_TRUNC} to mask the result to
+the target width; when it is wider, it emits \texttt{IR\_SEXT} for signed
+source types and \texttt{IR\_ZEXT} for unsigned ones, with the source width in
+\texttt{IR\_SRC2}.  Equal-width casts are \emph{not} always no-ops: a sub-word
+value (\texttt{char}/\texttt{short}) is physically held in a register extended
+per its own signedness, so a same-size cast that only flips signedness must
+re-extend the low \texttt{size} bytes to the target's convention
+(\texttt{IR\_ZEXT} towards unsigned, \texttt{IR\_SEXT} towards signed).
+Without this, \texttt{(unsigned char)(signed char)0xFF} stays $-1$ instead of
+$255$ --- precisely the misread that made Lua's \texttt{zgetc} treat every
+\texttt{0xFF} byte as \texttt{EOZ} and reject valid bytecode as a truncated
+chunk.  Word-width targets ($\geq 4$ bytes) share a bit pattern under
+AArch64's zero-extending 32-bit operations and are left unchanged.
 
 @d IR: build cast @{
 // -- kcc_ir_build_cast ----------------------------------------------------
@@ -1516,14 +1663,19 @@ _kcc_ir_build_cast:
     // Any conversion touching a floating type is delegated to
     // _kcc_ir_convert, which inserts sitofp / fptosi as needed and rounds to
     // single precision when the target is float.  Integer-only casts fall
-    // through to the width-resize path below.
+    // through to the width-resize path below.  We test each operand
+    // separately and branch immediately: holding one is_fp result across the
+    // second call is unsafe, because _kcc_ir_type_is_fp clobbers x1 as scratch
+    // (it reads TY_KIND into x1).  A stale x1 OR-ed into the decision would be
+    // a non-zero type kind, mis-routing every integer cast into _kcc_ir_convert
+    // (which no-ops integer width changes), silently dropping the conversion.
     mov x0, x22
     bl _kcc_ir_type_is_fp
-    mov x1, x0                   // target_is_fp
+    cbnz x0, .Lbc_fp_convert
     mov x0, x23
-    bl _kcc_ir_type_is_fp        // source_is_fp
-    orr x0, x0, x1
+    bl _kcc_ir_type_is_fp
     cbz x0, .Lbc_int_resize
+.Lbc_fp_convert:
     mov x0, x21                  // src vreg
     mov x1, x23                  // from type
     mov x2, x22                  // to type
@@ -1546,9 +1698,42 @@ _kcc_ir_build_cast:
     ldr x2, [x23, #TY_SIZE]     // source size
 
     cmp x1, x2
-    b.eq .Lbc_done               // same width: no conversion
+    b.eq .Lbc_same_size          // same width: maybe re-extend for signedness
     b.lo .Lbc_trunc              // target < source: truncate
     b .Lbc_extend                // target > source: extend
+
+.Lbc_same_size:
+    // Equal byte width.  A sub-word integer value (char/short) is physically
+    // held in a register sign- or zero-extended according to its own type, so
+    // a cast that only flips signedness must re-extend the low `size` bytes to
+    // match the TARGET type -- otherwise (unsigned char)(signed char)0xFF would
+    // stay -1 instead of 255, which is exactly how Lua's zgetc misread every
+    // 0xFF byte as EOZ.  Word-width types (>=4 bytes) already share a bit
+    // pattern under AArch64's zero-extending 32-bit ops, so they need nothing.
+    cmp x1, #4
+    b.hs .Lbc_done
+    ldr x3, [x22, #TY_F0]        // target signedness (1=signed, 0=unsigned)
+    ldr x4, [x23, #TY_F0]        // source signedness
+    cmp x3, x4
+    b.eq .Lbc_done               // same signedness: nothing to materialise
+    cbz x3, .Lbc_ss_zext
+    mov x0, #IR_SEXT
+    b .Lbc_ss_emit
+.Lbc_ss_zext:
+    mov x0, #IR_ZEXT
+.Lbc_ss_emit:
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    str x22, [x20, #IR_TYPE]    // target type
+    str x21, [x20, #IR_SRC1]    // source vreg
+    ldr x0, [x22, #TY_SIZE]     // re-extend from `size` bytes
+    str x0, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x21, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+    b .Lbc_done
 
 .Lbc_trunc:
     mov x0, #IR_TRUNC

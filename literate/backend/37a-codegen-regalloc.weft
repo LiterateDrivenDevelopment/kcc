@@ -224,6 +224,15 @@ _kcc_cg_regalloc:
     adrp x0, _kcc_cg_fp_save_count@@PAGE
     add  x0, x0, _kcc_cg_fp_save_count@@PAGEOFF
     str xzr, [x0]
+    // Default the slot colouring to the identity all-spill layout: no map, and
+    // one slot per vreg.  The colouring pass at the end overwrites both once the
+    // allocation maps are known.
+    adrp x0, _kcc_cg_slotmap@@PAGE
+    add  x0, x0, _kcc_cg_slotmap@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_cg_max_slot@@PAGE
+    add  x0, x0, _kcc_cg_max_slot@@PAGEOFF
+    str x20, [x0]                   // max_slot = vreg_n (identity default)
     cbz x20, .Lra_done             // no vregs
 
     // Allocate one zeroed block of seven vreg_n-entry arrays (8 bytes each):
@@ -994,6 +1003,14 @@ _kcc_cg_regalloc:
     add  x0, x0, _kcc_cg_save_count@@PAGEOFF
     str x2, [x0]
 
+    // Colour the spill slots now that the register/FP/promotion maps are final.
+    // x19=func, x20=vreg_n, x21=lastuse, x24=flags are still the pass's bases.
+    mov x0, x19
+    mov x1, x20
+    mov x2, x21
+    mov x3, x24
+    bl _kcc_cg_color_slots
+
 .Lra_done:
     ldp x27, x28, [sp, #80]
     ldp x25, x26, [sp, #64]
@@ -1003,5 +1020,278 @@ _kcc_cg_regalloc:
     ldp x29, x30, [sp], #496
     ret
 @| _kcc_cg_regalloc _kcc_ra_use _kcc_ra_disq
+@}
+
+\section{Spill-Slot Colouring}
+\label{sec:slotcolour}
+
+The all-spill frame gives every vreg its own eight-byte slot, so a function's
+frame grows with its \emph{total} vreg count.  For a small function this is
+invisible, but a very large one---Lua's \texttt{luaV\_execute}, a single
+function of some fifteen thousand IR instructions---then demands a
+$15000 \times 8 \approx 120$\,KB frame.  Two hundred nested C calls through such
+a frame overrun the default eight-megabyte stack, so a program that recurses in
+C (Lua catching its own stack-overflow, say) faults the hardware stack before
+the interpreter's own recursion guard can fire.  A production compiler must not
+let a frame scale with the instruction count when most of those values are
+short-lived temporaries.
+
+The remedy is to let non-overlapping vregs \emph{share} a slot, exactly as the
+register allocator lets them share a register.  The colouring runs right after
+the register/FP/promotion maps are final and reuses the liveness the allocator
+already computed: the per-vreg last-use position and the ``escapes its block''
+flag.  A subtlety governs \emph{which} vregs get a slot.  It is tempting to
+colour only the values that stay in memory and skip anything the allocator put
+in a register, but that is unsafe: a value the integer allocator kept in a
+general register can still have its stack slot addressed---by the
+incoming-argument spill, and by the general-register paths that stage a value
+through its slot---so leaving it slot-less lets that address land on another
+value's slot and corrupt it.  The colouring therefore assigns a slot to
+\emph{every} integer value, excluding only the two kinds that provably never
+touch an integer slot: a value homed in a \texttt{d}-register (its accesses go
+through the FP map) and a promoted scalar local (its accesses become register
+moves).  Reuse then shrinks the frame; the register-resident values simply
+occupy a slot across their live range like any other.
+
+A single linear scan over the instructions, in the same order and with the same
+position numbering pass~1 used, does the work.  At each position it first
+\emph{expires} every active single-block vreg whose last use lies strictly
+before the current position, returning its slot to a free list; then, if the
+instruction defines a slot-needing vreg, it hands that vreg a slot.  A value
+confined to one basic block (the escape flag clear) is a \emph{reuse}
+candidate: it takes a slot off the free list when one is available, and joins
+the active set so its slot is recycled once it dies.  This is safe irrespective
+of loops---within a single block textual order is execution order, and across a
+back-edge every single-block value from the previous iteration is already dead
+when the block re-executes, so no live value ever shares a slot.  A value that
+escapes its block is given a \emph{dedicated} slot that is never freed; that is
+trivially correct and keeps the pass from needing any cross-block liveness.
+
+Incoming parameters have no defining instruction---their vregs are live from
+entry and are always slot-needing (never marked candidates)---so a final
+straggler sweep gives every still-unassigned such vreg a fresh dedicated slot.
+The
+high-water mark of the slot counter becomes \texttt{\_kcc\_cg\_max\_slot}, the
+size of the frame's vreg-value area, and the vreg$\rightarrow$slot array is
+published in \texttt{\_kcc\_cg\_slotmap} for \texttt{slot\_offset} to consult.
+Because the map defaults to absent and \texttt{max\_slot} to the raw vreg count,
+a function the pass declines to touch keeps its exact all-spill layout.
+
+@d CodeGen: slot colouring @{
+// -- kcc_cg_color_slots -------------------------------------------------------
+// void kcc_cg_color_slots(ir_func *func, uint64_t vreg_n,
+//                         uint64_t *lastuse, uint64_t *flags)
+// Builds _kcc_cg_slotmap (vreg → reused stack-slot index) and _kcc_cg_max_slot
+// (slot count) by a linear-scan colouring of the SPILLED vregs, reusing a slot
+// among single-block vregs whose live ranges do not overlap.
+//   Frame (192): x29/x30 + x19..x28; locals from #96.
+.text
+.globl _kcc_cg_color_slots
+.p2align 2
+_kcc_cg_color_slots:
+    stp x29, x30, [sp, #-192]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+    mov x19, x0                    // func
+    mov x20, x1                    // vreg_n
+    mov x21, x2                    // lastuse base
+    mov x22, x3                    // flags base
+
+    // Four vreg_n-entry arrays: slotmap, active_vreg, active_slot, free_slot.
+    lsl x9, x20, #3               // vreg_n * 8
+    lsl x0, x9, #2               // * 4
+    bl _kcc_arena_alloc
+    mov x23, x0                    // slotmap
+    lsl x9, x20, #3
+    add x24, x23, x9              // active_vreg
+    add x25, x24, x9              // active_slot
+    add x26, x25, x9              // free_slot
+
+    // slotmap[v] = -1 (SENTINEL: unassigned) for every v.
+    mov x9, #0
+    mov x10, #-1
+.Lcs_init:
+    cmp x9, x20
+    b.hs .Lcs_init_done
+    str x10, [x23, x9, lsl #3]
+    add x9, x9, #1
+    b .Lcs_init
+.Lcs_init_done:
+
+    // Cache the allocation maps (published by the caller before this runs).
+    adrp x0, _kcc_cg_regmap@@PAGE
+    add  x0, x0, _kcc_cg_regmap@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [sp, #144]
+    adrp x0, _kcc_cg_fpregmap@@PAGE
+    add  x0, x0, _kcc_cg_fpregmap@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [sp, #152]
+    adrp x0, _kcc_cg_promoted@@PAGE
+    add  x0, x0, _kcc_cg_promoted@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [sp, #160]
+
+    str xzr, [sp, #96]           // next_slot
+    str xzr, [sp, #104]          // active_count
+    str xzr, [sp, #112]          // free_count
+    str xzr, [sp, #120]          // pos
+
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x0, [x0, #VEC_COUNT]
+    str x0, [sp, #136]           // bb_count
+    str xzr, [sp, #128]          // bb_index
+.Lcs_bb:
+    ldr x0, [sp, #128]
+    ldr x1, [sp, #136]
+    cmp x0, x1
+    b.hs .Lcs_final
+    ldr x0, [x19, #IRF_BLOCKS]
+    ldr x1, [sp, #128]
+    bl _kcc_vec_get
+    ldr x27, [x0]
+    ldr x27, [x27, #BB_FIRST]
+.Lcs_instr:
+    cbz x27, .Lcs_next_bb
+
+    // --- expire active single-block vregs whose lastuse < pos ---
+    ldr x28, [sp, #120]          // pos
+    ldr x11, [sp, #104]          // active_count
+    mov x9, #0                    // read index
+    mov x10, #0                   // write index (compaction)
+.Lcs_exp:
+    cmp x9, x11
+    b.hs .Lcs_exp_done
+    ldr x12, [x24, x9, lsl #3]    // v
+    ldr x13, [x25, x9, lsl #3]    // slot
+    ldr x14, [x21, x12, lsl #3]   // lastuse[v]
+    cmp x14, x28
+    b.hs .Lcs_exp_keep            // still live (lastuse >= pos)
+    ldr x15, [sp, #112]          // free_count
+    str x13, [x26, x15, lsl #3]   // free_slot[free_count++] = slot
+    add x15, x15, #1
+    str x15, [sp, #112]
+    b .Lcs_exp_adv
+.Lcs_exp_keep:
+    str x12, [x24, x10, lsl #3]
+    str x13, [x25, x10, lsl #3]
+    add x10, x10, #1
+.Lcs_exp_adv:
+    add x9, x9, #1
+    b .Lcs_exp
+.Lcs_exp_done:
+    str x10, [sp, #104]          // active_count = kept
+
+    // --- assign a slot to a spilled DEST ---
+    ldr x0, [x27, #IR_DEST]
+    cbz x0, .Lcs_adv             // no dest
+    cmp x0, x20
+    b.hs .Lcs_adv                // out of range
+    mov x28, x0                   // d
+    // A value homed in a d-register or a promoted local never touches an
+    // integer stack slot, so it needs none.  A value the integer allocator put
+    // in a general register is NOT excluded: several codegen paths still address
+    // its slot (the incoming-argument spill writes each parameter to its slot
+    // whether or not it stayed in a register; a general-register value is also
+    // materialised through its slot on some paths), so it must own a valid,
+    // non-colliding slot for its whole live range---hence it joins the scan.
+    ldr x1, [sp, #152]           // fpmap
+    cbz x1, .Lcs_chk_pr
+    ldr x2, [x1, x28, lsl #3]
+    cbnz x2, .Lcs_adv            // in a d-register
+.Lcs_chk_pr:
+    ldr x1, [sp, #160]           // promoted
+    cbz x1, .Lcs_spilled
+    ldr x2, [x1, x28, lsl #3]
+    cbnz x2, .Lcs_adv            // promoted local (register)
+.Lcs_spilled:
+    ldr x1, [x22, x28, lsl #3]    // flags[d]
+    tst x1, #2                    // escapes its block?
+    b.ne .Lcs_dedicated
+    // single-block: reuse a freed slot if any, else a fresh one; track active.
+    ldr x2, [sp, #112]           // free_count
+    cbz x2, .Lcs_fresh_sb
+    sub x2, x2, #1
+    str x2, [sp, #112]
+    ldr x3, [x26, x2, lsl #3]     // slot = free_slot[--free_count]
+    b .Lcs_sb_have
+.Lcs_fresh_sb:
+    ldr x3, [sp, #96]
+    add x4, x3, #1
+    str x4, [sp, #96]            // next_slot++
+.Lcs_sb_have:
+    str x3, [x23, x28, lsl #3]    // slotmap[d] = slot
+    ldr x2, [sp, #104]
+    str x28, [x24, x2, lsl #3]    // active_vreg[active_count] = d
+    str x3, [x25, x2, lsl #3]     // active_slot[active_count] = slot
+    add x2, x2, #1
+    str x2, [sp, #104]
+    b .Lcs_adv
+.Lcs_dedicated:
+    ldr x3, [sp, #96]
+    add x4, x3, #1
+    str x4, [sp, #96]            // next_slot++ (never freed)
+    str x3, [x23, x28, lsl #3]    // slotmap[d] = slot
+.Lcs_adv:
+    ldr x0, [sp, #120]
+    add x0, x0, #1
+    str x0, [sp, #120]           // pos++
+    ldr x27, [x27, #IR_NEXT]
+    b .Lcs_instr
+.Lcs_next_bb:
+    ldr x0, [sp, #128]
+    add x0, x0, #1
+    str x0, [sp, #128]
+    b .Lcs_bb
+
+.Lcs_final:
+    // Straggler sweep: parameters and any other spilled vreg with no defining
+    // instruction get a fresh dedicated slot.
+    mov x9, #0
+.Lcs_str:
+    cmp x9, x20
+    b.hs .Lcs_publish
+    ldr x10, [x23, x9, lsl #3]
+    adds xzr, x10, #1            // slotmap[v] == -1 (unassigned)?
+    b.ne .Lcs_str_next
+    ldr x1, [sp, #152]           // fp-homed → no integer slot
+    cbz x1, .Lcs_str_pr
+    ldr x2, [x1, x9, lsl #3]
+    cbnz x2, .Lcs_str_next
+.Lcs_str_pr:
+    ldr x1, [sp, #160]
+    cbz x1, .Lcs_str_assign
+    ldr x2, [x1, x9, lsl #3]
+    cbnz x2, .Lcs_str_next
+.Lcs_str_assign:
+    ldr x3, [sp, #96]
+    add x4, x3, #1
+    str x4, [sp, #96]
+    str x3, [x23, x9, lsl #3]
+.Lcs_str_next:
+    add x9, x9, #1
+    b .Lcs_str
+
+.Lcs_publish:
+    adrp x0, _kcc_cg_slotmap@@PAGE
+    add  x0, x0, _kcc_cg_slotmap@@PAGEOFF
+    str x23, [x0]
+    ldr x0, [sp, #96]           // next_slot high-water = slot count
+    adrp x1, _kcc_cg_max_slot@@PAGE
+    add  x1, x1, _kcc_cg_max_slot@@PAGEOFF
+    str x0, [x1]
+
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #192
+    ret
+@| _kcc_cg_color_slots
 @}
 

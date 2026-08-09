@@ -78,7 +78,8 @@ _kcc_ir_build:
 
 .Lirb_scan:
     // Decide whether this unit needs a module-init function: it must lack a
-    // main definition yet carry at least one file-scope initializer.
+    // main definition yet carry at least one initializer to run at startup ---
+    // a file-scope one, or a `static` local initializer inside a function body.
     adrp x0, _kcc_ir_trans_unit@@PAGE
     add  x0, x0, _kcc_ir_trans_unit@@PAGEOFF
     ldr x0, [x0]
@@ -92,6 +93,28 @@ _kcc_ir_build:
     b.ne .Lirb_scan_var
     ldr x0, [x19, #AST_F3]      // body → a definition, not a prototype
     cbz x0, .Lirb_scan_next
+
+    // Scan the body for a `static` local with an initializer: it too must run
+    // once at startup, so in a non-main unit it is what obliges a module-init
+    // function (no calls here, so x9/x10 survive to the main check below).
+    ldr x9, [x0, #AST_F0]       // first body statement
+.Lirb_scan_body:
+    cbz x9, .Lirb_scan_main
+    ldr x10, [x9, #AST_TAG]
+    cmp x10, #AST_VAR_DECL
+    b.ne .Lirb_scan_body_next
+    ldr x10, [x9, #AST_F3]      // storage class (3 = static)
+    cmp x10, #3
+    b.ne .Lirb_scan_body_next
+    ldr x10, [x9, #AST_F2]      // initializer present?
+    cbz x10, .Lirb_scan_body_next
+    mov x21, #1                  // static-local initializer → needs module init
+    b .Lirb_scan_main
+.Lirb_scan_body_next:
+    ldr x9, [x9, #AST_F4]
+    b .Lirb_scan_body
+
+.Lirb_scan_main:
     ldr x0, [x19, #AST_F1]      // name
     cbz x0, .Lirb_scan_next
     adrp x1, _kcc_str_main@@PAGE
@@ -146,8 +169,11 @@ A second pass then seeds the \texttt{static} locals
 (\S\ref{sec:ir-static-locals}).  Since these are hoisted to globals but
 their declarations live inside function bodies, this pass walks each
 function's top-level statement list for \texttt{static} declarations
-that carry an initialiser and emits the same
-\texttt{IR\_GLOBAL\_REF$+$IR\_STORE} against the mangled symbol.
+that carry an initialiser, materialises the mangled symbol with an
+\texttt{IR\_GLOBAL\_REF}, and hands it to the shared
+\texttt{\_kcc\_ir\_emit\_init\_stores} routine---so a scalar, an
+aggregate list, or a string static is initialised by exactly the same
+code path a file-scope global uses.
 Running it here---at the top of \texttt{main}---is what gives a static
 its \emph{initialise once} semantics: the store executes at program
 start rather than on every entry to the declaring function.  A static
@@ -205,125 +231,12 @@ _kcc_ir_emit_global_inits:
     mov x0, x21
     bl _kcc_ir_emit
 
-    // Aggregate initializer? (BSS is already zero, so only write given elems)
-    ldr x0, [x19, #AST_F2]
-    ldr x1, [x0, #AST_TAG]
-    cmp x1, #AST_INIT_LIST
-    b.eq .Legi_initlist
-    cmp x1, #AST_STR_LIT
-    b.eq .Legi_string
-
-.Legi_scalar:
-    // Build the initializer expression
-    ldr x0, [x19, #AST_F2]
-    bl _kcc_ir_build_expr
-    mov x21, x0                  // x21 = value vreg
-
-    // A _Bool global normalises its initializer to 0/1.
-    ldr x0, [x19, #AST_F0]      // declared type spec
-    bl _kcc_sema_resolve_type
-    cbz x0, .Legi_scalar_store
-    ldr x0, [x0, #TY_KIND]
-    cmp x0, #TY_BOOL
-    b.ne .Legi_scalar_store
-    mov x0, x21
-    bl _kcc_ir_emit_bool_norm
-    mov x21, x0
-
-.Legi_scalar_store:
-    // Emit IR_STORE: value -> global address
-    mov x0, #IR_STORE
-    bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]     // value
-    str x22, [x0, #IR_SRC2]     // address
-    bl _kcc_ir_emit
-    b .Legi_next
-
-.Legi_initlist:
-    // Determine the element/aggregate type for byte-accurate offsets:
-    // for an array, the element type; for a struct, the struct type itself.
-    ldr x0, [x19, #AST_F0]      // declared type spec
-    bl _kcc_sema_resolve_type
-    cbz x0, .Legi_il_int
-    ldr x1, [x0, #TY_KIND]
-    cmp x1, #TY_ARRAY
-    b.ne .Legi_il_typed
-    ldr x0, [x0, #TY_F0]        // array element type
-    b .Legi_il_typed
-.Legi_il_int:
-    adrp x0, _kcc_type_int_s@@PAGE
-    add  x0, x0, _kcc_type_int_s@@PAGEOFF
-    ldr x0, [x0]
-.Legi_il_typed:
-    mov x23, x0                  // element/aggregate type
-
-    ldr x20, [x19, #AST_F2]     // init list node
-    ldr x20, [x20, #AST_F0]     // first element
-    mov x21, #0                  // element index (current object position)
-.Legi_il_loop:
-    cbz x20, .Legi_next
-    // Honour a designator, exactly as the local-variable path does.
-    ldr x9, [x20, #AST_TAG]
-    cmp x9, #AST_DESIGNATOR
-    b.ne .Legi_il_pos
-    ldr x9, [x20, #AST_F1]       // is_field?
-    cbz x9, .Legi_il_arr
-    mov x0, x23                  // aggregate type
-    ldr x1, [x20, #AST_F0]      // member name
-    bl _kcc_ir_field_index
-    tbnz x0, #63, .Legi_il_desval
-    mov x21, x0
-.Legi_il_desval:
-    ldr x0, [x20, #AST_F3]      // value node
-    b .Legi_il_build
-.Legi_il_arr:
-    ldr x21, [x20, #AST_F0]      // [i] = : position becomes i
-    ldr x0, [x20, #AST_F3]      // value node
-    b .Legi_il_build
-.Legi_il_pos:
-    mov x0, x20                  // value node = element itself
-.Legi_il_build:
-    bl _kcc_ir_build_expr
-    mov x24, x0                  // value
-    mov x0, x23                  // element/aggregate type
-    mov x1, x21                  // index
-    bl _kcc_ir_elem_off_width    // x0 = byte offset, x1 = width
-    mov x3, x1                   // width
-    mov x1, x0                   // byte offset
-    mov x0, x22                  // base = global address vreg
-    mov x2, x24                  // value
-    bl _kcc_ir_store_elem        // bit-field aware
-    add x21, x21, #1
-    ldr x20, [x20, #AST_F4]      // next element
-    b .Legi_il_loop
-
-.Legi_string:
-    // File-scope char s[] = "abc": copy bytes into BSS (a char *g stores the
-    // address, so only an array target takes this path).
-    ldr x0, [x19, #AST_F0]      // declared type
-    bl _kcc_sema_resolve_type
-    cbz x0, .Legi_scalar
-    ldr x1, [x0, #TY_KIND]
-    cmp x1, #TY_ARRAY
-    b.ne .Legi_scalar
-    ldr x21, [x0, #TY_F1]       // array length (char → bytes)
-    ldr x0, [x19, #AST_F2]
-    ldr x23, [x0, #AST_F0]      // str_ptr
-    ldr x24, [x0, #AST_F1]      // str_len
-    cbnz x21, .Legi_str_call
-    add x21, x24, #1
-.Legi_str_call:
-    mov x0, x22                  // base = global address vreg
-    mov x1, x23                  // str_ptr
-    mov x2, x24                  // str_len
-    mov x3, x21                  // array_len
-    mov x4, #0                   // BSS already zero
-    bl _kcc_ir_emit_string_init
-    b .Legi_next
+    // Emit the initializer (scalar, aggregate list, or string) against the
+    // just-materialised base address.  The same routine serves the static
+    // locals below, keyed only on the base address it is handed.
+    mov x0, x19                  // decl node
+    mov x1, x22                  // base address vreg
+    bl _kcc_ir_emit_init_stores
 
 .Legi_next:
     ldr x19, [x19, #AST_F4]     // next sibling
@@ -355,7 +268,11 @@ _kcc_ir_emit_global_inits:
     ldr x0, [x20, #AST_F2]      // initializer
     cbz x0, .Legi_stmt_next
 
-    // GLOBAL_REF(mangled) + build_expr(init) + STORE
+    // GLOBAL_REF(mangled) + shared initializer emission.  Because the static
+    // shares one routine with file-scope globals, an aggregate static
+    // (`static const struct P p = {..}` or `static const int a[] = {..}`) is
+    // laid out element-by-element into its storage, not truncated to a single
+    // scalar store.
     mov x0, x20
     bl _kcc_ir_static_name
     mov x21, x0                  // mangled name
@@ -374,19 +291,9 @@ _kcc_ir_emit_global_inits:
     mov x0, x22
     bl _kcc_ir_emit
 
-    ldr x0, [x20, #AST_F2]
-    bl _kcc_ir_build_expr
-    mov x22, x0                  // value vreg
-
-    mov x0, #IR_STORE
-    bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    str x22, [x0, #IR_SRC1]     // value
-    str x21, [x0, #IR_SRC2]     // address
-    bl _kcc_ir_emit
+    mov x0, x20                  // static decl node
+    mov x1, x21                  // base address vreg
+    bl _kcc_ir_emit_init_stores
 
 .Legi_stmt_next:
     ldr x20, [x20, #AST_F4]
@@ -402,6 +309,322 @@ _kcc_ir_emit_global_inits:
     ldp x29, x30, [sp], #64
     ret
 @| _kcc_ir_emit_global_inits
+@}
+
+\paragraph{Shared initializer emission.}
+Both file-scope globals and hoisted static locals reduce to the same
+problem: given a base address and a declaration, emit the store
+instructions that realise its initialiser.  Factoring that into one
+routine, \texttt{\_kcc\_ir\_emit\_init\_stores}, is what lets a
+\texttt{static const} aggregate be laid out correctly---the earlier
+static pass truncated \texttt{\{7,\,9\}} to a single scalar store,
+leaving the second field at its BSS zero, so \texttt{lcode.c}'s
+\texttt{static const expdesc ef = \{VKINT,\,\{0\},\,NO\_JUMP,\,NO\_JUMP\}}
+came back mis-initialised.  The routine takes the declaration in
+\texttt{x0} and the base-address vreg in \texttt{x1}, dispatches on the
+shape of the initialiser, and emits the corresponding stores: a scalar
+(with the \texttt{\_Bool} 0/1 normalisation), a brace-enclosed list
+(one \texttt{\_kcc\_ir\_store\_elem} per element, honouring designators
+and byte-accurate offsets), or a string literal copied into an array.
+It writes nothing for the unmentioned tail, since BSS already supplies
+the zero image.
+
+\paragraph{Nested aggregate initialisers.}  A brace-enclosed initialiser can
+nest: an array of structs (\texttt{static const luaL\_Reg lib[] =
+\{\{"a",\,f\},\ldots\}}) or a struct with an aggregate member.  Each element's
+initialiser is itself a brace list that must be laid out at the element's
+offset, recursively.  \texttt{\_kcc\_ir\_emit\_aggregate\_init} does exactly
+that: it walks one init-list against an aggregate type, and for an element
+whose type is again a struct/union/array \emph{and} whose initialiser is a
+nested brace list, it computes the element's sub-address
+(\texttt{IR\_GEP} of base $+$ offset) and recurses.  Flattening this to a
+single scalar store per element---the earlier behaviour---placed a
+function-pointer field's brace initialiser at the wrong slot, so Lua's
+\texttt{loadedlibs} table called into its own data (an \texttt{EXC\_BAD\_ACCESS}
+during \texttt{luaL\_openlibs}).  The per-element type comes from the array's
+element type or, for a struct, the field decl that
+\texttt{\_kcc\_ir\_elem\_off\_width} publishes.
+
+@d IR: build @{
+// -- kcc_ir_emit_aggregate_init ------------------------------------------
+// void kcc_ir_emit_aggregate_init(node *init_list, type *agg, uint64_t base)
+//   x0 = AST_INIT_LIST, x1 = aggregate type (array/struct/union, or a scalar
+//   type for the untyped int fallback), x2 = base address vreg.
+// Emits stores for each element, honouring designators and byte offsets, and
+// recursing for an element that is itself a nested aggregate initialiser.
+.text
+.globl _kcc_ir_emit_aggregate_init
+.p2align 2
+_kcc_ir_emit_aggregate_init:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    mov x19, x0                  // init-list node
+    mov x28, x1                  // full aggregate type
+    mov x22, x2                  // base address vreg
+
+    // Offset-calc type x23: array → element type; struct/union/scalar → itself.
+    // (`_kcc_ir_elem_off_width` strides an array by sizeof(element) and walks a
+    // struct's fields; a scalar type gives the int-fallback stride.)
+    mov x23, x28
+    ldr x0, [x28, #TY_KIND]
+    cmp x0, #TY_ARRAY
+    b.ne .Leai_typed
+    ldr x23, [x28, #TY_F0]       // array element type
+.Leai_typed:
+
+    ldr x20, [x19, #AST_F0]     // first element
+    mov x21, #0                  // element index / position
+.Leai_loop:
+    cbz x20, .Leai_done
+
+    // Designator (`.f =` / `[i] =`) or a positional element.
+    ldr x9, [x20, #AST_TAG]
+    cmp x9, #AST_DESIGNATOR
+    b.ne .Leai_pos
+    ldr x9, [x20, #AST_F1]       // is_field?
+    cbz x9, .Leai_arr
+    mov x0, x28                  // struct type for the field lookup
+    ldr x1, [x20, #AST_F0]      // member name
+    bl _kcc_ir_field_index
+    tbnz x0, #63, .Leai_desval
+    mov x21, x0
+.Leai_desval:
+    ldr x25, [x20, #AST_F3]     // value node
+    b .Leai_have
+.Leai_arr:
+    ldr x21, [x20, #AST_F0]      // [i] = : position becomes i
+    ldr x25, [x20, #AST_F3]     // value node
+    b .Leai_have
+.Leai_pos:
+    mov x25, x20                 // value node = element itself
+.Leai_have:
+    // Byte offset, width, and per-element type x24 for this position.  An
+    // array strides by sizeof(element)---even when the element is a struct, so
+    // `_kcc_ir_elem_off_width` (which would walk a struct's fields) is only
+    // used for a genuine struct/union aggregate.
+    ldr x0, [x28, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Leai_struct_elem
+    cmp x0, #TY_UNION
+    b.eq .Leai_struct_elem
+    // Array (or scalar fallback): offset = index * sizeof(element).
+    mov x0, x23                  // element type
+    bl _kcc_type_layout          // x0 = sizeof(element)
+    mul x26, x21, x0             // offset = index * element size
+    mov x0, x23
+    bl _kcc_ir_store_width       // x0 = access width
+    mov x27, x0
+    mov x24, x23                 // per-element type = element type
+    b .Leai_type_ready
+.Leai_struct_elem:
+    mov x0, x28                  // struct type
+    mov x1, x21                  // field position
+    bl _kcc_ir_elem_off_width    // x0 = byte offset, x1 = width; publishes field
+    mov x26, x0
+    mov x27, x1
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Leai_scalar_notype
+    ldr x0, [x0, #AST_F0]       // field type node
+    bl _kcc_sema_resolve_type
+    mov x24, x0
+    b .Leai_type_ready
+.Leai_scalar_notype:
+    mov x24, #0
+.Leai_type_ready:
+
+    // A nested brace initialiser whose target is itself an aggregate recurses.
+    ldr x0, [x25, #AST_TAG]
+    cmp x0, #AST_INIT_LIST
+    b.ne .Leai_scalar
+    cbz x24, .Leai_scalar
+    ldr x0, [x24, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Leai_recurse
+    cmp x0, #TY_UNION
+    b.eq .Leai_recurse
+    cmp x0, #TY_ARRAY
+    b.ne .Leai_scalar
+.Leai_recurse:
+    // sub-address = base + offset, then recurse with the element's type.
+    mov x0, x26                  // byte offset
+    bl _kcc_ir_emit_const        // const vreg
+    mov x2, x0
+    mov x0, #IR_GEP
+    mov x1, x22                  // base
+    bl _kcc_ir_emit_binop        // base + offset (stride 1) → sub-address vreg
+    mov x2, x0                   // sub-base
+    mov x0, x25                  // nested init-list
+    mov x1, x24                  // nested aggregate type
+    bl _kcc_ir_emit_aggregate_init
+    b .Leai_next
+.Leai_scalar:
+    mov x0, x25                  // element value expression
+    bl _kcc_ir_build_expr
+    mov x2, x0                   // value
+    mov x3, x27                  // width
+    mov x1, x26                  // byte offset
+    mov x0, x22                  // base
+    bl _kcc_ir_store_elem
+.Leai_next:
+    add x21, x21, #1
+    ldr x20, [x20, #AST_F4]      // next element
+    b .Leai_loop
+.Leai_done:
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@| _kcc_ir_emit_aggregate_init
+@}
+
+@d IR: build @{
+// -- kcc_ir_emit_init_stores ---------------------------------------------
+// void kcc_ir_emit_init_stores(node *decl, uint64_t base_vreg)
+//   x0 = AST_VAR_DECL (AST_F0 = declared type, AST_F2 = initializer)
+//   x1 = base address vreg (storage the initializer writes into)
+// Emits the store(s) for a scalar, aggregate init-list, or string init.
+.text
+.globl _kcc_ir_emit_init_stores
+.p2align 2
+_kcc_ir_emit_init_stores:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    mov x19, x0                  // decl node
+    mov x22, x1                  // base address vreg
+
+    ldr x0, [x19, #AST_F2]      // initializer
+    cbz x0, .Leis_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.eq .Leis_initlist
+    cmp x1, #AST_STR_LIT
+    b.eq .Leis_string
+
+.Leis_scalar:
+    // An initializer that is neither a brace list nor a string literal, but
+    // whose target is a struct/union (`expdesc temp = *e1;`, `S a = b;`), is a
+    // whole-object COPY, not a scalar store---otherwise only the first word is
+    // copied and the rest of the object is left as stack garbage.  (This is a
+    // different path from a plain assignment `a = b`: a declaration with an
+    // initializer.)  It broke Lua's `lcode.c`, whose `swapexps` does exactly
+    // `expdesc temp = *e1;` to compile the `>`/`>=` operators, so every `a > b`
+    // crashed the parser.
+    ldr x0, [x19, #AST_F0]      // declared type spec
+    bl _kcc_sema_resolve_type
+    cbz x0, .Leis_scalar_val
+    mov x23, x0                  // x23 = resolved type
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.eq .Leis_struct_copy
+    cmp x1, #TY_UNION
+    b.eq .Leis_struct_copy
+    b .Leis_scalar_val
+
+.Leis_struct_copy:
+    ldr x0, [x19, #AST_F2]      // initializer expression
+    bl _kcc_ir_build_struct_addr // x0 = source struct base address vreg
+    mov x24, x0                  // x24 = src
+    mov x0, x23
+    bl _kcc_type_layout          // x0 = aggregate byte size
+    add x0, x0, #7
+    lsr x2, x0, #3              // slot count = ceil(size / 8)
+    mov x0, x24                  // src
+    mov x1, x22                  // dst = base address
+    bl _kcc_ir_emit_struct_copy
+    b .Leis_done
+
+.Leis_scalar_val:
+    // Build the initializer expression
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    mov x21, x0                  // x21 = value vreg
+
+    // A _Bool target normalises its initializer to 0/1.
+    ldr x0, [x19, #AST_F0]      // declared type spec
+    bl _kcc_sema_resolve_type
+    cbz x0, .Leis_scalar_store
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_BOOL
+    b.ne .Leis_scalar_store
+    mov x0, x21
+    bl _kcc_ir_emit_bool_norm
+    mov x21, x0
+
+.Leis_scalar_store:
+    // Emit IR_STORE: value -> base address
+    mov x0, #IR_STORE
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x21, [x0, #IR_SRC1]     // value
+    str x22, [x0, #IR_SRC2]     // address
+    bl _kcc_ir_emit
+    b .Leis_done
+
+.Leis_initlist:
+    // Lay out the brace initialiser against the declared aggregate type,
+    // recursing for nested aggregates.  When the type does not resolve, fall
+    // back to an int-strided array (the historical untyped behaviour).
+    ldr x0, [x19, #AST_F0]      // declared type spec
+    bl _kcc_sema_resolve_type
+    cbnz x0, .Leis_il_have_type
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr x0, [x0]
+.Leis_il_have_type:
+    mov x1, x0                   // aggregate type
+    ldr x0, [x19, #AST_F2]      // init-list node
+    mov x2, x22                  // base address vreg
+    bl _kcc_ir_emit_aggregate_init
+    b .Leis_done
+
+.Leis_string:
+    // char s[] = "abc": copy bytes into the array storage (a char *g stores
+    // the address, so only an array target takes this path).
+    ldr x0, [x19, #AST_F0]      // declared type
+    bl _kcc_sema_resolve_type
+    cbz x0, .Leis_scalar
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Leis_scalar
+    ldr x21, [x0, #TY_F1]       // array length (char → bytes)
+    ldr x0, [x19, #AST_F2]
+    ldr x23, [x0, #AST_F0]      // str_ptr
+    ldr x24, [x0, #AST_F1]      // str_len
+    cbnz x21, .Leis_str_call
+    add x21, x24, #1
+.Leis_str_call:
+    mov x0, x22                  // base = address vreg
+    mov x1, x23                  // str_ptr
+    mov x2, x24                  // str_len
+    mov x3, x21                  // array_len
+    mov x4, #0                   // BSS already zero
+    bl _kcc_ir_emit_string_init
+
+.Leis_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_emit_init_stores
 @}
 
 The synthesised module-init function is an ordinary IR function built by
@@ -834,10 +1057,13 @@ _kcc_ir_build_param:
     mov x19, x0                  // param_decl
     mov x22, x1                  // x22 = param index (= incoming vreg)
 
-    // Resolve type
+    // Resolve type.  An array/function parameter decays to a pointer
+    // (\stdref{6.7.6.3}): the callee receives the passed address, so the
+    // storage is a single pointer slot, not inline array space.
     ldr x0, [x19, #AST_F0]
     cbz x0, .Libp_done
     bl _kcc_sema_resolve_type
+    bl _kcc_type_param_adjust
     mov x20, x0                  // x20 = type desc
     cbz x20, .Libp_done
 
@@ -908,11 +1134,21 @@ _kcc_ir_build_param:
 .Libp_scalar_store:
     // Scalar / ST1: store the incoming value into the alloca.
     // IR_STORE: SRC1 = value vreg (param index), SRC2 = pointer vreg (alloca)
+    // The access-size code (store_width of the parameter type) must be set so a
+    // `float` parameter is written to its stack home as a 4-byte single, exactly
+    // as every read of it loads a single---otherwise the copy stored 8 double
+    // bytes while each use read 4 single bytes, and the value came back as ~0.
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
+    str x0, [sp, #56]           // stash store instr
     str x22, [x0, #IR_SRC1]     // value = incoming param vreg
     str x23, [x0, #IR_SRC2]     // ptr = alloca vreg
     str x20, [x0, #IR_TYPE]
+    mov x0, x20                 // parameter type → access-size code
+    bl _kcc_ir_store_width
+    ldr x1, [sp, #56]
+    str x0, [x1, #IR_DEST]
+    ldr x0, [sp, #56]
     bl _kcc_ir_emit
     b .Libp_record
 
@@ -1285,10 +1521,16 @@ _kcc_ir_build_stmt:
 \section{Building Return}
 \label{sec:struct-return}
 
-A return statement evaluates its expression (if any), emits
+A return statement evaluates its expression (if any), \emph{converts} the
+value to the function's declared return type, emits
 \texttt{IR\_RET} with the result vreg as \texttt{SRC1}, and marks
-the current basic block as terminated.  A void return emits
-\texttt{IR\_RET} with a void type and no source operand.  The
+the current basic block as terminated.  The conversion is the same
+\stdref{6.8.6.4} coercion an assignment applies: \texttt{return 504} from a
+function typed \texttt{double} must yield \texttt{504.0}, not the integer's
+bit pattern reinterpreted in a floating register---the defect that made
+Lua's \texttt{lua\_version} (\texttt{return LUA\_VERSION\_NUM}) hand back
+zero and trip \texttt{luaL\_checkversion}'s ``version mismatch''.  A void
+return emits \texttt{IR\_RET} with a void type and no source operand.  The
 termination flag prevents the builder from appending further
 instructions to this block.
 
@@ -1338,6 +1580,22 @@ _kcc_ir_build_return:
     bl _kcc_ir_build_expr
     mov x20, x0                  // x20 = vreg of return value
 
+    // Convert the value to the function's return type (int<->double, widths):
+    // `return 504` from a double function must produce 504.0, not int bits.
+    adrp x0, _kcc_ir_cur_func@@PAGE
+    add  x0, x0, _kcc_ir_cur_func@@PAGEOFF
+    ldr x0, [x0]
+    ldr x2, [x0, #IRF_RETTYPE]   // to = return type
+    cbz x2, .Libret_scalar_emit
+    ldr x1, [x19, #AST_F0]      // return expr node
+    cbz x1, .Libret_scalar_emit
+    ldr x1, [x1, #AST_F3]       // from = expr type
+    cbz x1, .Libret_scalar_emit
+    mov x0, x20                  // value vreg
+    bl _kcc_ir_convert           // (value x0, from x1, to x2) → converted
+    mov x20, x0
+
+.Libret_scalar_emit:
     // Emit ret with value
     mov x0, #IR_RET
     bl _kcc_ir_alloc_instr

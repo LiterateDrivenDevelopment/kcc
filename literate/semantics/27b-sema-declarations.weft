@@ -96,6 +96,25 @@ _kcc_sema_check_decl:
     b .Lscd_done
 
 .Lscd_var:
+    // Register any struct/union/enum tag the declared type introduces before
+    // resolving, exactly as for a typedef.  Without this a block-scoped
+    // `struct S { ... } x;` (or a bare `struct S { ... };`) never registers the
+    // `struct S` tag, so a later `struct S` / `sizeof(struct S)` / `(struct S*)`
+    // resolves to the int fallback and member access fails.
+    ldr x0, [x19, #AST_F0]         // type node
+    cbz x0, .Lscd_var_resolve
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_STRUCT
+    b.eq .Lscd_var_pretag
+    cmp x1, #AST_TYPE_UNION
+    b.eq .Lscd_var_pretag
+    cmp x1, #AST_TYPE_ENUM
+    b.ne .Lscd_var_resolve
+.Lscd_var_pretag:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_check_decl        // declares/completes the tag
+
+.Lscd_var_resolve:
     // Complete an incomplete array's length from its initializer (so every
     // later resolve — sizeof, the alloca, BSS sizing — sees the real length).
     mov x0, x19                    // decl node
@@ -204,9 +223,12 @@ _kcc_sema_check_decl:
     cbz x0, .Lscd_func_stmts
     mov x22, x0
 
-    // Resolve param type and register
+    // Resolve param type and register.  An array/function parameter is
+    // adjusted to a pointer (\stdref{6.7.6.3}) so `a[i]` indexes through the
+    // passed address, not inline storage.
     ldr x0, [x22, #AST_F0]         // param type node
     bl _kcc_sema_resolve_type
+    bl _kcc_type_param_adjust
     mov x21, x0
 
     ldr x0, [x22, #AST_F1]         // param name
@@ -256,7 +278,16 @@ following the standard C rules rather than the earlier one-slot-per-field
 approximation.
 Enum declarations register both the tag itself and each enumerator
 constant as an ordinary symbol of type \texttt{int}, assigning
-consecutive integer values starting from zero.
+consecutive integer values starting from zero.  An enumerator may carry
+an explicit \texttt{= expr} initializer, which \stdref{6.7.2.2} requires
+to be any integer constant expression and which resets the running
+counter; we fold it with the shared \texttt{\_kcc\_eval\_const\_int}
+evaluator so that arithmetic forms like \texttt{(UCHAR\_MAX + 1)}---the
+basis of Lua's reserved-token enumeration---are honoured, not just bare
+literals.  (Recognising only \texttt{INT\_LIT} here silently renumbered
+such an \texttt{enum} from zero, so \texttt{TK\_NAME} and its neighbours
+collapsed onto small single-character token codes and every keyword
+lexed as an ``unexpected symbol''.)
 
 \paragraph{Aggregate Layout}
 
@@ -508,13 +539,34 @@ mixed-type packing and zero-width separators are not yet modelled.
 
 @d Sema: check declaration @{
 .Lscd_typedef:
-    // Resolve type and register as typedef
+    // Register the tag BEFORE resolving.  `typedef struct S {...} S;` (and the
+    // forward `typedef struct S S;`) introduces the tag `struct S` as well as
+    // the typedef name.  Declaring the tag first means the resolve below binds
+    // the typedef to the tag's shared, completable descriptor rather than a
+    // fallback: a forward typedef whose tag does not yet exist would otherwise
+    // capture `int`, and a later `struct S { ... }` could never reach it.  It
+    // also lets a self-referential member (`struct S *next`) resolve the tag
+    // from inside the body.
+    ldr x0, [x19, #AST_F0]         // type node
+    cbz x0, .Lscd_done
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_STRUCT
+    b.eq .Lscd_td_pretag
+    cmp x1, #AST_TYPE_UNION
+    b.eq .Lscd_td_pretag
+    cmp x1, #AST_TYPE_ENUM
+    b.ne .Lscd_td_resolve
+.Lscd_td_pretag:
+    ldr x0, [x19, #AST_F0]         // struct/union/enum type node → declares tag
+    bl _kcc_sema_check_decl
+
+.Lscd_td_resolve:
+    // Resolve the (now tag-registered) type and bind the typedef name to it.
     ldr x0, [x19, #AST_F0]         // type node
     bl _kcc_sema_resolve_type
     mov x21, x0
-
     ldr x0, [x19, #AST_F1]         // name_ptr
-    cbz x0, .Lscd_td_tag           // nameless (invalid): still register any tag
+    cbz x0, .Lscd_done             // nameless (invalid): the tag is already set
     mov x22, x0
     bl _kcc_strlen
     mov x1, x0
@@ -522,24 +574,6 @@ mixed-type packing and zero-width separators are not yet modelled.
     mov x2, #SYM_TYPEDEF
     mov x3, x21
     bl _kcc_symtab_declare
-
-.Lscd_td_tag:
-    // `typedef struct S {...} S;` introduces the tag `struct S` as well as the
-    // typedef name.  When the typedef's type is a struct/union/enum definition,
-    // run the ordinary tag-registration path on that type node so `struct S`
-    // resolves for later references---above all a self-referential member such
-    // as `struct S *next`, which forward-references the tag from inside the body.
-    ldr x0, [x19, #AST_F0]         // type node
-    cbz x0, .Lscd_done
-    ldr x1, [x0, #AST_TAG]
-    cmp x1, #AST_TYPE_STRUCT
-    b.eq .Lscd_td_tag_reg
-    cmp x1, #AST_TYPE_UNION
-    b.eq .Lscd_td_tag_reg
-    cmp x1, #AST_TYPE_ENUM
-    b.ne .Lscd_done
-.Lscd_td_tag_reg:
-    bl _kcc_sema_check_decl        // x0 = struct/union/enum type node → declares tag
     b .Lscd_done
 
 .Lscd_type_struct:
@@ -555,6 +589,30 @@ mixed-type packing and zero-width separators are not yet modelled.
     cbz x0, .Lscd_done
     mov x22, x0
 
+    // A struct tag may already exist as an \emph{incomplete} descriptor---from
+    // a forward declaration or a forward `typedef struct S S;`---and a later
+    // definition must complete that \emph{same} object so every binding (the
+    // typedef, earlier references) sees the members.  Look the tag up first;
+    // four cases follow from (existing tag?) times (this decl has a body?).
+    mov x0, x22
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x22
+    bl _kcc_symtab_lookup_tag
+    cbz x0, .Lscd_struct_new
+    ldr x21, [x0, #SYM_TYPE]       // existing descriptor
+    cbz x21, .Lscd_struct_new
+    // Existing tag: a body completes it in place; a bodyless reference is a
+    // no-op---it must not overwrite an existing definition with an empty one.
+    ldr x0, [x19, #AST_F1]         // fields
+    cbz x0, .Lscd_done
+    str x19, [x21, #TY_F0]         // repoint at the completing decl
+    str xzr, [x21, #TY_SIZE]       // reset so layout recomputes
+    mov x0, x21
+    bl _kcc_type_layout
+    b .Lscd_done
+
+.Lscd_struct_new:
     // Create type for struct/union
     mov x0, x19
     cmp x20, #AST_STRUCT_DECL
@@ -608,29 +666,15 @@ mixed-type packing and zero-width separators are not yet modelled.
 .Lscd_enum_loop:
     cbz x22, .Lscd_done
 
-    // Explicit value (= expr) resets the running counter (§6.7.2.2).
+    // Explicit value (= expr) resets the running counter (§6.7.2.2).  The
+    // initializer is any integer constant expression---a literal, a
+    // parenthesised or arithmetic form like (UCHAR_MAX + 1), a cast, or
+    // sizeof---so fold it with the shared evaluator instead of matching a
+    // few shapes by hand (which renumbered such enums from zero).
     ldr x0, [x22, #AST_F1]         // value expr, or 0
-    cbz x0, .Lscd_enum_reg
-    ldr x1, [x0, #AST_TAG]
-    cmp x1, #AST_INT_LIT
-    b.eq .Lscd_enum_lit
-    cmp x1, #AST_CHAR_LIT
-    b.eq .Lscd_enum_lit
-    cmp x1, #AST_UNARY_EXPR
-    b.ne .Lscd_enum_reg            // unsupported const form: keep the counter
-    ldr x1, [x0, #AST_F0]          // unary op token
-    cmp x1, #TOK_MINUS
-    b.ne .Lscd_enum_reg
-    ldr x1, [x0, #AST_F1]          // operand
-    cbz x1, .Lscd_enum_reg
-    ldr x2, [x1, #AST_TAG]
-    cmp x2, #AST_INT_LIT
-    b.ne .Lscd_enum_reg
-    ldr x20, [x1, #AST_F0]
-    neg x20, x20                   // = -literal
-    b .Lscd_enum_reg
-.Lscd_enum_lit:
-    ldr x20, [x0, #AST_F0]         // = literal
+    cbz x0, .Lscd_enum_reg         // no explicit value → keep the counter
+    bl _kcc_eval_const_int
+    mov x20, x0                    // reset counter to the evaluated value
 
 .Lscd_enum_reg:
     ldr x0, [x22, #AST_F0]         // name_ptr

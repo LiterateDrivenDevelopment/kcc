@@ -1813,6 +1813,22 @@ operand is an expression, it is type-checked (though its value is not
 evaluated at run time).  In both cases the result type is
 \texttt{unsigned long}, which is \texttt{size\_t} on ARM64.
 
+One subtlety deserves care: \stdref{6.3.2.1} says an array is \emph{not}
+converted to a pointer when it is the operand of \texttt{sizeof}, so
+\texttt{sizeof(arr)} must be the whole array and not a pointer.
+\texttt{\_kcc\_sema\_expr} has already decayed the operand to a pointer in
+its \texttt{AST\_F3}, so we undo that for two array-valued operand shapes
+by pinning the un-decayed array type back onto the operand node (which is
+what the IR builder and constant folder read).  A named array is looked up
+in the symbol table and its \texttt{TY\_ARRAY} type restored.  A
+\emph{string literal} is an array \texttt{char[N+1]} (\stdref{6.4.5}) even
+though we type it as \texttt{char~*} everywhere else for convenient decay;
+here we rebuild \texttt{char[len+1]} from its recorded length so that
+\texttt{sizeof("...")} is the array size, not~8.  Without this,
+\texttt{sizeof(literal)/-1} length idioms---\texttt{luaS\_newliteral} among
+them---silently truncated every string to the pointer size, corrupting
+memory downstream.
+
 @d Sema: expr sizeof @{
 // -- kcc_sema_expr_sizeof -------------------------------------------------
 // type_desc *kcc_sema_expr_sizeof(node *expr)
@@ -1850,6 +1866,8 @@ _kcc_sema_expr_sizeof:
     cbnz x1, .Lses_unwrap
     b .Lses_result
 .Lses_inner:
+    cmp x0, #AST_STR_LIT
+    b.eq .Lses_strlit
     cmp x0, #AST_IDENT_EXPR
     b.ne .Lses_result
     ldr x21, [x1, #AST_F0]         // name ptr
@@ -1866,6 +1884,20 @@ _kcc_sema_expr_sizeof:
     cmp x1, #TY_ARRAY
     b.ne .Lses_result
     str x0, [x20, #AST_F3]         // set the un-decayed array type on the operand
+    b .Lses_result
+
+.Lses_strlit:
+    // A string literal is an array char[N+1] (§6.4.5); sema_expr already
+    // decayed it to char* in AST_F3, but sizeof must see the whole array.
+    // Rebuild char[len+1] from the recorded length and pin it on the operand.
+    ldr x21, [x1, #AST_F1]         // string length N
+    add x21, x21, #1              // + terminating NUL
+    adrp x0, _kcc_type_char_s@@PAGE
+    add  x0, x0, _kcc_type_char_s@@PAGEOFF
+    ldr  x0, [x0]                  // element type char
+    mov  x1, x21
+    bl _kcc_type_array             // → char[N+1]
+    str x0, [x20, #AST_F3]         // un-decayed array type on the operand
     b .Lses_result
 
 .Lses_type:

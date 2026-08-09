@@ -206,8 +206,25 @@ _kcc_ir_build_struct_addr:
     b.eq .Libsad_member
     cmp x1, #AST_SUBSCRIPT
     b.eq .Libsad_subscript
+    cmp x1, #AST_UNARY_EXPR
+    b.eq .Libsad_deref
     mov x0, x19
     bl _kcc_ir_build_expr        // fallback: operand already yields an address
+    b .Libsad_done
+
+.Libsad_deref:
+    // `*p` (a dereferenced pointer to a struct): the pointer's VALUE is the
+    // struct's address, so build the pointer operand---not the deref, which
+    // would emit a struct load.  Any other unary operator falls back.
+    ldr x1, [x19, #AST_F0]      // unary op token
+    cmp x1, #TOK_STAR
+    b.ne .Libsad_fallback
+    ldr x0, [x19, #AST_F1]      // pointer operand
+    bl _kcc_ir_build_expr
+    b .Libsad_done
+.Libsad_fallback:
+    mov x0, x19
+    bl _kcc_ir_build_expr
     b .Libsad_done
 
 .Libsad_ident:
@@ -748,9 +765,13 @@ _kcc_ir_build_var_decl:
     cmp x1, #AST_STR_LIT
     b.eq .Libvd_string_init
 
-    // Struct types need field-by-field copy
+    // Struct/union types initialised from another aggregate value copy the
+    // whole object; a scalar initializer (or an aggregate whose type failed to
+    // resolve) takes the single-store path.
     ldr x1, [x21, #TY_KIND]
     cmp x1, #TY_STRUCT
+    b.eq .Libvd_struct_init
+    cmp x1, #TY_UNION
     b.eq .Libvd_struct_init
     b .Libvd_scalar_init
 
@@ -792,96 +813,45 @@ _kcc_ir_build_var_decl:
     bl _kcc_ir_convert
     mov x24, x0
 
-    // Emit store: value -> alloca
+    // Emit store: value -> alloca.  Set the access-size from the declared type
+    // so the value is written at its true width; in particular a `float`, whose
+    // 4-byte single representation differs from the double working format, is
+    // narrowed and stored as 4 bytes (store_width → code 8) rather than as an
+    // 8-byte double---otherwise `&f`/`sizeof`-4 copies of the local saw double
+    // bytes (Lua's `string.pack("<f", …)` wrote zeros).
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
-    str x21, [x0, #IR_TYPE]     // type
-    str x24, [x0, #IR_SRC1]     // value vreg
-    str x23, [x0, #IR_SRC2]     // alloca vreg
+    mov x22, x0                  // x22 = store instr
+    str x21, [x22, #IR_TYPE]     // type
+    str x24, [x22, #IR_SRC1]     // value vreg
+    str x23, [x22, #IR_SRC2]     // alloca vreg
+    mov x0, x21                  // declared type → access-size code
+    bl _kcc_ir_store_width
+    str x0, [x22, #IR_DEST]      // access-size override
+    mov x0, x22
     bl _kcc_ir_emit
     b .Libvd_done
 
 .Libvd_struct_init:
-    // x0 = init expr, x21 = struct type, x23 = dst alloca vreg
-    mov x24, x0                  // save init expr node
-
-    // Init must be an identifier for struct copy
-    ldr x1, [x24, #AST_TAG]
-    cmp x1, #AST_IDENT_EXPR
-    b.ne .Libvd_struct_expr_init
-
-    // Look up init identifier in locals
-    ldr x20, [x24, #AST_F0]     // name ptr
-    mov x0, x20
-    bl _kcc_strlen
-    mov x2, x0
-    adrp x0, _kcc_ir_locals@@PAGE
-    add  x0, x0, _kcc_ir_locals@@PAGEOFF
-    ldr x0, [x0]
-    mov x1, x20
-    bl _kcc_ht_get
-    cbz x0, .Libvd_struct_global_init
-
-    // Local struct: alloca vreg is the struct base
-    bic x0, x0, #0x8000000000000000
-    sub x24, x0, #1              // x24 = src alloca vreg
-    b .Libvd_struct_copy
-
-.Libvd_struct_global_init:
-    // Global struct: emit global_ref
-    mov x0, #IR_GLOBAL_REF
-    bl _kcc_ir_alloc_instr
-    str x20, [x0, #IR_SRC1]
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
-    mov x22, x0
-    bl _kcc_ir_next_vreg
-    str x0, [x22, #IR_DEST]
-    mov x24, x0                  // x24 = global ref vreg
-    mov x0, x22
-    bl _kcc_ir_emit
-
-.Libvd_struct_copy:
-    // x24 = src base vreg, x23 = dst base vreg, x21 = struct type
-    // Count fields
-    ldr x0, [x21, #TY_F0]       // AST_STRUCT_DECL
-    ldr x0, [x0, #AST_F1]       // first field
-    mov x2, #0
-.Libvd_sc_count:
-    cbz x0, .Libvd_sc_go
-    add x2, x2, #1
-    ldr x0, [x0, #AST_F4]
-    b .Libvd_sc_count
-.Libvd_sc_go:
+    // x0 = init expr, x21 = struct/union type, x23 = dst alloca vreg.
+    // A struct/union declared with an initializer that is itself a
+    // struct/union value---`S a = b;`, `S a = *p;`, `S a = q.m;`, `S a = f();`,
+    // `expdesc temp = *e1;`---is a whole-object COPY.  `_kcc_ir_build_struct_addr`
+    // resolves the source's base address for every such shape (ident, call,
+    // member, subscript, dereferenced pointer, parenthesised); copy
+    // ceil(TY_SIZE/8) 8-byte slots.  Earlier this recognised only an identifier
+    // and a call, and used the field count instead of the slot count---so a
+    // union or a `= *p` initializer copied only the first word.  lcode's
+    // `swapexps` (`expdesc temp = *e1;`) hit exactly that and crashed on `>`.
+    bl _kcc_ir_build_struct_addr // x0 = source struct base address vreg
+    mov x24, x0                  // src
+    mov x0, x21
+    bl _kcc_type_layout          // x0 = aggregate byte size
+    add x0, x0, #7
+    lsr x2, x0, #3              // slot count = ceil(size / 8)
     mov x0, x24                  // src
-    mov x1, x23                  // dst
+    mov x1, x23                  // dst = this variable's alloca
     bl _kcc_ir_emit_struct_copy
-    b .Libvd_done
-
-.Libvd_struct_expr_init:
-    // A struct-returning call initializer yields the address of its result
-    // buffer; copy the aggregate field-by-field into this variable.
-    ldr x1, [x24, #AST_TAG]
-    cmp x1, #AST_CALL_EXPR
-    b.ne .Libvd_struct_store_one
-    mov x0, x24
-    bl _kcc_ir_build_expr        // x0 = result buffer address vreg
-    mov x24, x0                  // src base vreg
-    b .Libvd_struct_copy         // copy src(x24) → dst(x23), type x21
-
-.Libvd_struct_store_one:
-    // Other non-identifier struct init — fallback to single-value copy
-    mov x0, x24
-    bl _kcc_ir_build_expr
-    mov x24, x0
-    mov x0, #IR_STORE
-    bl _kcc_ir_alloc_instr
-    str x21, [x0, #IR_TYPE]
-    str x24, [x0, #IR_SRC1]
-    str x23, [x0, #IR_SRC2]
-    bl _kcc_ir_emit
     b .Libvd_done
 
 .Libvd_initlist:

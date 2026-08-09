@@ -818,7 +818,35 @@ _kcc_enc_str_fp:
     orr w3, w3, w0                // Rt
     mov w0, w3
     ret
-@| _kcc_enc_fp_dp2 _kcc_enc_scvtf _kcc_enc_fcvtzs _kcc_enc_fcvt_s_d _kcc_enc_fcvt_d_s _kcc_enc_fcmp _kcc_enc_ldr_fp _kcc_enc_str_fp
+
+// -- kcc_enc_ldr_fp_s / kcc_enc_str_fp_s --------------------------------------
+// LDR/STR St, [Xn, #imm12*4] — SIMD&FP unsigned offset, single precision (32
+// bits).  A `float` in memory is a 4-byte IEEE-754 single; these move it to and
+// from an `s`-register (which aliases the low half of the matching `d`), so the
+// float paths pair them with FCVT to reach the double working format.
+//   x0=Rt(fp), x1=Rn, x2=imm12 (already scaled by 4)
+.text
+.globl _kcc_enc_ldr_fp_s
+.p2align 2
+_kcc_enc_ldr_fp_s:
+    movz w3, #0xBD40, lsl #16     // LDR St = 0xBD400000
+    orr w3, w3, w2, lsl #10       // imm12
+    orr w3, w3, w1, lsl #5        // Rn
+    orr w3, w3, w0                // Rt
+    mov w0, w3
+    ret
+
+.text
+.globl _kcc_enc_str_fp_s
+.p2align 2
+_kcc_enc_str_fp_s:
+    movz w3, #0xBD00, lsl #16     // STR St = 0xBD000000
+    orr w3, w3, w2, lsl #10       // imm12
+    orr w3, w3, w1, lsl #5        // Rn
+    orr w3, w3, w0                // Rt
+    mov w0, w3
+    ret
+@| _kcc_enc_fp_dp2 _kcc_enc_scvtf _kcc_enc_fcvtzs _kcc_enc_fcvt_s_d _kcc_enc_fcvt_d_s _kcc_enc_fcmp _kcc_enc_ldr_fp _kcc_enc_str_fp _kcc_enc_ldr_fp_s _kcc_enc_str_fp_s
 @}
 
 \section{Branch Encoding}

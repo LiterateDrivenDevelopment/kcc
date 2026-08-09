@@ -86,15 +86,228 @@ _kcc_pp_do_ifdef:
 
 The \texttt{\#if} and \texttt{\#elif} directives evaluate a constant
 integer expression to decide whether to process the enclosed source.
-\texttt{\_kcc\_pp\_do\_if} extracts the rest of the directive line,
-temporarily redirects the lexer to scan the expression text, calls the
+\stdref{6.10.1}/4 requires the controlling line to undergo \emph{full
+macro replacement}---after the \texttt{defined} operator is resolved---%
+before it is parsed as an expression.  \texttt{\_kcc\_pp\_do\_if}
+extracts the rest of the directive line, hands it to
+\texttt{\_kcc\_pp\_prepare\_cond} (which expands it, described next),
+temporarily redirects the lexer to scan the resulting text, calls the
 recursive-descent evaluator, and pushes an \texttt{ACTIVE} or
 \texttt{SKIP} state accordingly.  \texttt{\_kcc\_pp\_do\_elif} follows
 the same pattern but must also account for whether a previous branch
 in the same group was already taken---if so, the state becomes
 \texttt{DONE} regardless of the expression's value.
 
+\paragraph{Expanding the controlling line.}
+The recursive-descent evaluator reads raw lexer tokens and looks up each
+bare identifier as a macro on the fly.  That shortcut is correct for an
+object-like macro or a chain of them, but it cannot bind the parameters
+of a \emph{function-like} macro: evaluating the body of
+\texttt{L\_INTHASBITS(b)} directly leaves \texttt{b} unbound (hence~0),
+so a real header's \texttt{\#if L\_INTHASBITS(SIZE\_Bx)} collapses to
+\texttt{((UINT\_MAX >{}> -1) >= 1)}, takes the wrong branch, and silently
+mis-sizes a bit-field constant.  The cure is to obey the standard
+literally: fully expand the line first, then evaluate a stream that holds
+only numbers and operators.  \texttt{\_kcc\_pp\_prepare\_cond} does this
+in two passes.  \texttt{\_kcc\_pp\_protect\_defined} raw-scans the line
+and rewrites each \texttt{defined NAME} / \texttt{defined(NAME)} to the
+literal \texttt{1} or \texttt{0}---looking the operand up \emph{without}
+expanding it, as \stdref{6.10.1} demands---while copying every other
+token verbatim.  The result is then run through
+\texttt{\_kcc\_pp\_expand\_arg}, the same argument-prescan engine the
+macro expander already uses, which performs a complete macro replacement
+(function-like invocations included) and returns re-lexable text.
+
 @d PP: conditional @{
+// -- _kcc_pp_protect_defined ----------------------------------------
+// (const char *src, uint64_t len) -> x0 = buf, x1 = len
+// Raw-scans one #if/#elif controlling line, copying every token verbatim
+// EXCEPT `defined NAME` / `defined(NAME)`, which become the literal 1 or 0.
+// The operand is looked up but never expanded (6.10.1): expansion happens
+// only afterwards, on the rewritten line.  Output is at most 2*len bytes
+// (each token plus one separating space; `defined` only ever shrinks), so
+// the buffer never needs to grow.
+.p2align 2
+_kcc_pp_protect_defined:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+    mov x23, x0                  // src
+    mov x24, x1                  // len
+
+    // Save lexer state, then aim it at the controlling text.
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x22, [x0]
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x23, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    add  x1, x23, x24
+    str  x1, [x0]
+
+    // Output buffer: 2*len + 64 bytes (never grows; see header note).
+    lsl  x0, x24, #1
+    add  x0, x0, #64
+    bl _kcc_arena_alloc
+    mov  x19, x0                 // out_buf
+    mov  x20, #0                 // out_len
+
+    bl _kcc_lex_next
+.Lpd_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lpd_done           // TOK_EOF
+
+    // Is this token the identifier `defined` (length 7, exact match)?
+    cmp  x0, #TOK_IDENT
+    b.ne .Lpd_copy
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #7
+    b.ne .Lpd_copy
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_pp_s_defined@@PAGE
+    add  x1, x1, _kcc_pp_s_defined@@PAGEOFF
+    mov  x2, #7
+    bl _kcc_memcmp
+    cbnz x0, .Lpd_copy
+
+    // `defined` seen.  Next token is either `(` (parenthesised form) or the
+    // operand name itself.  Record which, and land on the name token.
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    cset w27, eq                 // w27 = 1 if parenthesised
+    cbz  w27, .Lpd_have_name
+    bl _kcc_lex_next             // step onto the name inside the parens
+.Lpd_have_name:
+    // Look the operand up in the macro table WITHOUT expanding it.
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_start@@PAGE
+    add  x1, x1, _kcc_tok_start@@PAGEOFF
+    ldr  x1, [x1]
+    adrp x2, _kcc_tok_len@@PAGE
+    add  x2, x2, _kcc_tok_len@@PAGEOFF
+    ldr  x2, [x2]
+    bl _kcc_ht_get
+    cmp  x0, #0
+    cset x25, ne                 // x25 = 1 if defined, else 0
+
+    // Advance past the name; for the parenthesised form also past the `)`.
+    bl _kcc_lex_next
+    cbz  w27, .Lpd_emit_bit
+    bl _kcc_lex_next             // consume `)`
+.Lpd_emit_bit:
+    cbz  x20, .Lpd_bit_nosep
+    mov  w0, #0x20               // space separator
+    strb w0, [x19, x20]
+    add  x20, x20, #1
+.Lpd_bit_nosep:
+    add  w1, w25, #0x30          // '0' + bit
+    strb w1, [x19, x20]
+    add  x20, x20, #1
+    b .Lpd_loop
+
+.Lpd_copy:
+    // Copy the current token verbatim, space-separated from the previous one.
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x25, [x0]               // tok_start
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x26, [x0]               // tok_len
+    cbz  x20, .Lpd_copy_nosep
+    mov  w0, #0x20
+    strb w0, [x19, x20]
+    add  x20, x20, #1
+.Lpd_copy_nosep:
+    add  x0, x19, x20
+    mov  x1, x25
+    mov  x2, x26
+    bl _kcc_memcpy
+    add  x20, x20, x26
+    bl _kcc_lex_next
+    b .Lpd_loop
+
+.Lpd_done:
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x21, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    str  x22, [x0]
+    mov  x0, x19
+    mov  x1, x20
+    ldr  x27, [sp, #80]
+    ldp  x25, x26, [sp, #64]
+    ldp  x23, x24, [sp, #48]
+    ldp  x21, x22, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #96
+    ret
+
+// -- _kcc_pp_prepare_cond -------------------------------------------
+// (const char *src, uint64_t len) -> x0 = buf, x1 = len
+// Resolves `defined`, then fully macro-expands the controlling line, so the
+// evaluator downstream sees only literals and operators.
+//
+// The expansion pass drives _kcc_pp_next, which normally suppresses tokens
+// while the current conditional branch is being skipped.  A `#elif` is
+// evaluated with its group's state still SKIP, so that suppression would
+// silently swallow the whole (correct) expansion and make every `#elif`
+// read as false.  We therefore zero the conditional depth across the
+// expansion---the pushed expand context is self-contained, so treating it
+// as unconditionally active is exactly right---and restore it afterwards.
+.p2align 2
+_kcc_pp_prepare_cond:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    bl _kcc_pp_protect_defined   // (src,len) -> (bufA,lenA)
+    mov x19, x0
+    mov x20, x1
+    cbz x20, .Lpc_ret            // nothing to expand
+
+    // Suspend conditional skipping for the duration of the expansion.
+    adrp x21, _kcc_pp_cond_depth@@PAGE
+    add  x21, x21, _kcc_pp_cond_depth@@PAGEOFF
+    ldr  x22, [x21]              // saved cond_depth
+    str  xzr, [x21]
+
+    mov x0, x19
+    mov x1, x20
+    bl _kcc_pp_expand_arg        // full macro replacement -> (bufB,lenB)
+    mov x19, x0
+    mov x20, x1
+
+    str  x22, [x21]             // restore cond_depth
+.Lpc_ret:
+    mov x0, x19
+    mov x1, x20
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- _kcc_pp_do_if --------------------------------------------------
 // Handles #if with basic expression evaluation.
 .p2align 2
@@ -104,10 +317,13 @@ _kcc_pp_do_if:
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
 
-    // Get rest of line as expression text
+    // Get rest of line as expression text, then fully expand it (resolving
+    // `defined` and every macro, including function-like ones) so the
+    // evaluator below sees only literals and operators.
     bl _kcc_pp_rest_of_line
-    mov x19, x0               // x19 = expr text
-    mov x20, x1               // x20 = expr len
+    bl _kcc_pp_prepare_cond
+    mov x19, x0               // x19 = expanded expr text
+    mov x20, x1               // x20 = expanded expr len
 
     // Save lexer state
     adrp x0, _kcc_lex_cursor@@PAGE
@@ -189,8 +405,10 @@ _kcc_pp_do_elif:
     cmp  w3, #PP_COND_DONE
     b.eq .Lelif_done_skip      // already found active → stay DONE
 
-    // State is SKIP: evaluate expression to see if this branch is active
+    // State is SKIP: evaluate expression to see if this branch is active.
+    // Expand the controlling line first (see _kcc_pp_do_if).
     bl _kcc_pp_rest_of_line
+    bl _kcc_pp_prepare_cond
     mov x19, x0
     mov x20, x1
 
@@ -392,9 +610,14 @@ branch, it must still track nested \texttt{\#if}/\texttt{\#endif}
 pairs so that a matching \texttt{\#endif} pops the correct level.
 \texttt{\_kcc\_pp\_skip\_directive} examines directives encountered
 during skipping: \texttt{\#if}, \texttt{\#ifdef}, and
-\texttt{\#ifndef} push a new \texttt{SKIP} state, \texttt{\#endif}
+\texttt{\#ifndef} push a new \texttt{DONE} state, \texttt{\#endif}
 pops a level, and \texttt{\#elif}/\texttt{\#else} toggle the top of
-the conditional stack when the depth matches.
+the conditional stack when the depth matches.  The pushed state is
+\texttt{DONE} rather than \texttt{SKIP} precisely because the nested
+conditional is already dead: \texttt{DONE} keeps every one of its
+branches skipped, whereas \texttt{SKIP} would treat a nested
+\texttt{\#else} as the branch to take and wrongly resume compilation
+inside the dead region.
 
 @d PP: conditional @{
 // -- _kcc_pp_skip_directive -----------------------------------------
@@ -496,8 +719,12 @@ _kcc_pp_skip_directive:
     b .Lskipd_done
 
 .Lskipd_push:
-    // Nested #if/#ifdef/#ifndef while skipping: push SKIP
-    mov x0, #PP_COND_SKIP
+    // Nested #if/#ifdef/#ifndef while skipping: the whole nested conditional
+    // lies in a dead region, so push DONE, not SKIP.  DONE makes a nested
+    // #else/#elif keep skipping; SKIP would let a nested #else \emph{activate}
+    // and resume processing code inside the dead branch (the bug that made a
+    // 64-bit build wrongly compile Lua's 32-bit `#else` fallback).
+    mov x0, #PP_COND_DONE
     bl _kcc_pp_cond_push
     b .Lskipd_done
 
@@ -525,10 +752,15 @@ _kcc_pp_skip_directive:
 \section{Expression Evaluation for \texttt{\#if}}
 
 The \texttt{\#if} and \texttt{\#elif} directives require evaluating
-a constant integer expression.  We support the subset commonly used
-in practice: integer literals, \texttt{defined(NAME)},
-\texttt{defined NAME}, the logical operators \texttt{!}, \texttt{\&\&},
-\texttt{||}, and comparison operators.
+a constant integer expression (\stdref{6.6}).  We implement the full
+integer operator set as a recursive-descent cascade, one function per
+precedence level: logical \texttt{||}, \texttt{\&\&}; bitwise \texttt{|},
+\texttt{\^{}}, \texttt{\&}; equality and relational comparisons; the
+shifts \texttt{<<}, \texttt{>>}; additive \texttt{+}, \texttt{-};
+multiplicative \texttt{*}, \texttt{/}, \texttt{\%}; the unary operators
+\texttt{!}, \texttt{\~{}}, \texttt{-}, \texttt{+}; and primaries---integer
+literals, parenthesised sub-expressions, \texttt{defined(NAME)}, and macro
+names (fully expanded, then~0 for any identifier left undefined).
 
 Any identifier not recognized as a macro evaluates to~0 per
 \stdref{6.10.1} paragraph~4.
@@ -541,8 +773,51 @@ Any identifier not recognized as a macro evaluates to~0 per
 .globl _kcc_pp_eval_expr
 .p2align 2
 _kcc_pp_eval_expr:
-    // Entry point: delegate to logical-or
-    b _kcc_pp_eval_lor
+    // Entry point: delegate to the conditional (ternary) operator
+    b _kcc_pp_eval_ternary
+
+// -- Conditional: cond ? then : else  (right-associative, lowest precedence)
+.p2align 2
+_kcc_pp_eval_ternary:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    bl _kcc_pp_eval_lor
+    mov x19, x0                // condition
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_QUESTION
+    b.ne .Leval_ter_done
+
+    bl _kcc_lex_next           // consume ?
+    bl _kcc_pp_eval_expr       // then-branch (runs up to the :)
+    mov x20, x0                // then value
+
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COLON
+    b.ne .Leval_ter_noelse
+    bl _kcc_lex_next           // consume :
+.Leval_ter_noelse:
+    bl _kcc_pp_eval_ternary    // else-branch (right-associative)
+
+    // Both branches are side-effect-free constant expressions, so evaluating
+    // both to advance the token stream and selecting is safe.
+    cmp  x19, #0
+    csel x0, x20, x0, ne       // cond nonzero → then, else → else
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+.Leval_ter_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
 
 // -- Logical OR: expr || expr
 .p2align 2
@@ -581,7 +856,7 @@ _kcc_pp_eval_land:
     mov x29, sp
     str x19, [sp, #16]
 
-    bl _kcc_pp_eval_eq
+    bl _kcc_pp_eval_bor
     mov x19, x0
 
 .Leval_land_loop:
@@ -592,7 +867,7 @@ _kcc_pp_eval_land:
     b.ne .Leval_land_done
 
     bl _kcc_lex_next
-    bl _kcc_pp_eval_eq
+    bl _kcc_pp_eval_bor
     and  x0, x19, x0
     cmp  x0, #0
     cset x19, ne
@@ -603,7 +878,89 @@ _kcc_pp_eval_land:
     ldr  x19, [sp, #16]
     ldp  x29, x30, [sp], #32
     ret
-@| _kcc_pp_eval_expr
+@| _kcc_pp_eval_expr _kcc_pp_eval_ternary
+@}
+
+Below the logical operators sit the three bitwise levels---%
+\texttt{|}, then \texttt{\^{}}, then \texttt{\&}---each a left-associative
+fold over the level beneath it.  A preprocessor constant expression is a
+full integer constant expression (\stdref{6.6}), so these are the same
+operators C allows outside \texttt{\#if}; real headers use them to test
+feature bitmasks (\texttt{\#if (FLAGS \& X)}).
+
+@d PP: eval @{
+// -- Bitwise OR: expr | expr
+.p2align 2
+_kcc_pp_eval_bor:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    bl _kcc_pp_eval_bxor
+    mov x19, x0
+.Leval_bor_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_PIPE
+    b.ne .Leval_bor_done
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_bxor
+    orr  x19, x19, x0
+    b .Leval_bor_loop
+.Leval_bor_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Bitwise XOR: expr ^ expr
+.p2align 2
+_kcc_pp_eval_bxor:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    bl _kcc_pp_eval_band
+    mov x19, x0
+.Leval_bxor_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_CARET
+    b.ne .Leval_bxor_done
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_band
+    eor  x19, x19, x0
+    b .Leval_bxor_loop
+.Leval_bxor_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Bitwise AND: expr & expr
+.p2align 2
+_kcc_pp_eval_band:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    bl _kcc_pp_eval_eq
+    mov x19, x0
+.Leval_band_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_AMP
+    b.ne .Leval_band_done
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_eq
+    and  x19, x19, x0
+    b .Leval_band_loop
+.Leval_band_done:
+    mov  x0, x19
+    ldr  x19, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+@| _kcc_pp_eval_bor _kcc_pp_eval_bxor _kcc_pp_eval_band
 @}
 
 The equality and relational operators form the next two precedence
@@ -662,7 +1019,7 @@ _kcc_pp_eval_rel:
     mov x29, sp
     stp x19, x20, [sp, #16]
 
-    bl _kcc_pp_eval_unary
+    bl _kcc_pp_eval_shift
     mov x19, x0
 
 .Leval_rel_loop:
@@ -681,7 +1038,7 @@ _kcc_pp_eval_rel:
 
 .Leval_rel_op:
     bl _kcc_lex_next
-    bl _kcc_pp_eval_unary
+    bl _kcc_pp_eval_shift
     cmp  x20, #TOK_LT
     b.eq .Leval_do_lt
     cmp  x20, #TOK_GT
@@ -712,9 +1069,139 @@ _kcc_pp_eval_rel:
     ret
 @}
 
+Beneath the relational operators come the shift, additive, and
+multiplicative levels---the arithmetic a real configuration header relies
+on (\texttt{\#if VERSION >= 5 * 100 + 4}, \texttt{\#if (N >> 3) == 1}).
+Each is a left-associative fold; division and remainder use signed
+\texttt{sdiv}, and because ARM64 \texttt{sdiv} yields zero rather than
+trapping on a zero divisor, an ill-formed \texttt{\#if X / 0} degrades to
+zero instead of crashing the compiler.  Right shift uses the \emph{logical}
+\texttt{lsr}: preprocessor \texttt{\#if} shifts are practically always
+bit-width probes of an unsigned maximum---\texttt{\#if ((ULONG\_MAX >> 31)
+>> 31) >= 3}, the idiom by which a header asks ``is this type at least 64
+bits?''---where an arithmetic shift of the all-ones \texttt{ULONG\_MAX}
+(which reads as \texttt{-1}) would stay \texttt{-1} and pick the wrong
+branch.  Logical shift is also correct for any non-negative signed operand;
+only a negative signed operand would differ, and that is both rare and
+implementation-defined.
+
+@d PP: eval @{
+// -- Shift: expr << expr, expr >> expr
+.p2align 2
+_kcc_pp_eval_shift:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    bl _kcc_pp_eval_add
+    mov x19, x0
+.Leval_shift_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x0]
+    cmp  x20, #TOK_SHL
+    b.eq .Leval_shift_op
+    cmp  x20, #TOK_SHR
+    b.eq .Leval_shift_op
+    b .Leval_shift_done
+.Leval_shift_op:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_add
+    cmp  x20, #TOK_SHL
+    b.ne .Leval_do_shr
+    lsl  x19, x19, x0
+    b .Leval_shift_loop
+.Leval_do_shr:
+    lsr  x19, x19, x0          // logical: correct for unsigned (and non-negative
+                               // signed) operands, which is every real #if use
+    b .Leval_shift_loop
+.Leval_shift_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Additive: expr + expr, expr - expr
+.p2align 2
+_kcc_pp_eval_add:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    bl _kcc_pp_eval_mul
+    mov x19, x0
+.Leval_add_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x0]
+    cmp  x20, #TOK_PLUS
+    b.eq .Leval_add_op
+    cmp  x20, #TOK_MINUS
+    b.eq .Leval_add_op
+    b .Leval_add_done
+.Leval_add_op:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_mul
+    cmp  x20, #TOK_PLUS
+    b.ne .Leval_do_sub
+    add  x19, x19, x0
+    b .Leval_add_loop
+.Leval_do_sub:
+    sub  x19, x19, x0
+    b .Leval_add_loop
+.Leval_add_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// -- Multiplicative: expr * expr, expr / expr, expr % expr
+.p2align 2
+_kcc_pp_eval_mul:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    bl _kcc_pp_eval_unary
+    mov x19, x0
+.Leval_mul_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x20, [x0]
+    cmp  x20, #TOK_STAR
+    b.eq .Leval_mul_op
+    cmp  x20, #TOK_SLASH
+    b.eq .Leval_mul_op
+    cmp  x20, #TOK_PERCENT
+    b.eq .Leval_mul_op
+    b .Leval_mul_done
+.Leval_mul_op:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary
+    cmp  x20, #TOK_STAR
+    b.eq .Leval_do_mul
+    cmp  x20, #TOK_SLASH
+    b.eq .Leval_do_div
+    // %  → x19 - (x19 / x0) * x0
+    sdiv x1, x19, x0
+    msub x19, x1, x0, x19
+    b .Leval_mul_loop
+.Leval_do_mul:
+    mul  x19, x19, x0
+    b .Leval_mul_loop
+.Leval_do_div:
+    sdiv x19, x19, x0
+    b .Leval_mul_loop
+.Leval_mul_done:
+    mov  x0, x19
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+@| _kcc_pp_eval_shift _kcc_pp_eval_add _kcc_pp_eval_mul
+@}
+
 At the lowest precedence tier sit the unary and primary expressions.
-\texttt{\_kcc\_pp\_eval\_unary} handles the logical-not operator
-\texttt{!} by recursing and then applying \texttt{cset eq}.
+\texttt{\_kcc\_pp\_eval\_unary} handles the unary operators
+\texttt{!}, \texttt{\~{}}, \texttt{-}, and \texttt{+} by recursing and
+then applying the corresponding operation (a leading \texttt{+} is a
+no-op).
 \texttt{\_kcc\_pp\_eval\_primary} recognizes four forms: integer
 literals (parsed via \texttt{\_kcc\_pp\_atoi}), parenthesized
 sub-expressions, the \texttt{defined} operator (with or without
@@ -732,12 +1219,40 @@ _kcc_pp_eval_unary:
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
     cmp  x0, #TOK_BANG
-    b.ne .Leval_primary
+    b.eq .Leval_un_not
+    cmp  x0, #TOK_TILDE
+    b.eq .Leval_un_bnot
+    cmp  x0, #TOK_MINUS
+    b.eq .Leval_un_neg
+    cmp  x0, #TOK_PLUS
+    b.eq .Leval_un_pos
+    b .Leval_primary
 
+.Leval_un_not:
     bl _kcc_lex_next
     bl _kcc_pp_eval_unary
     cmp  x0, #0
     cset x0, eq                // !x
+    ldp  x29, x30, [sp], #16
+    ret
+
+.Leval_un_bnot:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary
+    mvn  x0, x0                // ~x
+    ldp  x29, x30, [sp], #16
+    ret
+
+.Leval_un_neg:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary
+    neg  x0, x0                // -x
+    ldp  x29, x30, [sp], #16
+    ret
+
+.Leval_un_pos:
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_unary      // +x is a no-op
     ldp  x29, x30, [sp], #16
     ret
 
@@ -918,11 +1433,9 @@ body parsed as an integer; undefined names evaluate to~0.
     bl _kcc_ht_get
     cbz  x0, .Leval_ident_zero
 
-    // Found macro: get its body, try to parse as integer
-    mov  x19, x0
-    ldr  x0, [x19, #PP_MACRO_BODY]
-    ldr  x1, [x19, #PP_MACRO_BODYLEN]
-    bl _kcc_pp_atoi
+    // Found macro: fully expand and evaluate its body (handles macro chains
+    // and expression bodies, per §6.10.1's full macro replacement).
+    bl _kcc_pp_eval_macro
     mov  x19, x0
     bl _kcc_lex_next
     mov  x0, x19
@@ -938,22 +1451,130 @@ body parsed as an integer; undefined names evaluate to~0.
     ret
 @}
 
-\paragraph{Decimal integer parsing.}
-The helper \texttt{\_kcc\_pp\_atoi} converts a decimal digit string to a
-64-bit integer.  It walks the byte buffer from left to right, accumulating
-the result with a multiply-by-ten-and-add loop, and stops at the first
-non-digit character or end of input.  No sign handling is needed because
-preprocessor integer constants in \texttt{\#if} expressions are
-non-negative literals at this stage.
+\paragraph{Recursively evaluating a macro body.}
+A one-token object-like macro whose body is a number, such as
+\texttt{\#define LUA\_FLOAT\_DOUBLE 2}, could be handled by parsing the
+body as an integer.  But real headers chain macros---%
+\texttt{\#define LUA\_FLOAT\_TYPE LUA\_FLOAT\_DOUBLE}---and give them
+parenthesised expression bodies, and \stdref{6.10.1} requires the whole
+controlling expression to undergo full macro replacement before it is
+evaluated.  Rather than parse the body as a flat integer, we re-point the
+lexer at the macro's replacement text and evaluate it with the same
+recursive-descent parser.  A body that is itself a macro name recurses
+back through this routine until it bottoms out at a number or an
+undefined identifier (which is~0), so an arbitrarily long chain resolves
+correctly; a parenthesised or arithmetic body is evaluated as the
+expression it is.  A depth counter guards against a macro that expands to
+itself, which \stdref{6.10.3.4} forbids from re-expanding but which we
+must at least not loop on.
+
+@d PP: eval @{
+// -- _kcc_pp_eval_macro ---------------------------------------------
+// int64_t _kcc_pp_eval_macro(pp_macro *m)
+//   x0 = macro entry.  Returns the integer value of its expanded body.
+// Saves the lexer over the #if line, evaluates the body, and restores it
+// so the caller resumes at the token after the macro identifier.
+.p2align 2
+_kcc_pp_eval_macro:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // macro entry
+
+    // Depth guard: bail to 0 rather than loop on a self-referential macro.
+    adrp x2, _kcc_pp_eval_depth@@PAGE
+    add  x2, x2, _kcc_pp_eval_depth@@PAGEOFF
+    ldr  x1, [x2]
+    cmp  x1, #64
+    b.ge .Lem_zero
+    add  x1, x1, #1
+    str  x1, [x2]
+
+    // Save the current lexer position (cursor sits just past the identifier).
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x20, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x21, [x0]
+
+    // Point the lexer at the macro body and evaluate it as an expression.
+    ldr  x0, [x19, #PP_MACRO_BODY]
+    ldr  x1, [x19, #PP_MACRO_BODYLEN]
+    adrp x2, _kcc_lex_cursor@@PAGE
+    add  x2, x2, _kcc_lex_cursor@@PAGEOFF
+    str  x0, [x2]
+    add  x1, x0, x1
+    adrp x2, _kcc_lex_end@@PAGE
+    add  x2, x2, _kcc_lex_end@@PAGEOFF
+    str  x1, [x2]
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_expr
+    mov  x19, x0                 // result
+
+    // Restore the lexer to the #if line.
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x20, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    str  x21, [x0]
+
+    // Decrement the depth guard.
+    adrp x2, _kcc_pp_eval_depth@@PAGE
+    add  x2, x2, _kcc_pp_eval_depth@@PAGEOFF
+    ldr  x1, [x2]
+    sub  x1, x1, #1
+    str  x1, [x2]
+
+    mov  x0, x19
+    ldr  x21, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #48
+    ret
+
+.Lem_zero:
+    mov  x0, #0
+    ldr  x21, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #48
+    ret
+@}
+
+\paragraph{Integer-constant parsing.}
+The helper \texttt{\_kcc\_pp\_atoi} converts an integer-constant token to a
+64-bit value, honouring the three C bases: a \texttt{0x}/\texttt{0X} prefix
+selects hexadecimal, a bare leading \texttt{0} selects octal, and anything
+else is decimal.  This matters because real headers gate on hex feature
+masks (\texttt{\#if (FLAGS \& 0x04)}); a decimal-only reader would see
+\texttt{0x04} as~0 and mis-evaluate every such test.  Each base accumulates
+by its radix and stops at the first character that is not a digit of that
+base---which also discards any \texttt{u}/\texttt{l} suffix---so no explicit
+suffix handling is needed.  Constants here are non-negative; unary minus is
+applied one precedence level up.
 
 @d PP: eval @{
 // -- _kcc_pp_atoi ---------------------------------------------------
-// Simple ASCII-to-integer: x0=ptr, x1=len → x0=value
+// Integer-constant to value (hex/octal/decimal): x0=ptr, x1=len → x0=value
 .p2align 2
 _kcc_pp_atoi:
     mov  x2, #0                // accumulator
     mov  x3, #0                // index
-.Latoi_loop:
+    // Detect a 0x / 0X (hex) or bare-0 (octal) prefix.
+    cmp  x1, #2
+    b.lo .Latoi_dec            // too short for a prefix → decimal
+    ldrb w4, [x0]
+    cmp  w4, #'0'
+    b.ne .Latoi_dec
+    ldrb w4, [x0, #1]
+    orr  w4, w4, #0x20         // fold case
+    cmp  w4, #'x'
+    b.eq .Latoi_hex
+    b .Latoi_oct               // leading 0, not x → octal
+
+.Latoi_dec:
     cmp  x3, x1
     b.hs .Latoi_done
     ldrb w4, [x0, x3]
@@ -966,7 +1587,50 @@ _kcc_pp_atoi:
     mul  x2, x2, x5
     add  x2, x2, x4
     add  x3, x3, #1
-    b .Latoi_loop
+    b .Latoi_dec
+
+.Latoi_hex:
+    mov  x3, #2                // skip "0x"
+.Latoi_hex_loop:
+    cmp  x3, x1
+    b.hs .Latoi_done
+    ldrb w4, [x0, x3]
+    cmp  w4, #'0'
+    b.lo .Latoi_done
+    cmp  w4, #'9'
+    b.hi .Latoi_hex_af
+    sub  w4, w4, #'0'
+    b .Latoi_hex_acc
+.Latoi_hex_af:
+    orr  w4, w4, #0x20         // fold case
+    cmp  w4, #'a'
+    b.lo .Latoi_done
+    cmp  w4, #'f'
+    b.hi .Latoi_done
+    sub  w4, w4, #'a'
+    add  w4, w4, #10
+.Latoi_hex_acc:
+    lsl  x2, x2, #4
+    add  x2, x2, x4
+    add  x3, x3, #1
+    b .Latoi_hex_loop
+
+.Latoi_oct:
+    mov  x3, #1                // skip leading 0
+.Latoi_oct_loop:
+    cmp  x3, x1
+    b.hs .Latoi_done
+    ldrb w4, [x0, x3]
+    cmp  w4, #'0'
+    b.lo .Latoi_done
+    cmp  w4, #'7'
+    b.hi .Latoi_done
+    sub  w4, w4, #'0'
+    lsl  x2, x2, #3
+    add  x2, x2, x4
+    add  x3, x3, #1
+    b .Latoi_oct_loop
+
 .Latoi_done:
     mov  x0, x2
     ret

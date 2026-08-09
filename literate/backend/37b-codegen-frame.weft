@@ -134,14 +134,19 @@ _kcc_codegen_func:
     add x3, x3, #1
     b .Lcgf_alloca_scan_bb
 .Lcgf_alloca_scan_done:
-    // x0 = total alloca slots (promoted locals excluded), x20 = vreg_count
+    // x0 = total alloca slots (promoted locals excluded)
     mov x24, x0                    // total_alloca_slots
-    mov x25, x20                   // vreg_count
+    // The vreg value area is sized by the colouring pass's slot count
+    // (_kcc_cg_max_slot), which reuses one slot for many non-overlapping
+    // spilled vregs; it equals the raw vreg count when colouring is inactive.
+    adrp x1, _kcc_cg_max_slot@@PAGE
+    add  x1, x1, _kcc_cg_max_slot@@PAGEOFF
+    ldr x25, [x1]                  // max_slot (vreg value-slot count)
 
-    // save_base = 16 + vreg_count*8 + total_alloca*8 — the callee-save area
+    // save_base = 16 + max_slot*8 + total_alloca*8 — the callee-save area
     // sits above the vreg slots and alloca storage, so those offsets (and the
     // frame-relative va_arg/stack-argument reads) are unaffected.
-    lsl x1, x25, #3               // vreg_count * 8
+    lsl x1, x25, #3               // max_slot * 8
     lsl x0, x24, #3               // total_alloca_slots * 8
     add x0, x0, x1
     add x0, x0, #16                // + fp/lr
@@ -493,10 +498,11 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
     // GP / ST1 / REF: spill x<ngrn> into slot(base); base += 1
     cmp x26, #8
     b.ge .Lcgf_sa_stack
+    ldr x0, [sp, #96]            // base vreg → colored slot immediate
+    bl _kcc_cg_slot_offset
+    mov x2, x0                   // imm12_scaled = slot(base) + 2
     mov x0, x26                    // rt = x<ngrn>
     mov x1, #29
-    ldr x2, [sp, #96]
-    add x2, x2, #2               // imm12_scaled = base + 2
     mov x3, #1
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
@@ -520,10 +526,11 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
 
 .Lcgf_sa_x8:
     // Hidden result pointer: spill x8 into the sret vreg slot (no NGRN/NSRN).
+    ldr x0, [sp, #96]            // base vreg → colored slot immediate
+    bl _kcc_cg_slot_offset
+    mov x2, x0
     mov x0, #8
     mov x1, #29
-    ldr x2, [sp, #96]
-    add x2, x2, #2
     mov x3, #1
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
@@ -534,18 +541,22 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
 
 .Lcgf_sa_st2:
     // 9..16B struct in two registers: spill x<ngrn>→slot(base),
-    // x<ngrn+1>→slot(base+1); base += 2.
+    // x<ngrn+1>→slot(base+1); base += 2.  The two vregs may map to
+    // non-adjacent colored slots, so each is resolved separately.
     cmp x26, #6
     b.gt .Lcgf_sa_stack
-    ldr x2, [sp, #96]
-    add x2, x2, #2               // slot(base)
+    ldr x0, [sp, #96]            // base → slot(base)+2
+    bl _kcc_cg_slot_offset
+    mov x2, x0
     mov x0, x26
     mov x1, #29
     mov x3, #1
     bl _kcc_enc_str_imm
     bl _kcc_code_emit32
-    ldr x2, [sp, #96]
-    add x2, x2, #3               // slot(base+1) = (base+1)+2
+    ldr x0, [sp, #96]
+    add x0, x0, #1               // base+1 → slot(base+1)+2
+    bl _kcc_cg_slot_offset
+    mov x2, x0
     add x0, x26, #1
     mov x1, #29
     mov x3, #1
@@ -568,9 +579,9 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
     mov x0, #9                   // rt = x9
     mov x2, #0                   // kind = LDR int
     bl _kcc_cg_emit_frame_ldst
-    ldr x1, [sp, #96]           // base
-    add x1, x1, #2               // slot index = base + 2
-    lsl x1, x1, #3               // byte offset from x29
+    ldr x0, [sp, #96]           // base vreg → colored slot immediate
+    bl _kcc_cg_slot_offset
+    lsl x1, x0, #3               // byte offset from x29
     mov x0, #9                   // rt = x9
     mov x2, #1                   // kind = STR int
     bl _kcc_cg_emit_frame_ldst
@@ -762,25 +773,36 @@ base) is:
 
 ARM64 unsigned-offset loads and stores encode the immediate as
 \texttt{imm12\_scaled} = byte\_offset / access\_size.  For 64-bit
-accesses the divisor is~8, so vreg~$N$ has
-$\mathit{imm12\_scaled} = (16 + N \times 8)/8 = N + 2$.
+accesses the divisor is~8, so the slot at frame index~$S$ has
+$\mathit{imm12\_scaled} = (16 + S \times 8)/8 = S + 2$.
 
-Three helpers wrap this: \texttt{slot\_offset} returns the scaled
-immediate, \texttt{load\_vreg} emits a \textsc{ldr} from a vreg
-slot into a named register, and \texttt{store\_vreg} emits the
-corresponding \textsc{str}.
+The frame index~$S$ is \emph{not} the vreg number in general: the slot
+colouring pass (\S\ref{sec:slotcolour}) reuses one slot for many spilled
+vregs whose live ranges do not overlap, and publishes the mapping in
+\texttt{\_kcc\_cg\_slotmap}.  \texttt{slot\_offset} is the single point that
+turns a vreg into its scaled slot immediate: it applies the map (falling back
+to the identity $S = \mathit{vreg}$ when no map is published, so the all-spill
+model is unchanged), then adds the constant~2.  Every spill site---the
+\texttt{load\_vreg}/\texttt{store\_vreg} family and the incoming-argument
+spill---routes through it, so no caller ever assumes slot~$=$~vreg.
 
 @d CodeGen: vreg slot offset @{
 // -- kcc_cg_slot_offset -------------------------------------------------------
 // uint64_t kcc_cg_slot_offset(uint64_t vreg)
-// Returns the scaled imm12 value for LDR/STR unsigned offset (64-bit).
-// slot_offset = (16 + vreg * 8) / 8 = vreg + 2
-// So LDR x9, [x29, #(16 + vreg*8)] encodes imm12_scaled = vreg + 2
+// Returns the scaled imm12 value for a 64-bit LDR/STR to the vreg's spill slot:
+// imm12_scaled = slotmap[vreg] + 2 (or vreg + 2 when no colouring map exists).
+// Clobbers x0 (return) and x1 (scratch) only.
 .text
 .globl _kcc_cg_slot_offset
 .p2align 2
 _kcc_cg_slot_offset:
-    add x0, x0, #2                // imm12_scaled = vreg + 2
+    adrp x1, _kcc_cg_slotmap@@PAGE
+    add  x1, x1, _kcc_cg_slotmap@@PAGEOFF
+    ldr x1, [x1]
+    cbz x1, .Lso_ident
+    ldr x0, [x1, x0, lsl #3]      // x0 = slotmap[vreg]
+.Lso_ident:
+    add x0, x0, #2                // imm12_scaled = slot + 2
     ret
 @| _kcc_cg_slot_offset
 @}
@@ -841,8 +863,9 @@ _kcc_cg_load_vreg:
     bl _kcc_code_emit32
     b .Llv_done
 .Llv_spill:
-    add x1, x19, #2                // slot index = vreg + 2
-    lsl x1, x1, #3                 // byte offset from x29
+    mov x0, x19                    // vreg → colored slot immediate
+    bl _kcc_cg_slot_offset
+    lsl x1, x0, #3                 // byte offset from x29
     mov x0, x20                    // rt = target reg
     mov x2, #0                     // kind = LDR int
     bl _kcc_cg_emit_frame_ldst
@@ -896,8 +919,9 @@ _kcc_cg_store_vreg:
     bl _kcc_code_emit32
     b .Lsv_done
 .Lsv_spill:
-    add x1, x19, #2                // slot index = vreg + 2
-    lsl x1, x1, #3                 // byte offset from x29
+    mov x0, x19                    // vreg → colored slot immediate
+    bl _kcc_cg_slot_offset
+    lsl x1, x0, #3                 // byte offset from x29
     mov x0, x20                    // rt = source reg
     mov x2, #1                     // kind = STR int
     bl _kcc_cg_emit_frame_ldst
@@ -971,8 +995,9 @@ _kcc_cg_load_vreg_fp:
     bl _kcc_code_emit32
     b .Llvf_done
 .Llvf_spill:
-    add x1, x19, #2                // slot index = vreg + 2
-    lsl x1, x1, #3                 // byte offset from x29
+    mov x0, x19                    // vreg → colored slot immediate
+    bl _kcc_cg_slot_offset
+    lsl x1, x0, #3                 // byte offset from x29
     mov x0, x20                    // Rt = fp reg
     mov x2, #2                     // kind = LDR fp
     bl _kcc_cg_emit_frame_ldst
@@ -1018,8 +1043,9 @@ _kcc_cg_store_vreg_fp:
     bl _kcc_code_emit32
     b .Lsvf_done
 .Lsvf_spill:
-    add x1, x19, #2                // slot index = vreg + 2
-    lsl x1, x1, #3                 // byte offset from x29
+    mov x0, x19                    // vreg → colored slot immediate
+    bl _kcc_cg_slot_offset
+    lsl x1, x0, #3                 // byte offset from x29
     mov x0, x20                    // Rt = fp reg
     mov x2, #3                     // kind = STR fp
     bl _kcc_cg_emit_frame_ldst

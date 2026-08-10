@@ -355,21 +355,54 @@ makes it catchable}---with the tables in a read-only page, the offending store
 faults at its own instruction and \texttt{lldb} names the culprit function on
 the spot, instead of the investigator chasing distant scrambled data.
 
-\textbf{Work items.}
+\textbf{Mechanism (what reconnaissance established).}  The fix is larger than a
+section retag, because of two facts about \kcc's back end.  First, \kcc{} emits a
+single \texttt{MH\_OBJECT} and \emph{delegates final linking to the system
+\texttt{ld}}; the read-only page protection of \texttt{\_\_DATA\_CONST} (the
+\texttt{SG\_READ\_ONLY} segment flag) is therefore \texttt{ld}'s job, not
+\kcc's.  \kcc{} only has to \emph{name} the section (\texttt{\_\_TEXT,\_\_const}
+or \texttt{\_\_DATA\_CONST,\_\_const}) that \texttt{ld} already places in a
+read-only segment---there is no segment-protection code to write.  Second, and
+harder: \kcc{} stores \emph{no} initialiser bytes in the object.  The
+\texttt{\_\_common} section is \texttt{S\_ZEROFILL}, and \emph{every} global
+initialiser---scalars and aggregates alike---is executed at load time as runtime
+stores from a synthesised \texttt{kcc.module\_init} constructor.  A store into a
+read-only page faults, so a \texttt{const} object cannot be both runtime-stored
+and write-protected.  Making it read-only therefore requires \emph{also}
+laying its initialiser bytes into a real (\texttt{S\_REGULAR}) file-backed
+section at compile time and suppressing its \texttt{module\_init} stores.  A
+third fact eases one worry: \texttt{const} is currently dropped in semantics
+(\S\ref{ch:ir-validation} neighbours), but it can be read straight from the
+declaration AST at global pre-registration, so the shared type descriptors---and
+the identity comparisons that depend on them---stay untouched.
+
+\textbf{Work items (staged).}
 \begin{itemize}
-\item Emit \texttt{static const} (and string-literal) aggregates into a
-      write-protected \texttt{\_\_DATA\_CONST}/\texttt{\_\_const} section rather
-      than the writable \texttt{\_\_common} lump, honouring the \texttt{const}
-      qualifier the front end already records.
-\item Separate zero-initialised BSS from initialised data, so a BSS overrun
-      cannot silently walk into a live initialised object.
-\item (Optional, cheap) A debug canary / guard-page mode around static tables,
-      giving any hunt for a still-silent overrun a tripwire.
+\item \textbf{Stage~1.}  A \texttt{const}-qualified static whose initialiser is a
+      non-relocatable compile-time constant (integer/float scalars and
+      aggregates of them---the \texttt{optsnum[]} victim class) is emitted into
+      \texttt{\_\_TEXT,\_\_const}: its bytes are evaluated at compile time into a
+      new file-backed data buffer, its symbol is routed to the new section, and
+      its \texttt{module\_init} stores are suppressed.  This alone protects the
+      most common const tables and is the first landing.
+\item \textbf{Stage~2.}  A \texttt{const} static whose initialiser contains
+      address relocations (e.g.\ \texttt{static const char *const opts[]}) goes
+      to \texttt{\_\_DATA\_CONST,\_\_const}, where \texttt{ld}/dyld apply the
+      pointer fix-ups and \emph{then} make the page read-only.
+\item \textbf{Stage~3 (optional).}  Split zero-initialised BSS from initialised
+      data so a BSS overrun cannot walk into a live object, and add a debug
+      canary / guard-page mode around static tables.
 \end{itemize}
 
-\textbf{weft files.}  \texttt{37-codegen} (data-section selection by
-qualifier), \texttt{38/39-emit} (the new section and its Mach-O segment
-protection attributes), \texttt{40-linker} (segment protection flags).
+\textbf{weft files.}  \texttt{37-codegen} (\texttt{const} detection at
+\texttt{\_kcc\_preregister\_globals} + a new compile-time initialiser-to-bytes
+data buffer), \texttt{40-linker-info} (per-symbol section decision in
+\texttt{\_kcc\_linker\_global\_sym}, a new \texttt{\_kcc\_rodata\_size} beside
+\texttt{\_kcc\_globals\_size}), \texttt{39-emit-macho} (the new
+\texttt{section\_64} header, its real file bytes, and the load-command/file-offset
+arithmetic), \texttt{32-ir-builder} (suppress the \texttt{module\_init}/%
+\texttt{main} init stores for a const object).  Note: \emph{not} segment
+protection---the system \texttt{ld} owns that.
 
 \textbf{Acceptance.}  A \texttt{static const} object lives in a read-only page
 (a deliberate write to one faults); the whole deterministic corpus---codegen,
@@ -379,10 +412,14 @@ stray write into a \texttt{const} table now aborts at the store, with
 \texttt{lldb} reporting the writing instruction, instead of surfacing as
 distant corruption.
 
-\textbf{Status.}  Open.  The defect is characterised and its exemplar (the Lua
-\texttt{:109} flake) documented; the emitter change is the remaining work.
-Being kind~B, this milestone may proceed in parallel with M1--M4 and need not
-precede the seam refactor---but doing it \emph{early} would have turned three
+\textbf{Status.}  Open, scope re-estimated after reconnaissance.  The defect is
+characterised, its exemplar (the Lua \texttt{:109} flake) documented, and the
+data path mapped end to end; the remaining work is the file-backed rodata
+pipeline of the staged items above (a real initialised-data section plus a
+compile-time initialiser evaluator), not the flag flip the one-line summary once
+implied.  Being kind~B, this milestone may proceed in parallel with M1--M4 and
+need not precede the seam refactor---but doing it \emph{early} would have turned
+three
 past heisenbugs (Bugs~32, 38, 45) into one-line faults at the store site, which
 is the standing argument for scheduling oracle-hardening sooner rather than
 later.

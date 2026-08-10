@@ -5,6 +5,7 @@
 % locals, and the variable-declaration builder.
 
 \section{Building Variable Declarations}
+\label{sec:ir-aggregates}
 
 A variable declaration emits \texttt{IR\_ALLOCA} to reserve a stack
 slot, then records the mapping \texttt{name $\to$ vreg+1} in the
@@ -349,23 +350,39 @@ zero.  The builder therefore records the total slot count when it
 sizes the alloca and, after the provided values are placed, stores a
 single reused zero constant into every remaining slot.
 
-\emph{Designated initializers} (\texttt{[i] =}, \texttt{.member =}) fit
-this machinery with almost no new mechanism.  Each list element is
-either a plain value or an \texttt{AST\_DESIGNATOR} carrying its value
-in \texttt{AST\_F3}; the write loop keeps a running ``current object''
-position, and when it meets a designator it \emph{resets} that position
---- an array index goes straight in, a member name is turned into a
-field position by \texttt{kcc\_ir\_field\_index} --- then continues
-positionally from there, exactly as \stdref{6.7.9p17--18} prescribes.
-Because the whole region is zero-filled first, a sparse list such as
-\texttt{int a[6] = \{ [5] = 9 \}} leaves the gaps correctly at zero.
-The offset helper is untouched: it still maps a position to a byte
-offset, and the designator only changes \emph{which} position that is.
-Nested designator chains (\texttt{.a.b}, \texttt{[i][j]}) and string
-initialisers for character arrays (\texttt{char s[] = "abc"}) remain
-pending.  File-scope aggregates take the same shape but are seeded by
-\texttt{\_kcc\_ir\_emit\_global\_inits} rather than here, relying on
-BSS zero instead of an explicit zero-fill.
+\emph{Designated and nested initializers} (\stdref{6.7.9}) are emitted by
+a small recursive family, so an arbitrarily deep aggregate is initialised
+by descending it, not by a single flat loop.  After zero-filling the whole
+region, \texttt{\_kcc\_ir\_fill\_list} walks a brace-delimited list against
+the sub-objects of the target type, keeping a running ``current object''
+position (\stdref{6.7.9p17--18}).  A plain element with its own brace, or a
+scalar landing on a scalar sub-object, is written by
+\texttt{\_kcc\_ir\_fill\_one}; a designation---which may now be a
+\emph{chain} such as \texttt{.p.a}, \texttt{.arr[1]}, or
+\texttt{[0].x}---is resolved by \texttt{\_kcc\_ir\_resolve\_designator},
+which follows the \texttt{AST\_F2} links one sub-object at a time
+(\texttt{\_kcc\_ir\_subobj} descending both the byte offset and the type)
+to the leaf, and retargets the cursor to the first designator's position so
+plain elements that follow resume from there.  The remaining subtlety is
+\emph{brace elision} (\stdref{6.7.9p20}): when a plain scalar meets an
+aggregate sub-object that has no brace of its own, the scalar and those
+after it flow into that aggregate's leaves in order.
+\texttt{\_kcc\_ir\_fill} models exactly this---it treats the list as a flat
+stream and returns the next unconsumed element---so \texttt{int m[2][2] =
+\{1,2,3,4\}} fills the four leaves left to right and \texttt{struct \{int a;
+int r[2]; int b;\} = \{1,2,3,4\}} spills the middle two into the array.
+Because the region was zero-filled first, a sparse list such as
+\texttt{int a[6] = \{ [5] = 9 \}} still leaves the gaps at zero, and a
+bit-field leaf keeps its read--modify--write because
+\texttt{\_kcc\_ir\_subobj} publishes the resolved field for
+\texttt{\_kcc\_ir\_store\_elem}.  String initialisers for character arrays
+(\texttt{char s[] = "abc"}) take their own byte-copy path above.
+File-scope aggregates share this exact machinery: their emitter
+(\texttt{\_kcc\_ir\_emit\_aggregate\_init}, \S\ref{sec:global-inits}) is a
+thin adapter that calls \texttt{\_kcc\_ir\_fill\_list} against the global's
+materialised base address instead of a stack alloca, relying on zeroed BSS
+in place of the explicit zero-fill, so designator chains and brace elision
+work identically at file scope.
 
 @d IR: aggregate init helpers @{
 // -- kcc_ir_initlist_count ------------------------------------------------
@@ -587,10 +604,451 @@ _kcc_ir_field_index:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+
+// -- kcc_ir_subobj --------------------------------------------------------
+// (offset, width, sub_type) kcc_ir_subobj(type *agg, uint64_t index)
+//   x0 = the *actual* aggregate type (array, struct, or union); x1 = the
+//        position of a sub-object within it.
+//   Returns x0 = the sub-object's byte offset inside `agg`, x1 = its store
+//   access-size code, x2 = its type descriptor.  A struct/union position is
+//   the index-th field (offset from its laid-out AST_F3); an array position
+//   is index * sizeof(element).  Also publishes the resolved field in
+//   _kcc_ir_member_field (cleared for an array element) so a following
+//   _kcc_ir_store_elem can detect a bit-field target.  This is the typed
+//   companion to _kcc_ir_elem_off_width, which the recursive initializer
+//   needs so it can descend into a nested aggregate sub-object.
+.text
+.globl _kcc_ir_subobj
+.p2align 2
+_kcc_ir_subobj:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                  // aggregate type
+    mov x20, x1                  // index
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str xzr, [x0]                // default: no bit-field field published
+    cbz x19, .Lso_void
+    ldr x2, [x19, #TY_KIND]
+    cmp x2, #TY_ARRAY
+    b.eq .Lso_array
+    cmp x2, #TY_STRUCT
+    b.eq .Lso_struct
+    cmp x2, #TY_UNION
+    b.eq .Lso_struct
+    // Scalar (or a braced scalar `int x = {5}`): one element of `agg` itself.
+    mov x0, x19
+    bl _kcc_type_layout          // size
+    mul x20, x20, x0             // offset = index * size
+    mov x0, x19
+    bl _kcc_ir_store_width       // width
+    mov x1, x0
+    mov x0, x20                  // offset
+    mov x2, x19                  // sub_type = the scalar itself
+    b .Lso_ret
+.Lso_void:
+    lsl x0, x20, #3              // no type: fall back to 8-byte slots
+    mov x1, #0
+    mov x2, #0
+    b .Lso_ret
+.Lso_array:
+    ldr x21, [x19, #TY_F0]       // element type = sub_type
+    mov x0, x21
+    bl _kcc_type_layout          // element size
+    mul x20, x20, x0             // offset = index * element size
+    mov x0, x21
+    bl _kcc_ir_store_width       // width
+    mov x1, x0
+    mov x0, x20                  // offset
+    mov x2, x21                  // sub_type
+    b .Lso_ret
+.Lso_struct:
+    mov x0, x19
+    bl _kcc_type_layout          // ensure per-field offsets
+    ldr x21, [x19, #TY_F0]       // struct decl
+    cbz x21, .Lso_zero
+    ldr x21, [x21, #AST_F1]      // first field
+.Lso_walk:
+    cbz x21, .Lso_zero
+    cbz x20, .Lso_found
+    ldr x21, [x21, #AST_F4]      // next field
+    sub x20, x20, #1
+    b .Lso_walk
+.Lso_found:
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str x21, [x0]                // publish for a possible bit-field store
+    ldr x1, [x21, #AST_F0]       // field type spec
+    cbz x1, .Lso_found_w0
+    mov x0, x1
+    bl _kcc_sema_resolve_type    // x0 = sub_type
+    mov x20, x0                  // hold sub_type across store_width
+    bl _kcc_ir_store_width       // x0 = width (reads x0 = sub_type)
+    mov x1, x0                   // width
+    ldr x0, [x21, #AST_F3]       // field byte offset
+    mov x2, x20                  // sub_type
+    b .Lso_ret
+.Lso_found_w0:
+    ldr x0, [x21, #AST_F3]       // offset
+    mov x1, #0                   // width
+    mov x2, #0                   // sub_type
+    b .Lso_ret
+.Lso_zero:
+    mov x0, #0
+    mov x1, #0
+    mov x2, #0
+.Lso_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_resolve_designator --------------------------------------------
+// (offset, sub_type, first_pos, field)
+//     kcc_ir_resolve_designator(type *agg, uint64_t base_off, node *desig)
+//   x0 = the aggregate type the designation applies to; x1 = its base byte
+//        offset; x2 = the head AST_DESIGNATOR of a designator chain (linked
+//        through AST_F2, e.g. `.p.a`, `.arr[1]`, `[0].x`).
+//   Walks the chain, descending one sub-object per designator, and returns
+//   x0 = the absolute byte offset of the designated leaf, x1 = its type,
+//   x2 = the *first* designator's position (so plain elements that follow in
+//   the enclosing list resume from there), x3 = the leaf field descriptor
+//   (0 for an array leaf) for bit-field-aware storage.
+.text
+.globl _kcc_ir_resolve_designator
+.p2align 2
+_kcc_ir_resolve_designator:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // cur_type
+    mov x20, x1                  // cur_off (absolute)
+    mov x21, x2                  // current designator
+    mov x22, #-1                 // first_pos sentinel
+    mov x23, #0                  // leaf field
+.Lrd_loop:
+    cbz x21, .Lrd_done
+    ldr x0, [x21, #AST_F1]       // is_field?
+    cbz x0, .Lrd_index
+    mov x0, x19                  // cur_type
+    ldr x1, [x21, #AST_F0]       // member name
+    bl _kcc_ir_field_index       // x0 = position (or -1)
+    mov x24, x0                  // position
+    b .Lrd_sub
+.Lrd_index:
+    ldr x24, [x21, #AST_F0]      // [i] : position = i
+.Lrd_sub:
+    mov x0, x19
+    mov x1, x24
+    bl _kcc_ir_subobj            // x0=off, x1=width, x2=sub_type; publishes field
+    add x20, x20, x0             // cur_off += off
+    mov x19, x2                  // descend: cur_type = sub_type
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x23, [x0]                // remember leaf field (last one wins)
+    cmn x22, #1                  // first_pos still -1?
+    b.ne .Lrd_next
+    mov x22, x24                 // record the first position
+.Lrd_next:
+    ldr x21, [x21, #AST_F2]      // next designator in the chain
+    b .Lrd_loop
+.Lrd_done:
+    mov x0, x20                  // absolute offset
+    mov x1, x19                  // leaf type
+    mov x2, x22                  // first position
+    mov x3, x23                  // leaf field
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+// -- kcc_ir_agg_count -----------------------------------------------------
+// uint64_t kcc_ir_agg_count(type *ty)
+//   Number of sub-objects the brace-elision consumer must fill for an
+//   aggregate: an array's element count, a struct's field count, 1 for a
+//   union (elision fills only the first member) or a scalar.
+.text
+.globl _kcc_ir_agg_count
+.p2align 2
+_kcc_ir_agg_count:
+    cbz x0, .Lac_one
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.eq .Lac_array
+    cmp x1, #TY_STRUCT
+    b.eq .Lac_struct
+.Lac_one:
+    mov x0, #1
+    ret
+.Lac_array:
+    ldr x0, [x0, #TY_F1]         // element count
+    ret
+.Lac_struct:
+    ldr x1, [x0, #TY_F0]         // struct decl
+    cbz x1, .Lac_one
+    ldr x1, [x1, #AST_F1]        // first field
+    mov x0, #0
+.Lac_sc:
+    cbz x1, .Lac_scdone
+    add x0, x0, #1
+    ldr x1, [x1, #AST_F4]        // next field
+    b .Lac_sc
+.Lac_scdone:
+    ret
+
+// -- kcc_ir_fill_one ------------------------------------------------------
+// void kcc_ir_fill_one(type *ty, base_alloca, uint64_t off, node, field)
+//   Initialize the single object of type `ty` at `off` from ONE initializer
+//   `node` (no stream elision).  A braced `node` fills `ty` from its own
+//   sub-list; a scalar `node` whose target is an aggregate (a designator
+//   naming an aggregate, `.m = 1`) elides from that point via _kcc_ir_fill;
+//   an ordinary scalar leaf is stored at `ty`'s width, honouring `field`
+//   for a bit-field.  This is the one place a value is actually emitted.
+.text
+.globl _kcc_ir_fill_one
+.p2align 2
+_kcc_ir_fill_one:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // ty
+    mov x20, x1                  // base_alloca
+    mov x21, x2                  // off
+    mov x22, x3                  // node
+    mov x23, x4                  // field
+    cbz x22, .Lfo_done
+    ldr x0, [x22, #AST_TAG]
+    cmp x0, #AST_INIT_LIST
+    b.eq .Lfo_list
+    // Scalar node.  If its target type is an aggregate, elide into it.
+    cbz x19, .Lfo_scalar
+    ldr x0, [x19, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Lfo_elide
+    cmp x0, #TY_UNION
+    b.eq .Lfo_elide
+    cmp x0, #TY_ARRAY
+    b.eq .Lfo_elide
+.Lfo_scalar:
+    mov x0, x22
+    bl _kcc_ir_build_expr
+    mov x24, x0                  // value vreg
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    str x23, [x0]                // republish field (build_expr may clear it)
+    mov x0, x19
+    bl _kcc_ir_store_width
+    mov x3, x0                   // width
+    mov x0, x20                  // base
+    mov x1, x21                  // offset
+    mov x2, x24                  // value
+    bl _kcc_ir_store_elem
+    b .Lfo_done
+.Lfo_list:
+    ldr x3, [x22, #AST_F0]       // sub-list head
+    mov x0, x19
+    mov x1, x20
+    mov x2, x21
+    bl _kcc_ir_fill_list
+    b .Lfo_done
+.Lfo_elide:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x21
+    mov x3, x22
+    bl _kcc_ir_fill              // consume this one node into the aggregate
+.Lfo_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_ir_fill ----------------------------------------------------------
+// node *kcc_ir_fill(type *ty, base_alloca, uint64_t off, node *elem)
+//   Brace-elision stream consumer.  Fills the object of type `ty` at `off`
+//   by drawing elements from the flat list stream starting at `elem`, and
+//   returns the next unconsumed element.  A scalar `ty` consumes exactly
+//   one element; an aggregate with no brace of its own recurses across its
+//   sub-objects, so `int m[2][2] = {1,2,3,4}` flows the four scalars into
+//   the four leaves in order (\stdref{6.7.9p20}).
+.text
+.globl _kcc_ir_fill
+.p2align 2
+_kcc_ir_fill:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+    mov x19, x0                  // ty
+    mov x20, x1                  // base_alloca
+    mov x21, x2                  // off
+    mov x22, x3                  // elem
+    cbz x22, .Lfl_ret
+    cbz x19, .Lfl_scalar
+    ldr x0, [x19, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Lfl_agg
+    cmp x0, #TY_UNION
+    b.eq .Lfl_agg
+    cmp x0, #TY_ARRAY
+    b.eq .Lfl_agg
+.Lfl_scalar:
+    mov x0, x19
+    mov x1, x20
+    mov x2, x21
+    mov x3, x22
+    mov x4, #0                   // elision has no bit-field context
+    bl _kcc_ir_fill_one
+    ldr x22, [x22, #AST_F4]      // consumed one element
+    b .Lfl_ret
+.Lfl_agg:
+    mov x0, x19
+    bl _kcc_ir_agg_count
+    mov x23, x0                  // number of sub-objects
+    mov x24, #0                  // cursor
+.Lfl_agg_loop:
+    cbz x22, .Lfl_ret            // stream exhausted
+    cmp x24, x23
+    b.ge .Lfl_ret                // all positions filled
+    mov x0, x19
+    mov x1, x24
+    bl _kcc_ir_subobj            // x0=off, x2=sub_type
+    mov x25, x2                  // sub_type
+    add x2, x21, x0              // absolute offset
+    mov x0, x25                  // sub_type
+    mov x1, x20                  // base
+    mov x3, x22                  // elem
+    bl _kcc_ir_fill              // consume; returns next element
+    mov x22, x0
+    add x24, x24, #1
+    b .Lfl_agg_loop
+.Lfl_ret:
+    mov x0, x22                  // next unconsumed element (may be 0)
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+// -- kcc_ir_fill_list -----------------------------------------------------
+// void kcc_ir_fill_list(type *ty, base_alloca, uint64_t base_off, node *head)
+//   Fill the aggregate `ty` at `base_off` from a brace-delimited element
+//   list `head..`.  Walks a running cursor over `ty`'s sub-objects; a
+//   designator chain retargets the cursor (and the value goes to the named
+//   leaf), a plain element with an explicit brace or scalar-into-scalar
+//   fills one sub-object, and a plain scalar whose sub-object is itself an
+//   aggregate spills into it by brace elision (via _kcc_ir_fill).  Gaps left
+//   by a sparse list keep the caller's zero-fill.
+.text
+.globl _kcc_ir_fill_list
+.p2align 2
+_kcc_ir_fill_list:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x19, x0                  // ty
+    mov x20, x1                  // base_alloca
+    mov x21, x2                  // base_off
+    mov x22, x3                  // current element
+    mov x23, #0                  // cursor position
+.Lfll_loop:
+    cbz x22, .Lfll_done
+    ldr x0, [x22, #AST_TAG]
+    cmp x0, #AST_DESIGNATOR
+    b.ne .Lfll_plain
+    // Designator chain: retarget the cursor and fill the named leaf.
+    mov x0, x19
+    mov x1, x21
+    mov x2, x22
+    bl _kcc_ir_resolve_designator  // x0=abs, x1=sub_type, x2=first_pos, x3=field
+    mov x23, x2                  // cursor = first position
+    mov x24, x0                  // absolute offset
+    mov x25, x1                  // sub_type
+    mov x26, x3                  // leaf field
+    ldr x3, [x22, #AST_F3]       // value node (on the head)
+    mov x0, x25
+    mov x1, x20
+    mov x2, x24
+    mov x4, x26
+    bl _kcc_ir_fill_one
+    add x23, x23, #1
+    ldr x22, [x22, #AST_F4]
+    b .Lfll_loop
+.Lfll_plain:
+    mov x0, x19
+    mov x1, x23                  // sub-object at the cursor
+    bl _kcc_ir_subobj            // x0=off, x2=sub_type; publishes field
+    mov x25, x2                  // sub_type
+    add x24, x21, x0             // absolute offset
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x26, [x0]                // leaf field for this position
+    cbz x25, .Lfll_skip          // ran past the aggregate: ignore the element
+    // Elision only when the sub-object is an aggregate AND the element is
+    // not its own brace; otherwise one element fills this sub-object.
+    ldr x0, [x22, #AST_TAG]
+    cmp x0, #AST_INIT_LIST
+    b.eq .Lfll_one
+    ldr x0, [x25, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Lfll_elide
+    cmp x0, #TY_UNION
+    b.eq .Lfll_elide
+    cmp x0, #TY_ARRAY
+    b.eq .Lfll_elide
+.Lfll_one:
+    mov x0, x25
+    mov x1, x20
+    mov x2, x24
+    mov x3, x22
+    mov x4, x26
+    bl _kcc_ir_fill_one
+    ldr x22, [x22, #AST_F4]
+    b .Lfll_adv
+.Lfll_elide:
+    mov x0, x25
+    mov x1, x20
+    mov x2, x24
+    mov x3, x22
+    bl _kcc_ir_fill              // spill the stream into this aggregate
+    mov x22, x0                  // next unconsumed element
+    b .Lfll_adv
+.Lfll_skip:
+    ldr x22, [x22, #AST_F4]
+.Lfll_adv:
+    add x23, x23, #1
+    b .Lfll_loop
+.Lfll_done:
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
 @| _kcc_ir_initlist_count
 @| _kcc_ir_emit_indexed_store
 @| _kcc_ir_elem_off_width
 @| _kcc_ir_field_index
+@| _kcc_ir_subobj
+@| _kcc_ir_resolve_designator
+@| _kcc_ir_agg_count
+@| _kcc_ir_fill_one
+@| _kcc_ir_fill
+@| _kcc_ir_fill_list
 @}
 
 \subsection{Static Locals}
@@ -893,17 +1351,21 @@ _kcc_ir_build_var_decl:
     b .Libvd_done
 
 .Libvd_initlist:
-    // x0 = AST_INIT_LIST; x21 = element/aggregate type; x23 = base alloca vreg;
-    // [sp,#72] = total slot count.  Zero the whole region first (slot by
-    // slot), then write each given element at its byte-accurate offset, so
-    // the two loops need not agree on element vs. slot indexing.
-    ldr x20, [x0, #AST_F0]      // first element
-    ldr x24, [sp, #72]          // total slot count
+    // x0 = AST_INIT_LIST; x23 = base alloca vreg; [sp,#72] = total slot count.
+    // Zero the whole region first (slot by slot), then hand the list to the
+    // recursive initializer, which descends into nested braces and follows
+    // designator chains.  The declared aggregate type is resolved afresh
+    // because x21 has been narrowed to the *element* type for an array; the
+    // recursion needs the real array/struct type to size its sub-objects.
+    mov x22, x0                  // init-list node (survives the zero-fill)
+    ldr x0, [x19, #AST_F0]      // declared type spec
+    bl _kcc_sema_resolve_type
+    mov x21, x0                  // aggregate type (array/struct/union)
 
-    // one reusable zero constant
+    ldr x24, [sp, #72]          // total slot count
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
-    mov x19, x0
+    mov x19, x0                  // zero-const instr (decl node no longer needed)
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
@@ -911,60 +1373,29 @@ _kcc_ir_build_var_decl:
     str xzr, [x19, #IR_SRC1]
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
-    str x0, [sp, #72]           // stash zero vreg (slot count now in x24)
+    mov x20, x0                  // zero vreg
     mov x0, x19
     bl _kcc_ir_emit
 
-    mov x22, #0                  // slot index
+    mov x19, #0                  // slot index
 .Libvd_il_zf_loop:
-    cmp x22, x24
-    b.ge .Libvd_il_write
+    cmp x19, x24
+    b.ge .Libvd_il_emit
     mov x0, x23                  // base
-    lsl x1, x22, #3             // byte offset = slot * 8
-    ldr x2, [sp, #72]           // zero vreg
+    lsl x1, x19, #3             // byte offset = slot * 8
+    mov x2, x20                  // zero vreg
     mov x3, #0                   // width = 8-byte slot
     bl _kcc_ir_emit_indexed_store
-    add x22, x22, #1
+    add x19, x19, #1
     b .Libvd_il_zf_loop
 
-.Libvd_il_write:
-    mov x22, #0                  // element index (current object position)
-.Libvd_il_loop:
-    cbz x20, .Libvd_done
-    // A designator resets the current position; a plain element keeps it.
-    ldr x9, [x20, #AST_TAG]
-    cmp x9, #AST_DESIGNATOR
-    b.ne .Libvd_il_pos
-    ldr x9, [x20, #AST_F1]       // is_field?
-    cbz x9, .Libvd_il_arr
+.Libvd_il_emit:
+    ldr x3, [x22, #AST_F0]       // list head element
     mov x0, x21                  // aggregate type
-    ldr x1, [x20, #AST_F0]      // member name
-    bl _kcc_ir_field_index       // x0 = position, or -1
-    tbnz x0, #63, .Libvd_il_desval
-    mov x22, x0
-.Libvd_il_desval:
-    ldr x0, [x20, #AST_F3]      // value node
-    b .Libvd_il_build
-.Libvd_il_arr:
-    ldr x22, [x20, #AST_F0]      // [i] = : position becomes i
-    ldr x0, [x20, #AST_F3]      // value node
-    b .Libvd_il_build
-.Libvd_il_pos:
-    mov x0, x20                  // value node = element itself
-.Libvd_il_build:
-    bl _kcc_ir_build_expr        // element value vreg
-    str x0, [sp, #72]           // stash value vreg
-    mov x0, x21                  // element/aggregate type
-    mov x1, x22                  // element index
-    bl _kcc_ir_elem_off_width    // x0 = byte offset, x1 = width
-    mov x3, x1                   // width
-    mov x1, x0                   // byte offset
-    mov x0, x23                  // base
-    ldr x2, [sp, #72]           // value vreg
-    bl _kcc_ir_store_elem        // bit-field aware
-    add x22, x22, #1
-    ldr x20, [x20, #AST_F4]      // next element
-    b .Libvd_il_loop
+    mov x1, x23                  // base alloca
+    mov x2, #0                   // base offset
+    bl _kcc_ir_fill_list
+    b .Libvd_done
 
 .Libvd_static:
     // Hoist: record source-name -> mangled global; skip alloca and init

@@ -1877,6 +1877,23 @@ returns its result vreg.  The field to act on is the one
 bit offset and width, and its declared type gives the container size and
 signedness.
 
+A \texttt{volatile} bit-field (\stdref{6.7.3}) needs one more thing: the
+whole read-modify-write is expressed as ordinary loads and stores of the
+container, and the optimizer keys volatility off an instruction's
+\texttt{IR\_TYPE}, so those container accesses must carry the volatile bit
+or CSE could merge two reads and dead-store elimination could drop a
+write---silently defeating the qualifier.  \texttt{\_kcc\_ir\_bitfield\_%
+load} and \texttt{\_kcc\_ir\_bitfield\_store} therefore ask
+\texttt{\_kcc\_ir\_bf\_container\_type} for the container's IR type: the
+canonical unsigned long, or---when the field's type is
+volatile-qualified---a once-cloned copy of it with the volatile bit set,
+which they pass to the type-taking \texttt{\_kcc\_ir\_emit\_load\_t} /
+\texttt{\_kcc\_ir\_emit\_store\_t} instead of the default wrappers.  This
+brings a volatile bit-field to parity with a volatile scalar member; a
+bit-field made volatile only through a volatile \emph{object}
+(\texttt{volatile struct S s}) is not yet distinguished, the same broader
+gap that non-bit-field members share.
+
 @d IR: bitfield access @{
 // -- kcc_ir_emit_const ----------------------------------------------------
 // uint64_t kcc_ir_emit_const(uint64_t value) → result vreg
@@ -2136,10 +2153,14 @@ _kcc_ir_bitfield_load:
     bl _kcc_ir_type_layout_size  // x0 = container bytes
     bl _kcc_ir_bf_code
     mov x20, x0                  // unsigned load code
-    // container LOAD
-    mov x0, x19
-    mov x1, x20
-    bl _kcc_ir_emit_load
+    // container LOAD --- carry a volatile-qualified container type for a
+    // volatile bit-field so its read is never merged or eliminated.
+    mov x0, x24                  // field type
+    bl _kcc_ir_bf_container_type
+    mov x2, x0                   // container IR type
+    mov x0, x19                  // addr
+    mov x1, x20                  // access-size code
+    bl _kcc_ir_emit_load_t
     mov x21, x0                  // loaded value vreg
     // shift right by lsb
     cbz x23, .Lbfl_mask
@@ -2207,14 +2228,20 @@ _kcc_ir_bitfield_store:
     lsr x23, x0, #16             // lsb
     ldr x0, [x2, #AST_F0]        // field type
     bl _kcc_sema_resolve_type
+    mov x25, x0                  // field type (kept for the volatile check)
     bl _kcc_ir_type_layout_size  // container bytes
     bl _kcc_ir_bf_code
     mov x24, x0                  // access-size code
     // old = LOAD(addr)  (intermediates live in x21/x22/x26; the emitters only
-    // clobber x0-x2 and their own x19-x22, so x23-x26 survive across calls)
-    mov x0, x19
-    mov x1, x24
-    bl _kcc_ir_emit_load
+    // clobber x0-x2 and their own x19-x22, so x23-x26 survive across calls).
+    // A volatile bit-field's read-modify-write reads and writes its container
+    // through a volatile-qualified type so neither half is optimized away.
+    mov x0, x25                  // field type
+    bl _kcc_ir_bf_container_type
+    mov x2, x0                   // container IR type
+    mov x0, x19                  // addr
+    mov x1, x24                  // access-size code
+    bl _kcc_ir_emit_load_t
     mov x26, x0                  // old container vreg
     mov x0, x22
     bl _kcc_ir_bf_mask
@@ -2248,11 +2275,15 @@ _kcc_ir_bitfield_store:
     mov x0, #IR_OR
     bl _kcc_ir_emit_binop
     mov x21, x0                  // newval
-    // STORE newval → addr (container width)
-    mov x0, x21
-    mov x1, x19
-    mov x2, x24
-    bl _kcc_ir_emit_store
+    // STORE newval → addr (container width), volatile-qualified when the
+    // field is volatile so the write is a mandatory side effect.
+    mov x0, x25                  // field type
+    bl _kcc_ir_bf_container_type
+    mov x3, x0                   // container IR type
+    mov x0, x21                  // value
+    mov x1, x19                  // addr
+    mov x2, x24                  // access-size code
+    bl _kcc_ir_emit_store_t
     mov x0, x20                  // assignment result = the value
     ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
@@ -2264,21 +2295,33 @@ _kcc_ir_bitfield_store:
 // -- kcc_ir_emit_load / kcc_ir_emit_store ---------------------------------
 // vreg kcc_ir_emit_load(addr_vreg, size_code); void kcc_ir_emit_store(value,
 // addr, size_code).  Thin wrappers around IR_LOAD / IR_STORE with an
-// access-size override, used by the bit-field synthesis.
+// access-size override, used by the bit-field synthesis.  Each is a stub that
+// supplies the canonical unsigned-long type and tail-calls the `_t` variant;
+// the bit-field code calls the `_t` variant directly to pass a
+// volatile-qualified container type when the field is volatile, so the
+// optimizer sees the required side effect.
 .p2align 2
 _kcc_ir_emit_load:
-    stp x29, x30, [sp, #-32]!
-    mov x29, sp
-    stp x19, x20, [sp, #16]
-    mov x19, x1                  // size code
-    mov x20, x0                  // addr
-    mov x0, #IR_LOAD
-    bl _kcc_ir_alloc_instr
-    mov x1, x0
     adrp x2, _kcc_type_long_u@@PAGE
     add  x2, x2, _kcc_type_long_u@@PAGEOFF
     ldr x2, [x2]
-    str x2, [x1, #IR_TYPE]
+    b _kcc_ir_emit_load_t
+
+// vreg kcc_ir_emit_load_t(addr_vreg, size_code, type)
+.globl _kcc_ir_emit_load_t
+.p2align 2
+_kcc_ir_emit_load_t:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x1                  // size code
+    mov x20, x0                  // addr
+    mov x21, x2                  // IR type (volatile-qualified when volatile)
+    mov x0, #IR_LOAD
+    bl _kcc_ir_alloc_instr
+    mov x1, x0
+    str x21, [x1, #IR_TYPE]
     str x20, [x1, #IR_SRC1]
     str x19, [x1, #IR_SRC2]
     mov x20, x1
@@ -2288,32 +2331,100 @@ _kcc_ir_emit_load:
     mov x0, x20
     bl _kcc_ir_emit
     mov x0, x19
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 
 .p2align 2
 _kcc_ir_emit_store:
+    adrp x3, _kcc_type_long_u@@PAGE
+    add  x3, x3, _kcc_type_long_u@@PAGEOFF
+    ldr x3, [x3]
+    b _kcc_ir_emit_store_t
+
+// void kcc_ir_emit_store_t(value, addr, size_code, type)
+.globl _kcc_ir_emit_store_t
+.p2align 2
+_kcc_ir_emit_store_t:
     stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
-    str x21, [sp, #32]
+    stp x21, x22, [sp, #32]
     mov x19, x0                  // value
     mov x20, x1                  // addr
     mov x21, x2                  // size code
+    mov x22, x3                  // IR type (volatile-qualified when volatile)
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
-    adrp x2, _kcc_type_long_u@@PAGE
-    add  x2, x2, _kcc_type_long_u@@PAGEOFF
-    ldr x2, [x2]
-    str x2, [x0, #IR_TYPE]
+    str x22, [x0, #IR_TYPE]
     str x19, [x0, #IR_SRC1]      // value
     str x20, [x0, #IR_SRC2]      // addr
     str x21, [x0, #IR_DEST]      // access-size override
     bl _kcc_ir_emit
-    ldr x21, [sp, #32]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_bf_container_type ---------------------------------------------
+// type *kcc_ir_bf_container_type(type *field_type)
+//   The IR type to stamp on a bit-field's container load/store: the canonical
+//   unsigned long, or---when the field (or its object) is volatile---a cached
+//   clone of it with the volatile bit set, so the optimizer's CSE and DCE
+//   passes (which key volatility off the instruction's IR_TYPE) treat every
+//   container access as a mandatory, un-mergeable side effect (\stdref{6.7.3}).
+.globl _kcc_ir_bf_container_type
+.p2align 2
+_kcc_ir_bf_container_type:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    cbz x0, .Lbct_plain
+    ldr x1, [x0, #TY_QUALS]
+    tst x1, #2
+    b.eq .Lbct_plain
+    adrp x0, _kcc_ir_vol_longu@@PAGE
+    add  x0, x0, _kcc_ir_vol_longu@@PAGEOFF
+    ldr x1, [x0]
+    cbnz x1, .Lbct_cached
+    // First volatile bit-field: clone the long_u descriptor and set volatile.
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0                  // new descriptor
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr x0, [x0]                 // source descriptor
+    ldr x1, [x0, #0]
+    str x1, [x19, #0]
+    ldr x1, [x0, #8]
+    str x1, [x19, #8]
+    ldr x1, [x0, #16]
+    str x1, [x19, #16]
+    ldr x1, [x0, #24]
+    str x1, [x19, #24]
+    ldr x1, [x0, #32]
+    str x1, [x19, #32]
+    ldr x1, [x0, #40]
+    str x1, [x19, #40]
+    ldr x1, [x19, #TY_QUALS]
+    orr x1, x1, #2               // mark volatile
+    str x1, [x19, #TY_QUALS]
+    adrp x0, _kcc_ir_vol_longu@@PAGE
+    add  x0, x0, _kcc_ir_vol_longu@@PAGEOFF
+    str x19, [x0]                // cache for subsequent volatile bit-fields
+    mov x0, x19
+    b .Lbct_ret
+.Lbct_cached:
+    mov x0, x1
+    b .Lbct_ret
+.Lbct_plain:
+    adrp x0, _kcc_type_long_u@@PAGE
+    add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr x0, [x0]
+.Lbct_ret:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
     ret
 
 // -- kcc_ir_type_layout_size ----------------------------------------------
@@ -2956,6 +3067,26 @@ operand's sema type; if one is \texttt{TY\_PTR}, it emits
 operand by the pointee's \texttt{TY\_SIZE}.  If the pointee size is
 $\le 1$ (e.g.\ \texttt{char~*}), no scaling is needed.
 
+\paragraph{Floating-point operations and single-precision rounding.}
+If either operand or the result is floating, the emitter takes the FP
+path: any integer operand is widened to \texttt{double} with
+\texttt{IR\_SITOFP}, and the operation is emitted carrying the
+\texttt{double} type, which is the code generator's signal to use the
+floating-point unit.  Values therefore \emph{live} as doubles in SIMD
+registers regardless of their C type---a uniform model that keeps the
+backend simple.  The catch is \texttt{float}: Apple ARM64 uses
+\texttt{FLT\_EVAL\_METHOD}~$0$, so every \texttt{float} operation must
+yield a result rounded to single precision, not a wider double carried on
+into the next operation.  So when the expression's \emph{own} result type
+is \texttt{float}, the emitter appends an \texttt{IR\_FPROUND} (a
+\texttt{double}$\to$\texttt{single}$\to$\texttt{double} round-trip) to the
+result, rounding each \texttt{float} sub-expression exactly once as it is
+produced.  A chain like \texttt{a/b*c} thus rounds \texttt{a/b} to single
+before multiplying, matching \texttt{clang} to the last bit; a comparison
+(result type \texttt{int}) and a mixed \texttt{float}/\texttt{double}
+expression (result type \texttt{double}, full precision kept) are both
+correctly left un-rounded.
+
 @d IR: build binary @{
 // -- kcc_ir_build_binary --------------------------------------------------
 // uint64_t kcc_ir_build_binary(node *expr)
@@ -3412,6 +3543,23 @@ _kcc_ir_build_binary:
     mov x23, x0
     mov x0, x24
     bl _kcc_ir_emit
+    // If this expression's own type is `float` (single precision), round the
+    // just-computed double result back to single, so each float sub-expression
+    // is rounded once as it is produced.  Without this the operation carries a
+    // wider double intermediate into the next one---FLT_EVAL_METHOD 1/2 rather
+    // than the 0 that Apple ARM64 (and clang) use---so a chain like `a/b*c`
+    // differed from clang by an ULP.  A comparison's result type is int, so it
+    // is naturally excluded; a mixed float/double expression is typed double
+    // and correctly keeps full precision.
+    ldr x1, [x19, #AST_F3]       // this expression's result type
+    cbz x1, .Libb_fp_ret
+    ldr x1, [x1, #TY_KIND]
+    cmp x1, #TY_FLOAT
+    b.ne .Libb_fp_ret
+    mov x0, x23                  // double result vreg
+    bl _kcc_ir_emit_fpround      // → single-rounded result
+    mov x23, x0
+.Libb_fp_ret:
     mov x0, x23
     b .Libb_done
 @| _kcc_ir_build_binary

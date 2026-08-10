@@ -244,11 +244,12 @@ registers---and allocates both integer and floating values to registers.
 Its current limits are worth stating plainly so you are not surprised.  It
 targets Apple silicon only; there is no cross-compilation to other
 processors or operating systems yet (the framework for adding one is
-described in Chapter~\ref{ch:retargeting}).  A few tail corners of C17 remain:
-\texttt{volatile} bit-fields, arbitrarily nested designator chains, and
-per-operation single-precision rounding for \texttt{float} arithmetic
-(intermediate results are computed in \texttt{double} and rounded at the
-boundaries).  Appendix~\ref{ch:roadmap} tracks the state of every feature in
+described in Chapter~\ref{ch:retargeting}).  One tail corner of C17 remains:
+propagating \texttt{volatile} from a qualified \emph{object} through member
+access (a member or bit-field declared \texttt{volatile} is already
+honoured).  Nested designator chains, brace elision, and per-operation
+single-precision rounding for \texttt{float} arithmetic are now fully
+supported.  Appendix~\ref{ch:roadmap} tracks the state of every feature in
 detail.
 
 \section{Building This Book}

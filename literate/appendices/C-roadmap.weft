@@ -1009,10 +1009,14 @@ already in hand, so the leverage now is in usability and coverage, not speed.
 \item \textbf{Tail C17 features---\_Generic, \texttt{long double},
       \texttt{volatile}} (Stage~9a).  \texttt{volatile} is now honoured for
       every lvalue access---scalar, global, pointer dereference, array element,
-      and struct/union member (only volatile bit-fields remain)---a soundness
-      requirement once the optimizer was added: it must not merge or drop a
-      volatile load.  The qualifier reaches the IR at each access and CSE/DCE
-      respect it.  \texttt{\_Generic} is now selected at type-check time---the
+      struct/union member, and (as of milestone~M1) a volatile-declared
+      bit-field, whose synthesised read-modify-write now carries the volatile
+      bit on its container load and store---a soundness requirement once the
+      optimizer was added: it must not merge or drop a volatile load.  The
+      qualifier reaches the IR at each access and CSE/DCE respect it.  (What
+      remains is propagating \texttt{volatile} from a qualified \emph{object}
+      through member access, a gap shared by all members, not bit-fields
+      specifically.)  \texttt{\_Generic} is now selected at type-check time---the
       controlling expression is typed but not evaluated, and the compatible
       association's expression is the one lowered.  Integer constants are now
       fully typed per \stdref{6.4.4.1}: the suffix (\texttt{3L} $\to$
@@ -1155,12 +1159,14 @@ point is now in place.  This stage adds every remaining C17 type.
       which the backend lowers to \texttt{FCVT\;s,d} followed by
       \texttt{FCVT\;d,s} to truncate the value to single precision.  So
       \texttt{16777217.0f == 16777216.0f} and \texttt{(float)d} agree with
-      \texttt{clang} (six \texttt{float-*} differential tests).  Arithmetic
-      is still performed at \texttt{double} precision and rounded at the
-      \texttt{float} boundaries (permitted excess intermediate precision);
-      exact per-operation single-precision rounding and the
+      \texttt{clang} (eight \texttt{float-*} differential tests).  Arithmetic runs
+      in \texttt{double} registers, but as of milestone~M1 a binary operation
+      whose result type is \texttt{float} appends an \texttt{IR\_FPROUND}, so
+      each \texttt{float} sub-expression is rounded to single precision as it
+      is produced---\texttt{FLT\_EVAL\_METHOD}~$0$, bit-exact with
+      \texttt{clang} on chains like \texttt{a/b*c}.  Only the
       \texttt{s0}--\texttt{s7} argument convention for \texttt{clang}
-      float-argument interop remain.  \texttt{long double} is lowered as
+      float-argument interop remains.  \texttt{long double} is lowered as
       \texttt{double} per the Apple ARM64 ABI (identical 64-bit representation).
 \item[\checkmark] \textbf{Unions.}  Done: \texttt{\_kcc\_type\_layout} lays a
       union out with every member at offset~0 and \texttt{TY\_SIZE} equal to
@@ -1524,7 +1530,7 @@ Feature & Status & Note \\
 \hline
 standard struct layout           & \checkmark & padding/align, 15 diff. tests \\
 \texttt{double} floating point   & \checkmark & complete, 14 diff. tests \\
-single-precision \texttt{float}  & \checkmark & rounded at boundaries; 6 diff. tests \\
+single-precision \texttt{float}  & \checkmark & per-op single rounding (M1); 8 diff. tests \\
 \texttt{long double}             & \checkmark & Apple ABI: aliased to \texttt{double} (64-bit) \\
 \texttt{union}                   & \checkmark & offset-0 layout; 6 diff. tests \\
 bit-fields                       & \checkmark & LSB-first packing; 7 diff. tests \\
@@ -1589,10 +1595,13 @@ with \texttt{union}s, single-precision \texttt{float}, bit-fields, single-level
 designated initializers, \texttt{\_Bool} normalization,
 \texttt{char s[] = "..."}, \texttt{\_Generic} selection, full
 integer-constant typing, \texttt{volatile} semantics, and \texttt{long double}
-(Apple-ABI aliased to \texttt{double}) now done, the bounded pieces still
-missing are volatile bit-fields, nested designator chains, and per-operation
-single-precision float rounding (today \texttt{float} arithmetic rounds only at
-conversion boundaries).
+(Apple-ABI aliased to \texttt{double}) now done---and, as of milestone~M1
+(Appendix~\ref{ch:multitarget-roadmap}), volatile bit-fields, nested
+designator chains with brace elision, and per-operation single-precision
+\texttt{float} rounding as well---the language axis is essentially closed.
+The one bounded piece still missing is propagating \texttt{volatile} from a
+qualified \emph{object} through member access, which is not specific to
+bit-fields.
 
 The toolchain axis, previously the weakest, has closed most of its gaps.
 Standard struct layout, more-than-eight stack arguments, variadic function

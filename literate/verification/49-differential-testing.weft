@@ -417,6 +417,10 @@ difftest "float-precision-cast" \
     "int main(void){ return (float)16777217.0 == 16777216.0f ? 1 : 0; }"
 difftest "float-sizeof" \
     "int main(void){ return (int)(sizeof(float) + sizeof(1.5f)); }"
+difftest "float-single-round-chain" \
+    "int main(void){ volatile float a=1.0f,b=3.0f,c=7.0f; float r=a/b*c; union { float f; unsigned u; } v; v.f=r; return v.u & 0xFF; }"
+difftest "float-single-round-sum" \
+    "int main(void){ volatile float a=1.1f,c=2.2f,d=3.3f,e=0.7f; float r=a*c+d*e; union { float f; unsigned u; } v; v.f=r; return v.u & 0xFF; }"
 difftest "float-arith" \
     "int main(void){ float f = 1.5f, g = 2.25f; return (int)((f + g) * 8); }"
 difftest "float-func" \
@@ -632,6 +636,8 @@ difftest "bitfield-desig" \
     "struct F { unsigned a:3; unsigned b:5; unsigned c:4; }; int main(void){ struct F f = { .c = 7, .a = 2 }; return f.a*100 + f.b*10 + f.c; }"
 difftest "bitfield-global" \
     "struct F { unsigned a:3; unsigned b:5; }; struct F g = { 6, 25 }; int main(void){ return g.a + g.b; }"
+difftest "bitfield-volatile" \
+    "struct S { volatile unsigned f:3; volatile int g:5; int tail; }; int main(void){ struct S s; s.tail=0; s.f=5; s.g=10; s.f=s.f+1; return s.f*10 + s.g; }"
 difftest "compound-member" \
     "struct S { int x; int y; }; int main(void){ struct S a; a.x=10; a.y=3; a.x+=5; a.y*=4; a.x-=2; return a.x + a.y; }"
 difftest "compound-subscript" \

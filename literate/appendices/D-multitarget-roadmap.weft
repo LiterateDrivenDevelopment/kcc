@@ -76,7 +76,7 @@ the split.  The table is the scan; the sections are the detail.
 \hline
 \textbf{\#} & \textbf{Milestone} & \textbf{Kind} & \textbf{Effort} & \textbf{Status}\\
 \hline
-M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{float}) & neutral & \meterB & \stPart\\
+M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{float}) & neutral & \meterB & \stDone\\
 M2 & Harden the IR verifier                    & neutral & \meterB & \stOpen\\
 M3 & Systematic conformance battery            & neutral & \meterA & \stOpen\\
 M4 & Broaden the IR optimizer                  & neutral & \meterA & \stOpen\\
@@ -108,15 +108,23 @@ every target.
       \texttt{.a.b[2] = v} and brace-elision across aggregate levels.
       Single-level \texttt{.f=}/\texttt{[i]=} is already done; the
       recursion over sub-objects is the gap.
-\item \textbf{Volatile bit-fields}: the load/store of a bit-field must
-      keep its access-once semantics, combining the existing volatile
-      barrier with the bit-field read--modify--write.
-\item \textbf{A real single-precision \texttt{float} model.}  Arithmetic
-      is presently carried in \texttt{double} throughout, rounded only at
-      storage boundaries.  This is a \emph{semantic} decision that both
-      targets inherit; settling it now (true single-precision intermediate
-      results where the standard requires them) avoids re-baselining two
-      backends later.
+\item \textbf{Volatile bit-fields} \emph{(landed)}: the synthesised
+      read--modify--write of a \texttt{volatile}-declared bit-field now stamps
+      the volatile bit on its container load and store
+      (\texttt{\_kcc\_ir\_bf\_container\_type} feeding the type-taking
+      \texttt{\_kcc\_ir\_emit\_load\_t}/\texttt{\_store\_t}), so CSE and DCE
+      treat each access as a mandatory side effect---parity with a volatile
+      scalar member.
+\item \textbf{A real single-precision \texttt{float} model} \emph{(landed)}.
+      Values still live as \texttt{double} in the SIMD registers---a uniform
+      backend model---but a binary operation whose \emph{result} type is
+      \texttt{float} now appends an \texttt{IR\_FPROUND}, rounding that
+      sub-expression to single precision as it is produced.  This gives the
+      \texttt{FLT\_EVAL\_METHOD}~$0$ semantics Apple ARM64 and \texttt{clang}
+      use---\texttt{a/b*c} matches \texttt{clang} to the last bit---while a
+      comparison (\texttt{int} result) and a mixed \texttt{float}/%
+      \texttt{double} expression (full precision) are correctly left alone.
+      Settling this \emph{now} avoids re-baselining two backends later.
 \end{itemize}
 
 \textbf{weft files.}  \texttt{27b-sema-declarations} and
@@ -129,9 +137,18 @@ is neutral, the final load/store width is where ARM64 realizes it);
 gains cases for each feature and stays byte-identical to \texttt{clang};
 self-host stays byte-identical; no existing suite regresses.
 
-\textbf{Status.}  Partial---single-level designators and boundary-rounded
-\texttt{float} are landed; nested designators, volatile bit-fields, and
-true single-precision intermediates remain.
+\textbf{Status.}  In progress.  Nested designator chains
+(\texttt{.p.a}, \texttt{.arr[1]}, \texttt{[0].x}) and brace elision
+(\texttt{int m[2][2] = \{1,2,3,4\}}) are \emph{landed}, at both block and
+file scope, through a single recursive initializer
+(\texttt{\_kcc\_ir\_fill\_list}) shared by the local and global paths and
+validated element-for-element against \texttt{clang}.  Volatile-declared bit-fields now carry the volatile bit on their
+container access, at parity with volatile scalar members.  Single-precision
+\texttt{float} arithmetic now rounds each \texttt{float} sub-expression once
+(\texttt{FLT\_EVAL\_METHOD}~$0$), bit-exact with \texttt{clang}.  With this,
+\textbf{M1 is complete}; the residual (propagating \texttt{volatile} from a
+qualified \emph{object} through member access) is a general member-access
+matter, not specific to this milestone.
 
 % ================================================================
 \section{M2 --- Harden the IR Verifier}

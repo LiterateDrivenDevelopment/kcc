@@ -331,159 +331,46 @@ the zero image.
 
 \paragraph{Nested aggregate initialisers.}  A brace-enclosed initialiser can
 nest: an array of structs (\texttt{static const luaL\_Reg lib[] =
-\{\{"a",\,f\},\ldots\}}) or a struct with an aggregate member.  Each element's
-initialiser is itself a brace list that must be laid out at the element's
-offset, recursively.  \texttt{\_kcc\_ir\_emit\_aggregate\_init} does exactly
-that: it walks one init-list against an aggregate type, and for an element
-whose type is again a struct/union/array \emph{and} whose initialiser is a
-nested brace list, it computes the element's sub-address
-(\texttt{IR\_GEP} of base $+$ offset) and recurses.  Flattening this to a
-single scalar store per element---the earlier behaviour---placed a
-function-pointer field's brace initialiser at the wrong slot, so Lua's
-\texttt{loadedlibs} table called into its own data (an \texttt{EXC\_BAD\_ACCESS}
-during \texttt{luaL\_openlibs}).  The per-element type comes from the array's
-element type or, for a struct, the field decl that
-\texttt{\_kcc\_ir\_elem\_off\_width} publishes.
+\{\{"a",\,f\},\ldots\}}) or a struct with an aggregate member, and it may use
+designator chains (\texttt{.p.a = 1}) or brace elision (\texttt{int m[2][2] =
+\{1,2,3,4\}}) just as a block-scope initialiser can.  Rather than duplicate
+that logic, \texttt{\_kcc\_ir\_emit\_aggregate\_init} is now a thin adapter
+onto the shared recursive initializer (\S\ref{sec:ir-aggregates}): it hands
+the list, the aggregate type, and the global's base \emph{address} to
+\texttt{\_kcc\_ir\_fill\_list}, which descends the object emitting one
+\texttt{IR\_GEP}-plus-store per leaf.  The base being a materialised address
+rather than an alloca vreg makes no difference---\texttt{IR\_GEP} strides
+either by a byte offset all the same---so file-scope and block-scope
+aggregates share a single, tested code path.  A flat single-store-per-element
+scheme (the original behaviour) once placed a function-pointer field's brace
+initialiser at the wrong slot, so Lua's \texttt{loadedlibs} table called into
+its own data (an \texttt{EXC\_BAD\_ACCESS} during \texttt{luaL\_openlibs});
+routing both scopes through the same recursion keeps that class of bug fixed
+in one place.
 
 @d IR: build @{
 // -- kcc_ir_emit_aggregate_init ------------------------------------------
 // void kcc_ir_emit_aggregate_init(node *init_list, type *agg, uint64_t base)
 //   x0 = AST_INIT_LIST, x1 = aggregate type (array/struct/union, or a scalar
-//   type for the untyped int fallback), x2 = base address vreg.
-// Emits stores for each element, honouring designators and byte offsets, and
-// recursing for an element that is itself a nested aggregate initialiser.
+//   type for the untyped int fallback), x2 = base ADDRESS vreg.
+// Thin adapter onto the shared recursive initializer: the file-scope path
+// emits its stores against a materialised base address exactly as the local
+// path does against an alloca, so both go through _kcc_ir_fill_list and get
+// designator chains and brace elision for free.  No zero-fill here---a
+// file-scope aggregate starts life in zeroed BSS, so a sparse list's gaps
+// are already zero.
 .text
 .globl _kcc_ir_emit_aggregate_init
 .p2align 2
 _kcc_ir_emit_aggregate_init:
-    stp x29, x30, [sp, #-96]!
+    stp x29, x30, [sp, #-16]!
     mov x29, sp
-    stp x19, x20, [sp, #16]
-    stp x21, x22, [sp, #32]
-    stp x23, x24, [sp, #48]
-    stp x25, x26, [sp, #64]
-    stp x27, x28, [sp, #80]
-
-    mov x19, x0                  // init-list node
-    mov x28, x1                  // full aggregate type
-    mov x22, x2                  // base address vreg
-
-    // Offset-calc type x23: array → element type; struct/union/scalar → itself.
-    // (`_kcc_ir_elem_off_width` strides an array by sizeof(element) and walks a
-    // struct's fields; a scalar type gives the int-fallback stride.)
-    mov x23, x28
-    ldr x0, [x28, #TY_KIND]
-    cmp x0, #TY_ARRAY
-    b.ne .Leai_typed
-    ldr x23, [x28, #TY_F0]       // array element type
-.Leai_typed:
-
-    ldr x20, [x19, #AST_F0]     // first element
-    mov x21, #0                  // element index / position
-.Leai_loop:
-    cbz x20, .Leai_done
-
-    // Designator (`.f =` / `[i] =`) or a positional element.
-    ldr x9, [x20, #AST_TAG]
-    cmp x9, #AST_DESIGNATOR
-    b.ne .Leai_pos
-    ldr x9, [x20, #AST_F1]       // is_field?
-    cbz x9, .Leai_arr
-    mov x0, x28                  // struct type for the field lookup
-    ldr x1, [x20, #AST_F0]      // member name
-    bl _kcc_ir_field_index
-    tbnz x0, #63, .Leai_desval
-    mov x21, x0
-.Leai_desval:
-    ldr x25, [x20, #AST_F3]     // value node
-    b .Leai_have
-.Leai_arr:
-    ldr x21, [x20, #AST_F0]      // [i] = : position becomes i
-    ldr x25, [x20, #AST_F3]     // value node
-    b .Leai_have
-.Leai_pos:
-    mov x25, x20                 // value node = element itself
-.Leai_have:
-    // Byte offset, width, and per-element type x24 for this position.  An
-    // array strides by sizeof(element)---even when the element is a struct, so
-    // `_kcc_ir_elem_off_width` (which would walk a struct's fields) is only
-    // used for a genuine struct/union aggregate.
-    ldr x0, [x28, #TY_KIND]
-    cmp x0, #TY_STRUCT
-    b.eq .Leai_struct_elem
-    cmp x0, #TY_UNION
-    b.eq .Leai_struct_elem
-    // Array (or scalar fallback): offset = index * sizeof(element).
-    mov x0, x23                  // element type
-    bl _kcc_type_layout          // x0 = sizeof(element)
-    mul x26, x21, x0             // offset = index * element size
-    mov x0, x23
-    bl _kcc_ir_store_width       // x0 = access width
-    mov x27, x0
-    mov x24, x23                 // per-element type = element type
-    b .Leai_type_ready
-.Leai_struct_elem:
-    mov x0, x28                  // struct type
-    mov x1, x21                  // field position
-    bl _kcc_ir_elem_off_width    // x0 = byte offset, x1 = width; publishes field
-    mov x26, x0
-    mov x27, x1
-    adrp x0, _kcc_ir_member_field@@PAGE
-    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
-    ldr x0, [x0]
-    cbz x0, .Leai_scalar_notype
-    ldr x0, [x0, #AST_F0]       // field type node
-    bl _kcc_sema_resolve_type
-    mov x24, x0
-    b .Leai_type_ready
-.Leai_scalar_notype:
-    mov x24, #0
-.Leai_type_ready:
-
-    // A nested brace initialiser whose target is itself an aggregate recurses.
-    ldr x0, [x25, #AST_TAG]
-    cmp x0, #AST_INIT_LIST
-    b.ne .Leai_scalar
-    cbz x24, .Leai_scalar
-    ldr x0, [x24, #TY_KIND]
-    cmp x0, #TY_STRUCT
-    b.eq .Leai_recurse
-    cmp x0, #TY_UNION
-    b.eq .Leai_recurse
-    cmp x0, #TY_ARRAY
-    b.ne .Leai_scalar
-.Leai_recurse:
-    // sub-address = base + offset, then recurse with the element's type.
-    mov x0, x26                  // byte offset
-    bl _kcc_ir_emit_const        // const vreg
-    mov x2, x0
-    mov x0, #IR_GEP
-    mov x1, x22                  // base
-    bl _kcc_ir_emit_binop        // base + offset (stride 1) → sub-address vreg
-    mov x2, x0                   // sub-base
-    mov x0, x25                  // nested init-list
-    mov x1, x24                  // nested aggregate type
-    bl _kcc_ir_emit_aggregate_init
-    b .Leai_next
-.Leai_scalar:
-    mov x0, x25                  // element value expression
-    bl _kcc_ir_build_expr
-    mov x2, x0                   // value
-    mov x3, x27                  // width
-    mov x1, x26                  // byte offset
-    mov x0, x22                  // base
-    bl _kcc_ir_store_elem
-.Leai_next:
-    add x21, x21, #1
-    ldr x20, [x20, #AST_F4]      // next element
-    b .Leai_loop
-.Leai_done:
-    ldp x27, x28, [sp, #80]
-    ldp x25, x26, [sp, #64]
-    ldp x23, x24, [sp, #48]
-    ldp x21, x22, [sp, #32]
-    ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #96
+    ldr x3, [x0, #AST_F0]        // list head element
+    mov x0, x1                   // aggregate type
+    mov x1, x2                   // base address vreg
+    mov x2, #0                   // base offset
+    bl _kcc_ir_fill_list
+    ldp x29, x30, [sp], #16
     ret
 @| _kcc_ir_emit_aggregate_init
 @}
@@ -1797,6 +1684,10 @@ _kcc_ir_trans_unit: .quad 0
 // member load/store can see its bit-field metadata (0 if none).
 .globl _kcc_ir_member_field
 _kcc_ir_member_field: .quad 0
+// Lazily-cloned `volatile unsigned long` descriptor: a volatile bit-field's
+// container load/store carries this so the optimizer sees the volatile bit.
+.globl _kcc_ir_vol_longu
+_kcc_ir_vol_longu: .quad 0
 
 // Short type names
 .section __TEXT,__cstring,cstring_literals

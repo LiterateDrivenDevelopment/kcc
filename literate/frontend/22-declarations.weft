@@ -1845,9 +1845,14 @@ element.  A designator makes an initializer list sparse and
 order-independent---\texttt{\{ [2] = 5, [0] = 1 \}} or
 \texttt{\{ .y = 2, .x = 1 \}}---and it resets the ``current object'' so
 that any plain elements that follow continue from the designated
-position.  \kcc{} supports a single top-level designator per element
-(\texttt{.member} or \texttt{[index]}); nested designator chains
-(\texttt{.a.b}, \texttt{[i][j]}) are not yet handled.
+position.  A designation may also be a \emph{chain}
+(\stdref{6.7.9p6}: \texttt{designator-list '='})---\texttt{.a.b},
+\texttt{.arr[1]}, \texttt{[0].x}---naming a sub-object several aggregate
+levels deep.  The parser collects the whole run of \texttt{.member} and
+\texttt{[index]} designators into a linked list of \texttt{AST\_DESIGNATOR}
+nodes before the \texttt{=}; the IR builder (\S\ref{sec:ir-aggregates})
+then walks that chain to the leaf.  A single designator is simply a chain
+of length one.
 
 @d Decl: parse init @{
 // -- kcc_parse_initializer ---------------------------------------------
@@ -1933,17 +1938,36 @@ _kcc_parse_initializer:
 
 // -- kcc_parse_designated_element --------------------------------------
 // node *kcc_parse_designated_element(void)
-// One initializer-list element.  If it starts with `.member` or
-// `[index]`, parse "<designator> = <initializer>" into an AST_DESIGNATOR
+// One initializer-list element.  If it starts with a designation---a
+// *sequence* of `.member` and `[index]` designators (\stdref{6.7.9p6}:
+// `designator-list '='`)---parse the whole chain followed by `=` and the
+// value initializer.  Each designator is one AST_DESIGNATOR node
 // (F0 = interned member name or integer index, F1 = 1 for a field / 0 for
-// an index, F3 = the value initializer).  Otherwise fall through to a
-// plain positional initializer.
+// an index); the nodes are linked head-to-tail through AST_F2, and the
+// value initializer is stored on the *head* node's AST_F3.  A single
+// designator is just a chain of length one, so `.x = v` is unchanged.
+// Anything not starting with `.`/`[` is a plain positional initializer.
 .p2align 2
 _kcc_parse_designated_element:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
 
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_DOT
+    b.eq .Lde_chain
+    cmp  x0, #TOK_LBRACKET
+    b.eq .Lde_chain
+    bl _kcc_parse_initializer
+    b .Lde_ret
+
+.Lde_chain:
+    mov x19, #0                   // chain head
+    mov x20, #0                   // chain tail
+.Lde_desig_loop:
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
@@ -1951,8 +1975,7 @@ _kcc_parse_designated_element:
     b.eq .Lde_field
     cmp  x0, #TOK_LBRACKET
     b.eq .Lde_index
-    bl _kcc_parse_initializer
-    b .Lde_ret
+    b .Lde_desig_end
 
 .Lde_field:
     bl _kcc_pp_next               // consume '.'
@@ -1963,42 +1986,49 @@ _kcc_parse_designated_element:
     add  x1, x1, _kcc_tok_len@@PAGEOFF
     ldr  x1, [x1]
     bl _kcc_strtab_intern
-    mov x19, x0                   // interned member name
+    mov x21, x0                   // interned member name (survives ast_alloc)
     bl _kcc_pp_next               // consume member identifier
     mov x0, #AST_DESIGNATOR
     bl _kcc_ast_alloc
-    mov x20, x0                   // designator node
-    str x19, [x20, #AST_F0]      // name
-    mov x0, #1
-    str x0, [x20, #AST_F1]      // is_field
-    mov x0, #TOK_ASSIGN
-    bl _kcc_parse_expect
-    bl _kcc_parse_initializer
-    str x0, [x20, #AST_F3]      // value
-    mov x0, x20
-    b .Lde_ret
+    str x21, [x0, #AST_F0]       // name
+    mov x2, #1
+    str x2, [x0, #AST_F1]        // is_field
+    b .Lde_link
 
 .Lde_index:
     bl _kcc_pp_next               // consume '['
     bl _kcc_parse_assign_expr     // index expression
     bl _kcc_parse_const_index     // fold to an integer
-    mov x19, x0                   // index value
+    mov x21, x0                   // index value (survives ast_alloc)
     mov x0, #TOK_RBRACKET
     bl _kcc_parse_expect          // consume ']'
     mov x0, #AST_DESIGNATOR
     bl _kcc_ast_alloc
+    str x21, [x0, #AST_F0]       // index value
+    str xzr, [x0, #AST_F1]       // is_field = 0
+
+.Lde_link:
+    // Append the new designator node (in x0) to the chain via AST_F2.
+    cbnz x19, .Lde_link_tail
+    mov x19, x0                   // first node → head and tail
     mov x20, x0
-    str x19, [x20, #AST_F0]      // index value
-    str xzr, [x20, #AST_F1]      // is_field = 0
+    b .Lde_desig_loop
+.Lde_link_tail:
+    str x0, [x20, #AST_F2]       // previous tail → this node
+    mov x20, x0
+    b .Lde_desig_loop
+
+.Lde_desig_end:
     mov x0, #TOK_ASSIGN
     bl _kcc_parse_expect
     bl _kcc_parse_initializer
-    str x0, [x20, #AST_F3]      // value
-    mov x0, x20
+    str x0, [x19, #AST_F3]      // value on the head node
+    mov x0, x19
 
 .Lde_ret:
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 
 // -- kcc_parse_const_index ---------------------------------------------

@@ -1808,14 +1808,21 @@ _kcc_ir_build_member:
     ret
 
 .Libm_scalar:
-    // Load type: the field's (volatile-qualified) descriptor when volatile,
-    // else the canonical int.  Held in x21 across the width call and the alloc.
+    // Load type: the field's own descriptor when it is volatile or floating
+    // (so the back end emits an FP load for a `float`/`double` member rather
+    // than an integer one), else the canonical int with a width override.
+    // Held in x21 across the width call and the alloc.
     ldr x21, [x19, #AST_F3]     // field type
     cmp x21, #0x1000
     b.lo .Libm_intty
     ldr x0, [x21, #TY_QUALS]
     tst x0, #2
     b.ne .Libm_haveity
+    ldr x0, [x21, #TY_KIND]
+    cmp x0, #TY_FLOAT
+    b.eq .Libm_haveity
+    cmp x0, #TY_DOUBLE
+    b.eq .Libm_haveity
 .Libm_intty:
     adrp x21, _kcc_type_int_s@@PAGE
     add  x21, x21, _kcc_type_int_s@@PAGEOFF
@@ -2962,7 +2969,15 @@ _kcc_ir_build_ident:
     b.lo .Libi_gs_intty
     ldr x0, [x23, #TY_QUALS]
     tst x0, #2
-    b.ne .Libi_gs_haveity
+    b.ne .Libi_gs_haveity        // volatile: keep the qualified type
+    // Floating: keep the real type so the back end emits an FP load rather
+    // than an integer one---otherwise a global `double`/`float` read loaded
+    // its bytes into a general register and every use saw garbage.
+    ldr x0, [x23, #TY_KIND]
+    cmp x0, #TY_FLOAT
+    b.eq .Libi_gs_haveity
+    cmp x0, #TY_DOUBLE
+    b.eq .Libi_gs_haveity
 .Libi_gs_intty:
     adrp x23, _kcc_type_int_s@@PAGE
     add  x23, x23, _kcc_type_int_s@@PAGEOFF

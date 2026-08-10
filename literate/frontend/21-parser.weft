@@ -627,6 +627,13 @@ The top-level parsing function.  \texttt{kcc\_parse} consumes the first
 token from the preprocessor, then loops parsing external declarations
 until \texttt{TOK\_EOF}.  The result is an \texttt{AST\_TRANS\_UNIT} node
 whose \texttt{F0} points to the head of a linked list of declarations.
+One subtlety: a single external declaration may itself introduce several
+declarators (\texttt{int a, b;}), which the declaration parser returns as a
+short \texttt{AST\_F4} chain.  The loop therefore appends the \emph{next}
+external declaration after the \emph{tail} of that chain, not its head---%
+otherwise the link from \texttt{a} to \texttt{b} would be overwritten and
+every declarator but the first silently dropped (they would never reach
+semantic analysis and their names would be ``undeclared'').
 
 @d Parser: translation unit @{
 // -- kcc_parse ---------------------------------------------------------
@@ -666,18 +673,31 @@ _kcc_parse:
     // Skip null results from error recovery
     cbz x22, .Lparse_tu_loop
 
-    // Append to list
+    // A single external declaration may introduce several declarators sharing
+    // one set of specifiers---`int a, b;`---which the declaration parser links
+    // through AST_F4.  Find the tail of that group so the *next* external
+    // declaration is appended after all of them; otherwise appending to the
+    // returned head would overwrite the a->b link and drop every declarator but
+    // the first (they would never be declared).
+    mov x9, x22                  // x9 = tail of the returned group
+.Lparse_tu_tail:
+    ldr x0, [x9, #AST_F4]
+    cbz x0, .Lparse_tu_have_tail
+    mov x9, x0
+    b .Lparse_tu_tail
+.Lparse_tu_have_tail:
+
     cbz x20, .Lparse_tu_first
 
-    // Append: last->F4 = new
+    // Append: previous tail -> new group's head, then advance to its tail.
     str x22, [x21, #AST_F4]
-    mov x21, x22
+    mov x21, x9
     b .Lparse_tu_loop
 
 .Lparse_tu_first:
     // First declaration
     mov x20, x22
-    mov x21, x22
+    mov x21, x9
     b .Lparse_tu_loop
 
 .Lparse_tu_done:

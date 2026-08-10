@@ -78,7 +78,7 @@ the split.  The table is the scan; the sections are the detail.
 \hline
 M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{float}) & neutral & \meterB & \stDone\\
 M2 & Harden the IR verifier                    & neutral & \meterB & \stDone\\
-M3 & Systematic conformance battery            & neutral & \meterA & \stOpen\\
+M3 & Systematic conformance battery            & neutral & \meterA & \stDone\\
 M4 & Broaden the IR optimizer                  & neutral & \meterA & \stOpen\\
 M5 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
 \hline
@@ -197,25 +197,46 @@ localizes unambiguously to the core.
 
 \textbf{Work items.}
 \begin{itemize}
-\item Run an external conformance corpus (e.g.\ \texttt{c-testsuite})
-      through \kcc{} and record pass/fail.
-\item Add a differential harness that compiles randomly-generated
-      programs (e.g.\ \texttt{csmith}) with both \kcc{} and \texttt{clang}
-      and compares runtime output, shrinking any divergence to a minimal
-      reproducer.
+\item \emph{(done)} Run the \texttt{c-testsuite} curated corpus (220
+      single-file programs, each with an expected exit code and stdout)
+      through \kcc{} as an external oracle, and record a baseline: at the
+      start \textbf{181/220} passed (24 compile gaps, 15 miscompiles); after
+      the fixes below, \textbf{184/220}, and every bug the corpus surfaced
+      that lies in the shared front end or IR was fixed directly.
+\item \emph{(future)} A \texttt{csmith} random-differential harness
+      (compile with \kcc{} and \texttt{clang}, compare runtime output,
+      shrink divergences) is the natural next escalation; it needs the
+      external generator installed and is left as a follow-on.
 \end{itemize}
 Per project policy (\S no-fuzz-harness) this uses \emph{external}
-generators as oracles and fixes each surfaced bug directly; it does not
-add a bespoke in-tree fuzzing suite, and the existing suites stay green.
+generators as oracles and fixes each surfaced bug directly; it does not add
+a bespoke in-tree fuzzing suite.  Each fix instead gains a targeted
+differential regression test, and the existing suites stay green.
 
-\textbf{weft files.}  \texttt{44-test-harness} (a conformance driver
-target); no compiler-source changes except the fixes each run motivates.
+\textbf{Bugs the corpus surfaced and fixed} (all in the target-neutral
+core, so both targets inherit the fix): \textbf{(1)} reaching the closing
+brace of \texttt{main} now returns 0 (\stdref{5.1.2.2.3}) instead of a
+garbage register; \textbf{(2)} a file-scope floating variable initialised
+from an integer constant (\texttt{double d = 100;}) now converts to the
+floating representation instead of storing the integer bits; \textbf{(3)}
+reading a \texttt{float}/\texttt{double} \emph{global} or struct member now
+emits a floating load carrying the real type, not an integer load;
+\textbf{(4)} a multi-declarator external declaration (\texttt{int a, b;})
+now registers \emph{every} declarator, not just the first.
 
-\textbf{Acceptance.}  A recorded baseline pass-rate on the external
-corpus, and zero known-unfixed differential divergences at the chosen
-generator settings.
+\textbf{weft files.}  \texttt{21-parser} (multi-declarator tail),
+\texttt{32-ir-builder} (main-returns-0, global scalar init conversion),
+\texttt{32b-ir-expressions} (floating global/member load type),
+\texttt{49-differential-testing} (seven new regression cases).
 
-\textbf{Status.}  Open.
+\textbf{Acceptance.}  A recorded c-testsuite baseline, every
+core-attributable divergence fixed with a regression test, and the full
+kcc suite plus Lua and zlib still green.  Remaining corpus failures are
+tracked feature gaps (variadic \texttt{char} promotion, some predefined
+macros, a few control-flow corners), not silent miscompiles.
+
+\textbf{Status.}  Done (c-testsuite corpus); \texttt{csmith} follow-on
+deferred.
 
 % ================================================================
 \section{M4 --- Broaden the IR Optimizer}

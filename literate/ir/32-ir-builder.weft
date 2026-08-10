@@ -435,16 +435,33 @@ _kcc_ir_emit_init_stores:
     b .Leis_done
 
 .Leis_scalar_val:
-    // Build the initializer expression
-    ldr x0, [x19, #AST_F2]
+    // Build the initializer expression, remembering its sema type first so the
+    // value can be converted to the declared type---exactly as the block-scope
+    // scalar path does.  Without this a global `double d = 100;` stored the raw
+    // integer bits of 100 instead of the IEEE-754 double, and a `float f = 5;`
+    // stored 8 integer bytes; both read back as ~0.
+    ldr x0, [x19, #AST_F2]      // init expr node
+    ldr x24, [x0, #AST_F3]      // from = initializer's sema type (may be 0)
     bl _kcc_ir_build_expr
-    mov x21, x0                  // x21 = value vreg
+    mov x21, x0                  // value vreg
 
-    // A _Bool target normalises its initializer to 0/1.
     ldr x0, [x19, #AST_F0]      // declared type spec
     bl _kcc_sema_resolve_type
-    cbz x0, .Leis_scalar_store
-    ldr x0, [x0, #TY_KIND]
+    mov x23, x0                  // to = declared type (may be 0)
+
+    // Convert across the int/float boundary if both types are known.
+    cbz x23, .Leis_sv_bool
+    cbz x24, .Leis_sv_bool
+    mov x0, x21
+    mov x1, x24                  // from
+    mov x2, x23                  // to
+    bl _kcc_ir_convert
+    mov x21, x0
+
+.Leis_sv_bool:
+    // A _Bool target normalises its initializer to 0/1.
+    cbz x23, .Leis_scalar_store
+    ldr x0, [x23, #TY_KIND]
     cmp x0, #TY_BOOL
     b.ne .Leis_scalar_store
     mov x0, x21
@@ -452,15 +469,27 @@ _kcc_ir_emit_init_stores:
     mov x21, x0
 
 .Leis_scalar_store:
-    // Emit IR_STORE: value -> base address
+    // Compute the access-size from the declared type (x24 is free after the
+    // conversion) so a narrow scalar---and a `float`, whose 4-byte single form
+    // differs from the double working format---is written at its true width.
+    mov x0, x23
+    bl _kcc_ir_store_width
+    mov x24, x0                  // access-size code
+
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
+    cbz x23, .Leis_sv_inttype
+    str x23, [x0, #IR_TYPE]     // declared type
+    b .Leis_sv_havetype
+.Leis_sv_inttype:
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
     str x1, [x0, #IR_TYPE]
+.Leis_sv_havetype:
     str x21, [x0, #IR_SRC1]     // value
     str x22, [x0, #IR_SRC2]     // address
+    str x24, [x0, #IR_DEST]     // access-size override
     bl _kcc_ir_emit
     b .Leis_done
 
@@ -870,11 +899,31 @@ _kcc_ir_build_func:
     tst x1, #BB_FLAG_TERMINATED
     b.ne .Libf_register
 
-    // Emit implicit return (void or UB for non-void without return)
+    // Emit implicit return.  Reaching the closing brace of main returns 0
+    // (\stdref{5.1.2.2.3}); every other non-void function that falls off the
+    // end is undefined behaviour, so it returns no value (unchanged).
+    ldr x0, [x23, #IRF_NAME]
+    cbz x0, .Libf_impret_void
+    adrp x1, .Libf_main_name@@PAGE
+    add  x1, x1, .Libf_main_name@@PAGEOFF
+    bl _kcc_strcmp
+    cbnz x0, .Libf_impret_void
+    mov x0, #0
+    bl _kcc_ir_emit_const        // vreg holding the constant 0
+    str x0, [sp, #72]            // stash across alloc_instr
+    mov x0, #IR_RET
+    bl _kcc_ir_alloc_instr
+    str x22, [x0, #IR_TYPE]
+    ldr x1, [sp, #72]
+    str x1, [x0, #IR_SRC1]       // main's implicit return value = 0
+    bl _kcc_ir_emit
+    b .Libf_impret_done
+.Libf_impret_void:
     mov x0, #IR_RET
     bl _kcc_ir_alloc_instr
     str x22, [x0, #IR_TYPE]     // ret type
     bl _kcc_ir_emit
+.Libf_impret_done:
 
     // Mark BB terminated
     adrp x1, _kcc_ir_cur_bb@@PAGE
@@ -899,6 +948,11 @@ _kcc_ir_build_func:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #80
     ret
+
+.section __TEXT,__cstring,cstring_literals
+.Libf_main_name:
+    .asciz "main"
+.text
 @| _kcc_ir_build_func
 @}
 

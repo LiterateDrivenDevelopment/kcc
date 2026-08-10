@@ -427,6 +427,14 @@ difftest "float-func" \
     "float sq(float x){ return x * x; } int main(void){ return (int)sq(7.0f); }"
 difftest "float-int-regalloc" \
     "int main(void){ int a = 3, b = 5, c = 7, d = 11; int e = a*b + c*d - a*c + b*d; double x = 3.5; int di = (int)(x * (a + b + c + d)); return (e % 100) + (di % 100); }"
+difftest "global-double-init-int" \
+    "double g = 100; int main(void){ return (int)g + (g < 1); }"
+difftest "global-float-init-int" \
+    "float g = 5; int main(void){ return (int)(g * 2); }"
+difftest "global-double-read" \
+    "double g = 2.5; int main(void){ return (int)(g * 4); }"
+difftest "struct-double-member" \
+    "struct S { double d; int t; }; struct S s = { 3.5, 9 }; int main(void){ return (int)s.d + s.t; }"
 @}
 
 \section{Operators and Edge Cases}
@@ -550,6 +558,12 @@ difftest "assign-chain" \
     "int main(void){ int a; int b; int c; a = b = c = 7; return a + b + c; }"
 difftest "hex-octal" \
     "int main(void){ int a = 0xFF; int b = 0777; return a + b; }"
+difftest "main-implicit-return" \
+    "int main(void){ int x = 7; x = x + 1; }"
+difftest "multi-declarator-global" \
+    "int a = 1, b = 2, c = 3; int main(void){ return a + b + c; }"
+difftest "multi-declarator-global-noinit" \
+    "int a, b, c; int main(void){ a = 4; b = 5; c = 6; return a + b + c; }"
 difftest "char-escapes" \
     "int main(void){ char n = '\\n'; char t = '\\t'; char z = '\\0'; return n + t + z; }"
 @}

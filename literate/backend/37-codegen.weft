@@ -79,11 +79,17 @@ _kcc_codegen_init:
     add  x0, x0, _kcc_cg_frame_size@@PAGEOFF
     str xzr, [x0]
 
-    // Allocate cstring buffer (4KB initial)
+    // Allocate cstring buffer (4KB initial) and record its capacity so it can
+    // grow: the buffer holds not only string literals but (M5) the byte images
+    // of read-only const globals, which can exceed the old fixed 4KB.
     mov x0, #4096
     bl _kcc_arena_alloc
     adrp x1, _kcc_cstr_buf@@PAGE
     add  x1, x1, _kcc_cstr_buf@@PAGEOFF
+    str x0, [x1]
+    mov x0, #4096
+    adrp x1, _kcc_cstr_cap@@PAGE
+    add  x1, x1, _kcc_cstr_cap@@PAGEOFF
     str x0, [x1]
 
     adrp x1, _kcc_cstr_pos@@PAGE
@@ -703,6 +709,72 @@ The result is a single contiguous \texttt{\_\_text} section where
 the first part is executable instructions and the tail is read-only
 string data—exactly the layout that Apple's linker expects.
 
+Because that read-only tail now carries more than string literals---under
+M5 it also holds the byte images of \texttt{const} globals
+(\S\ref{sec:mt-m5})---the buffer can no longer be a fixed 4\,KB block.
+\texttt{\_kcc\_cstr\_reserve} ensures the buffer can hold a requested end
+offset, doubling (allocate-and-copy, mirroring the code buffer's growth) when
+it would overflow.  Every writer calls it before appending and re-reads
+\texttt{\_kcc\_cstr\_buf} afterwards, so a relocation of the buffer is
+transparent.  This also closes a latent overflow: a translation unit with more
+than 4\,KB of string data previously wrote past the block.
+
+@d CodeGen: emit strings @{
+// -- kcc_cstr_reserve ---------------------------------------------------------
+// void kcc_cstr_reserve(uint64_t need)
+// Ensure the cstring buffer holds at least `need` bytes; grow (allocate 2x or
+// `need`, whichever is larger, and copy the live prefix) otherwise.  Preserves
+// x19-x28 so callers holding state across it are safe.
+.text
+.globl _kcc_cstr_reserve
+.p2align 2
+_kcc_cstr_reserve:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    mov x19, x0                    // need (required end offset)
+    adrp x0, _kcc_cstr_cap@@PAGE
+    add  x0, x0, _kcc_cstr_cap@@PAGEOFF
+    ldr x0, [x0]                   // current capacity
+    cmp x19, x0
+    b.le .Lcrsv_done               // already fits
+
+    lsl x20, x0, #1                // candidate new cap = cap*2
+    cmp x20, x19
+    b.ge .Lcrsv_alloc
+    mov x20, x19                   // ...but at least `need`
+.Lcrsv_alloc:
+    mov x0, x20
+    bl _kcc_arena_alloc            // x0 = new buffer
+    mov x21, x0                    // x21 = new buffer
+
+    // Copy the live prefix (cstr_pos bytes) from old buffer to new.
+    adrp x0, _kcc_cstr_pos@@PAGE
+    add  x0, x0, _kcc_cstr_pos@@PAGEOFF
+    ldr x2, [x0]                   // n = live bytes
+    adrp x0, _kcc_cstr_buf@@PAGE
+    add  x0, x0, _kcc_cstr_buf@@PAGEOFF
+    ldr x1, [x0]                   // src = old buffer
+    mov x0, x21                    // dst = new buffer
+    bl _kcc_memcpy
+
+    adrp x0, _kcc_cstr_buf@@PAGE
+    add  x0, x0, _kcc_cstr_buf@@PAGEOFF
+    str x21, [x0]                  // publish new buffer
+    adrp x0, _kcc_cstr_cap@@PAGE
+    add  x0, x0, _kcc_cstr_cap@@PAGEOFF
+    str x20, [x0]                  // publish new capacity
+
+.Lcrsv_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_cstr_reserve
+@}
+
 @d CodeGen: emit strings @{
 // -- kcc_codegen_string_lit ---------------------------------------------------
 // void kcc_codegen_string_lit(ir_instr *instr)
@@ -728,6 +800,12 @@ _kcc_codegen_string_lit:
     adrp x0, _kcc_cstr_pos@@PAGE
     add  x0, x0, _kcc_cstr_pos@@PAGEOFF
     ldr x23, [x0]                  // x23 = cstr_offset
+
+    // 1a. Ensure room for len+1 bytes (data + NUL) at cstr_offset; the buffer
+    // may relocate, so every later access re-reads _kcc_cstr_buf.
+    add x0, x23, x21
+    add x0, x0, #1
+    bl _kcc_cstr_reserve
 
     // 2. Copy string data to cstring buffer
     adrp x0, _kcc_cstr_buf@@PAGE
@@ -1044,6 +1122,8 @@ _kcc_cg_slotmap:     .quad 0     // per-function vreg→compacted spill-slot map
 _kcc_cg_max_slot:    .quad 0     // number of vreg value slots reserved in the frame
 .globl _kcc_cstr_buf
 _kcc_cstr_buf:       .quad 0     // cstring data buffer
+.globl _kcc_cstr_cap
+_kcc_cstr_cap:       .quad 0     // capacity (bytes) of the cstring buffer
 .globl _kcc_cstr_pos
 _kcc_cstr_pos:       .quad 0     // write position in cstring buffer
 .globl _kcc_cstr_count

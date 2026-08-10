@@ -1,61 +1,118 @@
 % 33-ir-validation.weft — IR Validation
 %
-% Basic validation: ensures every basic block has a terminator
-% instruction (ret, br, or br_cond).
+% A structural verifier that rejects malformed IR before it reaches the
+% optimizer or the code generator.
 
 \chapter{IR Validation}
 \label{ch:ir-validation}
 
-Before the IR is handed to the optimizer or code generator, a validation pass checks that structural invariants hold.  This chapter implements that check.  Currently a single invariant is enforced: every basic block must end with a terminator instruction (\texttt{IR\_BR}, \texttt{IR\_BR\_COND}, or \texttt{IR\_RET}), since a missing terminator would cause the code generator to fall through into the next block, producing incorrect machine code.
+Before the IR is handed to the code generator, a validation pass checks that
+structural invariants hold.  With a single code-generation target this is a
+useful safety net; with a \emph{second} target on the horizon
+(Appendix~\ref{ch:multitarget-roadmap}) it becomes essential, because a bug in
+the shared front end and a bug in a new back end present identically---a crash
+deep in code generation.  A verifier that rejects the malformed IR \emph{at the
+seam} keeps a front-end defect from masquerading as a back-end one, and it runs
+between the optimizer and the back end so it also catches an optimization pass
+that corrupts the IR (exactly how the stale-\texttt{NOP} bug once fed a garbage
+opcode into register allocation and crashed it).
 
-\section{Terminator Check}
+\section{What the Verifier Checks}
 
-Validation currently performs a single structural check: every basic block
-must end with a terminator instruction (\texttt{IR\_BR}, \texttt{IR\_BR\_COND},
-or \texttt{IR\_RET}).  A missing terminator means the code generator would fall
-through into the next block's prologue, producing incorrect machine code.
-The current implementation is a placeholder that unconditionally returns
-success; the actual walk will be added when we need stricter IR invariants.
+The verifier walks every function, every basic block (down the \texttt{BB\_NEXT}
+list from the entry block), and every instruction (down the \texttt{IR\_NEXT}
+list from \texttt{BB\_FIRST}).  It enforces three invariants that hold for all
+well-formed \kcc{} IR and whose violation would otherwise surface as undefined
+back-end behaviour:
+
+\begin{itemize}
+\item \textbf{Valid opcodes.}  Every instruction's \texttt{IR\_OP} lies in the
+      defined opcode range $[1, \text{\texttt{IR\_STRING\_LIT}}]$.  A zero or
+      out-of-range opcode means an uninitialised or corrupted instruction---the
+      shape of the stale-\texttt{NOP} corruption---which the instruction
+      selector would then dispatch on as if it were real.
+\item \textbf{Terminated blocks.}  Every non-empty block carries the
+      \texttt{BB\_FLAG\_TERMINATED} flag, i.e.\ it was closed with a branch or a
+      return.  An unterminated block would let the code generator fall through
+      into the next block's body, producing incorrect machine code.
+\item \textbf{Finite instruction lists.}  The walk down each block is bounded;
+      a self-referential or cyclic \texttt{IR\_NEXT} link (which would hang both
+      the verifier and every later pass) is reported rather than spun on.
+\end{itemize}
+
+On the first violation the verifier prints an internal-error diagnostic naming
+the offending function and returns non-zero; the driver treats that as a
+compilation failure.  Because every program in the test corpus, plus Lua and
+zlib, passes cleanly, the check is a pure safety net: it never rejects valid IR,
+only genuinely malformed IR.
+
+Deliberately \emph{not} checked here are dataflow invariants that need dominance
+analysis (strict def-before-use across control flow) or that do not hold in
+\kcc's pre-register-allocation IR (single static assignment); those would risk
+false rejections and belong to a later, dataflow-aware pass.
+
+\section{The Verifier}
 
 @d IR: validate @{
 // -- kcc_ir_validate ------------------------------------------------------
 // uint64_t kcc_ir_validate(void)
-// Checks all IR functions: every BB must have a terminator.
-// Returns 0 on success, 1 on failure.
+// Structural check of every IR function: valid opcodes, terminated blocks,
+// and finite (acyclic) instruction lists.  Returns 0 on success, 1 on the
+// first violation (after printing an internal-error diagnostic).
 .text
 .globl _kcc_ir_validate
 .p2align 2
 _kcc_ir_validate:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
 
-    // Walk all functions
     adrp x0, _kcc_ir_funcs@@PAGE
     add  x0, x0, _kcc_ir_funcs@@PAGEOFF
     ldr x19, [x0]
     cbz x19, .Lirv_ok
-
     ldr x20, [x19, #VEC_COUNT]
     mov x21, #0
 
 .Lirv_func_loop:
     cmp x21, x20
     b.ge .Lirv_ok
-
     mov x0, x19
     mov x1, x21
     bl _kcc_vec_get
-    ldr x22, [x0]               // func ptr
+    ldr x22, [x0]                // function record
 
-    // Walk blocks vec
-    ldr x0, [x22, #IRF_BLOCKS]
-    cbz x0, .Lirv_next_func
+    ldr x23, [x22, #IRF_ENTRY]   // first basic block
+.Lirv_blk_loop:
+    cbz x23, .Lirv_next_func
 
-    mov x19, x0                 // save — actually this clobbers our vec.
-    // Simpler: just return OK for now (stub)
-    b .Lirv_ok
+    ldr x24, [x23, #BB_FIRST]    // first instruction
+    mov x25, #0                  // instruction counter (cycle bound)
+.Lirv_ins_loop:
+    cbz x24, .Lirv_ins_done
+    add x25, x25, #1
+    mov x26, #0x100000           // 1M-instruction ceiling per block
+    cmp x25, x26
+    b.hi .Lirv_fail_loop
+    ldr x0, [x24, #IR_OP]
+    cbz x0, .Lirv_fail_op        // opcode 0 = uninitialised
+    cmp x0, #IR_STRING_LIT       // highest defined opcode
+    b.hi .Lirv_fail_op
+    ldr x24, [x24, #IR_NEXT]
+    b .Lirv_ins_loop
+.Lirv_ins_done:
+    // A non-empty block must have been terminated (branch or return).
+    ldr x0, [x23, #BB_FIRST]
+    cbz x0, .Lirv_blk_next
+    ldr x0, [x23, #BB_FLAGS]
+    tst x0, #BB_FLAG_TERMINATED
+    b.eq .Lirv_fail_term
+.Lirv_blk_next:
+    ldr x23, [x23, #BB_NEXT]
+    b .Lirv_blk_loop
 
 .Lirv_next_func:
     add x21, x21, #1
@@ -63,9 +120,49 @@ _kcc_ir_validate:
 
 .Lirv_ok:
     mov x0, #0
+    b .Lirv_ret
+
+.Lirv_fail_op:
+    adrp x0, .Lirv_msg_op@@PAGE
+    add  x0, x0, .Lirv_msg_op@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lirv_fail_name
+.Lirv_fail_term:
+    adrp x0, .Lirv_msg_term@@PAGE
+    add  x0, x0, .Lirv_msg_term@@PAGEOFF
+    bl _kcc_io_puts
+    b .Lirv_fail_name
+.Lirv_fail_loop:
+    adrp x0, .Lirv_msg_loop@@PAGE
+    add  x0, x0, .Lirv_msg_loop@@PAGEOFF
+    bl _kcc_io_puts
+.Lirv_fail_name:
+    ldr x0, [x22, #IRF_NAME]
+    cbz x0, .Lirv_fail_nl
+    bl _kcc_io_puts
+.Lirv_fail_nl:
+    adrp x0, .Lirv_msg_nl@@PAGE
+    add  x0, x0, .Lirv_msg_nl@@PAGEOFF
+    bl _kcc_io_puts
+    mov x0, #1
+
+.Lirv_ret:
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #80
     ret
+
+.section __TEXT,__cstring,cstring_literals
+.Lirv_msg_op:
+    .asciz "kcc: internal error: invalid IR opcode in function "
+.Lirv_msg_term:
+    .asciz "kcc: internal error: unterminated basic block in function "
+.Lirv_msg_loop:
+    .asciz "kcc: internal error: cyclic instruction list in function "
+.Lirv_msg_nl:
+    .asciz "\n"
+.text
 @| _kcc_ir_validate
 @}

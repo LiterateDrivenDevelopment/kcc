@@ -101,6 +101,13 @@ _kcc_driver_compile:
     // 12. Optimize
     bl _kcc_opt_run
 
+    // 12b. Verify the optimized IR before handing it to the back end.  A
+    // structural violation (bad opcode, unterminated block, cyclic list) is an
+    // internal error, not a user error, so it aborts the compile rather than
+    // letting the code generator produce garbage.
+    bl _kcc_ir_validate
+    cbnz x0, .Ldc_error
+
     // 13. Initialize backend
     bl _kcc_code_init
     bl _kcc_linker_init

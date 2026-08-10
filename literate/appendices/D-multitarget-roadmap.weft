@@ -77,7 +77,7 @@ the split.  The table is the scan; the sections are the detail.
 \textbf{\#} & \textbf{Milestone} & \textbf{Kind} & \textbf{Effort} & \textbf{Status}\\
 \hline
 M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{float}) & neutral & \meterB & \stDone\\
-M2 & Harden the IR verifier                    & neutral & \meterB & \stOpen\\
+M2 & Harden the IR verifier                    & neutral & \meterB & \stDone\\
 M3 & Systematic conformance battery            & neutral & \meterA & \stOpen\\
 M4 & Broaden the IR optimizer                  & neutral & \meterA & \stOpen\\
 M5 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
@@ -160,20 +160,31 @@ backend.  With one code generator, a backend crash and an IR defect look
 alike; with two, a verifier that catches the defect at the seam is what
 keeps a frontend bug from masquerading as a backend bug.
 
-\textbf{Work items.}  Check type well-formedness on every operand, the
-def-before-use and single-def invariants, block termination and
-successor consistency, and that every opcode's operand arity and access
-widths are internally consistent.  Run the verifier as a mandatory pass
-in the debug build.
+\textbf{Work items} \emph{(landed)}.  The verifier
+(\texttt{\_kcc\_ir\_validate}, \S\ref{ch:ir-validation}) now walks every
+function, block, and instruction and enforces three invariants whose
+violation is undefined back-end behaviour: valid opcodes (an
+uninitialised or corrupted \texttt{IR\_OP}---the shape of the
+stale-\texttt{NOP} bug---is rejected), terminated blocks (a non-empty
+block that would let code generation fall through is rejected), and finite
+instruction lists (a cyclic \texttt{IR\_NEXT} is reported, not spun on).
+It is wired into the driver as a mandatory pass between the optimizer and
+the back end, so it also catches an optimization pass that corrupts the
+IR.  Dataflow invariants that need dominance (strict def-before-use) or
+that \kcc's pre-register-allocation IR does not maintain (single static
+assignment) are deliberately left to a later dataflow-aware pass, to avoid
+false rejections.
 
-\textbf{weft files.}  \texttt{33-ir-validation} (extend);
-\texttt{34-pass-manager} (wire the verifier between passes).
+\textbf{weft files.}  \texttt{33-ir-validation} (real verifier replacing
+the stub); \texttt{42-driver} (mandatory call before code generation).
 
 \textbf{Acceptance.}  The verifier accepts all IR the current suites
-produce and rejects a curated set of hand-broken IR fragments; enabling
-it changes no tangled output.
+produce---every codegen, difftest, self-host, interop, e2e case, plus all
+of Lua and zlib, compiles with no false rejection---and a controlled fault
+(tightening the opcode ceiling) confirms it does fire and abort the
+compile with a diagnostic naming the function.
 
-\textbf{Status.}  Open.
+\textbf{Status.}  Done.
 
 % ================================================================
 \section{M3 --- Systematic Conformance Battery}

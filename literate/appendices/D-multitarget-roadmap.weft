@@ -1,0 +1,280 @@
+% D-multitarget-roadmap.weft — The consolidation roadmap that must be
+% completed before kcc grows a second code-generation target.
+%
+% The Phase 0--9 roadmap (Appendix, C-roadmap.weft) carries kcc from a
+% bootable skeleton to a self-hosting, single-target production compiler.
+% Its final open item (#10) is "a second target (x86-64 / ELF)."  This
+% appendix is the roadmap for everything that should be finished *first*,
+% organized around a single principle so the order is not arbitrary.
+
+\chapter{Roadmap: The Road to a Second Target}
+\label{ch:multitarget-roadmap}
+
+% Status glyphs.  Defined with \providecommand so this appendix renders
+% whether or not the Phase~9 roadmap (which defines the same names) has
+% already been read in the same document.
+\providecommand{\stDone}{\textcolor{green!55!black}{\checkmark\,\textsc{done}}}
+\providecommand{\stPart}{\textcolor{orange!90!black}{$\odot$\,\textsc{partial}}}
+\providecommand{\stOpen}{\textcolor{black!45}{$\circ$\,\textsc{open}}}
+\providecommand{\meterA}{$\bullet\bullet\bullet$}
+\providecommand{\meterB}{$\bullet\bullet\circ$}
+\providecommand{\meterC}{$\bullet\circ\circ$}
+
+\kcc{} today is a correct, self-hosting C17 compiler for one target
+(ARM64 / Mach-O) that compiles and runs real software---Lua~5.4.7's
+entire official suite, zlib~1.3.1 end to end, cJSON byte-identical to
+\texttt{clang}.  The natural next ambition is a \emph{second} target.
+This appendix argues that a second target should not be started yet, and
+lays out precisely what to finish first.
+
+% ================================================================
+\section{The Guiding Principle}
+\label{sec:mt-principle}
+
+The retargeting playbook (Chapter~\ref{ch:retargeting}) establishes that
+the IR is the \emph{neutral seam}: roughly seventy percent of the
+compiler---the preprocessor, parser, semantic analysis, IR construction,
+the optimizer, and the IR verifier---is target-independent and is reused
+verbatim by every backend.  Only the last thirty percent (instruction
+selection, register banks, ABI, object emission) is target-specific.
+
+That split dictates the order of work by one rule:
+
+\begin{center}
+\fcolorbox{black!55}{black!4}{%
+\parbox{0.9\linewidth}{\centering\smallskip
+\textbf{Finish the shared seventy percent before you split.}\\[3pt]
+Every defect in the target-neutral core that survives into a two-target
+world costs \emph{twice}: it must be re-diagnosed through the ambiguity
+``is this the shared frontend or the new backend?'', and every fix must
+be re-validated against two code generators and two test baselines.  A
+feature added to the IR optimizer \emph{before} the split is written once
+and inherited free by the second target; the same feature added
+\emph{after} must be proven correct on both.\smallskip}}
+\end{center}
+
+\noindent There is a second, quieter reason.  The ARM64 backend is not
+just \emph{a} target---once a second target exists it becomes the
+\emph{oracle}: the differential reference (\texttt{clang}-validated,
+byte-identical on real code) against which the new backend's output is
+checked.  An oracle must be complete and trustworthy before it is relied
+upon.  So the pre-split work is of exactly two kinds: \textbf{(A)}
+complete and prove the shared core, and \textbf{(B)} polish ARM64 into a
+dependable oracle.
+
+% ================================================================
+\section{Milestones at a Glance}
+\label{sec:mt-glance}
+
+Five milestones (M1--M5) precede the second target (M6).  M1--M4 are
+target-neutral (kind~A); M5 is the structural work that \emph{enables}
+the split.  The table is the scan; the sections are the detail.
+
+\begin{center}
+\small
+\begin{tabular}{@@{}clccl@@{}}
+\hline
+\textbf{\#} & \textbf{Milestone} & \textbf{Kind} & \textbf{Effort} & \textbf{Status}\\
+\hline
+M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{float}) & neutral & \meterB & \stPart\\
+M2 & Harden the IR verifier                    & neutral & \meterB & \stOpen\\
+M3 & Systematic conformance battery            & neutral & \meterA & \stOpen\\
+M4 & Broaden the IR optimizer                  & neutral & \meterA & \stOpen\\
+M5 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
+\hline
+M6 & Second target (x86-64 / ELF)              & backend & \meterA & \stOpen\\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent\emph{Effort:}\quad \meterA{}\,high \quad \meterB{}\,medium
+\quad \meterC{}\,low.\quad M1--M4 may proceed in parallel; M5 must come
+last of the five, because it is validated by re-running the now-complete
+M1--M4 suites through the refactored ARM64 path with byte-identical
+output.
+
+% ================================================================
+\section{M1 --- Finish the C17 Frontend}
+\label{sec:mt-m1}
+
+\textbf{Goal.}  Close the remaining language gaps so the shared frontend
+is genuinely conforming before it feeds two backends.  Each of these is
+IR-\emph{construction} work---it lives above the seam and is reused by
+every target.
+
+\textbf{Work items.}
+\begin{itemize}
+\item \textbf{Nested designated initializers} (\stdref{6.7.9}):
+      \texttt{.a.b[2] = v} and brace-elision across aggregate levels.
+      Single-level \texttt{.f=}/\texttt{[i]=} is already done; the
+      recursion over sub-objects is the gap.
+\item \textbf{Volatile bit-fields}: the load/store of a bit-field must
+      keep its access-once semantics, combining the existing volatile
+      barrier with the bit-field read--modify--write.
+\item \textbf{A real single-precision \texttt{float} model.}  Arithmetic
+      is presently carried in \texttt{double} throughout, rounded only at
+      storage boundaries.  This is a \emph{semantic} decision that both
+      targets inherit; settling it now (true single-precision intermediate
+      results where the standard requires them) avoids re-baselining two
+      backends later.
+\end{itemize}
+
+\textbf{weft files.}  \texttt{27b-sema-declarations} and
+\texttt{32c-ir-aggregates} (designators); \texttt{32b-ir-expressions}
+and \texttt{37c-codegen-dispatch} (volatile bit-fields; the value model
+is neutral, the final load/store width is where ARM64 realizes it);
+\texttt{28-conversions} and the IR float opcodes (\texttt{float} model).
+
+\textbf{Acceptance.}  The differential corpus (\texttt{make difftest})
+gains cases for each feature and stays byte-identical to \texttt{clang};
+self-host stays byte-identical; no existing suite regresses.
+
+\textbf{Status.}  Partial---single-level designators and boundary-rounded
+\texttt{float} are landed; nested designators, volatile bit-fields, and
+true single-precision intermediates remain.
+
+% ================================================================
+\section{M2 --- Harden the IR Verifier}
+\label{sec:mt-m2}
+
+\textbf{Goal.}  Make the IR verifier (Chapter~\ref{ch:ir-validation})
+strong enough to reject malformed IR \emph{before} it reaches any
+backend.  With one code generator, a backend crash and an IR defect look
+alike; with two, a verifier that catches the defect at the seam is what
+keeps a frontend bug from masquerading as a backend bug.
+
+\textbf{Work items.}  Check type well-formedness on every operand, the
+def-before-use and single-def invariants, block termination and
+successor consistency, and that every opcode's operand arity and access
+widths are internally consistent.  Run the verifier as a mandatory pass
+in the debug build.
+
+\textbf{weft files.}  \texttt{33-ir-validation} (extend);
+\texttt{34-pass-manager} (wire the verifier between passes).
+
+\textbf{Acceptance.}  The verifier accepts all IR the current suites
+produce and rejects a curated set of hand-broken IR fragments; enabling
+it changes no tangled output.
+
+\textbf{Status.}  Open.
+
+% ================================================================
+\section{M3 --- Systematic Conformance Battery}
+\label{sec:mt-m3}
+
+\textbf{Goal.}  Prove the shared frontend and IR are correct on the
+\emph{uncommon} cases that no hand-picked real program happened to
+exercise---\emph{while there is still only one target}, so a failure
+localizes unambiguously to the core.
+
+\textbf{Work items.}
+\begin{itemize}
+\item Run an external conformance corpus (e.g.\ \texttt{c-testsuite})
+      through \kcc{} and record pass/fail.
+\item Add a differential harness that compiles randomly-generated
+      programs (e.g.\ \texttt{csmith}) with both \kcc{} and \texttt{clang}
+      and compares runtime output, shrinking any divergence to a minimal
+      reproducer.
+\end{itemize}
+Per project policy (\S no-fuzz-harness) this uses \emph{external}
+generators as oracles and fixes each surfaced bug directly; it does not
+add a bespoke in-tree fuzzing suite, and the existing suites stay green.
+
+\textbf{weft files.}  \texttt{44-test-harness} (a conformance driver
+target); no compiler-source changes except the fixes each run motivates.
+
+\textbf{Acceptance.}  A recorded baseline pass-rate on the external
+corpus, and zero known-unfixed differential divergences at the chosen
+generator settings.
+
+\textbf{Status.}  Open.
+
+% ================================================================
+\section{M4 --- Broaden the IR Optimizer}
+\label{sec:mt-m4}
+
+\textbf{Goal.}  Raise generated-code quality with passes that are
+\emph{entirely} IR-to-IR, so the second target inherits every one of
+them at no additional cost.  This is the milestone where the ``write
+once, reused free'' economics of the guiding principle pay off most.
+
+\textbf{Work items.}  On top of the present constant folding, DCE, and
+CSE: \textbf{copy propagation}, \textbf{constant propagation},
+\textbf{strength reduction} (e.g.\ multiply-by-constant to shift/add),
+and \textbf{inlining of small functions}.  Each runs to a fixpoint under
+the existing pass manager and is verified against the ARM64 oracle.
+
+\textbf{weft files.}  new pass fragments alongside \texttt{35-peephole},
+\texttt{36-dce}, \texttt{36a-cse}; \texttt{34-pass-manager}
+(sequence and fixpoint).
+
+\textbf{Acceptance.}  Each pass preserves observable behaviour on the
+full suite (self-host byte-identical is \emph{not} required here---output
+is expected to improve---but runtime results and the differential corpus
+must match \texttt{clang}); a size/instruction-count metric shows the
+intended reduction.
+
+\textbf{Status.}  Open.
+
+% ================================================================
+\section{M5 --- Carve the Target Interface}
+\label{sec:mt-m5}
+
+\textbf{Goal.}  Perform the structural refactor that turns ``the ARM64
+backend'' into ``the first instance of a target interface,'' so a second
+target slots in beside it rather than forking the backend.  This is the
+step that literally \emph{enables} M6.
+
+\textbf{Work items.}  Following the retargeting playbook
+(Chapter~\ref{ch:retargeting}): express register banks as
+\emph{descriptors} (so the linear-scan allocator becomes
+bank-parameterized rather than ARM64-wired), lift the ABI into a
+\emph{table} (argument/return classification, callee-saved sets,
+alignment), and route instruction selection, prologue/epilogue, and
+object emission through a \emph{target vtable}.  Add the
+\texttt{-{}-target} selection plumbing to the driver.  Throughout, ARM64
+remains the sole concrete target and must keep passing through the new
+indirection.
+
+\textbf{weft files.}  \texttt{37/37a/37b/37c-codegen} (behind the
+vtable), \texttt{38/39-emit} and \texttt{40-linker} (object-format
+parameterization), \texttt{42-driver} (\texttt{-{}-target}); the
+interface itself is a new backend-infrastructure fragment.
+
+\textbf{Acceptance.}  The \emph{whole} suite---most importantly self-host
+and \texttt{difftest}---stays \textbf{byte-identical} after the refactor:
+a pure structural change to ARM64's path must produce the exact same
+bytes it did before.  This is why M5 comes last of the five: it is
+validated by re-running the by-now-complete M1--M4 suites through the
+refactored path.
+
+\textbf{Status.}  Open.  The playbook (Chapter~\ref{ch:retargeting})
+already specifies the interface shape; this milestone is its
+implementation for ARM64.
+
+% ================================================================
+\section{M6 --- The Second Target (Hand-off)}
+\label{sec:mt-m6}
+
+With M1--M5 complete, adding x86-64 / Mach-O (then ELF / Linux) is the
+thirty-percent problem the playbook describes: an instruction-selection
+table, a register-bank descriptor, an ABI table, and an object emitter,
+validated differentially against the ARM64 oracle and run under
+Rosetta~/ qemu.  It is deliberately \emph{out of scope} for this
+appendix, whose entire purpose is to guarantee that when M6 begins, every
+failure it uncovers belongs to the new backend and nowhere else.  The
+mechanics of M6 live in the retargeting playbook
+(Chapter~\ref{ch:retargeting}).
+
+% ================================================================
+\section{Summary}
+\label{sec:mt-summary}
+
+The order is not a preference; it falls out of the seam.  M1--M4 finish
+and prove the target-neutral seventy percent while a single target still
+makes every failure unambiguous.  M5 carves the interface with ARM64 as
+the only occupant, proven by byte-identical output.  Only then does M6
+introduce a second occupant---by which point the shared core is complete,
+the optimizer is inherited free, the verifier guards the seam, and ARM64
+is a trustworthy oracle.  \emph{Finish the shared part before you split};
+the rest is instruction tables.

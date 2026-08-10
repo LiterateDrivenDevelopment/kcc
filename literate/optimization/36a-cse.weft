@@ -335,5 +335,107 @@ _kcc_opt_cse:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #160
     ret
-@| _kcc_opt_cse _kcc_cse_canon _kcc_cse_canon_ops
+
+// -- kcc_opt_copyprop -----------------------------------------------------
+// uint64_t kcc_opt_copyprop(ir_func *func) -> number of forwards.
+// Store-to-load forwarding = copy propagation + constant propagation for the
+// memory-backed locals this IR uses.  It is deliberately airtight: within one
+// straight-line block it tracks the single most recent store (address, value,
+// and access-size code); a following load of that exact address forwards the
+// stored value ONLY when (a) no store, call, or va_start intervened---so memory
+// is provably unchanged---and (b) both sides are the natural 8-byte access, so
+// no truncation or re-extension can make the loaded register differ from the
+// stored vreg.  Substitution is intra-block (the map is reset at each block
+// boundary), so no cross-block dominance question arises.  DCE then sweeps the
+// loads this makes dead.  These three conditions together mean it never needs
+// alias, escape, or dominance analysis to be correct.
+.p2align 2
+.globl _kcc_opt_copyprop
+_kcc_opt_copyprop:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    mov x19, x0                   // func
+    mov x22, #0                   // forward count
+    ldr x20, [x19, #IRF_VREG_N]
+    cbz x20, .Lcp_done
+    add x20, x20, #1              // vreg bound (canon reads x20)
+    lsl x0, x20, #3
+    bl _kcc_arena_alloc
+    mov x21, x0                   // replacement map (canon reads x21)
+
+    ldr x24, [x19, #IRF_ENTRY]
+.Lcp_bb:
+    cbz x24, .Lcp_done
+    mov x9, #0                    // reset map to identity (forwards are block-local)
+.Lcp_reset:
+    cmp x9, x20
+    b.ge .Lcp_bb_start
+    str x9, [x21, x9, lsl #3]
+    add x9, x9, #1
+    b .Lcp_reset
+.Lcp_bb_start:
+    mov x25, #0                   // last-store valid = no
+    ldr x23, [x24, #BB_FIRST]
+.Lcp_i:
+    cbz x23, .Lcp_nb
+    mov x0, x23
+    bl _kcc_cse_canon_ops         // rewrite operands via forwards seen so far
+
+    ldr x9, [x23, #IR_OP]
+    cmp x9, #IR_STORE
+    b.eq .Lcp_store
+    cmp x9, #IR_LOAD
+    b.eq .Lcp_load
+    cmp x9, #IR_CALL
+    b.eq .Lcp_kill
+    cmp x9, #IR_CALL_IND
+    b.eq .Lcp_kill
+    cmp x9, #IR_VA_START
+    b.eq .Lcp_kill
+    b .Lcp_next
+.Lcp_store:
+    ldr x26, [x23, #IR_SRC2]      // address
+    ldr x27, [x23, #IR_SRC1]      // value (already canonical)
+    ldr x28, [x23, #IR_DEST]      // store access-size code
+    mov x25, #1
+    b .Lcp_next
+.Lcp_kill:
+    mov x25, #0                   // memory may have changed
+    b .Lcp_next
+.Lcp_load:
+    cbz x25, .Lcp_next
+    ldr x9, [x23, #IR_SRC1]       // load address
+    cmp x9, x26
+    b.ne .Lcp_next
+    cbnz x28, .Lcp_next           // store not the natural 8-byte
+    ldr x9, [x23, #IR_SRC2]       // load access-size code
+    cbnz x9, .Lcp_next            // load not 8-byte
+    ldr x10, [x23, #IR_DEST]
+    cmp x10, x20
+    b.ge .Lcp_next
+    str x27, [x21, x10, lsl #3]   // map[load_dest] = stored value
+    add x22, x22, #1
+.Lcp_next:
+    ldr x23, [x23, #IR_NEXT]
+    b .Lcp_i
+.Lcp_nb:
+    ldr x24, [x24, #BB_NEXT]
+    b .Lcp_bb
+
+.Lcp_done:
+    mov x0, x22
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@| _kcc_opt_cse _kcc_cse_canon _kcc_cse_canon_ops _kcc_opt_copyprop
 @}

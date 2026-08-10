@@ -6,7 +6,7 @@
 \chapter{Optimization Passes}
 \label{ch:ir-passes}
 
-Generating correct IR is necessary, but the initial translation from AST to IR often leaves redundancy---constant expressions that could be evaluated at compile time, subexpressions and loads computed more than once, and instructions whose results are never consumed.  This chapter provides the pass manager that drives optimization.  It iterates over every IR function and runs the available passes---constant folding, common subexpression elimination, and dead code elimination---in a loop until no further changes occur, achieving a fixed-point result.  Running them together matters: folding a cast can expose a common subexpression, eliminating it can leave a load dead, and each pass feeds the next until the IR settles.
+Generating correct IR is necessary, but the initial translation from AST to IR often leaves redundancy---constant expressions that could be evaluated at compile time, subexpressions and loads computed more than once, and instructions whose results are never consumed.  This chapter provides the pass manager that drives optimization.  It iterates over every IR function and runs the available passes---constant folding, strength reduction, common subexpression elimination, copy/constant propagation, and dead code elimination---in a loop until no further changes occur, achieving a fixed-point result.  Running them together matters: folding a cast can expose a common subexpression, strength-reducing a multiply into a shift can expose a fresh constant, forwarding a stored value to a load can leave that load dead, eliminating a subexpression can leave another load dead, and each pass feeds the next until the IR settles.  Every pass is a pure IR-to-IR transform, so it lives above the code generator and a second target inherits all of them unchanged.
 
 \section{Pass Manager}
 
@@ -92,10 +92,24 @@ _kcc_opt_run_func:
     bl _kcc_opt_constfold
     mov x1, x0                  // fold count
 
+    // Strength reduction / algebraic simplification (mul/div/mod by a power
+    // of two -> shift/mask).  Runs after folding so a constant operand it
+    // relies on is already materialised, and before CSE/DCE so the shift it
+    // introduces is available for their bookkeeping.
+    mov x0, x19
+    bl _kcc_opt_strength
+    add x1, x1, x0              // + strength count
+
     // Run common subexpression elimination
     mov x0, x19
     bl _kcc_opt_cse
     add x1, x1, x0              // + cse count
+
+    // Copy / constant propagation (store-to-load forwarding); DCE below then
+    // sweeps the loads it makes dead.
+    mov x0, x19
+    bl _kcc_opt_copyprop
+    add x1, x1, x0             // + copyprop count
 
     // Run DCE
     mov x0, x19

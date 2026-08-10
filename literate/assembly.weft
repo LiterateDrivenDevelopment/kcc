@@ -449,6 +449,7 @@ The directives below route code fragments to their physical assembly files under
 @<Vec: constants@>
 @<Types: constants@>
 @<Opt: constant fold@>
+@<Opt: strength reduction@>
 @<Opt: dead code elimination@>
 @<Opt: common subexpression elimination@>
 @<Opt: pass manager@>

@@ -447,6 +447,24 @@ cases round out the corpus.
 echo ""
 echo "--- Operators and Edge Cases ---"
 
+# Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
+# The signed div/mod and negative cases must stay numerically correct
+# (they are NOT reduced, precisely because a shift would round differently).
+difftest "strength-unsigned-mul" \
+    "unsigned f(unsigned x){ return x*8 + x*16; } int main(void){ return (int)(f(3) % 200); }"
+difftest "strength-unsigned-div" \
+    "unsigned f(unsigned x){ return x/4 + x/8; } int main(void){ return (int)f(100); }"
+difftest "strength-unsigned-mod" \
+    "unsigned f(unsigned x){ return x%16 + x%4; } int main(void){ return (int)f(103); }"
+difftest "strength-signed-mul" \
+    "int f(int x){ return x*32; } int main(void){ return f(-3) + 100; }"
+difftest "strength-signed-divmod-neg" \
+    "int main(void){ int a=-17; return (a/4)*10 + (a%8) + 100; }"
+difftest "strength-mul-zero" \
+    "int f(int x){ return x*0 + 7; } int main(void){ return f(999); }"
+difftest "strength-nonpow2" \
+    "unsigned f(unsigned x){ return x*3 + x/5 + x%7; } int main(void){ return (int)f(100); }"
+
 difftest "ternary-chain" \
     "int main(void){ int x = 3; return x == 1 ? 10 : x == 2 ? 20 : x == 3 ? 30 : 40; }"
 difftest "comma" \
@@ -564,6 +582,14 @@ difftest "multi-declarator-global" \
     "int a = 1, b = 2, c = 3; int main(void){ return a + b + c; }"
 difftest "multi-declarator-global-noinit" \
     "int a, b, c; int main(void){ a = 4; b = 5; c = 6; return a + b + c; }"
+difftest "copyprop-chain" \
+    "long f(long a){ long x = a; long y = x; long z = y; return x + y + z; } int main(void){ return (int)f(7); }"
+difftest "copyprop-alias-invalidate" \
+    "long f(void){ long v = 5; long *p = &v; long a = v; *p = 9; long b = v; return a * 10 + b; } int main(void){ return (int)f(); }"
+difftest "copyprop-reassign" \
+    "long f(long a){ long x = a; long b = x; x = a + 100; long c = x; return b + c; } int main(void){ return (int)f(1); }"
+difftest "copyprop-across-call" \
+    "long id(long z){ return z; } long f(long a){ long x = a; long b = id(a); long c = x; return b + c; } int main(void){ return (int)f(4); }"
 difftest "char-escapes" \
     "int main(void){ char n = '\\n'; char t = '\\t'; char z = '\\0'; return n + t + z; }"
 @}

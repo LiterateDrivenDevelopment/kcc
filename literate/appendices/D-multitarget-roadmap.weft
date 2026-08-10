@@ -66,9 +66,10 @@ dependable oracle.
 \section{Milestones at a Glance}
 \label{sec:mt-glance}
 
-Five milestones (M1--M5) precede the second target (M6).  M1--M4 are
-target-neutral (kind~A); M5 is the structural work that \emph{enables}
-the split.  The table is the scan; the sections are the detail.
+Six milestones (M1--M6) precede the second target (M7).  M1--M4 are
+target-neutral (kind~A); M5 is ARM64 oracle-hardening (kind~B); M6 is the
+structural work that \emph{enables} the split.  The table is the scan; the
+sections are the detail.
 
 \begin{center}
 \small
@@ -79,18 +80,19 @@ the split.  The table is the scan; the sections are the detail.
 M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{float}) & neutral & \meterB & \stDone\\
 M2 & Harden the IR verifier                    & neutral & \meterB & \stDone\\
 M3 & Systematic conformance battery            & neutral & \meterA & \stDone\\
-M4 & Broaden the IR optimizer                  & neutral & \meterA & \stOpen\\
-M5 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
+M4 & Broaden the IR optimizer (strength reduction + copy propagation) & neutral & \meterA & \stDone\\
+M5 & Write-protect read-only data (stray writes fault, not corrupt) & oracle & \meterB & \stOpen\\
+M6 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
 \hline
-M6 & Second target (x86-64 / ELF)              & backend & \meterA & \stOpen\\
+M7 & Second target (x86-64 / ELF)              & backend & \meterA & \stOpen\\
 \hline
 \end{tabular}
 \end{center}
 
 \noindent\emph{Effort:}\quad \meterA{}\,high \quad \meterB{}\,medium
-\quad \meterC{}\,low.\quad M1--M4 may proceed in parallel; M5 must come
-last of the five, because it is validated by re-running the now-complete
-M1--M4 suites through the refactored ARM64 path with byte-identical
+\quad \meterC{}\,low.\quad M1--M5 may proceed in parallel; M6 must come
+last of the six, because it is validated by re-running the now-complete
+M1--M5 suites through the refactored ARM64 path with byte-identical
 output.
 
 % ================================================================
@@ -247,32 +249,152 @@ deferred.
 them at no additional cost.  This is the milestone where the ``write
 once, reused free'' economics of the guiding principle pay off most.
 
-\textbf{Work items.}  On top of the present constant folding, DCE, and
-CSE: \textbf{copy propagation}, \textbf{constant propagation},
-\textbf{strength reduction} (e.g.\ multiply-by-constant to shift/add),
-and \textbf{inlining of small functions}.  Each runs to a fixpoint under
-the existing pass manager and is verified against the ARM64 oracle.
+\textbf{Work items.}  On top of the present constant folding, CSE, and DCE,
+the fixed-point pipeline gains two new IR-to-IR passes.
 
-\textbf{weft files.}  new pass fragments alongside \texttt{35-peephole},
-\texttt{36-dce}, \texttt{36a-cse}; \texttt{34-pass-manager}
-(sequence and fixpoint).
+\emph{(landed)} \textbf{Strength reduction and algebraic simplification}
+(\texttt{\_kcc\_opt\_strength}, \S\ref{sec:opt-strength}): multiply, unsigned
+divide, and unsigned remainder by a power of two become a shift or a mask
+(\texttt{x*2\textsuperscript{k}}$\to$\texttt{x<<k},
+\texttt{x/\textsubscript{u}2\textsuperscript{k}}$\to$\texttt{x>>\textsubscript{u}k},
+\texttt{x\%\textsubscript{u}2\textsuperscript{k}}$\to$\texttt{x\&(2\textsuperscript{k}-1)}),
+and \texttt{x*0}/\texttt{x\&0} fold to zero; signed \texttt{SDIV}/\texttt{SMOD}
+and every floating operation are deliberately left alone.
 
-\textbf{Acceptance.}  Each pass preserves observable behaviour on the
-full suite (self-host byte-identical is \emph{not} required here---output
-is expected to improve---but runtime results and the differential corpus
-must match \texttt{clang}); a size/instruction-count metric shows the
-intended reduction.
+\emph{(landed)} \textbf{Copy and constant propagation}
+(\texttt{\_kcc\_opt\_copyprop}, \S\ref{ch:cse}): because \kcc{} keeps locals
+in memory, ``copies'' live as store/load pairs, so the pass does
+\emph{store-to-load forwarding}---a load that reads exactly what a preceding
+store wrote takes the stored value (or constant) directly, and DCE removes
+the dead load.  It is airtight by three conditions rather than by alias or
+dominance analysis: the store and load sit in one straight-line block with no
+store, call, or \texttt{va\_start} between them (memory is provably
+unchanged); both are the natural 8-byte access (no truncation or re-extension
+can perturb the value); and substitution is intra-block (the map resets at
+each block boundary).  Constants stored then loaded are forwarded by the same
+mechanism, and constant \emph{folding} already propagates within a block
+through its value map, so global constant propagation is substantially
+covered.  \emph{(future)} Sparse-conditional constant propagation across the
+CFG and small-function inlining remain; the inliner (IR cloning, vreg
+remapping, param/argument binding, callee-alloca hoisting) is the largest
+dataflow addition and is deferred.
 
-\textbf{Status.}  Open.
+\textbf{weft files.}  \texttt{35-peephole} (\texttt{Opt: strength reduction}),
+\texttt{36a-cse} (\texttt{\_kcc\_opt\_copyprop}), \texttt{34-ir-passes}
+(pipeline), \texttt{assembly.weft} (routing).
+
+\textbf{Acceptance.}  Behaviour preserved on the whole deterministic
+corpus---codegen 222, difftest 208 (runtime-equal to \texttt{clang},
+including negative signed operands and a store-then-alias-store-then-load
+that must \emph{not} forward), self-host 222, and zlib (example self-test and
+a gzip round-trip) all green.  Metric: a benchmark of nine multiplies, three
+divides, and four remainders by powers of two compiles to \textbf{zero}
+\texttt{mul} and \texttt{udiv} machine instructions.  (The Lua suite, an
+additional oracle, is presently blocked by an environment-dependent flake
+unrelated to these passes---the historical commit that first passed it
+fails identically today---so the deterministic suites and zlib stand in.)
+
+\textbf{Status.}  \textbf{Done.}  Both IR-to-IR passes have landed---strength
+reduction and copy \& constant propagation---and the acceptance metric is met:
+the benchmark of multiplies, unsigned divides, and unsigned remainders by
+powers of two compiles to \emph{zero} \texttt{mul} and \texttt{udiv} machine
+instructions (each becomes a shift or a mask), with the deterministic corpus,
+self-host, and zlib all green and the Lua suite (its layout flake now
+non-reproducing) again passing as an extra oracle.  Sparse-conditional constant
+propagation across the CFG and function inlining are tracked as \emph{future
+escalations beyond this milestone}---valuable, but not open parts of M4's
+definition of done, exactly as the \texttt{csmith} harness is a deferred
+follow-on to M3 rather than a gap in it.
 
 % ================================================================
-\section{M5 --- Carve the Target Interface}
+\section{M5 --- Write-Protect Read-Only Data (Make Stray Writes Fault)}
 \label{sec:mt-m5}
+
+\textbf{Kind.}  This is the roadmap's first \emph{kind-B} milestone: it does
+not extend the shared core but polishes ARM64 into a trustworthy oracle, by
+converting a whole class of \emph{silent} miscompile into an immediate,
+deterministic fault.  An oracle that can corrupt data without complaint is not
+yet dependable enough to validate a second backend against.
+
+\textbf{The defect.}  \kcc's object emitter places \emph{all} program data into
+a single writable \texttt{\_\_common} section in \texttt{\_\_DATA}.  A build of
+Lua makes this concrete: the \texttt{static const} lookup tables of
+\texttt{luaL\_checkoption} (\texttt{opts[]}/\texttt{optsnum[]}), ordinary
+mutable globals, and zero-initialised BSS all share one writable segment
+(\texttt{vmaddr 0x100134000}, one \texttt{\_\_common} block), with no
+\texttt{\_\_DATA\_CONST}/\texttt{\_\_const} for read-only statics and no
+distinct \texttt{\_\_bss}.  Nothing that should be read-only is write-protected.
+This is what turns every codegen \emph{stray write}---the recurring bug family
+of an undersized \texttt{alloca} (Bug~38), a mis-coloured spill slot (Bug~32),
+or an 8-byte load/store through a 4-byte slot (Bug~45)---from a hard fault into
+a \emph{silent} corruption: the wild store lands on a neighbouring object and is
+discovered only much later, as scrambled data, at a site arbitrarily far from
+the cause.
+
+\textbf{The exemplar (Lua \texttt{all.lua:109}).}  Under \texttt{\_port=true},
+\texttt{collectgarbage("count")} intermittently returns \texttt{boolean false}
+instead of a number, and the entire \texttt{collectgarbage} option dispatch is
+scrambled (\texttt{"collect"}$\to$\texttt{nil}, \texttt{"count"}$\to$%
+\texttt{false}, \texttt{"isrunning"}$\to$a number) while every unrelated
+operation---\texttt{math.floor}, \texttt{string.format},
+\texttt{("count"):len()}---stays correct.  Disassembling the two functions
+proves the dispatch \emph{code} is right: it calls \texttt{luaL\_checkoption},
+indexes \texttt{optsnum[idx]} with an \texttt{ldrsw}, and switches on the result
+with a correct if-else chain.  So the fault is not logic; it is a foreign write
+onto the \texttt{opts[]}/\texttt{optsnum[]} tables the path reads.  And it is
+\emph{layout-sensitive}: \kcc's build is deterministic, yet whether the stray
+write collides with those tables depends on the final binary layout, so shifting
+any single translation unit---or merely changing the linker---moves the
+collision and flips the bug on or off.  The commit that historically first
+passed the whole Lua suite reproduces the failure in some environments and
+passes it in others (under both \kcc's own linker and \texttt{clang}'s ld
+today); the current build passes.  A heisenbug of this shape resists the
+ordinary tools: any injected \texttt{printf} or assert perturbs the layout and
+masks it, and it cannot be reproduced on demand.  \emph{Write protection is what
+makes it catchable}---with the tables in a read-only page, the offending store
+faults at its own instruction and \texttt{lldb} names the culprit function on
+the spot, instead of the investigator chasing distant scrambled data.
+
+\textbf{Work items.}
+\begin{itemize}
+\item Emit \texttt{static const} (and string-literal) aggregates into a
+      write-protected \texttt{\_\_DATA\_CONST}/\texttt{\_\_const} section rather
+      than the writable \texttt{\_\_common} lump, honouring the \texttt{const}
+      qualifier the front end already records.
+\item Separate zero-initialised BSS from initialised data, so a BSS overrun
+      cannot silently walk into a live initialised object.
+\item (Optional, cheap) A debug canary / guard-page mode around static tables,
+      giving any hunt for a still-silent overrun a tripwire.
+\end{itemize}
+
+\textbf{weft files.}  \texttt{37-codegen} (data-section selection by
+qualifier), \texttt{38/39-emit} (the new section and its Mach-O segment
+protection attributes), \texttt{40-linker} (segment protection flags).
+
+\textbf{Acceptance.}  A \texttt{static const} object lives in a read-only page
+(a deliberate write to one faults); the whole deterministic corpus---codegen,
+difftest, self-host---plus Lua and zlib stay green (re-baselined, since moving
+data to a new section legitimately changes the emitted bytes); and a controlled
+stray write into a \texttt{const} table now aborts at the store, with
+\texttt{lldb} reporting the writing instruction, instead of surfacing as
+distant corruption.
+
+\textbf{Status.}  Open.  The defect is characterised and its exemplar (the Lua
+\texttt{:109} flake) documented; the emitter change is the remaining work.
+Being kind~B, this milestone may proceed in parallel with M1--M4 and need not
+precede the seam refactor---but doing it \emph{early} would have turned three
+past heisenbugs (Bugs~32, 38, 45) into one-line faults at the store site, which
+is the standing argument for scheduling oracle-hardening sooner rather than
+later.
+
+% ================================================================
+\section{M6 --- Carve the Target Interface}
+\label{sec:mt-m6}
 
 \textbf{Goal.}  Perform the structural refactor that turns ``the ARM64
 backend'' into ``the first instance of a target interface,'' so a second
 target slots in beside it rather than forking the backend.  This is the
-step that literally \emph{enables} M6.
+step that literally \emph{enables} M7.
 
 \textbf{Work items.}  Following the retargeting playbook
 (Chapter~\ref{ch:retargeting}): express register banks as
@@ -293,8 +415,8 @@ interface itself is a new backend-infrastructure fragment.
 \textbf{Acceptance.}  The \emph{whole} suite---most importantly self-host
 and \texttt{difftest}---stays \textbf{byte-identical} after the refactor:
 a pure structural change to ARM64's path must produce the exact same
-bytes it did before.  This is why M5 comes last of the five: it is
-validated by re-running the by-now-complete M1--M4 suites through the
+bytes it did before.  This is why M6 comes last of the six: it is
+validated by re-running the by-now-complete M1--M5 suites through the
 refactored path.
 
 \textbf{Status.}  Open.  The playbook (Chapter~\ref{ch:retargeting})
@@ -302,17 +424,17 @@ already specifies the interface shape; this milestone is its
 implementation for ARM64.
 
 % ================================================================
-\section{M6 --- The Second Target (Hand-off)}
-\label{sec:mt-m6}
+\section{M7 --- The Second Target (Hand-off)}
+\label{sec:mt-m7}
 
-With M1--M5 complete, adding x86-64 / Mach-O (then ELF / Linux) is the
+With M1--M6 complete, adding x86-64 / Mach-O (then ELF / Linux) is the
 thirty-percent problem the playbook describes: an instruction-selection
 table, a register-bank descriptor, an ABI table, and an object emitter,
 validated differentially against the ARM64 oracle and run under
 Rosetta~/ qemu.  It is deliberately \emph{out of scope} for this
-appendix, whose entire purpose is to guarantee that when M6 begins, every
+appendix, whose entire purpose is to guarantee that when M7 begins, every
 failure it uncovers belongs to the new backend and nowhere else.  The
-mechanics of M6 live in the retargeting playbook
+mechanics of M7 live in the retargeting playbook
 (Chapter~\ref{ch:retargeting}).
 
 % ================================================================
@@ -321,8 +443,11 @@ mechanics of M6 live in the retargeting playbook
 
 The order is not a preference; it falls out of the seam.  M1--M4 finish
 and prove the target-neutral seventy percent while a single target still
-makes every failure unambiguous.  M5 carves the interface with ARM64 as
-the only occupant, proven by byte-identical output.  Only then does M6
+makes every failure unambiguous.  M5 write-protects read-only data so the
+ARM64 oracle turns stray writes into hard faults at the store instead of
+silent, layout-sensitive corruption---the oracle must not lie before it is
+trusted to judge a second backend.  M6 carves the interface with ARM64 as
+the only occupant, proven by byte-identical output.  Only then does M7
 introduce a second occupant---by which point the shared core is complete,
 the optimizer is inherited free, the verifier guards the seam, and ARM64
 is a trustworthy oracle.  \emph{Finish the shared part before you split};

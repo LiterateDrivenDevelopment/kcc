@@ -658,24 +658,26 @@ the label table and patch vector as context.
     b .Lcgf_bb_loop
 @}
 
-\paragraph{Patching Forward Branches and Registering the Symbol}
+\paragraph{Patching Forward Branches and the Symbol Value}
 Once every basic block has been lowered, two bookkeeping tasks
 remain.  First, the forward-branch patch pass resolves all
 placeholder \textsc{b} and \textsc{cbnz} instructions whose
-targets were not yet known at emission time.  Second, the
-function is registered as a defined Mach-O symbol with the
-conventional underscore prefix (\texttt{\_main} for
-\texttt{main}) and inserted into the extern hash table so that
-call sites in other functions can resolve to it.  The one
-exception is the synthesised \texttt{kcc.module\_init} function
-(\S\ref{sec:global-inits}): it is registered with \emph{local}
-linkage (\texttt{N\_SECT} without \texttt{N\_EXT}) so that several
-separately compiled units can each define one without colliding,
-and it is kept out of the extern table because nothing calls it by
-name---the \texttt{\_\_mod\_init\_func} pointer is its only
-reference.  Its symbol index is recorded in
-\texttt{\_kcc\_modinit\_sym} for the Mach-O writer to relocate
-against.
+targets were not yet known at emission time.  Second, the function's
+linker symbol---already created by the pre-pass
+(\S\ref{sec:preregister-globals}) with the correct underscore-prefixed
+name, linkage, and extern-table entry, but a placeholder value of
+zero---has its \texttt{SYM\_VALUE} patched to the code offset where the
+function now begins.  Registering the symbol earlier (rather than here)
+is what lets a call to a not-yet-compiled callee resolve to the
+definition instead of a fresh undefined external; that mattered
+especially for \texttt{static} callees, whose local symbols the linker
+cannot coalesce a stray undefined reference against.  The linkage
+itself is decided in the pre-pass: external
+(\texttt{N\_SECT $\vert$ N\_EXT}) by default, local (\texttt{N\_SECT}
+alone) for a \texttt{static} function or the synthesised
+\texttt{kcc.module\_init}, so two units that each define a private
+helper of the same name (for instance zlib's per-file
+\texttt{fixedtables}) do not collide.
 
 @d CodeGen: compile function @{
 .Lcgf_patch:
@@ -684,68 +686,20 @@ against.
     mov x1, x23                    // patch vec
     bl _kcc_codegen_patch_branches
 
-    // 9. Add function symbol to linker (Mach-O needs leading underscore)
-    ldr x24, [x19, #IRF_NAME]     // name
-    // The synthesised module-init function gets LOCAL linkage (no N_EXT) so
-    // several separately compiled units may each define one; it is also kept
-    // out of the extern table since nothing calls it by name---dyld reaches it
-    // through the __mod_init_func pointer alone.
-    mov x0, x24
-    adrp x1, _kcc_str_modinit@@PAGE
-    add  x1, x1, _kcc_str_modinit@@PAGEOFF
-    bl _kcc_strcmp
-    cmp x0, #0
-    cset x0, eq                    // x0 = is_modinit
-    str x0, [sp, #96]             // stash is_modinit across the calls below
-    mov x0, x24
-    bl _kcc_strlen
-    add x0, x0, #2                // +1 for '_' prefix, +1 for null
-    bl _kcc_arena_alloc
-    mov x25, x0                   // x25 = new name buffer
-    mov w1, #'_'
-    strb w1, [x25]                // prefix '_'
-    add x0, x25, #1              // dest = buf+1
-    mov x1, x24                   // src = original name
-    mov x2, x24
-    mov x0, x2
-    bl _kcc_strlen
-    add x2, x0, #1               // len = strlen(name) + 1 (include null)
-    add x0, x25, #1              // dest
-    mov x1, x24                   // src
-    bl _kcc_memcpy
-    mov x0, x25                   // name = "_main"
-    mov x1, #1                     // section = 1 (__text)
-    mov x2, x21                    // value = func_start_offset
-    mov x3, #(N_SECT | N_EXT)     // flags = defined + external
-    ldr x4, [sp, #96]            // is_modinit → strip N_EXT (local linkage)
-    cbz x4, .Lcgf_sym_flags
-    mov x3, #N_SECT
-.Lcgf_sym_flags:
-    bl _kcc_linker_add_sym
-    mov x26, x0                    // x26 = sym_index
-
-    // A module-init symbol: record its index for the __mod_init_func pointer
-    // and skip the extern table (it is never resolved by name).
-    ldr x4, [sp, #96]
-    cbz x4, .Lcgf_sym_extern
-    adrp x0, _kcc_modinit_sym@@PAGE
-    add  x0, x0, _kcc_modinit_sym@@PAGEOFF
-    add x1, x26, #1               // sym_index + 1 (0 = none)
-    str x1, [x0]
-    b .Lcgf_sym_done
-
-.Lcgf_sym_extern:
-    // Register in extern hash table so calls from other functions find it
-    mov x0, x25
-    bl _kcc_strlen
-    mov x27, x0                    // name len
-    adrp x0, _kcc_linker_extern_ht@@PAGE
-    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    // 9. Patch the pre-registered function symbol's value to the code offset.
+    // The symbol itself (with correct linkage and extern-table entry) was
+    // created by _kcc_cg_preregister_funcs before any body was compiled, so
+    // forward references have already resolved to it; here we only fill in the
+    // value that was unknown until the function was laid out.
+    ldr x26, [x19, #IRF_SYMIDX]   // pre-registered symbol index
+    adrp x0, _kcc_linker_syms@@PAGE
+    add  x0, x0, _kcc_linker_syms@@PAGEOFF
     ldr x0, [x0]
-    mov x1, x25                    // key = prefixed name
-    mov x2, x27                    // keylen
-    add x3, x26, #1               // value = sym_index + 1
-    bl _kcc_ht_put
+    ldr x0, [x0, #VEC_DATA]       // symbol entry array
+    mov x1, #SYM_ENTRY_SIZE
+    mul x1, x26, x1
+    add x0, x0, x1                // &syms[idx]
+    str x21, [x0, #SYM_VALUE]     // value = func_start_offset
 
 .Lcgf_sym_done:
     ldp x27, x28, [sp, #80]

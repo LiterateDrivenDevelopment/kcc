@@ -537,8 +537,8 @@ _kcc_ir_fill_param_classes:
     add x21, x21, #1
     b .Lfpc_zero
 .Lfpc_walk:
-    ldr x24, [x23, #AST_F2]      // first param decl (bit 0 = variadic)
-    bic x24, x24, #1
+    ldr x24, [x23, #AST_F2]      // first param decl (bit 0=variadic, bit 1=static)
+    bic x24, x24, #3
     mov x21, #0                  // named-param index
 .Lfpc_loop:
     cbz x24, .Lfpc_sret
@@ -3037,16 +3037,29 @@ _kcc_ir_build_binary:
 // operand by the pointed-to type's real byte size.  x23 = opcode
 // (ADD or SUB), x21 = LHS vreg, x22 = RHS vreg.  Since arrays are now
 // packed at their natural stride, the scale is the exact pointee size
-// (no clamp to 8).  After scaling, falls through to the emitter.
+// (no clamp to 8).  A TY_ARRAY operand (an undecayed struct-member array)
+// is treated the same as a pointer, with its element type in TY_F0.
+// After scaling, falls through to the emitter.
 .Libb_ptr_scale:
-    // Check if LHS is a pointer type
+    // Check if LHS is a pointer (or a still-undecayed array) type.  A struct
+    // member of array type, e.g. `state->lens + n`, keeps its TY_ARRAY type
+    // because the member-access sema path does not apply array-to-pointer
+    // decay (an ident array does); its IR value is nevertheless the element-0
+    // address, so it must be scaled exactly like a pointer.  For both TY_PTR
+    // and TY_ARRAY the element/pointee type is TY_F0, so the scaling below is
+    // identical.  Without this, `member_array + n` added an unscaled index and
+    // read at the wrong stride (the bug that corrupted inflate's distance
+    // lengths so zlib decode failed).
     ldr x0, [x19, #AST_F1]
     cbz x0, .Libb_emit
     ldr x0, [x0, #AST_F3]
     cbz x0, .Libb_ps_check_rhs
     ldr x1, [x0, #TY_KIND]
     cmp x1, #TY_PTR
+    b.eq .Libb_ps_lhs_ptr
+    cmp x1, #TY_ARRAY
     b.ne .Libb_ps_check_rhs
+.Libb_ps_lhs_ptr:
 
     // LHS is a pointer.  ptr - ptr is a pointer difference: fall through to
     // the ptrdiff handler; ptr + int / ptr - int scales the integer.
@@ -3059,17 +3072,22 @@ _kcc_ir_build_binary:
     ldr x2, [x2, #TY_KIND]
     cmp x2, #TY_PTR
     b.eq .Libb_ptr_diff
+    cmp x2, #TY_ARRAY
+    b.eq .Libb_ptr_diff
     b .Libb_ps_scale_rhs
 
 .Libb_ps_check_rhs:
-    // Check if RHS is a pointer type (int + ptr)
+    // Check if RHS is a pointer (or undecayed array) type (int + ptr)
     ldr x0, [x19, #AST_F2]
     cbz x0, .Libb_emit
     ldr x0, [x0, #AST_F3]
     cbz x0, .Libb_emit
     ldr x1, [x0, #TY_KIND]
     cmp x1, #TY_PTR
+    b.eq .Libb_ps_rhs_ptr
+    cmp x1, #TY_ARRAY
     b.ne .Libb_emit
+.Libb_ps_rhs_ptr:
 
     // RHS is pointer — scale LHS (x21) by the real pointee size
     ldr x0, [x0, #TY_F0]

@@ -541,8 +541,7 @@ _kcc_ir_emit_init_stores:
     mov x24, x0                  // x24 = src
     mov x0, x23
     bl _kcc_type_layout          // x0 = aggregate byte size
-    add x0, x0, #7
-    lsr x2, x0, #3              // slot count = ceil(size / 8)
+    mov x2, x0                    // byte size (exact)
     mov x0, x24                  // src
     mov x1, x22                  // dst = base address
     bl _kcc_ir_emit_struct_copy
@@ -808,6 +807,13 @@ _kcc_ir_build_func:
     ldr x0, [x19, #AST_LINE]
     str x0, [x23, #IRF_LINE]
 
+    // Propagate internal linkage: bit 1 of the packed params pointer marks a
+    // static function, which the emitter turns into a local Mach-O symbol.
+    ldr x0, [x19, #AST_F2]
+    and x0, x0, #2
+    lsr x0, x0, #1               // 1 if static, else 0
+    str x0, [x23, #IRF_STATIC]
+
     // Set as current function
     adrp x1, _kcc_ir_cur_func@@PAGE
     add  x1, x1, _kcc_ir_cur_func@@PAGEOFF
@@ -850,9 +856,10 @@ _kcc_ir_build_func:
     mov x0, x24
     bl _kcc_ir_set_bb
 
-    // Count parameters and set IRF_PARAMS (mask the variadic tag in bit 0)
-    ldr x25, [x19, #AST_F2]     // x25 = first param decl (bit 0 = variadic)
-    bic x25, x25, #1
+    // Count parameters and set IRF_PARAMS (mask the variadic tag in bit 0 and
+    // the static tag in bit 1 before dereferencing the param pointer)
+    ldr x25, [x19, #AST_F2]     // x25 = first param decl (bit 0=variadic, bit 1=static)
+    bic x25, x25, #3
     mov x20, #0                   // param count
 .Libf_count_params:
     cbz x25, .Libf_count_done
@@ -916,8 +923,8 @@ _kcc_ir_build_func:
 
     // Build alloca + store for each parameter, passing its vreg BASE (which
     // accounts for two-vreg ST2 parameters), not its ordinal index.
-    ldr x25, [x19, #AST_F2]     // first param decl (bit 0 = variadic)
-    bic x25, x25, #1
+    ldr x25, [x19, #AST_F2]     // first param decl (bit 0=variadic, bit 1=static)
+    bic x25, x25, #3
     mov x20, #0                   // param index
     mov x24, #0                   // vreg base (cumulative)
 
@@ -1154,10 +1161,13 @@ _kcc_ir_build_param:
 
 .Libp_struct_copy:
     // The incoming register holds a pointer to the caller's struct;
-    // copy its N slots into this parameter's own storage (pass by value).
+    // copy exactly sizeof(param) bytes into this parameter's own storage
+    // (pass by value).  x20 still holds the parameter's type descriptor.
+    mov x0, x20
+    bl _kcc_type_layout
+    mov x2, x0                    // byte size (exact)
     mov x0, x22                  // src base = incoming pointer vreg
     mov x1, x23                  // dst base = local param storage
-    ldr x2, [sp, #56]           // N slots
     bl _kcc_ir_emit_struct_copy
 
 .Libp_record:
@@ -1545,8 +1555,10 @@ returned object into that destination, followed by a void
 expression rather than a loaded scalar: an identifier resolves to its
 alloca vreg, a nested call yields the address of its own result buffer,
 and \texttt{.f}/\texttt{[i]} lvalues reuse the member and subscript
-address builders.  \texttt{\_kcc\_ir\_type\_slots} gives the number of
-8-byte slots to copy, exactly matching the all-spill struct layout.
+address builders.  \texttt{\_kcc\_type\_layout} gives the exact byte
+size to copy through the hidden \texttt{sret} pointer; copying the exact
+size (rather than rounding up to whole slots) avoids overrunning the
+caller's result buffer.
 
 @d IR: build return @{
 // -- kcc_ir_build_return --------------------------------------------------
@@ -1647,8 +1659,10 @@ _kcc_ir_build_return:
 
 .Libret_struct_ref:
     // >16B: copy through the hidden result pointer (received in x8), void ret.
+    // Copy exactly sizeof(struct) bytes; the caller's sret buffer is sized to
+    // the struct, so rounding up could overrun it.
     mov x0, x19
-    bl _kcc_ir_type_slots        // slot count (kept in x2, untouched below)
+    bl _kcc_type_layout          // byte size (kept in x2, untouched below)
     mov x2, x0
     // The hidden sret pointer is the last reserved parameter vreg, i.e. the
     // sum of every parameter's vreg width minus one (an ST2 param takes two).

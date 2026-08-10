@@ -564,6 +564,18 @@ runtime start-up---the link line is
 from \texttt{\$SDKROOT} or, failing that, the two standard SDK locations.  After
 a successful link the intermediate object files are removed.
 
+Not every non-option argument is a source.  As the driver scans the command
+line it classifies each one: a name ending in \texttt{.c} is compiled to a
+temporary object; a leading \texttt{-} is an unrecognised linker flag
+(\texttt{-lm}, \texttt{-Lpath}, \texttt{-framework}) forwarded verbatim so
+\texttt{ld} sees it in order; and anything else---most importantly a
+pre-compiled \texttt{.o} or a \texttt{.a} archive---is handed straight to the
+linker.  This is what lets \texttt{kcc main.c libfoo.o -o app} mix sources and
+objects in one invocation, rather than trying to \emph{compile} the object and
+choking on its binary contents.  Only the objects kcc compiled itself are
+tracked in a temp-object list and removed afterwards; a \texttt{.o} supplied by
+the user is left untouched.
+
 Because this path compiles each source inline as it scans the arguments, it
 first makes a preliminary pass to honour \texttt{-Wall} and \texttt{-g}
 wherever they appear, so a warning or debug-info request applies to every
@@ -728,7 +740,7 @@ _kcc_driver_spawn:
 .globl _kcc_driver_link_all
 .p2align 2
 _kcc_driver_link_all:
-    stp x29, x30, [sp, #-96]!
+    stp x29, x30, [sp, #-112]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -737,6 +749,9 @@ _kcc_driver_link_all:
     str x27, [sp, #80]
     mov x19, x0                  // argc
     mov x20, x1                  // argv
+    // [sp,#88] = temp-object list (compiled .c → .o names to unlink after the
+    // link), [sp,#96] = its count.  Only these are removed; a .o handed to us
+    // on the command line is the user's and must survive.
 
     // Pass 1: honour -Wall and -g wherever they appear on the command line,
     // so every source is compiled with them active regardless of position
@@ -811,6 +826,13 @@ _kcc_driver_link_all:
     bl _kcc_arena_alloc
     mov x21, x0                  // larg
 
+    // Temp-object list: at most one per argument.
+    add x0, x19, #1
+    lsl x0, x0, #3
+    bl _kcc_arena_alloc
+    str x0, [sp, #88]           // temp-object array
+    str xzr, [sp, #96]          // temp-object count
+
     adrp x0, _kcc_str_ld_argv0@@PAGE
     add  x0, x0, _kcc_str_ld_argv0@@PAGEOFF
     str x0, [x21]                // larg[0] = "ld"
@@ -858,16 +880,52 @@ _kcc_driver_link_all:
     add x24, x24, x0
     b .Lla_loop
 .Lla_src:
-    // A source file: derive its object name, record it, compile it.
+    // Classify a non-option argument.  A leading '-' is an unrecognised linker
+    // flag (e.g. -lm, -Lpath, -framework): forward it verbatim so ld sees it in
+    // order.  A ".c" file is compiled to a temporary object.  Anything else
+    // (".o", ".a", or another file) is handed straight to the linker.
+    ldrb w0, [x27]
+    cmp w0, #'-'
+    b.eq .Lla_passthru
+    mov x0, x27
+    bl _kcc_strlen
+    cmp x0, #2
+    b.lt .Lla_object             // too short for "x.c" → treat as a linker input
+    add x1, x27, x0
+    ldrh w2, [x1, #-2]           // last two bytes, little-endian: 'c'<<8 | '.'
+    mov w3, #0x632E              // ".c"
+    cmp w2, w3
+    b.ne .Lla_object
+
+    // A ".c" source: compile it to a temporary object and record that object
+    // both for the linker (larg) and for later removal (temp-object list).
     mov x0, x27
     bl _kcc_driver_obj_name
     str x0, [x21, x22, lsl #3]   // larg[k] = obj name
+    ldr x1, [sp, #88]           // temp-object array
+    ldr x2, [sp, #96]           // temp-object count
+    str x0, [x1, x2, lsl #3]
+    add x2, x2, #1
+    str x2, [sp, #96]
     mov x1, x0                    // out
     mov x0, x27                   // src
     bl _kcc_driver_compile
     orr x25, x25, x0
     add x22, x22, #1
-    add x26, x26, #1
+    add x26, x26, #1              // a file input
+    add x24, x24, #1
+    b .Lla_loop
+.Lla_object:
+    // A pre-compiled object / archive / other file: pass to the linker as-is.
+    str x27, [x21, x22, lsl #3]
+    add x22, x22, #1
+    add x26, x26, #1              // a file input
+    add x24, x24, #1
+    b .Lla_loop
+.Lla_passthru:
+    // An unrecognised linker flag: forward it without counting it as an input.
+    str x27, [x21, x22, lsl #3]
+    add x22, x22, #1
     add x24, x24, #1
     b .Lla_loop
 .Lla_skipopt:
@@ -933,11 +991,14 @@ _kcc_driver_link_all:
     bl _kcc_driver_spawn
     mov x25, x0                    // link status
 
-    // Remove the intermediate objects (larg[1 .. source count]).
-    mov x24, #1
+    // Remove only the objects we compiled ourselves (the temp-object list);
+    // a .o passed in on the command line belongs to the user and is left alone.
+    ldr x21, [sp, #88]          // temp-object array
+    ldr x26, [sp, #96]          // temp-object count
+    mov x24, #0
 .Lla_unlink:
     cmp x24, x26
-    b.gt .Lla_done
+    b.ge .Lla_done
     ldr x0, [x21, x24, lsl #3]
     bl _kcc_sys_unlink
     add x24, x24, #1

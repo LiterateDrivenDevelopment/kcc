@@ -87,6 +87,15 @@ _kcc_parse_decl:
     // Function definition: parse body
     bl _kcc_parse_compound
     str x0, [x21, #AST_F3]      // body
+    // Record internal linkage.  A FuncDecl packs its params pointer in F2 with
+    // the variadic flag in bit 0; we reuse the next free low bit (bit 1) for the
+    // `static` storage class so the emitter can give the symbol local linkage.
+    cmp x20, #3                  // storage class 3 = static
+    b.ne .Ldecl_func_def_done
+    ldr x0, [x21, #AST_F2]
+    orr x0, x0, #2               // set bit 1 = static
+    str x0, [x21, #AST_F2]
+.Ldecl_func_def_done:
     mov x0, x21
     b .Ldecl_done
 

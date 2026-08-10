@@ -284,7 +284,14 @@ _kcc_parse_expr_rest:
     str x20, [x0, #AST_F0]
     str x19, [x0, #AST_F1]
     str x21, [x0, #AST_F2]
-    b .Lexpr_rest_done
+    // The assignment becomes the new left operand and parsing continues into
+    // the comma check---an assignment is a valid comma operand, so a statement
+    // like `a = 1, b = 2;` (which reaches this path because the leading `a` was
+    // consumed for label lookahead) must not stop after the assignment.  The
+    // binary and ternary arms already fall through here; the assignment arm
+    // used to jump straight to done, so `a = 1, b` failed with `expected ';'`.
+    mov x19, x0
+    b .Lexpr_rest_check_comma
 
 .Lexpr_rest_check_binary:
     // Check for binary operators via precedence

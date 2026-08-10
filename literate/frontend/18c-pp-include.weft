@@ -1090,6 +1090,59 @@ unsigned long c32rtomb(char *s, char32_t c32, void *ps);
 #endif
 @}
 
+\paragraph{POSIX file bridges.}
+Two POSIX headers round out what a library's gzip file wrappers need---zlib's
+\texttt{gz*} layer is the motivating case.  \verb|<fcntl.h>| supplies the
+open-flag macros and \texttt{open}; \verb|<unistd.h>| supplies the raw
+file-descriptor I/O (\texttt{read}, \texttt{write}, \texttt{close},
+\texttt{lseek}) and the \texttt{SEEK\_*} whence constants.  Neither is an ISO
+C header, but the front end needs the flag values and prototypes to type each
+call, and the linker binds them to \texttt{libSystem}.  Two details earn their
+keep: the open flags carry their exact Apple values, so the call reaches the
+platform \texttt{open} with the semantics it expects; and \texttt{lseek}
+returns the wide \texttt{off\_t} (and \texttt{read}/\texttt{write} an
+\texttt{ssize\_t}), so declaring them keeps a file offset or byte count from
+being truncated to \texttt{int} by an implicit declaration.
+
+@d Header: fcntl @{
+#ifndef _FCNTL_H
+#define _FCNTL_H
+typedef unsigned short mode_t;
+#define O_RDONLY   0x0000
+#define O_WRONLY   0x0001
+#define O_RDWR     0x0002
+#define O_ACCMODE  0x0003
+#define O_NONBLOCK 0x0004
+#define O_APPEND   0x0008
+#define O_CREAT    0x0200
+#define O_TRUNC    0x0400
+#define O_EXCL     0x0800
+#define O_CLOEXEC  0x1000000
+int open(const char *path, int oflag, ...);
+int creat(const char *path, mode_t mode);
+int fcntl(int fd, int cmd, ...);
+#endif
+@}
+
+@d Header: unistd @{
+#ifndef _UNISTD_H
+#define _UNISTD_H
+typedef long ssize_t;
+typedef long off_t;
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
+ssize_t read(int fd, void *buf, unsigned long nbyte);
+ssize_t write(int fd, const void *buf, unsigned long nbyte);
+int close(int fd);
+off_t lseek(int fd, off_t offset, int whence);
+int unlink(const char *path);
+int isatty(int fd);
+#endif
+@}
+
 \paragraph{End-to-end tests.}
 The preprocessor already runs ahead of the code generator, so these
 tests compile and execute programs that lean on it: object-like and

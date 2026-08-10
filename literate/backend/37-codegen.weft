@@ -364,6 +364,128 @@ the code buffer contains the machine code for every function but
 string literal data has not yet been appended---that is a separate
 finalization step (\S\ref{sec:emit-strings}).
 
+\paragraph{Pre-registering function symbols.}
+Before compiling any body, a first pass registers a defined linker symbol
+for every function, with a placeholder value of zero, and records its index
+in \texttt{IRF\_SYMIDX}.  Non-\texttt{static} functions are external
+(\texttt{N\_SECT $\vert$ N\_EXT}); \texttt{static} functions and the
+synthesised module-init are local (\texttt{N\_SECT}).  This ordering is what
+makes a forward reference resolve correctly: when \texttt{deflate} calls the
+\texttt{static} helper \texttt{deflate\_stored} that is defined \emph{later}
+in the file, the call site's \texttt{kcc\_linker\_extern} lookup finds the
+already-registered \emph{defined} symbol rather than minting a fresh
+undefined external.  Without the pre-pass, that forward reference produced an
+\texttt{N\_UNDF $\vert$ N\_EXT} symbol which the linker could coalesce with a
+global definition but never with a local one---so a \texttt{static} callee
+referenced before its definition failed to link.  The subsequent
+\texttt{kcc\_codegen\_func} then only patches the pre-registered symbol's
+\texttt{SYM\_VALUE} to the real code offset.
+
+@d CodeGen: compile all @{
+// -- kcc_cg_preregister_funcs -------------------------------------------------
+// void kcc_cg_preregister_funcs(void)
+// Registers a defined (value=0) linker symbol for every IR function, records
+// the index in IRF_SYMIDX, and enters non-modinit functions into the extern
+// hash table so forward call sites resolve to the definition.
+.text
+.globl _kcc_cg_preregister_funcs
+.p2align 2
+_kcc_cg_preregister_funcs:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lcpf_done
+    ldr x19, [x0, #VEC_COUNT]      // function count
+    mov x20, #0                    // index
+
+.Lcpf_loop:
+    cmp x20, x19
+    b.ge .Lcpf_done
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    bl _kcc_vec_get
+    ldr x21, [x0]                  // x21 = ir_func
+    ldr x22, [x21, #IRF_NAME]      // x22 = name
+
+    // is_modinit = (name == "kcc.module_init")
+    mov x0, x22
+    adrp x1, _kcc_str_modinit@@PAGE
+    add  x1, x1, _kcc_str_modinit@@PAGEOFF
+    bl _kcc_strcmp
+    cmp x0, #0
+    cset x23, eq                   // x23 = is_modinit
+
+    // Build "_" + name
+    mov x0, x22
+    bl _kcc_strlen
+    add x0, x0, #2
+    bl _kcc_arena_alloc
+    mov x24, x0                    // x24 = mangled name buffer
+    mov w1, #'_'
+    strb w1, [x24]
+    mov x0, x22
+    bl _kcc_strlen
+    add x2, x0, #1                 // len incl. null
+    add x0, x24, #1
+    mov x1, x22
+    bl _kcc_memcpy
+
+    // Linkage flags: external unless modinit or static
+    mov x3, #(N_SECT | N_EXT)
+    cbnz x23, .Lcpf_local
+    ldr x4, [x21, #IRF_STATIC]
+    cbz x4, .Lcpf_flags
+.Lcpf_local:
+    mov x3, #N_SECT
+.Lcpf_flags:
+    mov x0, x24                    // name
+    mov x1, #1                     // section 1 (__text)
+    mov x2, #0                     // value placeholder (patched by codegen_func)
+    bl _kcc_linker_add_sym
+    str x0, [x21, #IRF_SYMIDX]     // record index on the IR function
+
+    // modinit: record its symbol index and stay out of the extern table.
+    cbz x23, .Lcpf_extern
+    adrp x1, _kcc_modinit_sym@@PAGE
+    add  x1, x1, _kcc_modinit_sym@@PAGEOFF
+    add x2, x0, #1                 // index + 1 (0 = none)
+    str x2, [x1]
+    b .Lcpf_next
+
+.Lcpf_extern:
+    // Enter into the extern hash table so calls by name find this definition.
+    mov x22, x0                    // save sym index
+    mov x0, x24
+    bl _kcc_strlen
+    mov x2, x0                     // keylen
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x24                    // key = mangled name
+    add x3, x22, #1               // value = index + 1
+    bl _kcc_ht_put
+
+.Lcpf_next:
+    add x20, x20, #1
+    b .Lcpf_loop
+
+.Lcpf_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_cg_preregister_funcs
+@}
+
 @d CodeGen: compile all @{
 // -- kcc_codegen_all ----------------------------------------------------------
 // void kcc_codegen_all(void)
@@ -376,6 +498,9 @@ _kcc_codegen_all:
     mov x29, sp
     stp x19, x20, [sp, #16]
     str x21, [sp, #32]
+
+    // Pre-register every function symbol so forward references resolve.
+    bl _kcc_cg_preregister_funcs
 
     // Get IR functions vec
     adrp x0, _kcc_ir_funcs@@PAGE

@@ -170,16 +170,16 @@ _kcc_sema_check_decl:
     // Wrap in TY_FUNC, carrying the parameter declaration list (masked of the
     // variadic bit) so a call site can convert and classify each argument by
     // its parameter's type.
-    ldr x1, [x19, #AST_F2]         // params pointer (bit 0 = variadic)
-    bic x1, x1, #1
+    ldr x1, [x19, #AST_F2]         // params pointer (bit 0=variadic, bit 1=static)
+    bic x1, x1, #3
     bl _kcc_type_func
     mov x21, x0                     // TY_FUNC descriptor
 
     // Variadic prototype: record the fixed-param count in TY_QUALS (see prose).
-    ldr x2, [x19, #AST_F2]         // params pointer (bit 0 = variadic)
+    ldr x2, [x19, #AST_F2]         // params pointer (bit 0=variadic, bit 1=static)
     tst x2, #1
     b.eq .Lscd_func_declared
-    bic x2, x2, #1
+    bic x2, x2, #3
     mov x3, #0                     // nfixed
 .Lscd_func_nfixed:
     cbz x2, .Lscd_func_setq
@@ -216,9 +216,9 @@ _kcc_sema_check_decl:
     bl _kcc_symtab_push_scope
     bl _kcc_symtab_label_begin
 
-    // Process parameters (mask the variadic tag in bit 0)
-    ldr x0, [x19, #AST_F2]         // first param (bit 0 = variadic)
-    bic x0, x0, #1
+    // Process parameters (mask the variadic tag in bit 0, static tag in bit 1)
+    ldr x0, [x19, #AST_F2]         // first param (bit 0=variadic, bit 1=static)
+    bic x0, x0, #3
 .Lscd_param_loop:
     cbz x0, .Lscd_func_stmts
     mov x22, x0
@@ -546,10 +546,25 @@ mixed-type packing and zero-width separators are not yet modelled.
     // fallback: a forward typedef whose tag does not yet exist would otherwise
     // capture `int`, and a later `struct S { ... }` could never reach it.  It
     // also lets a self-referential member (`struct S *next`) resolve the tag
-    // from inside the body.
+    // from inside the body.  The tag can sit under pointer/array declarators,
+    // as in the opaque-handle idiom `typedef struct S_s *SP;` (zlib's
+    // \texttt{gzFile}): unwrap those layers to reach the base struct/union/enum
+    // node, or the later `struct S_s { ... }` completes a descriptor the
+    // typedef never saw and `p->member` fails on a pointer-to-int.
     ldr x0, [x19, #AST_F0]         // type node
     cbz x0, .Lscd_done
+.Lscd_td_unwrap:
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_PTR
+    b.eq .Lscd_td_unwrap_step
+    cmp x1, #AST_TYPE_ARRAY
+    b.ne .Lscd_td_check
+.Lscd_td_unwrap_step:
+    ldr x2, [x0, #AST_F0]          // pointee / element type
+    cbz x2, .Lscd_td_resolve       // malformed: nothing to pre-register
+    mov x0, x2
+    b .Lscd_td_unwrap
+.Lscd_td_check:
     cmp x1, #AST_TYPE_STRUCT
     b.eq .Lscd_td_pretag
     cmp x1, #AST_TYPE_UNION
@@ -557,7 +572,7 @@ mixed-type packing and zero-width separators are not yet modelled.
     cmp x1, #AST_TYPE_ENUM
     b.ne .Lscd_td_resolve
 .Lscd_td_pretag:
-    ldr x0, [x19, #AST_F0]         // struct/union/enum type node → declares tag
+    // x0 = the unwrapped struct/union/enum type node → declares the tag
     bl _kcc_sema_check_decl
 
 .Lscd_td_resolve:

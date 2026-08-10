@@ -56,7 +56,9 @@ Offset & Field & Description \\
 .equ IRF_PARAM_CLS, 48     // arena array of per-param AAPCS64 classes (or 0)
 .equ IRF_LINE,      56     // source declaration line (for DWARF; 0 if unknown)
 .equ IRF_LOWPC,     64     // code offset where the function begins (set by codegen)
-.equ IR_FUNC_SIZE,  72
+.equ IRF_STATIC,    72     // 1 if the function has internal linkage (static)
+.equ IRF_SYMIDX,    80     // linker symbol index (pre-registered by codegen)
+.equ IR_FUNC_SIZE,  88
 
 // -- BB flags -------------------------------------------------------------
 .equ BB_FLAG_TERMINATED, 1
@@ -289,7 +291,9 @@ _kcc_ir_alloc_bb:
 @}
 
 A function node holds the name, parameter count, a vector of basic blocks,
-and the vreg counter.
+and the vreg counter.  It also carries an \texttt{IRF\_STATIC} flag---set by
+the builder from the declaration's storage class---that later tells the
+emitter to give a \texttt{static} function local Mach-O linkage.
 
 @d IR: alloc function @{
 // -- kcc_ir_alloc_func ----------------------------------------------------
@@ -321,6 +325,8 @@ _kcc_ir_alloc_func:
     str xzr, [x21, #IRF_PARAM_CLS]
     str xzr, [x21, #IRF_LINE]      // set by the builder from the FUNC_DECL node
     str xzr, [x21, #IRF_LOWPC]     // set by codegen at function entry
+    str xzr, [x21, #IRF_STATIC]    // extern by default; builder sets it for static
+    str xzr, [x21, #IRF_SYMIDX]    // set by the codegen function pre-pass
 
     // Allocate blocks vec
     mov x0, #VEC_SIZE

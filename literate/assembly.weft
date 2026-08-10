@@ -615,6 +615,14 @@ suppressed (\texttt{-s}) so the shipped headers read cleanly:
 @<Header: uchar@>
 @}
 
+@o tmp/include/fcntl.h -s @{
+@<Header: fcntl@>
+@}
+
+@o tmp/include/unistd.h -s @{
+@<Header: unistd@>
+@}
+
 \bigskip
 \noindent\textbf{Test binaries} --- test runner and conformance tests
 (assembled separately; linked into \texttt{tmp/test\_kcc}):

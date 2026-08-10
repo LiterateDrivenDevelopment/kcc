@@ -48,11 +48,10 @@ spun forever walking it.  So both aggregate kinds take the copy path.
 
 The builder resolves both the LHS and RHS base addresses (alloca vreg or
 global ref) and calls \texttt{\_kcc\_ir\_emit\_struct\_copy}, which copies
-whole 8-byte slots.  The slot count is \texttt{ceil(TY\_SIZE/8)} of the
-aggregate---\emph{not} the number of fields, which for a union (a handful
-of overlapping members) or a struct with sub-word fields bears no relation
-to its size, and copying the wrong count either truncates the object or
-runs off its end into the neighbour.  Both sides accept the same lvalue
+exactly \texttt{TY\_SIZE} bytes---\emph{not} a number of fields, which for a
+union (a handful of overlapping members) or a struct with sub-word fields
+bears no relation to its size, and copying the wrong amount either truncates
+the object or runs off its end into the neighbour.  Both sides accept the same lvalue
 shapes: a plain variable, an aggregate-typed member, an array element
 \texttt{a[i]}, or a dereferenced pointer \texttt{*p}, whose pointer
 \emph{value} is the aggregate's address.  The destination must recognise
@@ -64,6 +63,18 @@ value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
 bytes to save \texttt{x19}--\texttt{x24}.  In all cases the returned
 vreg is the stored value, matching the C semantics where assignment
 is an expression (\stdref{6.5.16}).
+
+The current-value load that opens the compound path must carry the same
+narrow access-size code (from \texttt{\_kcc\_ir\_load\_width}) that its
+paired store uses---not the natural 8-byte default.  A narrow scalar
+occupies only the low bytes of its 8-byte stack slot, and the store writes
+just those bytes, so an 8-byte reload would splice the slot's stale upper
+bytes into the value.  This was invisible while the leaked bits happened to
+be zero, but surfaced in zlib's \texttt{inflate\_table}: an
+\texttt{unsigned incr} written 4 bytes wide and then updated with
+\texttt{incr >>= 1} was reloaded 8 bytes wide, so the 64-bit shift dragged
+the garbage upper word down into \texttt{incr} the first time the loop body
+ran, corrupting the Huffman sub-table walk into an out-of-bounds write.
 
 Parentheses around the target are transparent: \texttt{(x) = v} is
 \texttt{x = v}.  The lvalue dispatch keys on the target's node tag
@@ -182,13 +193,21 @@ _kcc_ir_build_assign:
     // Load current value.  Use the lvalue's own type (stashed at [sp,#64]) so a
     // floating local's compound update stays floating: the binop below inherits
     // this type and the back end selects FADD/FSUB/FMUL/FDIV instead of the
-    // integer opcodes.
+    // integer opcodes.  The load also carries an access-size code (IR_SRC2)
+    // derived from that type, exactly as the matching store does below: a
+    // narrow scalar occupies only the low bytes of its 8-byte slot, so reading
+    // it back at the natural 8-byte width would splice the slot's stale upper
+    // bytes into the value.  For an `unsigned incr` written with a 4-byte store,
+    // an 8-byte reload followed by `incr >>= 1` would shift that garbage down.
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
     ldr x1, [sp, #64]           // lvalue (LHS) type
     str x1, [x0, #IR_TYPE]
     str x22, [x0, #IR_SRC1]
     mov x19, x0
+    ldr x0, [sp, #64]           // lvalue type → load access-size code (IR_SRC2)
+    bl _kcc_ir_load_width
+    str x0, [x19, #IR_SRC2]     // narrow read must zero/sign-extend, not slurp 8 bytes
     bl _kcc_ir_next_vreg
     str x0, [x19, #IR_DEST]
     mov x23, x0                  // current value vreg
@@ -584,14 +603,13 @@ _kcc_ir_build_assign:
     b .Liba_sc_do_copy
 
 .Liba_sc_do_copy:
-    // x24 = src, x23 = dst, x21 = aggregate type.  Copy ceil(TY_SIZE/8)
-    // whole 8-byte slots; the field count is wrong for a union or a struct
-    // with sub-word fields.  _kcc_type_layout is idempotent, so it just
-    // returns the (already-computed) byte size.
+    // x24 = src, x23 = dst, x21 = aggregate type.  Copy exactly TY_SIZE bytes;
+    // a field count would be wrong for a union or a struct with sub-word fields.
+    // _kcc_type_layout is idempotent, so it just returns the (already-computed)
+    // byte size.
     mov x0, x21
     bl _kcc_type_layout         // x0 = aggregate byte size
-    add x0, x0, #7
-    lsr x2, x0, #3              // slot count = ceil(size / 8)
+    mov x2, x0                    // byte size (exact)
     mov x0, x24                  // src
     mov x1, x23                  // dst
     bl _kcc_ir_emit_struct_copy
@@ -664,6 +682,15 @@ run_test "global mul-assign" \
 
 run_test "global sub-assign" \
     "int g; int main(void) { g = 10; g -= 3; return g; }" 7
+
+run_test "narrow uchar shr-assign" \
+    "int main(void) { unsigned char c = 200; c >>= 1; return c; }" 100
+
+run_test "narrow ushort shr-assign" \
+    "int main(void) { unsigned short s = 40000; s >>= 8; return s; }" 156
+
+run_test "unsigned shr-assign loop" \
+    "int main(void) { unsigned incr = 1u << 14; unsigned huff = 0x7FFF; while (huff & incr) incr >>= 1; return incr == 0; }" 1
 @}
 
 \subsection{Function Call}
@@ -1703,14 +1730,19 @@ _kcc_ir_build_cast:
     b .Lbc_extend                // target > source: extend
 
 .Lbc_same_size:
-    // Equal byte width.  A sub-word integer value (char/short) is physically
-    // held in a register sign- or zero-extended according to its own type, so
-    // a cast that only flips signedness must re-extend the low `size` bytes to
-    // match the TARGET type -- otherwise (unsigned char)(signed char)0xFF would
-    // stay -1 instead of 255, which is exactly how Lua's zgetc misread every
-    // 0xFF byte as EOZ.  Word-width types (>=4 bytes) already share a bit
-    // pattern under AArch64's zero-extending 32-bit ops, so they need nothing.
-    cmp x1, #4
+    // Equal byte width.  A value narrower than 8 bytes is physically held in a
+    // 64-bit register sign- or zero-extended according to its own type, so a
+    // cast that only flips signedness must re-extend the low `size` bytes to
+    // match the TARGET type.  Two cases motivate this.  At sub-word width,
+    // (unsigned char)(signed char)0xFF must become 255, not -1 -- exactly how
+    // Lua's zgetc misread every 0xFF byte as EOZ.  At word width (4 bytes) the
+    // same applies whenever the source's upper 32 bits are dirty: a negative
+    // constant like -1 is held as 0xFFFFFFFFFFFFFFFF, so (unsigned)-1 must be
+    // masked to 0xFFFFFFFF -- otherwise `((unsigned)-1 >> 2) + 1` folds to 0
+    // instead of 0x40000000 (zlib's gz_comp used exactly that for its write
+    // chunk size, and a 0 made it loop forever writing nothing).  Only a full
+    // 8-byte value uses every bit already and needs no re-extension.
+    cmp x1, #8
     b.hs .Lbc_done
     ldr x3, [x22, #TY_F0]        // target signedness (1=signed, 0=unsigned)
     ldr x4, [x23, #TY_F0]        // source signedness

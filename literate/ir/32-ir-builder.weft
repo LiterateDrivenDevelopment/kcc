@@ -196,47 +196,148 @@ always agree.  It reads \texttt{const} straight from the declarator---peeling
 \texttt{AST\_TYPE\_ARRAY} to the innermost \texttt{AST\_TYPE\_QUALS} and testing
 bit~0---because semantics drops the qualifier from resolved descriptors, and it
 accepts an integer \emph{or floating} scalar or array whose initialiser is a
-matching scalar literal or a flat list of matching literals
-(\texttt{\_kcc\_rodata\_is\_lit}: integer/character literals for an integer
-element, floating literals for a \texttt{float}/\texttt{double} element);
-anything else (designators, nested braces, pointers, structs, non-literal
-elements) falls back to the ordinary writable path, correct but unprotected.
+matching scalar or a flat list of matching leaves (\texttt{\_kcc\_rodata\_is\_lit}):
+for an integer element, any symtab-free constant expression built from
+integer/character literals and the operators \texttt{\_kcc\_eval\_const\_int}
+folds (\texttt{\_kcc\_rodata\_const\_intexpr}, so \texttt{\{1<<0,\ 1<<1\}} or a
+masked literal qualifies); for a \texttt{float}/\texttt{double} element, a
+floating literal or a unary minus of one.  Anything else (identifiers,
+\texttt{sizeof}, designators, nested braces, pointers, structs) falls back to the
+ordinary writable path, correct but unprotected.
 
 @d IR: build @{
 // -- kcc_rodata_is_lit --------------------------------------------------------
+// uint64_t kcc_rodata_binop_ok(uint64_t op)
+// 1 iff op is a binary operator _kcc_eval_const_int folds (arithmetic, shift,
+// bitwise).  Comparison and logical ops are excluded so an accepted expression
+// tree never reaches eval's return-0 default (which would silently misfold).
+.text
+.globl _kcc_rodata_binop_ok
+.p2align 2
+_kcc_rodata_binop_ok:
+    cmp x0, #TOK_PLUS
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_MINUS
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_STAR
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_SLASH
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_PERCENT
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_SHL
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_SHR
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_AMP
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_PIPE
+    b.eq .Lrbo_yes
+    cmp x0, #TOK_CARET
+    b.eq .Lrbo_yes
+    mov x0, #0
+    ret
+.Lrbo_yes:
+    mov x0, #1
+    ret
+
+// uint64_t kcc_rodata_const_intexpr(node *n)
+// 1 iff n is an integer constant expression built ONLY from integer/character
+// literals and the operators _kcc_eval_const_int folds -- no identifiers and no
+// sizeof, so evaluation is symtab-free and unambiguous.  This lets a bit-flag
+// table (`{1<<0, 1<<1, 1<<2}`), a masked literal, or a negated constant reach
+// rodata; anything eval might misfold to 0 is rejected to the writable path.
+.text
+.globl _kcc_rodata_const_intexpr
+.p2align 2
+_kcc_rodata_const_intexpr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    cbz x19, .Lrci_no
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_INT_LIT
+    b.eq .Lrci_yes
+    cmp x0, #AST_CHAR_LIT
+    b.eq .Lrci_yes
+    cmp x0, #AST_PAREN_EXPR
+    b.eq .Lrci_paren
+    cmp x0, #AST_CAST_EXPR
+    b.eq .Lrci_cast
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Lrci_unary
+    cmp x0, #AST_BINARY_EXPR
+    b.eq .Lrci_binary
+    b .Lrci_no
+.Lrci_paren:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_rodata_const_intexpr
+    b .Lrci_done
+.Lrci_cast:
+    ldr x0, [x19, #AST_F1]          // cast value (type ignored, as eval does)
+    bl _kcc_rodata_const_intexpr
+    b .Lrci_done
+.Lrci_unary:
+    ldr x1, [x19, #AST_F0]          // op: minus/tilde/bang are folded by eval
+    cmp x1, #TOK_MINUS
+    b.eq .Lrci_un_ok
+    cmp x1, #TOK_TILDE
+    b.eq .Lrci_un_ok
+    cmp x1, #TOK_BANG
+    b.ne .Lrci_no
+.Lrci_un_ok:
+    ldr x0, [x19, #AST_F1]          // operand
+    bl _kcc_rodata_const_intexpr
+    b .Lrci_done
+.Lrci_binary:
+    ldr x0, [x19, #AST_F0]          // op must be in the folded set
+    bl _kcc_rodata_binop_ok
+    cbz x0, .Lrci_no
+    ldr x0, [x19, #AST_F1]          // lhs
+    bl _kcc_rodata_const_intexpr
+    cbz x0, .Lrci_no
+    ldr x0, [x19, #AST_F2]          // rhs
+    bl _kcc_rodata_const_intexpr
+    b .Lrci_done
+.Lrci_yes:
+    mov x0, #1
+    b .Lrci_done
+.Lrci_no:
+    mov x0, #0
+.Lrci_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
 // uint64_t kcc_rodata_is_lit(node *n, uint64_t isfloat)
-// 1 iff n is a literal of the expected class -- a floating literal when isfloat,
-// else an integer or character literal -- or a unary minus of one.  A negated
-// literal (`-4`, `-2.5`) is common in const tables, and routing it through
-// rodata also keeps its value correct (the writable aggregate-init path has a
-// separate bug negating a floating literal in an array).
+// For an integer element, n must be an integer constant expression
+// (kcc_rodata_const_intexpr).  For a floating element, a floating literal or a
+// unary minus of one -- _kcc_eval_const_int is integer-only, so a float leaf
+// stays a literal whose bits come straight from AST_F0.
 .text
 .globl _kcc_rodata_is_lit
 .p2align 2
 _kcc_rodata_is_lit:
+    cbnz x1, .Lril_float
+    b _kcc_rodata_const_intexpr     // integer: tail-call the validator
+.Lril_float:
     ldr x2, [x0, #AST_TAG]
     cmp x2, #AST_UNARY_EXPR
-    b.ne .Lril_direct
+    b.ne .Lril_fdirect
     ldr x3, [x0, #AST_F0]           // unary op
     cmp x3, #TOK_MINUS
-    b.ne .Lril_no
-    ldr x0, [x0, #AST_F1]           // operand must itself be a matching literal
-    cbz x0, .Lril_no
+    b.ne .Lril_fno
+    ldr x0, [x0, #AST_F1]           // operand must be a floating literal
+    cbz x0, .Lril_fno
     ldr x2, [x0, #AST_TAG]
-.Lril_direct:
-    cbnz x1, .Lril_float
-    cmp x2, #AST_INT_LIT
-    b.eq .Lril_yes
-    cmp x2, #AST_CHAR_LIT
-    b.eq .Lril_yes
-    b .Lril_no
-.Lril_float:
+.Lril_fdirect:
     cmp x2, #AST_FLOAT_LIT
-    b.eq .Lril_yes
-.Lril_no:
+    b.eq .Lril_fyes
+.Lril_fno:
     mov x0, #0
     ret
-.Lril_yes:
+.Lril_fyes:
     mov x0, #1
     ret
 
@@ -316,7 +417,7 @@ _kcc_global_const_rodata:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_rodata_is_lit _kcc_global_const_rodata
+@| _kcc_rodata_binop_ok _kcc_rodata_const_intexpr _kcc_rodata_is_lit _kcc_global_const_rodata
 @}
 
 @d IR: build @{

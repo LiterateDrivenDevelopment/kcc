@@ -410,28 +410,29 @@ zero-filled, matching C's default initialisation of the unmentioned elements.
 @d CodeGen: preregister globals @{
 // -- kcc_rodata_leaf_bits -----------------------------------------------------
 // uint64_t kcc_rodata_leaf_bits(node *n, uint64_t kind)
-// Raw initializer bits for a literal or a unary minus of one.  Floating
-// negation flips the sign bit of the double pattern; integer negation is
-// arithmetic.  The predicate guarantees a unary node is minus-of-literal.
+// Raw initializer bits for a leaf.  An integer element is a symtab-free constant
+// expression (kcc_rodata_const_intexpr accepted it), so it folds through
+// _kcc_eval_const_int -- literals, negation, and arithmetic alike.  A floating
+// element is a literal or a unary minus of one; its double bit pattern comes
+// straight from AST_F0, negation being a sign-bit flip.
 .text
 .globl _kcc_rodata_leaf_bits
 .p2align 2
 _kcc_rodata_leaf_bits:
+    cmp x1, #TY_FLOAT               // integer kinds are < TY_FLOAT
+    b.ge .Lrlb_fp
+    b _kcc_eval_const_int           // integer: tail-call the constant folder
+.Lrlb_fp:
     ldr x2, [x0, #AST_TAG]
     cmp x2, #AST_UNARY_EXPR
-    b.ne .Lrlb_lit
+    b.ne .Lrlb_flit
     ldr x2, [x0, #AST_F1]           // operand literal
-    ldr x0, [x2, #AST_F0]           // its bits / value
-    cmp x1, #TY_FLOAT               // integer kinds are < TY_FLOAT
-    b.lt .Lrlb_intneg
+    ldr x0, [x2, #AST_F0]           // its double bit pattern
     mov x3, #1
     lsl x3, x3, #63
-    eor x0, x0, x3                  // flip the double pattern's sign bit
+    eor x0, x0, x3                  // flip the sign bit
     ret
-.Lrlb_intneg:
-    neg x0, x0
-    ret
-.Lrlb_lit:
+.Lrlb_flit:
     ldr x0, [x0, #AST_F0]
     ret
 @| _kcc_rodata_leaf_bits

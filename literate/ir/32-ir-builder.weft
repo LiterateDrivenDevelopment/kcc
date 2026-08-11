@@ -197,13 +197,14 @@ always agree.  It reads \texttt{const} straight from the declarator---peeling
 bit~0---because semantics drops the qualifier from resolved descriptors, and it
 accepts an integer \emph{or floating} scalar or array whose initialiser is a
 matching scalar or a flat list of matching leaves (\texttt{\_kcc\_rodata\_is\_lit}):
-for an integer element, any symtab-free constant expression built from
-integer/character literals and the operators \texttt{\_kcc\_eval\_const\_int}
-folds (\texttt{\_kcc\_rodata\_const\_intexpr}, so \texttt{\{1<<0,\ 1<<1\}} or a
-masked literal qualifies); for a \texttt{float}/\texttt{double} element, a
-floating literal or a unary minus of one.  Anything else (identifiers,
-\texttt{sizeof}, designators, nested braces, pointers, structs) falls back to the
-ordinary writable path, correct but unprotected.
+for an integer element, any constant expression built from integer/character
+literals, enum-constant identifiers, and the operators
+\texttt{\_kcc\_eval\_const\_int} folds (\texttt{\_kcc\_rodata\_const\_intexpr},
+so \texttt{\{1<<0,\ 1<<1\}}, a masked literal, or \texttt{\{STATE\_A,\ STATE\_B\}}
+qualifies); for a \texttt{float}/\texttt{double} element, a floating literal or a
+unary minus of one.  Anything else (\texttt{sizeof}, non-enum identifiers,
+designators, nested braces, pointers, structs) falls back to the ordinary
+writable path, correct but unprotected.
 
 @d IR: build @{
 // -- kcc_rodata_is_lit --------------------------------------------------------
@@ -242,11 +243,14 @@ _kcc_rodata_binop_ok:
     ret
 
 // uint64_t kcc_rodata_const_intexpr(node *n)
-// 1 iff n is an integer constant expression built ONLY from integer/character
-// literals and the operators _kcc_eval_const_int folds -- no identifiers and no
-// sizeof, so evaluation is symtab-free and unambiguous.  This lets a bit-flag
-// table (`{1<<0, 1<<1, 1<<2}`), a masked literal, or a negated constant reach
-// rodata; anything eval might misfold to 0 is rejected to the writable path.
+// 1 iff n is an integer constant expression built from integer/character
+// literals, enum-constant identifiers, and the operators _kcc_eval_const_int
+// folds.  An identifier is accepted only when it names an enum constant, looked
+// up in the scope stack that both IR-build and codegen see identically (neither
+// modifies the frozen post-sema stack), so the predicate agrees in both phases;
+// sizeof and non-enum identifiers are rejected so eval never hits its return-0
+// default.  This lets bit-flag tables (`{1<<0, 1<<1}`), masked literals, negated
+// constants, and enum tables (`{STATE_A, STATE_B}`) reach rodata.
 .text
 .globl _kcc_rodata_const_intexpr
 .p2align 2
@@ -269,7 +273,25 @@ _kcc_rodata_const_intexpr:
     b.eq .Lrci_unary
     cmp x0, #AST_BINARY_EXPR
     b.eq .Lrci_binary
+    cmp x0, #AST_IDENT_EXPR
+    b.eq .Lrci_ident
     b .Lrci_no
+.Lrci_ident:
+    // An identifier is a constant only when it names an enum constant; the
+    // symbol table is consulted identically at IR-build and codegen (both after
+    // sema), so the predicate agrees in both phases and _kcc_eval_const_int
+    // yields the enumerator's value.
+    ldr x0, [x19, #AST_F0]          // name ptr
+    cbz x0, .Lrci_no
+    bl _kcc_strlen
+    mov x1, x0
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_symtab_lookup
+    cbz x0, .Lrci_no
+    ldr x1, [x0, #SYM_KIND]
+    cmp x1, #SYM_ENUM_CONST
+    b.ne .Lrci_no
+    b .Lrci_yes
 .Lrci_paren:
     ldr x0, [x19, #AST_F0]
     bl _kcc_rodata_const_intexpr

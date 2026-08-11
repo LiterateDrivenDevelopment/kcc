@@ -390,7 +390,9 @@ When \texttt{\_kcc\_global\_const\_rodata} (\S\ref{sec:global-inits}) accepts a
 declaration, pre-registration routes it here instead of reserving
 \texttt{\_\_common} storage.  \texttt{\_kcc\_emit\_rodata\_global} evaluates the
 initialiser to a byte image directly---an integer or character literal's value
-lives in its \texttt{AST\_F0}, so no expression lowering is needed---and appends
+lives in its \texttt{AST\_F0}, and a floating literal's is the IEEE-754 double
+bit pattern there (narrowed to single precision for a \texttt{float} element by
+a compile-time \texttt{fcvt}), so no expression lowering is needed---and appends
 it to the same growable buffer that holds string literals, which
 \texttt{\_kcc\_codegen\_emit\_strings} concatenates onto the read-only
 \texttt{\_\_text} tail.  Three bookkeeping steps make the object linkable and
@@ -405,7 +407,49 @@ $\max(\mathit{layout},\ \mathit{count}\times\mathit{elem})$ so a type whose
 inferred array length lags its initialiser cannot under-allocate; the tail is
 zero-filled, matching C's default initialisation of the unmentioned elements.
 
+@d CodeGen: preregister globals @{
+// -- kcc_rodata_leaf_bits -----------------------------------------------------
+// uint64_t kcc_rodata_leaf_bits(node *n, uint64_t kind)
+// Raw initializer bits for a literal or a unary minus of one.  Floating
+// negation flips the sign bit of the double pattern; integer negation is
+// arithmetic.  The predicate guarantees a unary node is minus-of-literal.
+.text
+.globl _kcc_rodata_leaf_bits
+.p2align 2
+_kcc_rodata_leaf_bits:
+    ldr x2, [x0, #AST_TAG]
+    cmp x2, #AST_UNARY_EXPR
+    b.ne .Lrlb_lit
+    ldr x2, [x0, #AST_F1]           // operand literal
+    ldr x0, [x2, #AST_F0]           // its bits / value
+    cmp x1, #TY_FLOAT               // integer kinds are < TY_FLOAT
+    b.lt .Lrlb_intneg
+    mov x3, #1
+    lsl x3, x3, #63
+    eor x0, x0, x3                  // flip the double pattern's sign bit
+    ret
+.Lrlb_intneg:
+    neg x0, x0
+    ret
+.Lrlb_lit:
+    ldr x0, [x0, #AST_F0]
+    ret
+@| _kcc_rodata_leaf_bits
+@}
+
 @d CodeGen: rodata write LE @{
+    // A floating literal always carries the IEEE-754 *double* bit pattern in
+    // AST_F0.  For a float element, narrow it to single precision (the value
+    // model is double, but its 4-byte memory image is single) with a hardware
+    // fcvt on the literal itself; a double element keeps all 8 bytes, an integer
+    // element writes its value verbatim.
+    ldr x11, [x23, #TY_KIND]
+    cmp x11, #TY_FLOAT
+    b.ne 3f
+    fmov d0, x6
+    fcvt s0, d0
+    fmov w6, s0                    // x6 = single-precision bits (upper 32 = 0)
+3:
     // Write x24 little-endian bytes of the value in x6 at x25[x26].
     mov x8, x6                     // value
     mov x9, #0                     // byte index
@@ -512,13 +556,18 @@ _kcc_emit_rodata_global:
     ldr x28, [x0, #AST_F0]         // first element
 .Lerg_wr_loop:
     cbz x28, .Lerg_zero
-    ldr x6, [x28, #AST_F0]         // literal value
+    mov x0, x28
+    ldr x1, [x23, #TY_KIND]        // element kind (for negation / narrowing)
+    bl _kcc_rodata_leaf_bits
+    mov x6, x0                     // literal bits (negated if unary minus)
     @<CodeGen: rodata write LE@>
     add x26, x26, x24
     ldr x28, [x28, #AST_F4]
     b .Lerg_wr_loop
 .Lerg_scalar_wr:
-    ldr x6, [x0, #AST_F0]          // scalar literal value
+    ldr x1, [x23, #TY_KIND]        // x0 already = init node
+    bl _kcc_rodata_leaf_bits
+    mov x6, x0                     // scalar literal bits
     @<CodeGen: rodata write LE@>
     add x26, x26, x24
 

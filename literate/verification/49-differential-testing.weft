@@ -479,6 +479,14 @@ difftest "rodata-const-index-var" \
     "static const int t[4] = {11,22,33,44}; int at(int i){ return t[i]; } int main(void){ return at(2) - at(0); }"
 difftest "rodata-const-partial" \
     "static const int t[6] = {9,8,7}; int main(void){ int s=0; for(int i=0;i<6;i++) s+=t[i]; return s; }"
+difftest "rodata-const-neg-int" \
+    "static const int t[] = {-1,2,-3,4}; int main(void){ int s=0; for(int i=0;i<4;i++) s+=t[i]; return s + 100; }"
+difftest "rodata-const-double" \
+    "static const double t[] = {1.5,2.25,-4.0}; int main(void){ double s=0; for(int i=0;i<3;i++) s+=t[i]; return (int)(s*100); }"
+difftest "rodata-const-float" \
+    "static const float t[] = {0.5f,1.25f,-2.0f}; int main(void){ float s=0; for(int i=0;i<3;i++) s+=t[i]; return (int)(s*100); }"
+difftest "rodata-const-double-scalar" \
+    "const double pi = 3.14159; int main(void){ return (int)(pi*1000); }"
 
 difftest "ternary-chain" \
     "int main(void){ int x = 3; return x == 1 ? 10 : x == 2 ? 20 : x == 3 ? 30 : 40; }"

@@ -195,24 +195,45 @@ lay the bytes) consult; being a pure function of the declaration AST, they
 always agree.  It reads \texttt{const} straight from the declarator---peeling
 \texttt{AST\_TYPE\_ARRAY} to the innermost \texttt{AST\_TYPE\_QUALS} and testing
 bit~0---because semantics drops the qualifier from resolved descriptors, and it
-accepts only an integer scalar or array whose initialiser is a scalar literal
-or a flat list of integer/character literals (\texttt{\_kcc\_rodata\_is\_lit});
-anything else (designators, nested braces, pointers, floats, non-literal
+accepts an integer \emph{or floating} scalar or array whose initialiser is a
+matching scalar literal or a flat list of matching literals
+(\texttt{\_kcc\_rodata\_is\_lit}: integer/character literals for an integer
+element, floating literals for a \texttt{float}/\texttt{double} element);
+anything else (designators, nested braces, pointers, structs, non-literal
 elements) falls back to the ordinary writable path, correct but unprotected.
 
 @d IR: build @{
 // -- kcc_rodata_is_lit --------------------------------------------------------
-// uint64_t kcc_rodata_is_lit(node *n)
-// 1 iff n is an integer or character literal (value readable from AST_F0).
+// uint64_t kcc_rodata_is_lit(node *n, uint64_t isfloat)
+// 1 iff n is a literal of the expected class -- a floating literal when isfloat,
+// else an integer or character literal -- or a unary minus of one.  A negated
+// literal (`-4`, `-2.5`) is common in const tables, and routing it through
+// rodata also keeps its value correct (the writable aggregate-init path has a
+// separate bug negating a floating literal in an array).
 .text
 .globl _kcc_rodata_is_lit
 .p2align 2
 _kcc_rodata_is_lit:
-    ldr x1, [x0, #AST_TAG]
-    cmp x1, #AST_INT_LIT
+    ldr x2, [x0, #AST_TAG]
+    cmp x2, #AST_UNARY_EXPR
+    b.ne .Lril_direct
+    ldr x3, [x0, #AST_F0]           // unary op
+    cmp x3, #TOK_MINUS
+    b.ne .Lril_no
+    ldr x0, [x0, #AST_F1]           // operand must itself be a matching literal
+    cbz x0, .Lril_no
+    ldr x2, [x0, #AST_TAG]
+.Lril_direct:
+    cbnz x1, .Lril_float
+    cmp x2, #AST_INT_LIT
     b.eq .Lril_yes
-    cmp x1, #AST_CHAR_LIT
+    cmp x2, #AST_CHAR_LIT
     b.eq .Lril_yes
+    b .Lril_no
+.Lril_float:
+    cmp x2, #AST_FLOAT_LIT
+    b.eq .Lril_yes
+.Lril_no:
     mov x0, #0
     ret
 .Lril_yes:
@@ -221,15 +242,18 @@ _kcc_rodata_is_lit:
 
 // -- kcc_global_const_rodata --------------------------------------------------
 // uint64_t kcc_global_const_rodata(node *decl)
-// 1 iff decl is a const-qualified integer scalar/array global whose
-// initializer is a scalar literal or a flat list of integer/char literals.
+// 1 iff decl is a const-qualified scalar/array global of an integer or
+// floating element type whose initializer is a matching scalar literal or a
+// flat list of matching literals (integer/char literals for an integer element,
+// floating literals for a float/double element).
 .text
 .globl _kcc_global_const_rodata
 .p2align 2
 _kcc_global_const_rodata:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
     mov x19, x0
     ldr x0, [x19, #AST_F2]         // must have an initializer
     cbz x0, .Lgcr_no
@@ -251,22 +275,33 @@ _kcc_global_const_rodata:
     cbz x0, .Lgcr_no
     bl _kcc_sema_resolve_type
     cbz x0, .Lgcr_no
-    ldr x2, [x0, #TY_KIND]          // integer kinds: TY_BOOL(2)..TY_LLONG(7)
+    ldr x2, [x0, #TY_KIND]
+    // Integer kinds TY_BOOL(2)..TY_LLONG(7) take integer literals; the floating
+    // kinds TY_FLOAT(8)/TY_DOUBLE(9) take floating literals.  x21 = float mode.
     cmp x2, #TY_BOOL
     b.lt .Lgcr_no
     cmp x2, #TY_LLONG
+    b.le .Lgcr_intmode
+    cmp x2, #TY_DOUBLE
     b.gt .Lgcr_no
+    mov x21, #1                     // float/double element
+    b .Lgcr_init
+.Lgcr_intmode:
+    mov x21, #0
+.Lgcr_init:
     ldr x0, [x19, #AST_F2]          // initializer shape
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_INIT_LIST
     b.eq .Lgcr_list
-    bl _kcc_rodata_is_lit           // scalar: the init node itself
+    mov x1, x21                     // scalar: the init node itself
+    bl _kcc_rodata_is_lit
     b .Lgcr_done
 .Lgcr_list:
     ldr x20, [x0, #AST_F0]          // first element
 .Lgcr_list_loop:
-    cbz x20, .Lgcr_yes              // every element was a literal
+    cbz x20, .Lgcr_yes              // every element was a matching literal
     mov x0, x20
+    mov x1, x21
     bl _kcc_rodata_is_lit
     cbz x0, .Lgcr_no
     ldr x20, [x20, #AST_F4]         // next element
@@ -277,8 +312,9 @@ _kcc_global_const_rodata:
 .Lgcr_no:
     mov x0, #0
 .Lgcr_done:
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 @| _kcc_rodata_is_lit _kcc_global_const_rodata
 @}

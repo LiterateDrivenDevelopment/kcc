@@ -249,9 +249,20 @@ _kcc_preregister_globals:
     mov x1, x20
     bl _kcc_memcpy
 
+    // A const integer global with a literal initializer becomes read-only bytes
+    // in __TEXT rather than __common storage.
+    mov x0, x19
+    bl _kcc_global_const_rodata
+    cbz x0, .Lprg_common
+    mov x0, x19                  // decl
+    mov x1, x22                  // "_"+name
+    bl _kcc_emit_rodata_global
+    b .Lprg_defined
+.Lprg_common:
     mov x0, x22
     mov x1, x21
     bl _kcc_linker_global_sym
+.Lprg_defined:
 
     // Remember the source name as defined-in-this-TU
     mov x0, x20
@@ -332,9 +343,19 @@ _kcc_preregister_globals:
     mov x1, x21
     bl _kcc_memcpy
 
+    // Read-only const static locals go to __TEXT like file-scope const globals.
+    mov x0, x20                  // static decl
+    bl _kcc_global_const_rodata
+    cbz x0, .Lprg_st_common
+    mov x0, x20
+    mov x1, x23                  // "_"+mangled name
+    bl _kcc_emit_rodata_global
+    b .Lprg_st_defined
+.Lprg_st_common:
     mov x0, x23                  // "_"+mangled name
     mov x1, x22                  // byte size
     bl _kcc_linker_global_sym
+.Lprg_st_defined:
 
     mov x0, x21
     bl _kcc_strlen
@@ -360,6 +381,206 @@ _kcc_preregister_globals:
     ldp x29, x30, [sp], #64
     ret
 @| _kcc_preregister_globals
+@}
+
+\subsection{Read-Only Const Globals}
+\label{sec:codegen-rodata}
+
+When \texttt{\_kcc\_global\_const\_rodata} (\S\ref{sec:global-inits}) accepts a
+declaration, pre-registration routes it here instead of reserving
+\texttt{\_\_common} storage.  \texttt{\_kcc\_emit\_rodata\_global} evaluates the
+initialiser to a byte image directly---an integer or character literal's value
+lives in its \texttt{AST\_F0}, so no expression lowering is needed---and appends
+it to the same growable buffer that holds string literals, which
+\texttt{\_kcc\_codegen\_emit\_strings} concatenates onto the read-only
+\texttt{\_\_text} tail.  Three bookkeeping steps make the object linkable and
+referenceable: a \emph{section-1} symbol at the object's buffer offset (external
+unless the object is a \texttt{static} local); a \texttt{\_kcc\_cstr\_fixups}
+entry so the symbol's value is patched to $\mathit{code\_size}+\mathit{offset}$
+alongside the string literals; and a \texttt{\_kcc\_linker\_extern\_ht} entry so
+that every \texttt{IR\_GLOBAL\_REF}---which dedups through
+\texttt{\_kcc\_linker\_global\_sym}---resolves to this read-only symbol rather
+than allocating a fresh writable slot.  The reservation spans
+$\max(\mathit{layout},\ \mathit{count}\times\mathit{elem})$ so a type whose
+inferred array length lags its initialiser cannot under-allocate; the tail is
+zero-filled, matching C's default initialisation of the unmentioned elements.
+
+@d CodeGen: rodata write LE @{
+    // Write x24 little-endian bytes of the value in x6 at x25[x26].
+    mov x8, x6                     // value
+    mov x9, #0                     // byte index
+1:  cmp x9, x24
+    b.ge 2f
+    add x10, x26, x9
+    strb w8, [x25, x10]
+    lsr x8, x8, #8
+    add x9, x9, #1
+    b 1b
+2:
+@}
+
+@d CodeGen: preregister globals @{
+// -- kcc_emit_rodata_global ---------------------------------------------------
+// void kcc_emit_rodata_global(node *decl, char *uname)
+//   decl  = AST_VAR_DECL accepted by kcc_global_const_rodata
+//   uname = linker symbol name ("_"+source or "_"+mangled), arena-owned
+// Lays the initializer's byte image into the read-only cstring buffer and mints
+// a section-1 symbol at that offset, with a fixup (value patched to
+// code_size+offset) and an extern-table dedup entry so IR_GLOBAL_REF resolves
+// here instead of allocating __common storage.
+.text
+.globl _kcc_emit_rodata_global
+.p2align 2
+_kcc_emit_rodata_global:
+    stp x29, x30, [sp, #-112]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+    mov x19, x0                    // decl
+    mov x20, x1                    // uname
+
+    // Resolve type; total byte size; element type and size.
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    mov x21, x0                    // full type
+    bl _kcc_type_layout            // x0 = total size
+    mov x22, x0                    // x22 = total (becomes span)
+    ldr x0, [x21, #TY_KIND]
+    cmp x0, #TY_ARRAY
+    b.ne .Lerg_scalar_ty
+    ldr x23, [x21, #TY_F0]         // element type
+    b .Lerg_have_ty
+.Lerg_scalar_ty:
+    mov x23, x21                   // scalar: element is the type itself
+.Lerg_have_ty:
+    ldr x24, [x23, #TY_SIZE]       // element size
+
+    // Count elements; span = max(total, count*elem) guards a type whose
+    // inferred array length lags the initializer.
+    mov x9, #0
+    ldr x0, [x19, #AST_F2]
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.ne .Lerg_scalar_cnt
+    ldr x2, [x0, #AST_F0]
+.Lerg_cnt_loop:
+    cbz x2, .Lerg_cnt_done
+    add x9, x9, #1
+    ldr x2, [x2, #AST_F4]
+    b .Lerg_cnt_loop
+.Lerg_scalar_cnt:
+    mov x9, #1
+.Lerg_cnt_done:
+    mul x10, x9, x24
+    cmp x10, x22
+    csel x22, x10, x22, gt         // x22 = span
+
+    // Align the buffer position up to the element alignment (remember pos).
+    adrp x0, _kcc_cstr_pos@@PAGE
+    add  x0, x0, _kcc_cstr_pos@@PAGEOFF
+    ldr x26, [x0]                  // x26 = pos
+    ldr x9, [x23, #TY_ALIGN]
+    sub x11, x9, #1
+    add x8, x26, x11
+    bic x27, x8, x11              // x27 = O (aligned start)
+
+    // Reserve O+span; the buffer may relocate, so re-read it afterwards.
+    add x0, x27, x22
+    bl _kcc_cstr_reserve
+    adrp x0, _kcc_cstr_buf@@PAGE
+    add  x0, x0, _kcc_cstr_buf@@PAGEOFF
+    ldr x25, [x0]                  // x25 = buffer (stable after reserve)
+
+    // Zero the alignment padding [pos, O).
+    mov x1, x26
+.Lerg_pad:
+    cmp x1, x27
+    b.ge .Lerg_write
+    strb wzr, [x25, x1]
+    add x1, x1, #1
+    b .Lerg_pad
+
+.Lerg_write:
+    mov x26, x27                   // x26 = w (write cursor), from O
+    ldr x0, [x19, #AST_F2]
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.ne .Lerg_scalar_wr
+    ldr x28, [x0, #AST_F0]         // first element
+.Lerg_wr_loop:
+    cbz x28, .Lerg_zero
+    ldr x6, [x28, #AST_F0]         // literal value
+    @<CodeGen: rodata write LE@>
+    add x26, x26, x24
+    ldr x28, [x28, #AST_F4]
+    b .Lerg_wr_loop
+.Lerg_scalar_wr:
+    ldr x6, [x0, #AST_F0]          // scalar literal value
+    @<CodeGen: rodata write LE@>
+    add x26, x26, x24
+
+.Lerg_zero:
+    // Zero-fill the tail [w, O+span).
+    add x7, x27, x22
+.Lerg_zf:
+    cmp x26, x7
+    b.ge .Lerg_sym
+    strb wzr, [x25, x26]
+    add x26, x26, #1
+    b .Lerg_zf
+
+.Lerg_sym:
+    // Advance cstr_pos past this object.
+    add x0, x27, x22
+    adrp x1, _kcc_cstr_pos@@PAGE
+    add  x1, x1, _kcc_cstr_pos@@PAGEOFF
+    str x0, [x1]
+
+    // Mint symbol: section 1 (__text), value 0 (patched later).  External
+    // unless the object is a static local (storage class 3).
+    ldr x0, [x19, #AST_F3]
+    mov x3, #N_SECT
+    cmp x0, #3
+    b.eq .Lerg_flags
+    orr x3, x3, #N_EXT
+.Lerg_flags:
+    mov x0, x20                    // name
+    mov x1, #1                     // section 1
+    mov x2, #0                     // value placeholder
+    bl _kcc_linker_add_sym
+    mov x21, x0                    // sym_index
+
+    // Fixup {sym_index, O}: emit_strings patches value to code_size + O.
+    str x21, [sp, #96]
+    str x27, [sp, #104]
+    adrp x0, _kcc_cstr_fixups@@PAGE
+    add  x0, x0, _kcc_cstr_fixups@@PAGEOFF
+    ldr x0, [x0]
+    add x1, sp, #96
+    bl _kcc_vec_push
+
+    // Dedup entry: IR_GLOBAL_REF via kcc_linker_global_sym resolves here.
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0                     // keylen
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    add x3, x21, #1               // value = sym_index + 1
+    bl _kcc_ht_put
+
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #112
+    ret
+@| _kcc_emit_rodata_global
 @}
 
 \section{Compile All Functions}

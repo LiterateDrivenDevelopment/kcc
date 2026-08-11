@@ -81,7 +81,7 @@ M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{flo
 M2 & Harden the IR verifier                    & neutral & \meterB & \stDone\\
 M3 & Systematic conformance battery            & neutral & \meterA & \stDone\\
 M4 & Broaden the IR optimizer (strength reduction + copy propagation) & neutral & \meterA & \stDone\\
-M5 & Write-protect read-only data (stray writes fault, not corrupt) & oracle & \meterB & \stOpen\\
+M5 & Write-protect read-only data (stray writes fault, not corrupt) & oracle & \meterB & \stPart\\
 M6 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
 \hline
 M7 & Second target (x86-64 / ELF)              & backend & \meterA & \stOpen\\
@@ -381,10 +381,17 @@ the identity comparisons that depend on them---stay untouched.
 \item \textbf{Stage~1.}  A \texttt{const}-qualified static whose initialiser is a
       non-relocatable compile-time constant (integer/float scalars and
       aggregates of them---the \texttt{optsnum[]} victim class) is emitted into
-      \texttt{\_\_TEXT,\_\_const}: its bytes are evaluated at compile time into a
-      new file-backed data buffer, its symbol is routed to the new section, and
-      its \texttt{module\_init} stores are suppressed.  This alone protects the
-      most common const tables and is the first landing.
+      read-only \texttt{\_\_TEXT} \emph{(landed)}.  Rather than mint a new
+      \texttt{section\_64}, it reuses the existing read-only tail that already
+      carries string literals (the growable \texttt{\_kcc\_cstr\_buf} appended to
+      \texttt{\_\_text}): its bytes are evaluated at compile time from the
+      literal initialiser, a section-1 symbol is minted at that offset with a
+      fixup (value patched to $\mathit{code\_size}+\mathit{offset}$) and an
+      extern-table entry so every \texttt{IR\_GLOBAL\_REF} dedups to it, and its
+      \texttt{module\_init} stores are suppressed.  A stray write into such a
+      table now faults (\texttt{SIGBUS}) at the store instead of silently
+      corrupting a neighbour.  Structs, floats, and non-literal constant
+      initialisers still take the writable path and are a later slice.
 \item \textbf{Stage~2.}  A \texttt{const} static whose initialiser contains
       address relocations (e.g.\ \texttt{static const char *const opts[]}) goes
       to \texttt{\_\_DATA\_CONST,\_\_const}, where \texttt{ld}/dyld apply the
@@ -412,14 +419,17 @@ stray write into a \texttt{const} table now aborts at the store, with
 \texttt{lldb} reporting the writing instruction, instead of surfacing as
 distant corruption.
 
-\textbf{Status.}  Open, scope re-estimated after reconnaissance.  The defect is
-characterised, its exemplar (the Lua \texttt{:109} flake) documented, and the
-data path mapped end to end; the remaining work is the file-backed rodata
-pipeline of the staged items above (a real initialised-data section plus a
-compile-time initialiser evaluator), not the flag flip the one-line summary once
-implied.  Being kind~B, this milestone may proceed in parallel with M1--M4 and
-need not precede the seam refactor---but doing it \emph{early} would have turned
-three
+\textbf{Status.}  Partial---Stage~1 landed.  A \texttt{const} integer scalar or
+array with a literal initialiser is now write-protected: its bytes live in
+read-only \texttt{\_\_TEXT}, a laundered write to one faults with \texttt{SIGBUS}
+at the store, and the whole corpus stays green (codegen~222, difftest~213 with
+five new \texttt{rodata-*} cases, self-host~222, Lua \texttt{final OK} with
+\texttt{optsnum[]} now in read-only memory, zlib self-test).  Multi-TU
+\texttt{extern const} references and the \texttt{module\_init} path are verified.
+Remaining: Stage~1's struct/float/non-literal cases, then Stage~2
+(pointer-const $\to$ \texttt{\_\_DATA\_CONST}) and the optional Stage~3.  Being
+kind~B, this milestone may proceed in parallel with M1--M4 and need not precede
+the seam refactor---but doing it \emph{early} would have turned three
 past heisenbugs (Bugs~32, 38, 45) into one-line faults at the store site, which
 is the standing argument for scheduling oracle-hardening sooner rather than
 later.

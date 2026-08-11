@@ -465,6 +465,21 @@ difftest "strength-mul-zero" \
 difftest "strength-nonpow2" \
     "unsigned f(unsigned x){ return x*3 + x/5 + x%7; } int main(void){ return (int)f(100); }"
 
+# Read-only const globals (M5): a const integer scalar/array with a literal
+# initializer is emitted as read-only bytes in __TEXT rather than __common
+# storage.  These verify the byte image reads back correctly (the write-fault
+# property is out of band for a differential runtime test).
+difftest "rodata-const-array" \
+    "static const int t[] = {0,1,2,3,5,6,7,9,10,11}; int main(void){ int s=0; for(int i=0;i<10;i++) s+=t[i]; return s; }"
+difftest "rodata-const-scalar" \
+    "const int k = 1234; int main(void){ return k % 200; }"
+difftest "rodata-const-char" \
+    "static const char c[] = {'A','B','C','D'}; int main(void){ return c[0]+c[3]; }"
+difftest "rodata-const-index-var" \
+    "static const int t[4] = {11,22,33,44}; int at(int i){ return t[i]; } int main(void){ return at(2) - at(0); }"
+difftest "rodata-const-partial" \
+    "static const int t[6] = {9,8,7}; int main(void){ int s=0; for(int i=0;i<6;i++) s+=t[i]; return s; }"
+
 difftest "ternary-chain" \
     "int main(void){ int x = 3; return x == 1 ? 10 : x == 2 ? 20 : x == 3 ? 30 : 40; }"
 difftest "comma" \

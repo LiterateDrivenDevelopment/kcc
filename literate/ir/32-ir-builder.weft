@@ -182,6 +182,107 @@ BSS already supplies the zero.  Static locals declared inside nested
 blocks are not yet swept by this pass, so a non-zero initialiser on one
 is not applied (its storage still persists, starting at zero).
 
+\paragraph{Read-only const globals (M5).}  Most globals are zero-initialised
+storage seeded at load time by the stores this routine emits.  A
+\texttt{const} global whose initialiser is a pure integer byte image is
+different: the back end places its bytes in the read-only \texttt{\_\_TEXT}
+tail (\S\ref{sec:mt-m5}), where a stray write faults rather than silently
+corrupting a neighbour.  Such an object has \emph{no} writable storage, so this
+routine must \emph{not} emit a runtime store for it---a store into a read-only
+page would fault at startup.  \texttt{\_kcc\_global\_const\_rodata} is the
+predicate both this routine (to suppress the store) and the code generator (to
+lay the bytes) consult; being a pure function of the declaration AST, they
+always agree.  It reads \texttt{const} straight from the declarator---peeling
+\texttt{AST\_TYPE\_ARRAY} to the innermost \texttt{AST\_TYPE\_QUALS} and testing
+bit~0---because semantics drops the qualifier from resolved descriptors, and it
+accepts only an integer scalar or array whose initialiser is a scalar literal
+or a flat list of integer/character literals (\texttt{\_kcc\_rodata\_is\_lit});
+anything else (designators, nested braces, pointers, floats, non-literal
+elements) falls back to the ordinary writable path, correct but unprotected.
+
+@d IR: build @{
+// -- kcc_rodata_is_lit --------------------------------------------------------
+// uint64_t kcc_rodata_is_lit(node *n)
+// 1 iff n is an integer or character literal (value readable from AST_F0).
+.text
+.globl _kcc_rodata_is_lit
+.p2align 2
+_kcc_rodata_is_lit:
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INT_LIT
+    b.eq .Lril_yes
+    cmp x1, #AST_CHAR_LIT
+    b.eq .Lril_yes
+    mov x0, #0
+    ret
+.Lril_yes:
+    mov x0, #1
+    ret
+
+// -- kcc_global_const_rodata --------------------------------------------------
+// uint64_t kcc_global_const_rodata(node *decl)
+// 1 iff decl is a const-qualified integer scalar/array global whose
+// initializer is a scalar literal or a flat list of integer/char literals.
+.text
+.globl _kcc_global_const_rodata
+.p2align 2
+_kcc_global_const_rodata:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    ldr x0, [x19, #AST_F2]         // must have an initializer
+    cbz x0, .Lgcr_no
+    ldr x1, [x19, #AST_F0]         // declared type spec
+.Lgcr_peel:
+    cbz x1, .Lgcr_no
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_TYPE_ARRAY
+    b.ne .Lgcr_qual
+    ldr x1, [x1, #AST_F0]          // element type
+    b .Lgcr_peel
+.Lgcr_qual:
+    cmp x2, #AST_TYPE_QUALS         // innermost must be a qualifier node
+    b.ne .Lgcr_no
+    ldr x2, [x1, #AST_F1]           // qualifier flags
+    and x2, x2, #1                  // const bit
+    cbz x2, .Lgcr_no
+    ldr x0, [x1, #AST_F0]           // base type under the qualifier
+    cbz x0, .Lgcr_no
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lgcr_no
+    ldr x2, [x0, #TY_KIND]          // integer kinds: TY_BOOL(2)..TY_LLONG(7)
+    cmp x2, #TY_BOOL
+    b.lt .Lgcr_no
+    cmp x2, #TY_LLONG
+    b.gt .Lgcr_no
+    ldr x0, [x19, #AST_F2]          // initializer shape
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.eq .Lgcr_list
+    bl _kcc_rodata_is_lit           // scalar: the init node itself
+    b .Lgcr_done
+.Lgcr_list:
+    ldr x20, [x0, #AST_F0]          // first element
+.Lgcr_list_loop:
+    cbz x20, .Lgcr_yes              // every element was a literal
+    mov x0, x20
+    bl _kcc_rodata_is_lit
+    cbz x0, .Lgcr_no
+    ldr x20, [x20, #AST_F4]         // next element
+    b .Lgcr_list_loop
+.Lgcr_yes:
+    mov x0, #1
+    b .Lgcr_done
+.Lgcr_no:
+    mov x0, #0
+.Lgcr_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_rodata_is_lit _kcc_global_const_rodata
+@}
+
 @d IR: build @{
 // -- kcc_ir_emit_global_inits --------------------------------------------
 // void kcc_ir_emit_global_inits(void)
@@ -215,6 +316,12 @@ _kcc_ir_emit_global_inits:
     // Check for name (AST_F1)
     ldr x20, [x19, #AST_F1]
     cbz x20, .Legi_next
+
+    // A const integer global with a literal initializer is emitted as read-only
+    // bytes in __TEXT and has no writable storage; a runtime store would fault.
+    mov x0, x19
+    bl _kcc_global_const_rodata
+    cbnz x0, .Legi_next
 
     // Emit IR_GLOBAL_REF for this variable
     mov x0, #IR_GLOBAL_REF
@@ -267,6 +374,11 @@ _kcc_ir_emit_global_inits:
     b.ne .Legi_stmt_next
     ldr x0, [x20, #AST_F2]      // initializer
     cbz x0, .Legi_stmt_next
+
+    // Same read-only const rule as the file-scope pass: no runtime store.
+    mov x0, x20
+    bl _kcc_global_const_rodata
+    cbnz x0, .Legi_stmt_next
 
     // GLOBAL_REF(mangled) + shared initializer emission.  Because the static
     // shares one routine with file-scope globals, an aggregate static

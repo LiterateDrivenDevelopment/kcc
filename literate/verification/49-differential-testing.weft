@@ -502,6 +502,12 @@ difftest "rodata-const-arith" \
     "static const int t[]={2*3,10%3,0xFF&0x0F,100/4}; int main(void){ int s=0; for(int i=0;i<4;i++) s+=t[i]; return s; }"
 difftest "rodata-const-enum" \
     "enum{A=5,B=7,C=100}; static const int t[]={A,B,C,A+B}; int main(void){ int s=0; for(int i=0;i<4;i++) s+=t[i]; return s; }"
+difftest "rodata-const-struct" \
+    "struct P{int a;int b;int c;}; static const struct P p={10,20,30}; int main(void){ return p.a+p.b+p.c; }"
+difftest "rodata-const-struct-mixed" \
+    "struct Q{int a;double b;char c;}; static const struct Q q={7,2.5,65}; int main(void){ return q.a + (int)(q.b*2) + q.c; }"
+difftest "rodata-const-struct-partial" \
+    "struct R{int a;int b;int c;}; static const struct R r={100}; int main(void){ return r.a + r.b + r.c; }"
 
 difftest "ternary-chain" \
     "int main(void){ int x = 3; return x == 1 ? 10 : x == 2 ? 20 : x == 3 ? 30 : 40; }"

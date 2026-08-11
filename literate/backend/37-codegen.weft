@@ -402,10 +402,16 @@ entry so the symbol's value is patched to $\mathit{code\_size}+\mathit{offset}$
 alongside the string literals; and a \texttt{\_kcc\_linker\_extern\_ht} entry so
 that every \texttt{IR\_GLOBAL\_REF}---which dedups through
 \texttt{\_kcc\_linker\_global\_sym}---resolves to this read-only symbol rather
-than allocating a fresh writable slot.  The reservation spans
+than allocating a fresh writable slot.  For a scalar or array the reservation spans
 $\max(\mathit{layout},\ \mathit{count}\times\mathit{elem})$ so a type whose
-inferred array length lags its initialiser cannot under-allocate; the tail is
-zero-filled, matching C's default initialisation of the unmentioned elements.
+inferred array length lags its initialiser cannot under-allocate, and the tail is
+zero-filled to match C's default initialisation of the unmentioned elements.  A
+\texttt{struct} takes a parallel branch: it zeroes its whole \texttt{layout}
+span first (so inter-field padding and any unmentioned trailing fields are zero)
+and then writes each initialiser element at its member's recorded byte offset
+(\texttt{AST\_F3}), with that member's own kind driving the width and the
+\texttt{float} narrowing---so a mixed \texttt{\{int,\ double,\ char\}} record is
+laid out byte-accurately.
 
 @d CodeGen: preregister globals @{
 // -- kcc_rodata_leaf_bits -----------------------------------------------------
@@ -494,6 +500,8 @@ _kcc_emit_rodata_global:
     bl _kcc_type_layout            // x0 = total size
     mov x22, x0                    // x22 = total (becomes span)
     ldr x0, [x21, #TY_KIND]
+    cmp x0, #TY_STRUCT             // a struct is laid out field-by-field
+    b.eq .Lerg_struct
     cmp x0, #TY_ARRAY
     b.ne .Lerg_scalar_ty
     ldr x23, [x21, #TY_F0]         // element type
@@ -581,6 +589,57 @@ _kcc_emit_rodata_global:
     strb wzr, [x25, x26]
     add x26, x26, #1
     b .Lerg_zf
+
+.Lerg_struct:
+    // Struct: x21 = type, x22 = total size.  Align, reserve, zero the whole
+    // region (so padding gaps and unmentioned fields are zero), then lay each
+    // field's bytes at its own byte offset.
+    adrp x0, _kcc_cstr_pos@@PAGE
+    add  x0, x0, _kcc_cstr_pos@@PAGEOFF
+    ldr x26, [x0]                  // pos
+    ldr x9, [x21, #TY_ALIGN]
+    sub x11, x9, #1
+    add x8, x26, x11
+    bic x27, x8, x11              // O (aligned start)
+    add x0, x27, x22
+    bl _kcc_cstr_reserve
+    adrp x0, _kcc_cstr_buf@@PAGE
+    add  x0, x0, _kcc_cstr_buf@@PAGEOFF
+    ldr x25, [x0]                  // buffer
+    add x7, x27, x22             // end = O + total
+    mov x1, x26                   // zero [pos, O+total)
+.Lerg_st_zero:
+    cmp x1, x7
+    b.ge .Lerg_st_fields
+    strb wzr, [x25, x1]
+    add x1, x1, #1
+    b .Lerg_st_zero
+.Lerg_st_fields:
+    ldr x0, [x21, #TY_F0]         // AST_STRUCT_DECL
+    ldr x28, [x0, #AST_F1]        // first field (x28 = field cursor)
+    ldr x0, [x19, #AST_F2]        // init list
+    ldr x0, [x0, #AST_F0]         // first element
+    str x0, [sp, #96]            // elem cursor (scratch, freed before .Lerg_sym)
+.Lerg_st_loop:
+    cbz x28, .Lerg_sym            // no more fields
+    ldr x0, [sp, #96]
+    cbz x0, .Lerg_sym             // initializer exhausted: remaining fields zero
+    ldr x0, [x28, #AST_F0]        // field type
+    bl _kcc_sema_resolve_type
+    mov x23, x0                   // field type (for the write fragment's fcvt)
+    ldr x24, [x23, #TY_SIZE]      // field size
+    ldr x1, [x23, #TY_KIND]       // field kind
+    ldr x0, [sp, #96]             // element node
+    bl _kcc_rodata_leaf_bits
+    mov x6, x0                     // field bits
+    ldr x9, [x28, #AST_F3]        // field byte offset
+    add x26, x27, x9              // w = O + offset
+    @<CodeGen: rodata write LE@>
+    ldr x28, [x28, #AST_F4]       // next field
+    ldr x0, [sp, #96]
+    ldr x0, [x0, #AST_F4]         // next element
+    str x0, [sp, #96]
+    b .Lerg_st_loop
 
 .Lerg_sym:
     // Advance cstr_pos past this object.

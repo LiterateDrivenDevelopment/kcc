@@ -202,8 +202,11 @@ literals, enum-constant identifiers, and the operators
 \texttt{\_kcc\_eval\_const\_int} folds (\texttt{\_kcc\_rodata\_const\_intexpr},
 so \texttt{\{1<<0,\ 1<<1\}}, a masked literal, or \texttt{\{STATE\_A,\ STATE\_B\}}
 qualifies); for a \texttt{float}/\texttt{double} element, a floating literal or a
-unary minus of one.  Anything else (\texttt{sizeof}, non-enum identifiers,
-designators, nested braces, pointers, structs) falls back to the ordinary
+unary minus of one.  A non-array \texttt{struct} of scalar fields with a
+positional literal initialiser is also accepted (\texttt{\_kcc\_rodata\_struct\_ok}),
+laid field-by-field at each member's offset.  Anything else (\texttt{sizeof},
+non-enum identifiers, designators, nested braces, pointers, bit-fields,
+arrays of structs, structs with aggregate fields) falls back to the ordinary
 writable path, correct but unprotected.
 
 @d IR: build @{
@@ -363,12 +366,69 @@ _kcc_rodata_is_lit:
     mov x0, #1
     ret
 
+// uint64_t kcc_rodata_struct_ok(type *sty, node *init)
+// 1 iff sty is a struct whose members are all scalar integer/floating fields
+// (no bit-fields, no nested aggregates) and init is a positional list of
+// matching literals -- so the struct's byte image can be laid field-by-field.
+.text
+.globl _kcc_rodata_struct_ok
+.p2align 2
+_kcc_rodata_struct_ok:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                     // struct type
+    ldr x0, [x1, #AST_TAG]          // init must be a brace list
+    cmp x0, #AST_INIT_LIST
+    b.ne .Lrso_no
+    ldr x20, [x1, #AST_F0]          // x20 = init element cursor
+    mov x0, x19                     // force layout so offsets/sizes are valid
+    bl _kcc_type_layout
+    ldr x0, [x19, #TY_F0]           // AST_STRUCT_DECL
+    cbz x0, .Lrso_no
+    ldr x21, [x0, #AST_F1]          // x21 = field cursor
+.Lrso_loop:
+    cbz x20, .Lrso_yes              // init exhausted: remaining fields stay zero
+    cbz x21, .Lrso_no               // more initializers than fields
+    ldr x0, [x21, #AST_F2]          // reject bit-fields (width expr present)
+    cbnz x0, .Lrso_no
+    ldr x0, [x20, #AST_TAG]         // reject a designated element (positional only)
+    cmp x0, #AST_DESIGNATOR
+    b.eq .Lrso_no
+    ldr x0, [x21, #AST_F0]          // field type must be scalar int/float
+    cbz x0, .Lrso_no
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lrso_no
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_BOOL
+    b.lt .Lrso_no
+    cmp x1, #TY_DOUBLE
+    b.gt .Lrso_no
+    cmp x1, #TY_FLOAT               // matching literal (float leaf if kind>=FLOAT)
+    cset x1, ge
+    mov x0, x20
+    bl _kcc_rodata_is_lit
+    cbz x0, .Lrso_no
+    ldr x21, [x21, #AST_F4]         // next field
+    ldr x20, [x20, #AST_F4]         // next element
+    b .Lrso_loop
+.Lrso_yes:
+    mov x0, #1
+    b .Lrso_done
+.Lrso_no:
+    mov x0, #0
+.Lrso_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- kcc_global_const_rodata --------------------------------------------------
 // uint64_t kcc_global_const_rodata(node *decl)
-// 1 iff decl is a const-qualified scalar/array global of an integer or
-// floating element type whose initializer is a matching scalar literal or a
-// flat list of matching literals (integer/char literals for an integer element,
-// floating literals for a float/double element).
+// 1 iff decl is a const-qualified global whose storage can be a fixed byte
+// image: an integer/floating scalar or array with matching literal leaves, or a
+// (non-array) struct of scalar fields with a positional literal initializer.
 .text
 .globl _kcc_global_const_rodata
 .p2align 2
@@ -376,8 +436,9 @@ _kcc_global_const_rodata:
     stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
-    str x21, [sp, #32]
+    stp x21, x22, [sp, #32]
     mov x19, x0
+    mov x22, #0                     // x22 = saw_array (array wrapper seen while peeling)
     ldr x0, [x19, #AST_F2]         // must have an initializer
     cbz x0, .Lgcr_no
     ldr x1, [x19, #AST_F0]         // declared type spec
@@ -386,6 +447,7 @@ _kcc_global_const_rodata:
     ldr x2, [x1, #AST_TAG]
     cmp x2, #AST_TYPE_ARRAY
     b.ne .Lgcr_qual
+    mov x22, #1                     // record an array wrapper
     ldr x1, [x1, #AST_F0]          // element type
     b .Lgcr_peel
 .Lgcr_qual:
@@ -399,8 +461,11 @@ _kcc_global_const_rodata:
     bl _kcc_sema_resolve_type
     cbz x0, .Lgcr_no
     ldr x2, [x0, #TY_KIND]
-    // Integer kinds TY_BOOL(2)..TY_LLONG(7) take integer literals; the floating
-    // kinds TY_FLOAT(8)/TY_DOUBLE(9) take floating literals.  x21 = float mode.
+    // A struct base (no array wrapper) validates field-by-field; the integer
+    // kinds TY_BOOL(2)..TY_LLONG(7) take integer literals; the floating kinds
+    // TY_FLOAT(8)/TY_DOUBLE(9) take floating literals.  x21 = float mode.
+    cmp x2, #TY_STRUCT
+    b.eq .Lgcr_struct               // x0 = struct type
     cmp x2, #TY_BOOL
     b.lt .Lgcr_no
     cmp x2, #TY_LLONG
@@ -409,6 +474,11 @@ _kcc_global_const_rodata:
     b.gt .Lgcr_no
     mov x21, #1                     // float/double element
     b .Lgcr_init
+.Lgcr_struct:
+    cbnz x22, .Lgcr_no              // array-of-struct: not handled here
+    ldr x1, [x19, #AST_F2]          // init list (x0 = struct type)
+    bl _kcc_rodata_struct_ok
+    b .Lgcr_done
 .Lgcr_intmode:
     mov x21, #0
 .Lgcr_init:
@@ -435,11 +505,11 @@ _kcc_global_const_rodata:
 .Lgcr_no:
     mov x0, #0
 .Lgcr_done:
-    ldr x21, [sp, #32]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_rodata_binop_ok _kcc_rodata_const_intexpr _kcc_rodata_is_lit _kcc_global_const_rodata
+@| _kcc_rodata_binop_ok _kcc_rodata_const_intexpr _kcc_rodata_struct_ok _kcc_rodata_is_lit _kcc_global_const_rodata
 @}
 
 @d IR: build @{

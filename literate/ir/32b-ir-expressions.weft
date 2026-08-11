@@ -4076,12 +4076,22 @@ _kcc_ir_build_unary:
     b .Libu_done
 
 .Libu_neg:
-    // A floating operand negates in the FP unit (FNEG), typed with the operand
-    // type so the back end and the optimizer both treat it as floating; an
-    // integer operand keeps the integer path (and its width normalisation).
-    ldr x0, [x19, #AST_F1]
-    cbz x0, .Libu_neg_int
-    ldr x0, [x0, #AST_F3]        // operand type
+    // A floating operand negates in the FP unit (FNEG), typed floating so the
+    // back end and the optimizer both treat it as such; an integer operand keeps
+    // the integer path (and its width normalisation).  Float-ness is decided two
+    // ways: a floating *literal* is recognised by its tag---it always builds as a
+    // double constant (\_kcc\_ir\_build\_float\_lit), even in an aggregate
+    // initialiser, whose element expressions sema does not type---and any other
+    // operand by its sema type (AST_F3).  Without the tag check, `-4.0` inside a
+    // brace list fell to the integer path, and two's-complement-negating the
+    // double bit pattern turned it into a different (wrong) double: `-4.0`
+    // stored back as `-1.0`.
+    ldr x2, [x19, #AST_F1]       // operand node
+    cbz x2, .Libu_neg_int
+    ldr x1, [x2, #AST_TAG]
+    cmp x1, #AST_FLOAT_LIT
+    b.eq .Libu_neg_fp_dbl        // literal: negate as double (the const's type)
+    ldr x0, [x2, #AST_F3]        // else consult the operand's sema type
     cbz x0, .Libu_neg_int
     cmp x0, #0x1000
     b.lo .Libu_neg_int
@@ -4090,14 +4100,27 @@ _kcc_ir_build_unary:
     b.lo .Libu_neg_int
     cmp x1, #10                  // ..LDOUBLE
     b.hi .Libu_neg_int
-    // floating negation
+    // non-literal floating operand: type the FNEG with its sema float type.
     mov x0, #IR_NEG
     bl _kcc_ir_alloc_instr
-    ldr x1, [x19, #AST_F1]      // reload operand type (x19 preserved across alloc)
-    ldr x1, [x1, #AST_F3]
-    str x1, [x0, #IR_TYPE]
-    str x21, [x0, #IR_SRC1]
     mov x22, x0
+    str x21, [x22, #IR_SRC1]
+    ldr x2, [x19, #AST_F1]       // reload operand (x19 preserved across alloc)
+    ldr x0, [x2, #AST_F3]
+    str x0, [x22, #IR_TYPE]
+    b .Libu_neg_fp_fin
+.Libu_neg_fp_dbl:
+    // Floating literal: the operand vreg is a double constant, so negate as
+    // double regardless of any (possibly single) declared literal type.
+    mov x0, #IR_NEG
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    str x21, [x22, #IR_SRC1]
+    adrp x0, _kcc_type_double@@PAGE
+    add  x0, x0, _kcc_type_double@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x22, #IR_TYPE]
+.Libu_neg_fp_fin:
     bl _kcc_ir_next_vreg
     str x0, [x22, #IR_DEST]
     mov x20, x0

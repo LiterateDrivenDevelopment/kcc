@@ -401,6 +401,15 @@ difftest "fp-global" \
     "double g = 3.5; int main(void){ g = g + 1.5; return (int)g; }"
 difftest "fp-array" \
     "int main(void){ double a[3]; a[0] = 1.5; a[1] = 2.5; a[2] = 3.0; return (int)(a[0] + a[1] + a[2]); }"
+# A negative floating literal in an aggregate initializer negates in the FP
+# unit; it once fell to the integer path and two's-complement-negated the double
+# bit pattern (-4.0 became -1.0).
+difftest "fp-array-neg-init" \
+    "double m[3] = {1.5, -4.0, 2.0}; int main(void){ return (int)((m[0] + m[1] + m[2]) * 100); }"
+difftest "fp-float-array-neg-init" \
+    "float m[2] = {-2.5f, 4.0f}; int main(void){ return (int)((m[0] + m[1]) * 100); }"
+difftest "fp-array-neg-mixed" \
+    "double m[4] = {-1.0, 2.0, -3.0, 4.0}; int main(void){ double s=0; int i; for(i=0;i<4;i++) s+=m[i]; return (int)(s*10); }"
 difftest "fp-loop-accumulate" \
     "int main(void){ double s = 0.0; int i; for (i = 0; i < 5; i = i + 1) s = s + 1.5; return (int)s; }"
 difftest "fp-exponent-literal" \

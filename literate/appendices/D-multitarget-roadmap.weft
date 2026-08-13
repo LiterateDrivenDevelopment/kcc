@@ -399,9 +399,10 @@ the identity comparisons that depend on them---stay untouched.
       (\texttt{\{STATE\_A,\ STATE\_B\}}) fold through
       \texttt{\_kcc\_eval\_const\_int}.  A non-array \texttt{struct} of scalar
       fields is also laid out field-by-field at each member's offset (mixed
-      \texttt{\{int,\ double,\ char\}} records included).  Arrays of structs,
-      structs with aggregate fields, and non-literal floating initialisers still
-      take the writable path and are a later slice.
+      \texttt{\{int,\ double,\ char\}} records included), and to a 1-D array of
+      such structs (each element laid out at its stride).  Multi-dimensional
+      arrays of structs, structs with aggregate fields, and non-literal floating
+      initialisers still take the writable path and are a later slice.
 \item \textbf{Stage~2.}  A \texttt{const} static whose initialiser contains
       address relocations (e.g.\ \texttt{static const char *const opts[]}) goes
       to \texttt{\_\_DATA\_CONST,\_\_const}, where \texttt{ld}/dyld apply the
@@ -434,11 +435,11 @@ floating scalar/array whose initialiser is a literal, a negated literal, an
 integer constant expression, or an \texttt{enum} constant is now
 write-protected: its bytes live in read-only \texttt{\_\_TEXT}, a laundered write
 to one faults with \texttt{SIGBUS} at the store, and the whole corpus
-stays green (codegen~222, difftest~226 with fifteen \texttt{rodata-*} cases,
+stays green (codegen~222, difftest~229 with eighteen \texttt{rodata-*} cases,
 self-host~222, Lua \texttt{final OK} with \texttt{optsnum[]} now in read-only
 memory, zlib self-test).  Multi-TU \texttt{extern const} references and the
 \texttt{module\_init} path are verified.  Remaining: Stage~1's
-non-literal-floating, array-of-struct, and aggregate-field-struct cases, then
+non-literal-floating and aggregate-field-struct cases, then
 Stage~2 (pointer-const $\to$ \texttt{\_\_DATA\_CONST}) and the optional Stage~3.
 Being
 kind~B, this milestone may proceed in parallel with M1--M4 and need not precede

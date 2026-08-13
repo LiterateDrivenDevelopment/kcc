@@ -202,10 +202,11 @@ literals, enum-constant identifiers, and the operators
 \texttt{\_kcc\_eval\_const\_int} folds (\texttt{\_kcc\_rodata\_const\_intexpr},
 so \texttt{\{1<<0,\ 1<<1\}}, a masked literal, or \texttt{\{STATE\_A,\ STATE\_B\}}
 qualifies); for a \texttt{float}/\texttt{double} element, a floating literal or a
-unary minus of one.  A non-array \texttt{struct} of scalar fields with a
-positional literal initialiser is also accepted (\texttt{\_kcc\_rodata\_struct\_ok}),
-laid field-by-field at each member's offset.  Anything else (\texttt{sizeof},
-non-enum identifiers, designators, nested braces, pointers, bit-fields,
+unary minus of one.  A \texttt{struct} of scalar fields with a positional literal
+initialiser---and a 1-D array of such structs (\texttt{\_kcc\_rodata\_struct\_ok}
+per element, via \texttt{\_kcc\_rodata\_aos\_ok})---is also accepted, laid
+field-by-field at each member's offset.  Anything else (\texttt{sizeof}, non-enum
+identifiers, designators, pointers, bit-fields, brace elision, multi-dimensional
 arrays of structs, structs with aggregate fields) falls back to the ordinary
 writable path, correct but unprotected.
 
@@ -424,11 +425,52 @@ _kcc_rodata_struct_ok:
     ldp x29, x30, [sp], #48
     ret
 
+// uint64_t kcc_rodata_aos_ok(type *sty, node *outer)
+// 1 iff outer is a brace list whose every element is itself a brace list that
+// passes kcc_rodata_struct_ok for the element struct type -- i.e. a 1-D array of
+// scalar-field structs, each initialised positionally.  A short list leaves its
+// trailing structs zero; a flat (brace-elided) element is rejected.
+.text
+.globl _kcc_rodata_aos_ok
+.p2align 2
+_kcc_rodata_aos_ok:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                     // element struct type
+    ldr x0, [x1, #AST_TAG]
+    cmp x0, #AST_INIT_LIST
+    b.ne .Laos_no
+    ldr x21, [x1, #AST_F0]          // x21 = outer element cursor
+.Laos_loop:
+    cbz x21, .Laos_yes              // exhausted: remaining structs stay zero
+    ldr x0, [x21, #AST_TAG]         // each element must be its own brace
+    cmp x0, #AST_INIT_LIST
+    b.ne .Laos_no
+    mov x0, x19
+    mov x1, x21
+    bl _kcc_rodata_struct_ok
+    cbz x0, .Laos_no
+    ldr x21, [x21, #AST_F4]
+    b .Laos_loop
+.Laos_yes:
+    mov x0, #1
+    b .Laos_done
+.Laos_no:
+    mov x0, #0
+.Laos_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- kcc_global_const_rodata --------------------------------------------------
 // uint64_t kcc_global_const_rodata(node *decl)
 // 1 iff decl is a const-qualified global whose storage can be a fixed byte
-// image: an integer/floating scalar or array with matching literal leaves, or a
-// (non-array) struct of scalar fields with a positional literal initializer.
+// image: an integer/floating scalar or array with matching literal leaves, a
+// (non-array) struct of scalar fields, or a 1-D array of such structs, each with
+// a positional literal initializer.
 .text
 .globl _kcc_global_const_rodata
 .p2align 2
@@ -438,7 +480,7 @@ _kcc_global_const_rodata:
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     mov x19, x0
-    mov x22, #0                     // x22 = saw_array (array wrapper seen while peeling)
+    mov x22, #0                     // x22 = count of array wrappers peeled
     ldr x0, [x19, #AST_F2]         // must have an initializer
     cbz x0, .Lgcr_no
     ldr x1, [x19, #AST_F0]         // declared type spec
@@ -447,7 +489,7 @@ _kcc_global_const_rodata:
     ldr x2, [x1, #AST_TAG]
     cmp x2, #AST_TYPE_ARRAY
     b.ne .Lgcr_qual
-    mov x22, #1                     // record an array wrapper
+    add x22, x22, #1                // count the array wrapper
     ldr x1, [x1, #AST_F0]          // element type
     b .Lgcr_peel
 .Lgcr_qual:
@@ -475,7 +517,15 @@ _kcc_global_const_rodata:
     mov x21, #1                     // float/double element
     b .Lgcr_init
 .Lgcr_struct:
-    cbnz x22, .Lgcr_no              // array-of-struct: not handled here
+    // x0 = struct type.  No array wrapper -> scalar struct; exactly one -> a
+    // 1-D array of structs; more -> not handled.
+    cbz x22, .Lgcr_scalar_struct
+    cmp x22, #1
+    b.ne .Lgcr_no
+    ldr x1, [x19, #AST_F2]          // outer init list
+    bl _kcc_rodata_aos_ok
+    b .Lgcr_done
+.Lgcr_scalar_struct:
     ldr x1, [x19, #AST_F2]          // init list (x0 = struct type)
     bl _kcc_rodata_struct_ok
     b .Lgcr_done
@@ -509,7 +559,7 @@ _kcc_global_const_rodata:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_rodata_binop_ok _kcc_rodata_const_intexpr _kcc_rodata_struct_ok _kcc_rodata_is_lit _kcc_global_const_rodata
+@| _kcc_rodata_binop_ok _kcc_rodata_const_intexpr _kcc_rodata_struct_ok _kcc_rodata_aos_ok _kcc_rodata_is_lit _kcc_global_const_rodata
 @}
 
 @d IR: build @{

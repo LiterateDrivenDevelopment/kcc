@@ -471,6 +471,51 @@ _kcc_rodata_leaf_bits:
 @}
 
 @d CodeGen: preregister globals @{
+// -- kcc_emit_struct_fields ---------------------------------------------------
+// void kcc_emit_struct_fields(type *sty, node *init, char *buf, uint64_t base)
+// Lay one struct's fields into buf at byte offset `base`, positionally from the
+// brace list `init`.  The region is assumed already zeroed, so a short list
+// leaves its trailing fields zero.  Shared by the scalar-struct and
+// array-of-struct emit paths.  Preserves x19-x24/x27/x28; uses x25/x26 (the
+// write fragment's buffer and cursor) as scratch.
+.text
+.globl _kcc_emit_struct_fields
+.p2align 2
+_kcc_emit_struct_fields:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x25, x2                    // buffer (for the write fragment)
+    mov x22, x3                    // base byte offset
+    ldr x0, [x0, #TY_F0]           // AST_STRUCT_DECL
+    ldr x19, [x0, #AST_F1]         // x19 = field cursor
+    ldr x20, [x1, #AST_F0]         // x20 = init element cursor
+.Lesf_loop:
+    cbz x19, .Lesf_done            // no more fields
+    cbz x20, .Lesf_done            // initializer exhausted: rest stays zero
+    ldr x0, [x19, #AST_F0]         // field type
+    bl _kcc_sema_resolve_type
+    mov x23, x0                    // field type (for the write fragment's fcvt)
+    ldr x24, [x23, #TY_SIZE]       // field size
+    ldr x1, [x23, #TY_KIND]        // field kind
+    mov x0, x20                    // element node
+    bl _kcc_rodata_leaf_bits
+    mov x6, x0                     // field bits
+    ldr x9, [x19, #AST_F3]         // field byte offset
+    add x26, x22, x9              // write cursor = base + field offset
+    @<CodeGen: rodata write LE@>
+    ldr x19, [x19, #AST_F4]        // next field
+    ldr x20, [x20, #AST_F4]        // next element
+    b .Lesf_loop
+.Lesf_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // -- kcc_emit_rodata_global ---------------------------------------------------
 // void kcc_emit_rodata_global(node *decl, char *uname)
 //   decl  = AST_VAR_DECL accepted by kcc_global_const_rodata
@@ -505,6 +550,9 @@ _kcc_emit_rodata_global:
     cmp x0, #TY_ARRAY
     b.ne .Lerg_scalar_ty
     ldr x23, [x21, #TY_F0]         // element type
+    ldr x0, [x23, #TY_KIND]
+    cmp x0, #TY_STRUCT             // array of structs: lay each element out
+    b.eq .Lerg_aos
     b .Lerg_have_ty
 .Lerg_scalar_ty:
     mov x23, x21                   // scalar: element is the type itself
@@ -591,9 +639,9 @@ _kcc_emit_rodata_global:
     b .Lerg_zf
 
 .Lerg_struct:
-    // Struct: x21 = type, x22 = total size.  Align, reserve, zero the whole
-    // region (so padding gaps and unmentioned fields are zero), then lay each
-    // field's bytes at its own byte offset.
+    // Scalar struct: x21 = type, x22 = total size.  Align, reserve, zero the
+    // whole region (so padding gaps and unmentioned fields are zero), then lay
+    // out the fields with the shared helper.
     adrp x0, _kcc_cstr_pos@@PAGE
     add  x0, x0, _kcc_cstr_pos@@PAGEOFF
     ldr x26, [x0]                  // pos
@@ -606,40 +654,80 @@ _kcc_emit_rodata_global:
     adrp x0, _kcc_cstr_buf@@PAGE
     add  x0, x0, _kcc_cstr_buf@@PAGEOFF
     ldr x25, [x0]                  // buffer
-    add x7, x27, x22             // end = O + total
-    mov x1, x26                   // zero [pos, O+total)
+    add x7, x27, x22             // zero [pos, O+total)
+    mov x1, x26
 .Lerg_st_zero:
     cmp x1, x7
-    b.ge .Lerg_st_fields
+    b.ge .Lerg_st_lay
     strb wzr, [x25, x1]
     add x1, x1, #1
     b .Lerg_st_zero
-.Lerg_st_fields:
-    ldr x0, [x21, #TY_F0]         // AST_STRUCT_DECL
-    ldr x28, [x0, #AST_F1]        // first field (x28 = field cursor)
-    ldr x0, [x19, #AST_F2]        // init list
-    ldr x0, [x0, #AST_F0]         // first element
-    str x0, [sp, #96]            // elem cursor (scratch, freed before .Lerg_sym)
-.Lerg_st_loop:
-    cbz x28, .Lerg_sym            // no more fields
+.Lerg_st_lay:
+    mov x0, x21                    // struct type
+    ldr x1, [x19, #AST_F2]         // init list
+    mov x2, x25                    // buffer
+    mov x3, x27                    // base = O
+    bl _kcc_emit_struct_fields
+    b .Lerg_sym
+
+.Lerg_aos:
+    // Array of structs: x21 = array type, x23 = element struct type, x22 = total
+    // size.  Reserve and zero, then lay each element out at O + i*stride, where
+    // the stride is the element struct's (already padded) size.
+    ldr x24, [x23, #TY_SIZE]       // stride
+    // span = max(layout, count*stride) guards a lagging inferred array length.
+    mov x9, #0
+    ldr x0, [x19, #AST_F2]
+    ldr x0, [x0, #AST_F0]          // first outer element
+.Lerg_aos_cnt:
+    cbz x0, .Lerg_aos_cnt_done
+    add x9, x9, #1
+    ldr x0, [x0, #AST_F4]
+    b .Lerg_aos_cnt
+.Lerg_aos_cnt_done:
+    mul x10, x9, x24
+    cmp x10, x22
+    csel x22, x10, x22, gt         // x22 = span
+    adrp x0, _kcc_cstr_pos@@PAGE
+    add  x0, x0, _kcc_cstr_pos@@PAGEOFF
+    ldr x26, [x0]                  // pos
+    ldr x9, [x23, #TY_ALIGN]
+    sub x11, x9, #1
+    add x8, x26, x11
+    bic x27, x8, x11              // O
+    add x0, x27, x22
+    bl _kcc_cstr_reserve
+    adrp x0, _kcc_cstr_buf@@PAGE
+    add  x0, x0, _kcc_cstr_buf@@PAGEOFF
+    ldr x28, [x0]                  // x28 = buffer (survives the helper)
+    add x7, x27, x22             // zero [pos, O+total)
+    mov x1, x26
+.Lerg_aos_zero:
+    cmp x1, x7
+    b.ge .Lerg_aos_lay
+    strb wzr, [x28, x1]
+    add x1, x1, #1
+    b .Lerg_aos_zero
+.Lerg_aos_lay:
+    ldr x0, [x19, #AST_F2]        // outer init list
+    ldr x0, [x0, #AST_F0]         // first element (a struct brace)
+    str x0, [sp, #96]            // element cursor
+    str x27, [sp, #104]          // running base offset = O
+.Lerg_aos_loop:
     ldr x0, [sp, #96]
-    cbz x0, .Lerg_sym             // initializer exhausted: remaining fields zero
-    ldr x0, [x28, #AST_F0]        // field type
-    bl _kcc_sema_resolve_type
-    mov x23, x0                   // field type (for the write fragment's fcvt)
-    ldr x24, [x23, #TY_SIZE]      // field size
-    ldr x1, [x23, #TY_KIND]       // field kind
-    ldr x0, [sp, #96]             // element node
-    bl _kcc_rodata_leaf_bits
-    mov x6, x0                     // field bits
-    ldr x9, [x28, #AST_F3]        // field byte offset
-    add x26, x27, x9              // w = O + offset
-    @<CodeGen: rodata write LE@>
-    ldr x28, [x28, #AST_F4]       // next field
+    cbz x0, .Lerg_sym             // initializer exhausted: remaining structs zero
+    mov x0, x23                   // element struct type
+    ldr x1, [sp, #96]             // element init (brace list)
+    mov x2, x28                   // buffer
+    ldr x3, [sp, #104]           // base for this element
+    bl _kcc_emit_struct_fields
+    ldr x0, [sp, #104]
+    add x0, x0, x24              // base += stride
+    str x0, [sp, #104]
     ldr x0, [sp, #96]
     ldr x0, [x0, #AST_F4]         // next element
     str x0, [sp, #96]
-    b .Lerg_st_loop
+    b .Lerg_aos_loop
 
 .Lerg_sym:
     // Advance cstr_pos past this object.
@@ -689,7 +777,7 @@ _kcc_emit_rodata_global:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #112
     ret
-@| _kcc_emit_rodata_global
+@| _kcc_emit_struct_fields _kcc_emit_rodata_global
 @}
 
 \section{Compile All Functions}

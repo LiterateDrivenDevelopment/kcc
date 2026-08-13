@@ -416,9 +416,27 @@ the identity comparisons that depend on them---stay untouched.
       read-only.  A laundered write to such a table faults with \texttt{SIGBUS}.
       The whole layout addition is gated on a per-object flag, so an object with
       no const pointer table is byte-unchanged.
-\item \textbf{Stage~3 (optional).}  Split zero-initialised BSS from initialised
-      data so a BSS overrun cannot walk into a live object, and add a debug
-      canary / guard-page mode around static tables.
+\item \textbf{Stage~3 (optional, re-scoped).}  The original aim---split
+      zero-initialised BSS from initialised data ``so a BSS overrun cannot walk
+      into a live object''---turns out \emph{not} to be achievable as a
+      write-protection measure in \kcc's model.  \kcc{} emits one segment and
+      delegates linking to \texttt{ld}; in the final image \emph{all} mutable
+      data (initialised globals and BSS alike) lands in the single writable
+      \texttt{\_\_DATA} segment.  Even after separating an initialised
+      \texttt{\_\_DATA,\_\_data} section from the \texttt{\_\_common} BSS, the two
+      remain contiguous in that one rw segment, so an overrun between them still
+      does not fault---catching it would require a \emph{guard page between
+      separate segments}, i.e.\ taking over final linking, which is out of scope.
+      What \emph{is} achievable and valuable is the split itself as a
+      \emph{data-model} improvement (orthogonal to write protection): emit
+      simple initialised mutable globals as file-backed \texttt{\_\_DATA,\_\_data}
+      bytes (reusing the Stage-1 compile-time evaluator) instead of
+      \texttt{kcc.module\_init} runtime stores---standard, inspectable, faster
+      startup, and it sidesteps the whole \texttt{module\_init} init-bug class
+      (the negative-float-in-array miscompile fixed during Stage~1 lived there).
+      Because that is orthogonal to M5's write-protection theme and touches every
+      initialised global, it is better tracked as its own item than folded into
+      this milestone.
 \end{itemize}
 
 \textbf{weft files.}  \texttt{37-codegen} (\texttt{const} detection at

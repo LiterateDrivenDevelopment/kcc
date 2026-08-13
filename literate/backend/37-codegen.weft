@@ -117,6 +117,28 @@ _kcc_codegen_init:
     bl _kcc_arena_alloc
     str x0, [x19, #VEC_DATA]
 
+    // __DATA_CONST,__const state: absent until a const pointer array needs it.
+    adrp x1, _kcc_rodata_const_present@@PAGE
+    add  x1, x1, _kcc_rodata_const_present@@PAGEOFF
+    str xzr, [x1]
+    adrp x1, _kcc_rodata_const_size@@PAGE
+    add  x1, x1, _kcc_rodata_const_size@@PAGEOFF
+    str xzr, [x1]
+    mov x0, #VEC_SIZE              // relocs vec: {slot_offset, sym_index}
+    bl _kcc_arena_alloc
+    adrp x1, _kcc_rodata_const_relocs@@PAGE
+    add  x1, x1, _kcc_rodata_const_relocs@@PAGEOFF
+    str x0, [x1]
+    mov x1, #16
+    str x1, [x0, #VEC_ELEMSIZE]
+    mov x1, #32
+    str x1, [x0, #VEC_CAP]
+    str xzr, [x0, #VEC_COUNT]
+    mov x19, x0
+    mov x0, #512                  // 32 * 16
+    bl _kcc_arena_alloc
+    str x0, [x19, #VEC_DATA]
+
     // Fresh set of globals defined in this translation unit
     mov x0, #32
     bl _kcc_ht_init
@@ -249,14 +271,22 @@ _kcc_preregister_globals:
     mov x1, x20
     bl _kcc_memcpy
 
-    // A const integer global with a literal initializer becomes read-only bytes
-    // in __TEXT rather than __common storage.
+    // A const scalar/aggregate becomes read-only __TEXT bytes; a const pointer
+    // array goes to __DATA_CONST,__const; otherwise, __common storage.
     mov x0, x19
     bl _kcc_global_const_rodata
-    cbz x0, .Lprg_common
+    cbz x0, .Lprg_try_ptrarr
     mov x0, x19                  // decl
     mov x1, x22                  // "_"+name
     bl _kcc_emit_rodata_global
+    b .Lprg_defined
+.Lprg_try_ptrarr:
+    mov x0, x19
+    bl _kcc_global_const_ptrarr
+    cbz x0, .Lprg_common
+    mov x0, x19
+    mov x1, x22
+    bl _kcc_emit_rodata_ptrarr
     b .Lprg_defined
 .Lprg_common:
     mov x0, x22
@@ -343,13 +373,22 @@ _kcc_preregister_globals:
     mov x1, x21
     bl _kcc_memcpy
 
-    // Read-only const static locals go to __TEXT like file-scope const globals.
+    // Read-only const static locals go to __TEXT (scalars/aggregates) or
+    // __DATA_CONST,__const (pointer arrays), like file-scope const globals.
     mov x0, x20                  // static decl
     bl _kcc_global_const_rodata
-    cbz x0, .Lprg_st_common
+    cbz x0, .Lprg_st_try_ptrarr
     mov x0, x20
     mov x1, x23                  // "_"+mangled name
     bl _kcc_emit_rodata_global
+    b .Lprg_st_defined
+.Lprg_st_try_ptrarr:
+    mov x0, x20
+    bl _kcc_global_const_ptrarr
+    cbz x0, .Lprg_st_common
+    mov x0, x20
+    mov x1, x23                  // "_"+mangled name
+    bl _kcc_emit_rodata_ptrarr
     b .Lprg_st_defined
 .Lprg_st_common:
     mov x0, x23                  // "_"+mangled name
@@ -777,7 +816,115 @@ _kcc_emit_rodata_global:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #112
     ret
-@| _kcc_emit_struct_fields _kcc_emit_rodata_global
+
+// -- kcc_emit_rodata_ptrarr ---------------------------------------------------
+// void kcc_emit_rodata_ptrarr(node *decl, char *uname)
+//   decl accepted by kcc_global_const_ptrarr (a const array of const pointers
+//        initialised with string literals / NULL)
+//   uname = linker symbol name
+// Reserves the array's pointer slots in the __DATA_CONST,__const section, emits
+// each string element into the read-only cstring buffer and records an UNSIGNED
+// relocation binding its slot to the string symbol (NULL slots stay zero), and
+// mints a section-3 symbol at the array's offset.  Marks the __const section
+// present so the emitter lays it out.
+.text
+.globl _kcc_emit_rodata_ptrarr
+.p2align 2
+_kcc_emit_rodata_ptrarr:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+    mov x19, x0                    // decl
+    mov x20, x1                    // uname
+
+    // The object now needs a __DATA_CONST,__const section.
+    adrp x0, _kcc_rodata_const_present@@PAGE
+    add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
+    mov x1, #1
+    str x1, [x0]
+
+    // Total array bytes (declared length * 8).
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    bl _kcc_type_layout            // x0 = total size
+    mov x25, x0                    // x25 = total
+
+    // O = current const size, aligned to 8 (pointer alignment).
+    adrp x0, _kcc_rodata_const_size@@PAGE
+    add  x0, x0, _kcc_rodata_const_size@@PAGEOFF
+    ldr x21, [x0]
+    add x21, x21, #7
+    bic x21, x21, #7               // x21 = O (array's offset in __const)
+
+    ldr x0, [x19, #AST_F2]         // init list
+    ldr x22, [x0, #AST_F0]         // x22 = element cursor
+    mov x23, #0                    // x23 = slot index
+.Lerp_loop:
+    cbz x22, .Lerp_done
+    ldr x0, [x22, #AST_TAG]
+    cmp x0, #AST_STR_LIT
+    b.ne .Lerp_next                // NULL / non-string leaves the slot zero
+    ldr x0, [x22, #AST_F0]         // string data
+    ldr x1, [x22, #AST_F1]         // string length
+    bl _kcc_emit_cstring           // x0 = string symbol index
+    mov x24, x0
+    lsl x1, x23, #3                // slot offset = O + i*8
+    add x1, x21, x1
+    str x1, [sp, #72]             // reloc {slot_offset, sym_index}
+    str x24, [sp, #80]
+    adrp x0, _kcc_rodata_const_relocs@@PAGE
+    add  x0, x0, _kcc_rodata_const_relocs@@PAGEOFF
+    ldr x0, [x0]
+    add x1, sp, #72
+    bl _kcc_vec_push
+.Lerp_next:
+    add x23, x23, #1
+    ldr x22, [x22, #AST_F4]
+    b .Lerp_loop
+.Lerp_done:
+    // span = max(total, slot_count*8) guards a lagging inferred array length.
+    lsl x0, x23, #3
+    cmp x0, x25
+    csel x25, x0, x25, gt
+    add x0, x21, x25               // new const size = O + span
+    adrp x1, _kcc_rodata_const_size@@PAGE
+    add  x1, x1, _kcc_rodata_const_size@@PAGEOFF
+    str x0, [x1]
+
+    // Mint the section-3 symbol at offset O; external unless static local.
+    ldr x0, [x19, #AST_F3]
+    mov x3, #N_SECT
+    cmp x0, #3
+    b.eq .Lerp_flags
+    orr x3, x3, #N_EXT
+.Lerp_flags:
+    mov x0, x20                    // name
+    mov x1, #3                     // section 3 (__DATA_CONST,__const)
+    mov x2, x21                    // value = offset in section
+    bl _kcc_linker_add_sym
+    mov x24, x0                    // sym index
+
+    // Dedup entry so IR_GLOBAL_REF resolves to this symbol.
+    mov x0, x20
+    bl _kcc_strlen
+    mov x2, x0
+    adrp x0, _kcc_linker_extern_ht@@PAGE
+    add  x0, x0, _kcc_linker_extern_ht@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x20
+    add x3, x24, #1
+    bl _kcc_ht_put
+
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@| _kcc_emit_struct_fields _kcc_emit_rodata_global _kcc_emit_rodata_ptrarr
 @}
 
 \section{Compile All Functions}
@@ -1194,6 +1341,129 @@ _kcc_cstr_reserve:
 @}
 
 @d CodeGen: emit strings @{
+// -- kcc_emit_cstring ---------------------------------------------------------
+// uint64_t kcc_emit_cstring(const char *data, uint64_t len)
+// Copy a string into the read-only cstring buffer (NUL-terminated), mint a
+// local l_.str.N symbol at its offset with a fixup (value patched to
+// code_size+offset alongside the other string literals), and return the symbol
+// index.  This is the string-materialisation half of kcc_codegen_string_lit,
+// used to build the string elements of a const pointer table (M5 Stage 2).
+.text
+.globl _kcc_emit_cstring
+.p2align 2
+_kcc_emit_cstring:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x20, x0                    // data
+    mov x21, x1                    // len
+
+    adrp x0, _kcc_cstr_pos@@PAGE
+    add  x0, x0, _kcc_cstr_pos@@PAGEOFF
+    ldr x23, [x0]                  // x23 = cstr_offset
+    add x0, x23, x21
+    add x0, x0, #1
+    bl _kcc_cstr_reserve
+    adrp x0, _kcc_cstr_buf@@PAGE
+    add  x0, x0, _kcc_cstr_buf@@PAGEOFF
+    ldr x0, [x0]
+    add x0, x0, x23
+    mov x1, x20
+    mov x2, x21
+    cbz x2, .Lecs_nullterm
+    bl _kcc_memcpy
+.Lecs_nullterm:
+    adrp x0, _kcc_cstr_buf@@PAGE
+    add  x0, x0, _kcc_cstr_buf@@PAGEOFF
+    ldr x0, [x0]
+    add x1, x23, x21
+    strb wzr, [x0, x1]
+    add x24, x23, x21
+    add x24, x24, #1
+    adrp x0, _kcc_cstr_pos@@PAGE
+    add  x0, x0, _kcc_cstr_pos@@PAGEOFF
+    str x24, [x0]
+
+    // Mint a local l_.str.N symbol.
+    adrp x0, _kcc_cstr_count@@PAGE
+    add  x0, x0, _kcc_cstr_count@@PAGEOFF
+    ldr x24, [x0]
+    add x1, x24, #1
+    str x1, [x0]
+    mov x0, #20
+    bl _kcc_arena_alloc
+    mov x25, x0
+    mov w1, #'l'
+    strb w1, [x25, #0]
+    mov w1, #'_'
+    strb w1, [x25, #1]
+    mov w1, #'.'
+    strb w1, [x25, #2]
+    mov w1, #'s'
+    strb w1, [x25, #3]
+    mov w1, #'t'
+    strb w1, [x25, #4]
+    mov w1, #'r'
+    strb w1, [x25, #5]
+    mov w1, #'.'
+    strb w1, [x25, #6]
+    add x0, x25, #7
+    mov x1, x24
+    cbz x1, .Lecs_zero
+    mov x2, x0
+.Lecs_cvt:
+    cbz x1, .Lecs_rev
+    mov x3, #10
+    udiv x4, x1, x3
+    msub x5, x4, x3, x1
+    add w5, w5, #'0'
+    strb w5, [x0], #1
+    mov x1, x4
+    b .Lecs_cvt
+.Lecs_rev:
+    strb wzr, [x0]
+    sub x3, x0, #1
+.Lecs_rvlp:
+    cmp x2, x3
+    b.ge .Lecs_named
+    ldrb w4, [x2]
+    ldrb w5, [x3]
+    strb w5, [x2], #1
+    strb w4, [x3], #-1
+    b .Lecs_rvlp
+.Lecs_zero:
+    mov w1, #'0'
+    strb w1, [x0]
+    strb wzr, [x0, #1]
+.Lecs_named:
+    mov x0, x25
+    mov x1, #1                     // section 1 (__text)
+    mov x2, #0                     // value placeholder
+    mov x3, #N_SECT
+    bl _kcc_linker_add_sym
+    mov x26, x0                    // sym index
+    str x26, [sp, #80]
+    str x23, [sp, #88]
+    adrp x0, _kcc_cstr_fixups@@PAGE
+    add  x0, x0, _kcc_cstr_fixups@@PAGEOFF
+    ldr x0, [x0]
+    add x1, sp, #80
+    bl _kcc_vec_push
+    mov x0, x26                    // return the symbol index
+
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@| _kcc_emit_cstring
+@}
+
+@d CodeGen: emit strings @{
 // -- kcc_codegen_string_lit ---------------------------------------------------
 // void kcc_codegen_string_lit(ir_instr *instr)
 // Handles IR_STRING_LIT: copies string to cstring buffer, creates a
@@ -1548,6 +1818,14 @@ _kcc_cstr_pos:       .quad 0     // write position in cstring buffer
 _kcc_cstr_count:     .quad 0     // string literal counter (for naming)
 .globl _kcc_cstr_fixups
 _kcc_cstr_fixups:    .quad 0     // vec of {sym_index, cstr_offset} fixups
+.globl _kcc_rodata_const_present
+_kcc_rodata_const_present: .quad 0 // 1 if a __DATA_CONST,__const section is needed
+.globl _kcc_rodata_const_size
+_kcc_rodata_const_size: .quad 0  // running byte size of the __const section
+.globl _kcc_rodata_const_relocs
+_kcc_rodata_const_relocs: .quad 0 // vec of {slot_offset, sym_index} for __const
+.globl _kcc_rodata_const_fileoff
+_kcc_rodata_const_fileoff: .quad 0 // file offset of __const data (set in finalize)
 .globl _kcc_cg_defined_globals
 _kcc_cg_defined_globals: .quad 0 // hash set: globals defined in this TU
 .globl _kcc_cg_regmap
@@ -1582,6 +1860,10 @@ _kcc_cg_fp_save_base:   .quad 0  // byte offset of the FP callee-save area from 
 @| _kcc_cstr_pos
 @| _kcc_cstr_count
 @| _kcc_cstr_fixups
+@| _kcc_rodata_const_present
+@| _kcc_rodata_const_size
+@| _kcc_rodata_const_relocs
+@| _kcc_rodata_const_fileoff
 @| _kcc_cg_defined_globals
 @| _kcc_cg_regmap
 @| _kcc_cg_callee_mask

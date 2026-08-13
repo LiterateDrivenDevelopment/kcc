@@ -446,6 +446,14 @@ _kcc_macho_finalize:
     cbz  x0, .Lmf_no_modinit_lc
     add  x22, x22, #80
 .Lmf_no_modinit_lc:
+    // A const-pointer table adds a __DATA_CONST,__const section (one more
+    // 80-byte section_64 inside the same segment).
+    adrp x0, _kcc_rodata_const_present@@PAGE
+    add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_const_lc
+    add  x22, x22, #80
+.Lmf_no_const_lc:
     // Under -g, reserve a __DWARF LC_SEGMENT_64 (72 + 80*3 sections = 312).
     // Adding it to x22 here auto-shifts every downstream file offset.
     adrp x0, _kcc_dwarf_enabled@@PAGE
@@ -483,6 +491,22 @@ _kcc_macho_finalize:
     str x24, [x0]
     add x24, x24, #8             // reserve the pointer's 8 bytes
 .Lmf_no_modinit_off:
+    // Reserve the __const section's data (const_size bytes, 8-aligned) after the
+    // modinit pointer; remember its file offset.
+    adrp x0, _kcc_rodata_const_present@@PAGE
+    add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_const_off
+    add x24, x24, #7
+    bic x24, x24, #7
+    adrp x0, _kcc_rodata_const_fileoff@@PAGE
+    add  x0, x0, _kcc_rodata_const_fileoff@@PAGEOFF
+    str x24, [x0]
+    adrp x0, _kcc_rodata_const_size@@PAGE
+    add  x0, x0, _kcc_rodata_const_size@@PAGEOFF
+    ldr x0, [x0]
+    add x24, x24, x0             // reserve the const data
+.Lmf_no_const_off:
     add x24, x24, #3
     bic x24, x24, #3              // x24 = reloc_offset (4-byte aligned)
 
@@ -497,6 +521,19 @@ _kcc_macho_finalize:
     cbz  x0, .Lmf_no_modinit_reloc_sz
     add x25, x25, #RELOC_INFO_SIZE
 .Lmf_no_modinit_reloc_sz:
+    // The __const section appends one UNSIGNED reloc per non-NULL slot.
+    adrp x0, _kcc_rodata_const_present@@PAGE
+    add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_const_reloc_sz
+    adrp x0, _kcc_rodata_const_relocs@@PAGE
+    add  x0, x0, _kcc_rodata_const_relocs@@PAGEOFF
+    ldr x0, [x0]
+    ldr x0, [x0, #VEC_COUNT]     // number of const relocs
+    mov x1, #RELOC_INFO_SIZE
+    mul x0, x0, x1
+    add x25, x25, x0
+.Lmf_no_const_reloc_sz:
 
     // String table offset = symtab_offset + nsyms * 16
     mov x26, #NLIST_64_SIZE
@@ -623,13 +660,20 @@ versions.
     // cmd
     mov w0, #LC_SEGMENT_64
     bl _kcc_macho_write32
-    // cmdsize = 72 + 80*nsects (232 for 2, 312 when __mod_init_func is present)
+    // cmdsize = 72 + 80*nsects.  Base 232 (2 sections); +80 for
+    // __mod_init_func, +80 for __DATA_CONST,__const.
     mov w0, #232
     adrp x1, _kcc_modinit_present@@PAGE
     add  x1, x1, _kcc_modinit_present@@PAGEOFF
     ldr  x1, [x1]
+    cbz  x1, .Lmf_cmdsz_nomod
+    add  w0, w0, #80
+.Lmf_cmdsz_nomod:
+    adrp x1, _kcc_rodata_const_present@@PAGE
+    add  x1, x1, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x1, [x1]
     cbz  x1, .Lmf_seg_cmdsize
-    mov w0, #312
+    add  w0, w0, #80
 .Lmf_seg_cmdsize:
     bl _kcc_macho_write32
     // segname (16 bytes, empty for object files)
@@ -651,6 +695,17 @@ versions.
     bic x0, x0, #7               // 8-align the pointer's VM address
     add x0, x0, #8               // + 8 bytes for the pointer
 .Lmf_seg_vmsize:
+    adrp x1, _kcc_rodata_const_present@@PAGE
+    add  x1, x1, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_seg_vmsize_done
+    add x0, x0, #7
+    bic x0, x0, #7               // 8-align the __const section's VM address
+    adrp x1, _kcc_rodata_const_size@@PAGE
+    add  x1, x1, _kcc_rodata_const_size@@PAGEOFF
+    ldr x1, [x1]
+    add x0, x0, x1               // + const data
+.Lmf_seg_vmsize_done:
     bl _kcc_macho_write64
     // fileoff = text_offset
     mov x0, x23
@@ -668,6 +723,19 @@ versions.
     add x0, x0, #8               // end of the pointer
     sub x0, x0, x23              // relative to the segment's fileoff
 .Lmf_seg_filesize:
+    adrp x1, _kcc_rodata_const_present@@PAGE
+    add  x1, x1, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_seg_filesize_done
+    adrp x1, _kcc_rodata_const_fileoff@@PAGE
+    add  x1, x1, _kcc_rodata_const_fileoff@@PAGEOFF
+    ldr x1, [x1]
+    adrp x2, _kcc_rodata_const_size@@PAGE
+    add  x2, x2, _kcc_rodata_const_size@@PAGEOFF
+    ldr x2, [x2]
+    add x1, x1, x2               // end of the const data (furthest file byte)
+    sub x0, x1, x23              // relative to the segment's fileoff
+.Lmf_seg_filesize_done:
     bl _kcc_macho_write64
     // maxprot = 7 (rwx)
     mov w0, #7
@@ -675,13 +743,19 @@ versions.
     // initprot = 7
     mov w0, #7
     bl _kcc_macho_write32
-    // nsects = 2 (3 when the __mod_init_func section is present)
+    // nsects = 2 + (__mod_init_func) + (__DATA_CONST,__const)
     mov w0, #2
     adrp x1, _kcc_modinit_present@@PAGE
     add  x1, x1, _kcc_modinit_present@@PAGEOFF
     ldr  x1, [x1]
+    cbz  x1, .Lmf_nsects_nomod
+    add  w0, w0, #1
+.Lmf_nsects_nomod:
+    adrp x1, _kcc_rodata_const_present@@PAGE
+    add  x1, x1, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x1, [x1]
     cbz  x1, .Lmf_seg_nsects
-    mov w0, #3
+    add  w0, w0, #1
 .Lmf_seg_nsects:
     bl _kcc_macho_write32
     // flags = 0
@@ -810,6 +884,84 @@ common two-section object byte-for-byte unchanged.
     bl _kcc_macho_write32
     mov w0, #0
     bl _kcc_macho_write32
+
+    // ---- Section: __DATA_CONST,__const (const pointer tables, section 3) ----
+    adrp x0, _kcc_rodata_const_present@@PAGE
+    add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_const_sect
+    // sectname "__const\0..."
+    mov x0, #0x5F5F
+    movk x0, #0x6F63, lsl #16
+    movk x0, #0x736E, lsl #32
+    movk x0, #0x0074, lsl #48
+    bl _kcc_macho_write64
+    mov x0, #0
+    bl _kcc_macho_write64
+    // segname "__DATA_CONST"
+    mov x0, #0x5F5F
+    movk x0, #0x4144, lsl #16
+    movk x0, #0x4154, lsl #32
+    movk x0, #0x435F, lsl #48
+    bl _kcc_macho_write64
+    mov x0, #0x4E4F
+    movk x0, #0x5453, lsl #16
+    bl _kcc_macho_write64
+    // addr = VM address after __common (and past the modinit pointer if any)
+    ldr x0, [sp, #112]           // globals_size
+    add x0, x0, x19              // + code_size
+    adrp x1, _kcc_modinit_present@@PAGE
+    add  x1, x1, _kcc_modinit_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_const_addr
+    add x0, x0, #7
+    bic x0, x0, #7
+    add x0, x0, #8              // past the modinit pointer's VM region
+.Lmf_const_addr:
+    add x0, x0, #7
+    bic x0, x0, #7             // 8-align the const section's VM address
+    bl _kcc_macho_write64
+    // size = const_size
+    adrp x0, _kcc_rodata_const_size@@PAGE
+    add  x0, x0, _kcc_rodata_const_size@@PAGEOFF
+    ldr x0, [x0]
+    bl _kcc_macho_write64
+    // offset = const file offset
+    adrp x0, _kcc_rodata_const_fileoff@@PAGE
+    add  x0, x0, _kcc_rodata_const_fileoff@@PAGEOFF
+    ldr w0, [x0]
+    bl _kcc_macho_write32
+    // align = 3 (8-byte aligned)
+    mov w0, #3
+    bl _kcc_macho_write32
+    // reloff = reloc_offset + (nrelocs + modinit?1:0) * 8  (const relocs trail
+    // the text relocs and the modinit reloc)
+    mov x0, #RELOC_INFO_SIZE
+    mul x0, x21, x0
+    add x0, x24, x0
+    adrp x1, _kcc_modinit_present@@PAGE
+    add  x1, x1, _kcc_modinit_present@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Lmf_const_reloff
+    add x0, x0, #RELOC_INFO_SIZE
+.Lmf_const_reloff:
+    bl _kcc_macho_write32
+    // nreloc = const reloc count
+    adrp x0, _kcc_rodata_const_relocs@@PAGE
+    add  x0, x0, _kcc_rodata_const_relocs@@PAGEOFF
+    ldr x0, [x0]
+    ldr w0, [x0, #VEC_COUNT]
+    bl _kcc_macho_write32
+    // flags = S_REGULAR
+    mov w0, #S_REGULAR
+    bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+    mov w0, #0
+    bl _kcc_macho_write32
+.Lmf_no_const_sect:
 
     // ---- Section: __DATA,__mod_init_func (only for a module-init unit) ----
     adrp x0, _kcc_modinit_present@@PAGE
@@ -1045,6 +1197,25 @@ and relocation type.
     bl _kcc_macho_write64
 .Lmf_no_modinit_data:
 
+    // ---- Write the __const section data (const_size zero bytes; pointer values
+    // come from the relocations) ----
+    adrp x0, _kcc_rodata_const_present@@PAGE
+    add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_const_data
+    mov x0, #8
+    bl _kcc_macho_pad_to           // lands on the reserved 8-aligned const offset
+    adrp x0, _kcc_rodata_const_size@@PAGE
+    add  x0, x0, _kcc_rodata_const_size@@PAGEOFF
+    ldr x28, [x0]                  // remaining bytes (a multiple of 8)
+.Lmf_const_data_loop:
+    cbz x28, .Lmf_no_const_data
+    mov x0, #0
+    bl _kcc_macho_write64
+    sub x28, x28, #8
+    b .Lmf_const_data_loop
+.Lmf_no_const_data:
+
     // Pad to reloc_offset
     mov x0, #4
     bl _kcc_macho_pad_to
@@ -1193,6 +1364,39 @@ module-init function symbol.
     // r_pcrel = 0, r_type = ARM64_RELOC_UNSIGNED (0)
     bl _kcc_macho_write32
 .Lmf_no_modinit_reloc_emit:
+
+    // ---- __const section relocations ----
+    // One ARM64_RELOC_UNSIGNED (length 3, not pc-relative) per pointer slot,
+    // binding it to its string-literal symbol.  They trail the modinit reloc,
+    // matching the reloff recorded in the __const section header.
+    adrp x0, _kcc_rodata_const_present@@PAGE
+    add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lmf_no_const_reloc_emit
+    mov x28, #0                    // reloc index
+.Lmf_const_reloc_loop:
+    adrp x0, _kcc_rodata_const_relocs@@PAGE
+    add  x0, x0, _kcc_rodata_const_relocs@@PAGEOFF
+    ldr x0, [x0]                  // relocs vec
+    ldr x2, [x0, #VEC_COUNT]
+    cmp x28, x2
+    b.ge .Lmf_no_const_reloc_emit
+    mov x1, x28
+    bl _kcc_vec_get               // x0 = entry {slot_offset, sym_index}
+    str x0, [sp, #96]             // stash entry ptr across write32
+    ldr w0, [x0]                  // r_address = slot_offset
+    bl _kcc_macho_write32
+    ldr x0, [sp, #96]
+    ldr x2, [x0, #8]             // original string-lit sym index
+    ldr x5, [sp, #120]           // remap array
+    ldr x3, [x5, x2, lsl #3]     // remapped output index
+    and w0, w3, #0xFFFFFF          // r_symbolnum
+    orr w0, w0, #(3 << 25)        // r_length = 3 (8-byte pointer)
+    orr w0, w0, #(1 << 27)        // r_extern = 1
+    bl _kcc_macho_write32
+    add x28, x28, #1
+    b .Lmf_const_reloc_loop
+.Lmf_no_const_reloc_emit:
 @}
 
 \subsection{Symbol Table and String Table}
@@ -1267,17 +1471,42 @@ file is closed.
     mov w0, #0
     bl _kcc_macho_write16
 
-    // n_value = symbol value (offset in section)
+    // n_value = symbol value (offset in section) rebased to the section's VM
+    // start.  Section 2 (__common) starts at code_size; section 3
+    // (__DATA_CONST,__const) starts 8-aligned after __common (past the modinit
+    // pointer when present), matching the addr written in its section header.
     ldr x2, [sp, #112]            // reload sym entry ptr
     ldr x0, [x2, #SYM_VALUE]
-    // For section 2 globals, value is relative to section start (code_size + offset)
     ldr x3, [x2, #SYM_SECTION]
     cmp x3, #2
-    b.ne .Lmf_sym_val_ok
-    // Global: n_value = code_size + sym_value
+    b.eq .Lmf_sym_val_sec2
+    cmp x3, #3
+    b.eq .Lmf_sym_val_sec3
+    b .Lmf_sym_val_ok
+.Lmf_sym_val_sec2:
     adrp x3, _kcc_code_pos@@PAGE
     add  x3, x3, _kcc_code_pos@@PAGEOFF
-    ldr x3, [x3]
+    ldr x3, [x3]                  // code_size
+    add x0, x0, x3
+    b .Lmf_sym_val_ok
+.Lmf_sym_val_sec3:
+    adrp x3, _kcc_code_pos@@PAGE
+    add  x3, x3, _kcc_code_pos@@PAGEOFF
+    ldr x3, [x3]                  // code_size
+    adrp x4, _kcc_globals_size@@PAGE
+    add  x4, x4, _kcc_globals_size@@PAGEOFF
+    ldr x4, [x4]
+    add x3, x3, x4                // code_size + globals_size
+    adrp x4, _kcc_modinit_present@@PAGE
+    add  x4, x4, _kcc_modinit_present@@PAGEOFF
+    ldr x4, [x4]
+    cbz x4, .Lmf_sym_val_sec3_al
+    add x3, x3, #7
+    bic x3, x3, #7
+    add x3, x3, #8               // past the modinit pointer
+.Lmf_sym_val_sec3_al:
+    add x3, x3, #7
+    bic x3, x3, #7               // 8-align the const section start
     add x0, x0, x3
 .Lmf_sym_val_ok:
     bl _kcc_macho_write64

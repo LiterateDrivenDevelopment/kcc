@@ -514,6 +514,14 @@ difftest "rodata-const-struct-array-mixed" \
     "struct Q{int a;double b;}; static const struct Q q[]={{1,1.5},{2,2.5}}; int main(void){ return q[0].a + (int)(q[0].b*10) + q[1].a + (int)(q[1].b*10); }"
 difftest "rodata-const-struct-array-partial" \
     "struct P{int x;int y;}; static const struct P t[3]={{7,8}}; int main(void){ return t[0].x+t[0].y+t[1].x+t[2].y; }"
+# Const pointer tables (M5 Stage 2): go to __DATA_CONST,__const with a
+# relocation per slot binding it to the string literal; NULL slots stay zero.
+difftest "rodata-ptrarr" \
+    "static const char *const o[]={\"ab\",\"cd\",\"ef\"}; int main(void){ int s=0; for(int i=0;i<3;i++) s+=o[i][0]; return s; }"
+difftest "rodata-ptrarr-null" \
+    "static const char *const o[]={\"x\",\"yz\",0}; int main(void){ int n=0; for(int i=0;o[i];i++) n++; return n*10 + o[1][1]; }"
+difftest "rodata-ptrarr-extern" \
+    "const char *const msgs[]={\"hello\",\"world\"}; int main(void){ return msgs[0][0]+msgs[1][0]; }"
 
 difftest "ternary-chain" \
     "int main(void){ int x = 3; return x == 1 ? 10 : x == 2 ? 20 : x == 3 ? 30 : 40; }"

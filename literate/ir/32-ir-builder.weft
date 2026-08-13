@@ -559,7 +559,60 @@ _kcc_global_const_rodata:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_rodata_binop_ok _kcc_rodata_const_intexpr _kcc_rodata_struct_ok _kcc_rodata_aos_ok _kcc_rodata_is_lit _kcc_global_const_rodata
+
+// uint64_t kcc_global_const_ptrarr(node *decl)
+// 1 iff decl is a 1-D array of const pointers (`const char *const opts[]`)
+// initialised with string literals and/or integer (NULL) constants.  Such a
+// table cannot live in immutable __TEXT---its pointers are relocated at load---so
+// it goes to __DATA_CONST,__const (a separate emit path, kcc_emit_rodata_ptrarr).
+.text
+.globl _kcc_global_const_ptrarr
+.p2align 2
+_kcc_global_const_ptrarr:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    ldr x0, [x19, #AST_F2]          // must have an initializer
+    cbz x0, .Lgcp_no
+    ldr x1, [x19, #AST_F0]          // declared type
+    cbz x1, .Lgcp_no
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_TYPE_ARRAY         // a 1-D array
+    b.ne .Lgcp_no
+    ldr x1, [x1, #AST_F0]           // element type: must be a pointer
+    cbz x1, .Lgcp_no
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_TYPE_PTR
+    b.ne .Lgcp_no
+    ldr x2, [x1, #AST_F1]           // the pointer's own qualifiers (the *const)
+    and x2, x2, #1                  // const bit: the element pointers are const,
+    cbz x2, .Lgcp_no                // so the array is read-only
+    ldr x0, [x19, #AST_F2]          // init: flat list of string/int-constant leaves
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.ne .Lgcp_no
+    ldr x20, [x0, #AST_F0]
+.Lgcp_loop:
+    cbz x20, .Lgcp_yes
+    ldr x0, [x20, #AST_TAG]
+    cmp x0, #AST_STR_LIT
+    b.eq .Lgcp_elem_ok
+    cmp x0, #AST_INT_LIT            // an integer constant (NULL) leaves a zero slot
+    b.ne .Lgcp_no
+.Lgcp_elem_ok:
+    ldr x20, [x20, #AST_F4]
+    b .Lgcp_loop
+.Lgcp_yes:
+    mov x0, #1
+    b .Lgcp_pdone
+.Lgcp_no:
+    mov x0, #0
+.Lgcp_pdone:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_rodata_binop_ok _kcc_rodata_const_intexpr _kcc_rodata_struct_ok _kcc_rodata_aos_ok _kcc_rodata_is_lit _kcc_global_const_rodata _kcc_global_const_ptrarr
 @}
 
 @d IR: build @{
@@ -596,10 +649,14 @@ _kcc_ir_emit_global_inits:
     ldr x20, [x19, #AST_F1]
     cbz x20, .Legi_next
 
-    // A const integer global with a literal initializer is emitted as read-only
-    // bytes in __TEXT and has no writable storage; a runtime store would fault.
+    // A const scalar/aggregate global emitted as read-only __TEXT bytes, or a
+    // const pointer array emitted to __DATA_CONST, has no writable storage; a
+    // runtime store would fault.  Suppress it.
     mov x0, x19
     bl _kcc_global_const_rodata
+    cbnz x0, .Legi_next
+    mov x0, x19
+    bl _kcc_global_const_ptrarr
     cbnz x0, .Legi_next
 
     // Emit IR_GLOBAL_REF for this variable
@@ -657,6 +714,9 @@ _kcc_ir_emit_global_inits:
     // Same read-only const rule as the file-scope pass: no runtime store.
     mov x0, x20
     bl _kcc_global_const_rodata
+    cbnz x0, .Legi_stmt_next
+    mov x0, x20
+    bl _kcc_global_const_ptrarr
     cbnz x0, .Legi_stmt_next
 
     // GLOBAL_REF(mangled) + shared initializer emission.  Because the static

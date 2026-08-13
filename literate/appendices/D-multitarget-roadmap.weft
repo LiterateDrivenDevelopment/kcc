@@ -81,7 +81,7 @@ M1 & Finish the C17 frontend (designators, volatile bit-fields, real \texttt{flo
 M2 & Harden the IR verifier                    & neutral & \meterB & \stDone\\
 M3 & Systematic conformance battery            & neutral & \meterA & \stDone\\
 M4 & Broaden the IR optimizer (strength reduction + copy propagation) & neutral & \meterA & \stDone\\
-M5 & Write-protect read-only data (stray writes fault, not corrupt) & oracle & \meterB & \stPart\\
+M5 & Write-protect read-only data (stray writes fault, not corrupt) & oracle & \meterB & \stDone\\
 M6 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
 \hline
 M7 & Second target (x86-64 / ELF)              & backend & \meterA & \stOpen\\
@@ -457,7 +457,9 @@ stray write into a \texttt{const} table now aborts at the store, with
 \texttt{lldb} reporting the writing instruction, instead of surfacing as
 distant corruption.
 
-\textbf{Status.}  Stages~1 and~2 landed.  A \texttt{const} integer/floating
+\textbf{Status.}  \textbf{Done} (Stages~1 and~2; Stage~3 re-scoped out as
+architecturally impractical for write protection---see its item above).
+A \texttt{const} integer/floating
 scalar, array, struct, or array-of-struct whose initialiser is a literal, a
 negated literal, an integer constant expression, or an \texttt{enum} constant is
 write-protected in read-only \texttt{\_\_TEXT}; and a \texttt{const} array of

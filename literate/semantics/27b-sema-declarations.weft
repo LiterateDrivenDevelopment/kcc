@@ -599,6 +599,29 @@ mixed-type packing and zero-width separators are not yet modelled.
     // Fall through to .Lscd_struct
 
 .Lscd_struct:
+    // A member's enum type introduces enumerator constants that leak into the
+    // enclosing scope (\stdref{6.2.1}), so `struct { enum { X } x; } s;` makes
+    // `X` visible outside.  Register them by processing each field whose type is
+    // an enum, before (and regardless of) the tag --- an anonymous aggregate
+    // still contributes its enumerators.  A bodyless reference has no fields, so
+    // the walk is a no-op there and constants are never registered twice.
+    ldr x21, [x19, #AST_F1]        // first field
+.Lscd_struct_efld:
+    cbz x21, .Lscd_struct_efld_done
+    ldr x0, [x21, #AST_F0]         // field type node
+    cbz x0, .Lscd_struct_efld_next
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_ENUM
+    b.eq .Lscd_struct_efld_reg
+    cmp x1, #AST_ENUM_DECL
+    b.ne .Lscd_struct_efld_next
+.Lscd_struct_efld_reg:
+    bl _kcc_sema_check_decl        // field's enum type: registers its enumerators
+.Lscd_struct_efld_next:
+    ldr x21, [x21, #AST_F4]
+    b .Lscd_struct_efld
+.Lscd_struct_efld_done:
+
     // Register struct/union tag if named
     ldr x0, [x19, #AST_F0]         // name_ptr
     cbz x0, .Lscd_done

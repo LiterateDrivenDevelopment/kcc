@@ -590,7 +590,10 @@ values, \texttt{sizeof} of a whole array (which must not decay to a
 pointer), the comma operator in a \texttt{for} clause (a parser register
 bug that hung the loop), and pointer difference.  The rest exercise
 \texttt{goto}, dense \texttt{switch}, deep recursion, eight-argument
-calls, pointer comparison, and a spread of operators.
+calls, pointer comparison, and a spread of operators.  Two cases pin the
+C11 anonymous member: a nameless \texttt{union} and a nameless
+\texttt{struct} whose fields are reached directly through the enclosing
+object, which must agree byte-for-byte with the reference compiler.
 
 @d Difftest: language @{
 echo ""
@@ -604,6 +607,10 @@ difftest "variadic-macro" \
     "#define CALL(F,...) F(__VA_ARGS__)\nint add3(int a,int b,int c){return a+b+c;}\nint main(void){ return CALL(add3, 10, 20, 12); }"
 difftest "variadic-macro-empty" \
     "#define SUM(base,...) (base)\nint main(void){ return SUM(7); }"
+difftest "anon-union-member" \
+    "struct S{int a; union{int b1;int b2;};}; int main(void){ struct S s; s.a=5; s.b1=12; return s.b2 - 12 + s.a; }"
+difftest "anon-struct-member" \
+    "struct S{int a; struct{int c1;int c2;};}; int main(void){ struct S s; s.a=3; s.c1=10; s.c2=2; return s.c1 + s.c2 - s.a - 2; }"
 
 difftest "enum-explicit" \
     "enum E { A, B, C, D = 10, E2 }; int main(void){ return A + B + C + D + E2; }"

@@ -1471,7 +1471,11 @@ address of \texttt{p}, not of the struct.  Second, the type
 resolution must dereference through the pointer type: the object's
 \texttt{AST\_F3} is \texttt{TY\_PTR}; we follow \texttt{TY\_F0} to
 reach the underlying \texttt{TY\_STRUCT} so that the field-name
-walk produces the correct index.
+search produces the correct offset.  That search is the same shared
+\texttt{kcc\_type\_find\_member} the type-checker uses, so an access
+that reaches through an anonymous (nameless) struct or union member
+resolves to the correct field and its offset is accumulated across the
+enclosing anonymous members.
 
 Global structs require a separate path from local structs.  When
 the identifier is not found in the locals hash table, the builder
@@ -1498,8 +1502,8 @@ rewriting the member node's object field to the bare inner expression
 // uint64_t kcc_ir_build_member_addr(node *member)
 //   x0 = AST_MEMBER (F0=object, F1=name_ptr, F3=resolved type)
 // Returns vreg holding the field address (GEP result).
-// The field index is computed by walking the struct declaration's
-// field chain and matching the member name.
+// The field byte offset is computed by kcc_type_find_member, which
+// matches the member name and descends into anonymous members.
 .text
 .globl _kcc_ir_build_member_addr
 .p2align 2
@@ -1665,26 +1669,18 @@ _kcc_ir_build_member_addr:
     mov x25, x0                 // preserve struct type across the call
     bl _kcc_type_layout
 
-    // Walk field list: TY_F0 = AST_STRUCT_DECL, F1 = first field
-    ldr x0, [x25, #TY_F0]       // AST_STRUCT_DECL
+    // Find the member.  A member of an anonymous (nameless) struct/union
+    // member is reachable directly, so we delegate to the shared recursive
+    // search that accumulates the enclosing anonymous members' offsets --
+    // the same routine sema uses, keeping type-check and lowering in step.
+    mov x0, x25                 // struct/union type
+    ldr x1, [x19, #AST_F1]      // member name to find
+    bl _kcc_type_find_member    // x0 = field decl (0 if none), x1 = byte offset
     cbz x0, .Libma_index_zero
-    ldr x23, [x0, #AST_F1]      // first field
-    ldr x24, [x19, #AST_F1]     // member name to find
-
-.Libma_field_loop:
-    cbz x23, .Libma_index_zero
-    ldr x0, [x23, #AST_F1]      // field name_ptr
-    cbz x0, .Libma_field_next
-    mov x1, x24
-    bl _kcc_strcmp
-    cbz x0, .Libma_found
-
-.Libma_field_next:
-    ldr x23, [x23, #AST_F4]     // next field
-    b .Libma_field_loop
+    mov x23, x0                 // field decl
+    mov x21, x1                 // accumulated byte offset
 
 .Libma_found:
-    ldr x21, [x23, #AST_F3]      // field byte offset (set by _kcc_type_layout)
     adrp x0, _kcc_ir_member_field@@PAGE
     add  x0, x0, _kcc_ir_member_field@@PAGEOFF
     str x23, [x0]                // expose the field decl for bit-field access

@@ -1657,15 +1657,87 @@ Member access handles both dot (\texttt{s.m}) and arrow
 (\texttt{p->m}) forms.  For arrow access the object type must be a
 pointer, which is dereferenced first.  The resulting type must be
 \texttt{TY\_STRUCT} or \texttt{TY\_UNION}; if not, the checker falls
-back to \texttt{int}.  The lookup walks the struct declaration's
-field chain (\texttt{AST\_F1} linked via \texttt{AST\_F4}), counting
-fields until it finds a name matching the member name in
-\texttt{AST\_MEMBER.F1}.  On a match the field's declared type is
-returned and stored in \texttt{AST\_F3} by the caller (the standard
-\texttt{.Lse\_store} path); the IR builder later re-walks the field
-list to compute the field index at code-generation time.
+back to \texttt{int}.  The lookup is factored into a shared helper,
+\texttt{kcc\_type\_find\_member}, which walks the aggregate's field
+chain (\texttt{AST\_F1} linked via \texttt{AST\_F4}) for a name matching
+the member in \texttt{AST\_MEMBER.F1}.  When it meets a \emph{nameless}
+field whose type is itself a struct or union --- an anonymous member in
+the sense of C11 \S6.7.2.1 --- it recurses into that member and, on a
+hit, adds the anonymous member's own byte offset to the offset returned
+from within.  A member of an anonymous inner aggregate is therefore
+reachable directly, as though its fields belonged to the enclosing type.
+The helper returns the matching field decl together with its accumulated
+byte offset; on a match the field's declared type is stored in
+\texttt{AST\_F3} by the caller (the standard \texttt{.Lse\_store} path).
+The IR builder calls the very same helper when lowering a member address,
+so type-checking and code generation agree on both the resolved field
+and its offset.
 
 @d Sema: expr member @{
+// -- kcc_type_find_member -------------------------------------------------
+// (AST_FIELD_DECL, uint64_t offset) kcc_type_find_member(type *sty, char *name)
+//   x0 = struct/union type, x1 = member name
+// Returns x0 = matching field decl (0 if none), x1 = its byte offset within
+// `sty`.  Recurses into anonymous (nameless) struct/union members and adds
+// their offsets (C11 6.7.2.1), so a member of an anonymous inner aggregate is
+// reachable directly.  Shared by member type-checking and the IR builder's
+// member-address lowering, keeping the two in lock-step.
+.text
+.globl _kcc_type_find_member
+.p2align 2
+_kcc_type_find_member:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                    // struct/union type
+    mov x20, x1                    // member name
+    mov x0, x19
+    bl _kcc_type_layout            // ensure per-field AST_F3 offsets are set
+    ldr x0, [x19, #TY_F0]          // AST_STRUCT_DECL / AST_UNION_DECL
+    cbz x0, .Lfm_notfound
+    ldr x21, [x0, #AST_F1]         // first field
+.Lfm_loop:
+    cbz x21, .Lfm_notfound
+    ldr x0, [x21, #AST_F1]         // field name
+    cbz x0, .Lfm_anon              // nameless field: an anonymous member
+    mov x1, x20
+    bl _kcc_strcmp
+    cbz x0, .Lfm_direct
+    b .Lfm_next
+.Lfm_direct:
+    mov x0, x21
+    ldr x1, [x21, #AST_F3]         // field byte offset
+    b .Lfm_done
+.Lfm_anon:
+    ldr x0, [x21, #AST_F0]         // its type must be a struct/union to promote
+    cbz x0, .Lfm_next
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lfm_next
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.eq .Lfm_recurse
+    cmp x1, #TY_UNION
+    b.ne .Lfm_next
+.Lfm_recurse:
+    mov x1, x20
+    bl _kcc_type_find_member       // x0 = inner field, x1 = inner offset; x21 kept
+    cbz x0, .Lfm_next
+    ldr x2, [x21, #AST_F3]         // this anonymous member's own offset
+    add x1, x1, x2                 // accumulate
+    b .Lfm_done
+.Lfm_next:
+    ldr x21, [x21, #AST_F4]        // next field
+    b .Lfm_loop
+.Lfm_notfound:
+    mov x0, #0
+    mov x1, #0
+.Lfm_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- kcc_sema_expr_member -------------------------------------------------
 // type_desc *kcc_sema_expr_member(node *expr)
 //   x19 = expression node (AST_MEMBER)
@@ -1716,23 +1788,12 @@ _kcc_sema_expr_member:
     ret
 
 .Lsem_lookup:
-    // Walk the struct's field list to find the member
-    ldr x21, [x20, #TY_F0]         // AST_STRUCT_DECL node
-    ldr x21, [x21, #AST_F1]        // first field (AST_FIELD_DECL chain)
-    ldr x22, [x19, #AST_F1]        // member name to find
-
-.Lsem_field_loop:
-    cbz x21, .Lsem_not_found
-    ldr x0, [x21, #AST_F1]         // field name_ptr
-    cbz x0, .Lsem_field_next       // skip anonymous fields
-
-    mov x1, x22
-    bl _kcc_strcmp
-    cbz x0, .Lsem_found
-
-.Lsem_field_next:
-    ldr x21, [x21, #AST_F4]        // next field
-    b .Lsem_field_loop
+    // Find the member, descending through anonymous members (C11 6.7.2.1).
+    mov x0, x20                    // struct/union type
+    ldr x1, [x19, #AST_F1]         // member name
+    bl _kcc_type_find_member
+    mov x21, x0                    // matching AST_FIELD_DECL (0 if none)
+    cbnz x21, .Lsem_found
 
 .Lsem_not_found:
     ldr x0, [x19, #AST_LINE]
@@ -1767,6 +1828,7 @@ _kcc_sema_expr_member:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+@| _kcc_type_find_member _kcc_sema_expr_member
 @}
 
 \subsection{Cast Expression}

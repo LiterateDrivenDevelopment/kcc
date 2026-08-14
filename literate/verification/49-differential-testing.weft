@@ -628,6 +628,10 @@ difftest "cmp-promoted-uchar-schar" \
 
 difftest "builtin-line-macro" \
     "int main(void){ int a = __LINE__; return a + __LINE__; }"
+difftest "compound-literal-addr" \
+    "struct S{int a;int b;}; struct S *g = &(struct S){1,2}; int main(void){ return g->a + g->b - 3; }"
+difftest "compound-literal-local" \
+    "struct S{int a;int b;}; int sum(struct S s){return s.a+s.b;} int main(void){ struct S x = (struct S){7,9}; return sum(x) + sum((struct S){2,3}) - 21; }"
 difftest "ptr-to-array-declarator" \
     "int main(void){ char arr[2][4]; char (*p)[4]; p=arr; arr[1][3]=2; return (p[1][3]!=2)?1:0; }"
 difftest "enum-in-struct-member" \

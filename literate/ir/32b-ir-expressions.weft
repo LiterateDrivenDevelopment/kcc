@@ -73,9 +73,39 @@ _kcc_ir_build_expr:
     b.eq .Libe_va_arg
     cmp x0, #AST_GENERIC
     b.eq .Libe_generic
+    cmp x0, #AST_COMPOUND_LIT
+    b.eq .Libe_compound_lit
 
     // Unhandled expression — return 0
     b .Libe_zero
+
+.Libe_compound_lit:
+    // A compound literal materialises an anonymous object; its address is the
+    // aggregate ``value'' (as for an aggregate identifier), while a scalar
+    // literal loads through that address.  Only x19 is callee-saved here, so
+    // the object address rides the free frame slot [sp,#24] across the calls.
+    mov x0, x19
+    bl _kcc_ir_build_compound_lit
+    str x0, [sp, #24]            // stash object address
+    ldr x0, [x19, #AST_F0]       // literal type
+    bl _kcc_sema_resolve_type
+    cbz x0, .Libe_cl_addr
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.eq .Libe_cl_addr
+    cmp x1, #TY_UNION
+    b.eq .Libe_cl_addr
+    cmp x1, #TY_ARRAY
+    b.eq .Libe_cl_addr
+    // Scalar compound literal: load its value at the object's width.
+    bl _kcc_ir_store_width       // x0 = size code (x0 was the scalar type)
+    mov x1, x0                   // size code
+    ldr x0, [sp, #24]            // address
+    bl _kcc_ir_emit_load
+    b .Libe_done
+.Libe_cl_addr:
+    ldr x0, [sp, #24]            // aggregate: the address is the value
+    b .Libe_done
 
 .Libe_generic:
     // Sema already chose the association; build its expression from AST_F2.
@@ -4384,6 +4414,8 @@ _kcc_ir_build_unary:
     b.eq .Libu_addr_subscript
     cmp x0, #AST_MEMBER
     b.eq .Libu_addr_member
+    cmp x0, #AST_COMPOUND_LIT
+    b.eq .Libu_addr_compound
     cmp x0, #AST_IDENT_EXPR
     b.ne .Libu_addr_zero         // unsupported operand → 0
 
@@ -4414,6 +4446,12 @@ _kcc_ir_build_unary:
     // &s.f / &s->f: the member address
     mov x0, x21
     bl _kcc_ir_build_member_addr
+    b .Libu_done
+
+.Libu_addr_compound:
+    // &(T){...}: the address of the materialised compound-literal object.
+    mov x0, x21
+    bl _kcc_ir_build_compound_lit
     b .Libu_done
 
 .Libu_addr_global:

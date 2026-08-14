@@ -248,8 +248,18 @@ _kcc_ir_build_struct_addr:
     b.eq .Libsad_subscript
     cmp x1, #AST_UNARY_EXPR
     b.eq .Libsad_deref
+    cmp x1, #AST_COMPOUND_LIT
+    b.eq .Libsad_compound
     mov x0, x19
     bl _kcc_ir_build_expr        // fallback: operand already yields an address
+    b .Libsad_done
+
+.Libsad_compound:
+    // A compound literal is an lvalue; its materialised object's address is
+    // exactly what a struct address wants (used by `&(T){...}`, member access
+    // on a literal, and struct-copy initialisers).
+    mov x0, x19
+    bl _kcc_ir_build_compound_lit
     b .Libsad_done
 
 .Libsad_deref:
@@ -870,7 +880,124 @@ _kcc_ir_fill_one:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
+@}
 
+\paragraph{Compound literals.}
+A compound literal \texttt{(T)\{\ldots\}} (\stdref{6.5.2.5}) denotes an
+unnamed object of type \texttt{T} initialised by the brace list.  Inside a
+function it has automatic storage, so
+\texttt{\_kcc\_ir\_build\_compound\_lit} materialises exactly what a local
+aggregate declaration would: an \texttt{alloca} of the right size, a
+slot-by-slot zero-fill, then \texttt{\_kcc\_ir\_fill\_list} to place the
+initializer (designators and brace elision included).  A compound literal is
+an \emph{lvalue}, so the builder returns the vreg holding the object's
+\emph{address}; a caller wanting the value (a scalar literal, or a member
+access on it) loads through that address, while aggregate uses --- the common
+case, \texttt{\&(struct S)\{1,2\}} or passing one by value --- take the
+address directly.  A file-scope compound literal is a different animal (static
+storage), handled in the global-initializer path.
+
+@d IR: aggregate init helpers @{
+// -- kcc_ir_build_compound_lit --------------------------------------------
+// uint64_t kcc_ir_build_compound_lit(node *cl)
+//   x0 = AST_COMPOUND_LIT (F0 = type, F1 = brace init list)
+// Returns the vreg holding the address of the materialised automatic object.
+.text
+.globl _kcc_ir_build_compound_lit
+.p2align 2
+_kcc_ir_build_compound_lit:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                  // compound-literal node
+    ldr x0, [x19, #AST_F0]       // type node
+    bl _kcc_sema_resolve_type
+    mov x21, x0                  // object type
+    cbz x21, .Lbcl_zero
+
+    // Slot count = ceil(TY_SIZE / 8), at least one.
+    mov x0, x21
+    bl _kcc_type_layout          // byte size
+    add x0, x0, #7
+    lsr x24, x0, #3
+    cbnz x24, .Lbcl_alloca
+    mov x24, #1
+.Lbcl_alloca:
+    mov x0, #IR_ALLOCA
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_TYPE]
+    str x24, [x0, #IR_SRC1]      // slot count
+    mov x22, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x23, x0                  // x23 = alloca vreg (the object's address)
+    mov x0, x22
+    bl _kcc_ir_emit
+
+    // Zero the whole object, so a sparse initializer leaves zeros (§6.7.9).
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str xzr, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x20, x0                  // zero vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    mov x22, #0                  // slot index
+.Lbcl_zf:
+    cmp x22, x24
+    b.ge .Lbcl_fill
+    mov x0, x23                  // base
+    lsl x1, x22, #3             // byte offset = slot * 8
+    mov x2, x20                  // zero vreg
+    mov x3, #0                   // 8-byte slot
+    bl _kcc_ir_emit_indexed_store
+    add x22, x22, #1
+    b .Lbcl_zf
+
+.Lbcl_fill:
+    ldr x0, [x19, #AST_F1]       // brace init list
+    cbz x0, .Lbcl_ret            // no list → the zeroed object stands
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_INIT_LIST
+    b.ne .Lbcl_scalar
+    ldr x3, [x0, #AST_F0]        // list head
+    mov x0, x21                  // object type
+    mov x1, x23                  // base alloca
+    mov x2, #0                   // base offset
+    bl _kcc_ir_fill_list
+    b .Lbcl_ret
+.Lbcl_scalar:
+    // A non-brace initializer (a scalar compound literal whose value the
+    // parser did not wrap in a list): store it into the single object.
+    mov x3, x0                   // init node
+    mov x0, x21                  // type
+    mov x1, x23                  // base alloca
+    mov x2, #0                   // offset
+    mov x4, #0                   // no bit-field
+    bl _kcc_ir_fill_one
+.Lbcl_ret:
+    mov x0, x23                  // address of the object
+    b .Lbcl_done
+.Lbcl_zero:
+    mov x0, #0
+.Lbcl_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_build_compound_lit
+@}
+
+@d IR: aggregate init helpers @{
 // -- kcc_ir_fill ----------------------------------------------------------
 // node *kcc_ir_fill(type *ty, base_alloca, uint64_t off, node *elem)
 //   Brace-elision stream consumer.  Fills the object of type `ty` at `off`

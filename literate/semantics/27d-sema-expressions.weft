@@ -75,9 +75,19 @@ _kcc_sema_expr:
     b.eq .Lse_va_arg
     cmp x20, #AST_GENERIC
     b.eq .Lse_generic
+    cmp x20, #AST_COMPOUND_LIT
+    b.eq .Lse_compound_lit
 
     // Default: int
     b .Lse_default_int
+
+.Lse_compound_lit:
+    // A compound literal's type is its parenthesised type name; storing it in
+    // AST_F3 lets a postfix `.m`/`[i]`/pass-by-value see a real aggregate.
+    ldr x0, [x19, #AST_F0]        // the type node
+    cbz x0, .Lse_default_int
+    bl _kcc_sema_resolve_type
+    b .Lse_store
 
 .Lse_generic:
     mov x0, x19

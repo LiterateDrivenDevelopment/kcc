@@ -558,7 +558,9 @@ _kcc_parse_cast_expr:
     b .Lcast_done
 
 .Lcast_compound_lit:
-    // Compound literal: (type) { init-list }
+    // Compound literal: (type) { init-list }.  Like a parenthesised primary it
+    // is a postfix-expression, so member/subscript/call suffixes may chain onto
+    // it: `(struct S){1,2}.a`, `(int[]){1,2,3}[i]`.
     bl _kcc_parse_initializer
     mov x20, x0                  // x20 = init list
 
@@ -566,6 +568,7 @@ _kcc_parse_cast_expr:
     bl _kcc_ast_alloc
     str x19, [x0, #AST_F0]      // type
     str x20, [x0, #AST_F1]      // init_list
+    bl _kcc_parse_postfix_tail   // apply any .m / [i] / (args) suffixes
     b .Lcast_done
 
 .Lcast_paren_expr:

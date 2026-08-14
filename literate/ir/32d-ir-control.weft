@@ -639,15 +639,24 @@ branch from a non-terminated body block to the next case's block.  The
 exit block is pushed onto the loop stack as a break target so that
 \texttt{break} statements inside the switch branch to it.
 
-The builder uses three passes over the compound body's item list.
-Pass~1 creates a basic block for every \texttt{case} and
-\texttt{default} label and stashes the BB pointer in an unused AST
-field (\texttt{F2} for cases, \texttt{F1} for default).  Pass~2 emits
-the dispatch chain: each comparison occupies its own basic block
-terminated by \texttt{IR\_BR\_COND}.  Pass~3 walks the items once more
-and builds each statement in the appropriate basic block, inserting
-fall-through branches between consecutive labels when the preceding
-block is not yet terminated.
+A \texttt{case} or \texttt{default} label is not confined to the top level
+of the switch's body: the standard (\stdref{6.8.1}) lets it appear anywhere
+inside, nested within blocks, \texttt{if}s and loops --- the basis of
+Duff's device, where cases interleave a \texttt{do}/\texttt{while}.  The
+builder therefore treats a label like a \texttt{goto} target.  Two recursive
+scans, \texttt{\_kcc\_ir\_sw\_scan} and \texttt{\_kcc\_ir\_sw\_disp}, walk the
+whole body sub-tree --- descending through compounds, \texttt{if}s, loops and
+labels but stopping at a nested \texttt{switch}, whose labels are its own.
+The first allocates a basic block for every label and stashes it in an unused
+AST field (\texttt{F2} for a case, \texttt{F1} for a default), recording the
+default's block in \texttt{\_kcc\_sw\_default\_bb}.  The second, driven by the
+controlling value in \texttt{\_kcc\_sw\_cond\_vreg}, emits the dispatch chain
+in source order, each comparison in its own block terminated by
+\texttt{IR\_BR\_COND}.  The body is then built by a single ordinary
+\texttt{\_kcc\_ir\_build\_stmt} call: a \texttt{case}/\texttt{default} node
+encountered during that walk branches the current block into its
+pre-allocated block and continues there, giving C fall-through for free and
+placing interior labels exactly where they textually occur.
 
 @d IR: build switch @{
 // -- kcc_eval_const_int ---------------------------------------------------
@@ -827,10 +836,222 @@ _kcc_eval_const_int:
     ldp x29, x30, [sp], #48
     ret
 
+// -- Switch scan state (shared by the two recursive walkers below) --------
+.data
+.p2align 3
+_kcc_sw_default_bb: .quad 0
+_kcc_sw_cond_vreg:  .quad 0
+.text
+
+// -- kcc_ir_sw_scan -------------------------------------------------------
+// void kcc_ir_sw_scan(node *stmt)
+// Allocate a basic block for every case/default label reachable as a
+// sub-statement of a switch body, stashing it in the label (F2 for a case,
+// F1 for a default) and recording the default's block in _kcc_sw_default_bb.
+// Descends through compounds, if, loops and labels; a nested switch owns its
+// own labels, so it is not entered.
+.p2align 2
+_kcc_ir_sw_scan:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    cbz x0, .Lsws_done
+    mov x19, x0
+    ldr x20, [x19, #AST_TAG]
+    cmp x20, #AST_CASE_STMT
+    b.eq .Lsws_case
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Lsws_default
+    cmp x20, #AST_COMPOUND
+    b.eq .Lsws_compound
+    cmp x20, #AST_IF_STMT
+    b.eq .Lsws_if
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lsws_body_f1
+    cmp x20, #AST_DO_STMT
+    b.eq .Lsws_body_f0
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lsws_body_f3
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lsws_body_f1
+    b .Lsws_done                 // nested switch / leaf: do not descend
+.Lsws_case:
+    bl _kcc_ir_alloc_bb
+    str x0, [x19, #AST_F2]       // stash case BB
+    ldr x0, [x19, #AST_F1]       // case body may nest further labels
+    bl _kcc_ir_sw_scan
+    b .Lsws_done
+.Lsws_default:
+    bl _kcc_ir_alloc_bb
+    str x0, [x19, #AST_F1]       // stash default BB
+    adrp x1, _kcc_sw_default_bb@@PAGE
+    add  x1, x1, _kcc_sw_default_bb@@PAGEOFF
+    str x0, [x1]
+    ldr x0, [x19, #AST_F0]       // default body may nest further labels
+    bl _kcc_ir_sw_scan
+    b .Lsws_done
+.Lsws_compound:
+    ldr x19, [x19, #AST_F0]      // first item
+.Lsws_comp_loop:
+    cbz x19, .Lsws_done
+    mov x0, x19
+    bl _kcc_ir_sw_scan
+    ldr x19, [x19, #AST_F4]
+    b .Lsws_comp_loop
+.Lsws_if:
+    ldr x0, [x19, #AST_F1]       // then
+    bl _kcc_ir_sw_scan
+    ldr x0, [x19, #AST_F2]       // else
+    bl _kcc_ir_sw_scan
+    b .Lsws_done
+.Lsws_body_f0:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_sw_scan
+    b .Lsws_done
+.Lsws_body_f1:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_sw_scan
+    b .Lsws_done
+.Lsws_body_f3:
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_sw_scan
+.Lsws_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_sw_disp -------------------------------------------------------
+// void kcc_ir_sw_disp(node *stmt)
+// Emit the dispatch comparison for every case label, in source order, testing
+// the controlling value in _kcc_sw_cond_vreg.  Same traversal as the scan; a
+// default label emits no comparison (it is the fall-through target) but its
+// body is still descended for nested cases.
+.p2align 2
+_kcc_ir_sw_disp:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    cbz x0, .Lswd_done
+    mov x19, x0
+    ldr x20, [x19, #AST_TAG]
+    cmp x20, #AST_CASE_STMT
+    b.eq .Lswd_case
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Lswd_default
+    cmp x20, #AST_COMPOUND
+    b.eq .Lswd_compound
+    cmp x20, #AST_IF_STMT
+    b.eq .Lswd_if
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lswd_body_f1
+    cmp x20, #AST_DO_STMT
+    b.eq .Lswd_body_f0
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lswd_body_f3
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lswd_body_f1
+    b .Lswd_done
+.Lswd_case:
+    // Evaluate the case constant → IR_CONST
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_eval_const_int
+    mov x21, x0
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // case_const_vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // IR_CMP_EQ(cond_vreg, case_const_vreg)
+    mov x0, #IR_CMP_EQ
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    adrp x0, _kcc_sw_cond_vreg@@PAGE
+    add  x0, x0, _kcc_sw_cond_vreg@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x22, #IR_SRC1]      // cond_vreg
+    str x21, [x22, #IR_SRC2]     // case_const_vreg
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // cmp result vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // Fresh BB for the next comparison (false target)
+    bl _kcc_ir_alloc_bb
+    mov x22, x0
+    // IR_BR_COND: true → case_bb, false → next dispatch BB
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_DEST]
+    ldr x1, [x19, #AST_F2]       // case_bb
+    ldr x1, [x1, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    // Terminate current dispatch BB, switch to the next one
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]       // descend case body for nested cases
+    bl _kcc_ir_sw_disp
+    b .Lswd_done
+.Lswd_default:
+    ldr x0, [x19, #AST_F0]       // descend default body for nested cases
+    bl _kcc_ir_sw_disp
+    b .Lswd_done
+.Lswd_compound:
+    ldr x19, [x19, #AST_F0]
+.Lswd_comp_loop:
+    cbz x19, .Lswd_done
+    mov x0, x19
+    bl _kcc_ir_sw_disp
+    ldr x19, [x19, #AST_F4]
+    b .Lswd_comp_loop
+.Lswd_if:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_sw_disp
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_sw_disp
+    b .Lswd_done
+.Lswd_body_f0:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_ir_sw_disp
+    b .Lswd_done
+.Lswd_body_f1:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_sw_disp
+    b .Lswd_done
+.Lswd_body_f3:
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_ir_sw_disp
+.Lswd_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- kcc_ir_build_switch --------------------------------------------------
 // void kcc_ir_build_switch(node *stmt)
-//   x0 = AST_SWITCH_STMT (F0=expr, F1=compound body)
-// Lowers to: dispatch chain → case bodies → exit_bb
+//   x0 = AST_SWITCH_STMT (F0=expr, F1=body)
+// Lowers to: dispatch chain → body (labels placed by build_stmt) → exit_bb
 .text
 .globl _kcc_ir_build_switch
 .p2align 2
@@ -845,290 +1066,53 @@ _kcc_ir_build_switch:
 
     mov x19, x0                  // x19 = switch node
 
-    // 1. Evaluate controlling expression
+    // 1. Controlling expression → global cond vreg (read by the dispatch walk)
     ldr x0, [x19, #AST_F0]
     bl _kcc_ir_build_expr
-    mov x20, x0                  // x20 = cond_vreg
+    adrp x1, _kcc_sw_cond_vreg@@PAGE
+    add  x1, x1, _kcc_sw_cond_vreg@@PAGEOFF
+    str x0, [x1]
 
     // 2. Allocate exit BB
     bl _kcc_ir_alloc_bb
     mov x21, x0                  // x21 = exit_bb
 
-    // 3. Get first item of compound body
-    ldr x0, [x19, #AST_F1]      // compound stmt
-    ldr x23, [x0, #AST_F0]      // x23 = first item (constant)
+    // 3. Pass 1: recursively allocate a BB for every label; reset default first
+    adrp x0, _kcc_sw_default_bb@@PAGE
+    add  x0, x0, _kcc_sw_default_bb@@PAGEOFF
+    str xzr, [x0]
+    ldr x0, [x19, #AST_F1]       // switch body
+    bl _kcc_ir_sw_scan
+    adrp x0, _kcc_sw_default_bb@@PAGE
+    add  x0, x0, _kcc_sw_default_bb@@PAGEOFF
+    ldr x22, [x0]                // x22 = default_bb (0 if none)
 
-    mov x22, #0                  // x22 = default_bb (null)
+    // 4. Pass 2: recursively emit the dispatch chain
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_sw_disp
 
-    // -- Pass 0: flatten stacked labels --
-    // `case A: case B: body` nests B inside A's statement field (the parser
-    // makes the label's statement the next label), but the passes below walk
-    // only the F4 sibling chain.  Splice each nested case/default out as a
-    // sibling---its own empty, fall-through label---so every stacked label gets
-    // a dispatch entry.  Without this only the outermost label matched.
-    mov x24, x23
-.Lsw_flat:
-    cbz x24, .Lsw_flat_done
-    ldr x0, [x24, #AST_TAG]
-    cmp x0, #AST_CASE_STMT
-    b.eq .Lsw_flat_case
-    cmp x0, #AST_DEFAULT_STMT
-    b.eq .Lsw_flat_default
-    b .Lsw_flat_next
-.Lsw_flat_case:
-    ldr x1, [x24, #AST_F1]      // case body statement
-    b .Lsw_flat_check
-.Lsw_flat_default:
-    ldr x1, [x24, #AST_F0]      // default body statement
-.Lsw_flat_check:
-    cbz x1, .Lsw_flat_next
-    ldr x2, [x1, #AST_TAG]
-    cmp x2, #AST_CASE_STMT
-    b.eq .Lsw_flat_splice
-    cmp x2, #AST_DEFAULT_STMT
-    b.ne .Lsw_flat_next
-.Lsw_flat_splice:
-    ldr x2, [x24, #AST_F4]      // outer label's current next sibling
-    str x2, [x1, #AST_F4]       // nested.F4 = outer.F4
-    str x1, [x24, #AST_F4]      // outer.F4 = nested
-    ldr x0, [x24, #AST_TAG]
-    cmp x0, #AST_CASE_STMT
-    b.ne .Lsw_flat_clr_default
-    str xzr, [x24, #AST_F1]     // outer case now an empty fall-through label
-    b .Lsw_flat_advance
-.Lsw_flat_clr_default:
-    str xzr, [x24, #AST_F0]
-.Lsw_flat_advance:
-    mov x24, x1                 // reprocess the spliced label (may nest further)
-    b .Lsw_flat
-.Lsw_flat_next:
-    ldr x24, [x24, #AST_F4]
-    b .Lsw_flat
-.Lsw_flat_done:
-
-    // -- Pass 1: create BBs for each case/default --
-    mov x24, x23
-.Lsw_scan:
-    cbz x24, .Lsw_scan_done
-    ldr x0, [x24, #AST_TAG]
-    cmp x0, #AST_CASE_STMT
-    b.ne .Lsw_scan_nocase
-    bl _kcc_ir_alloc_bb
-    str x0, [x24, #AST_F2]      // stash case BB in F2
-    b .Lsw_scan_next
-.Lsw_scan_nocase:
-    cmp x0, #AST_DEFAULT_STMT
-    b.ne .Lsw_scan_next
-    bl _kcc_ir_alloc_bb
-    str x0, [x24, #AST_F1]      // stash default BB in F1
-    mov x22, x0                  // remember default_bb
-.Lsw_scan_next:
-    ldr x24, [x24, #AST_F4]
-    b .Lsw_scan
-.Lsw_scan_done:
-
-    // -- Pass 2: dispatch chain --
-    // For each case: emit const + cmp_eq + br_cond in current BB,
-    // then create a fresh dispatch BB for the next comparison.
-    mov x24, x23
-.Lsw_disp:
-    cbz x24, .Lsw_disp_done
-    ldr x0, [x24, #AST_TAG]
-    cmp x0, #AST_CASE_STMT
-    b.ne .Lsw_disp_next
-
-    // Get case constant value (evaluate: it may be `1 << 5`, not a bare literal)
-    ldr x0, [x24, #AST_F0]      // case expr
-    bl _kcc_eval_const_int
-    mov x25, x0                 // integer value
-
-    // Emit IR_CONST for case value
-    mov x0, #IR_CONST
-    bl _kcc_ir_alloc_instr
-    mov x26, x0
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x26, #IR_TYPE]
-    str x25, [x26, #IR_SRC1]    // immediate value
-    bl _kcc_ir_next_vreg
-    str x0, [x26, #IR_DEST]
-    mov x25, x0                  // x25 = case_const_vreg
-    mov x0, x26
-    bl _kcc_ir_emit
-
-    // Emit IR_CMP_EQ(cond_vreg, case_const_vreg)
-    mov x0, #IR_CMP_EQ
-    bl _kcc_ir_alloc_instr
-    mov x26, x0
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x26, #IR_TYPE]
-    str x20, [x26, #IR_SRC1]    // cond_vreg
-    str x25, [x26, #IR_SRC2]    // case_const_vreg
-    bl _kcc_ir_next_vreg
-    str x0, [x26, #IR_DEST]
-    mov x25, x0                  // x25 = cmp_vreg
-    mov x0, x26
-    bl _kcc_ir_emit
-
-    // Create next dispatch BB
-    bl _kcc_ir_alloc_bb
-    mov x27, x0                  // x27 = next_dispatch_bb
-
-    // Emit IR_BR_COND: true → case_bb, false → next_dispatch_bb
-    mov x0, #IR_BR_COND
-    bl _kcc_ir_alloc_instr
-    str x25, [x0, #IR_DEST]     // condition vreg
-    ldr x1, [x24, #AST_F2]      // case_bb (stashed in pass 1)
-    ldr x1, [x1, #BB_ID]
-    str x1, [x0, #IR_SRC1]      // true target
-    ldr x1, [x27, #BB_ID]
-    str x1, [x0, #IR_SRC2]      // false target
-    bl _kcc_ir_emit
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    orr x1, x1, #BB_FLAG_TERMINATED
-    str x1, [x0, #BB_FLAGS]
-
-    // Switch to next dispatch BB
-    mov x0, x27
-    bl _kcc_ir_set_bb
-
-.Lsw_disp_next:
-    ldr x24, [x24, #AST_F4]
-    b .Lsw_disp
-.Lsw_disp_done:
-
-    // End of dispatch chain: branch to default or exit
-    cbz x22, .Lsw_disp_exit
-    // Branch to default_bb
-    mov x0, #IR_BR
-    bl _kcc_ir_alloc_instr
-    ldr x1, [x22, #BB_ID]
-    str x1, [x0, #IR_SRC1]
-    bl _kcc_ir_emit
-    b .Lsw_disp_term
-.Lsw_disp_exit:
-    // Branch to exit_bb
-    mov x0, #IR_BR
-    bl _kcc_ir_alloc_instr
-    ldr x1, [x21, #BB_ID]
-    str x1, [x0, #IR_SRC1]
-    bl _kcc_ir_emit
-.Lsw_disp_term:
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    orr x1, x1, #BB_FLAG_TERMINATED
-    str x1, [x0, #BB_FLAGS]
-
-    // -- Pass 3: emit case/default bodies --
-    // Push break target (continue=0, not valid in switch)
-    ldr x0, [x21, #BB_ID]       // break → exit_bb
-    mov x1, #0                  // no continue target
-    bl _kcc_loop_push
-
-    mov x24, x23
-.Lsw_body:
-    cbz x24, .Lsw_body_done
-    ldr x0, [x24, #AST_TAG]
-    cmp x0, #AST_CASE_STMT
-    b.eq .Lsw_body_case
-    cmp x0, #AST_DEFAULT_STMT
-    b.eq .Lsw_body_default
-
-    // Regular statement: build in current BB
-    mov x0, x24
-    bl _kcc_ir_build_stmt
-    b .Lsw_body_next
-
-.Lsw_body_case:
-    ldr x25, [x24, #AST_F2]     // case_bb
-
-    // If current BB not terminated, emit fallthrough branch
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    tst x1, #BB_FLAG_TERMINATED
-    b.ne .Lsw_case_set_bb
-    mov x0, #IR_BR
-    bl _kcc_ir_alloc_instr
-    ldr x1, [x25, #BB_ID]
-    str x1, [x0, #IR_SRC1]
-    bl _kcc_ir_emit
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    orr x1, x1, #BB_FLAG_TERMINATED
-    str x1, [x0, #BB_FLAGS]
-.Lsw_case_set_bb:
-    mov x0, x25
-    bl _kcc_ir_set_bb
-    ldr x0, [x24, #AST_F1]      // case body statement
-    cbz x0, .Lsw_body_next
-    bl _kcc_ir_build_stmt
-    b .Lsw_body_next
-
-.Lsw_body_default:
-    // If current BB not terminated, emit fallthrough
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    tst x1, #BB_FLAG_TERMINATED
-    b.ne .Lsw_default_set_bb
-    mov x0, #IR_BR
-    bl _kcc_ir_alloc_instr
-    ldr x1, [x22, #BB_ID]
-    str x1, [x0, #IR_SRC1]
-    bl _kcc_ir_emit
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    orr x1, x1, #BB_FLAG_TERMINATED
-    str x1, [x0, #BB_FLAGS]
-.Lsw_default_set_bb:
+    // 5. End of dispatch: fall into the default block, or the exit if none
+    cbz x22, .Lsw_tail_exit
     mov x0, x22
-    bl _kcc_ir_set_bb
-    ldr x0, [x24, #AST_F0]      // default body statement
-    cbz x0, .Lsw_body_next
-    bl _kcc_ir_build_stmt
-    b .Lsw_body_next
+    b .Lsw_tail_go
+.Lsw_tail_exit:
+    mov x0, x21
+.Lsw_tail_go:
+    bl _kcc_ir_branch_to
 
-.Lsw_body_next:
-    ldr x24, [x24, #AST_F4]
-    b .Lsw_body
-.Lsw_body_done:
+    // 6. Pass 3: build the whole body as one statement; case/default labels
+    //    place themselves (see kcc_ir_build_stmt).  Exit is the break target;
+    //    a switch has no continue.
+    ldr x0, [x21, #BB_ID]
+    mov x1, #0
+    bl _kcc_loop_push
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_ir_build_stmt
     bl _kcc_loop_pop
 
-    // If current BB not terminated, branch to exit
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    tst x1, #BB_FLAG_TERMINATED
-    b.ne .Lsw_set_exit
-    mov x0, #IR_BR
-    bl _kcc_ir_alloc_instr
-    ldr x1, [x21, #BB_ID]
-    str x1, [x0, #IR_SRC1]
-    bl _kcc_ir_emit
-    adrp x0, _kcc_ir_cur_bb@@PAGE
-    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
-    ldr x0, [x0]
-    ldr x1, [x0, #BB_FLAGS]
-    orr x1, x1, #BB_FLAG_TERMINATED
-    str x1, [x0, #BB_FLAGS]
-
-.Lsw_set_exit:
+    // 7. Fall the final body block into exit, then continue there
+    mov x0, x21
+    bl _kcc_ir_branch_to
     mov x0, x21
     bl _kcc_ir_set_bb
 
@@ -1139,7 +1123,7 @@ _kcc_ir_build_switch:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #96
     ret
-@| _kcc_ir_build_switch _kcc_eval_const_int
+@| _kcc_ir_build_switch _kcc_eval_const_int _kcc_ir_sw_scan _kcc_ir_sw_disp
 @}
 
 \paragraph{End-to-end tests.}
@@ -1176,6 +1160,15 @@ run_test "switch-default-fallthrough" \
 
 run_test "switch-var-expr" \
     "int main(void) { int x = 3; int r = 0; switch (x) { case 1: r = 10; break; case 3: r = 30; break; } return r; }" 30
+
+run_test "switch-bare-labeled-body" \
+    "int main(void) { int x = 0; switch (x) case 0: return 7; return 1; }" 7
+
+run_test "switch-nested-case-loop" \
+    "int main(void) { int n = 3, i = 0; switch (n % 2) { case 0: do { i = i + 1; case 1: i = i + 1; } while (--n > 0); } return i; }" 5
+
+run_test "switch-case-in-block" \
+    "int main(void) { int x = 1, r = 0; switch (x) { case 0: { r = 5; case 1: r = r + 8; } break; } return r; }" 8
 @}
 
 \subsection{Break and Continue}

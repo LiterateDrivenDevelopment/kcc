@@ -1821,9 +1821,9 @@ _kcc_ir_build_stmt:
     cmp x0, #AST_GOTO_STMT
     b.eq .Libs_goto
     cmp x0, #AST_CASE_STMT
-    b.eq .Libs_done
+    b.eq .Libs_case
     cmp x0, #AST_DEFAULT_STMT
-    b.eq .Libs_done
+    b.eq .Libs_default
     cmp x0, #AST_NULL_STMT
     b.eq .Libs_done
 
@@ -1851,6 +1851,35 @@ _kcc_ir_build_stmt:
     bl _kcc_ir_branch_to        // branch to target, terminate current block
     bl _kcc_ir_alloc_bb         // fresh block for unreachable trailing code
     bl _kcc_ir_set_bb
+    b .Libs_done
+
+.Libs_case:
+    // A `case` label placed by the enclosing switch's scan (its BB is stashed
+    // in AST_F2).  Like a goto label, fall the current block into the case
+    // block and continue there --- giving C fall-through --- then build the
+    // labelled statement.  Labels can nest anywhere in the body, so this path
+    // in build_stmt is what makes Duff's device work.
+    ldr x20, [x19, #AST_F2]     // case BB (0 if not inside a switch)
+    cbz x20, .Libs_case_body
+    mov x0, x20
+    bl _kcc_ir_branch_to
+    mov x0, x20
+    bl _kcc_ir_set_bb
+.Libs_case_body:
+    ldr x0, [x19, #AST_F1]      // labelled statement
+    bl _kcc_ir_build_stmt
+    b .Libs_done
+
+.Libs_default:
+    ldr x20, [x19, #AST_F1]     // default BB (stashed in F1)
+    cbz x20, .Libs_default_body
+    mov x0, x20
+    bl _kcc_ir_branch_to
+    mov x0, x20
+    bl _kcc_ir_set_bb
+.Libs_default_body:
+    ldr x0, [x19, #AST_F0]      // labelled statement
+    bl _kcc_ir_build_stmt
     b .Libs_done
 
 .Libs_compound:

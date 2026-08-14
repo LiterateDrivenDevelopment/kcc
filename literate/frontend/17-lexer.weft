@@ -398,6 +398,33 @@ branches to the corresponding scanner subroutine.
     b .Llex_check_digit
 
 .Llex_go_ident:
+    // A prefix letter (L, u, U) immediately followed by a single quote is a
+    // prefixed character constant (L'x', u'x', U'x'), not an identifier.  kcc
+    // represents every character constant as an int-valued token, so the prefix
+    // only affects the declared type---which the char literal path already treats
+    // as int---and can be dropped: consume it and scan the quote as a char
+    // literal.  (Prefixed *string* literals L"/u"/U" still need wide elements and
+    // are handled elsewhere.)
+    cmp w0, #'L'
+    b.eq .Llex_pfx_char
+    cmp w0, #'u'
+    b.eq .Llex_pfx_char
+    cmp w0, #'U'
+    b.eq .Llex_pfx_char
+    b .Llex_ident_scan
+.Llex_pfx_char:
+    add x1, x20, #1
+    cmp x1, x21
+    b.hs .Llex_ident_scan        // prefix at end of buffer
+    ldrb w2, [x1]
+    cmp w2, #'\''
+    b.ne .Llex_ident_scan        // not a quote → ordinary identifier
+    add x20, x20, #1             // consume the prefix letter
+    adrp x1, _kcc_lex_cursor@@PAGE
+    add  x1, x1, _kcc_lex_cursor@@PAGEOFF
+    str x20, [x1]                // publish so scan_char sees the quote
+    b .Llex_go_char
+.Llex_ident_scan:
     bl _kcc_lex_scan_ident
     b .Llex_done
 

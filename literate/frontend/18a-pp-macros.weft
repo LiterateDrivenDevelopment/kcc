@@ -1334,6 +1334,28 @@ _kcc_pp_predefine:
     mov  x3, #1
     bl _kcc_pp_def_simple
 
+    // Data-model macros.  Apple ARM64 is LP64---long and pointer are 64-bit---so
+    // __LP64__/_LP64 are defined; portable code selects type widths from them.
+    // Arch/OS identity macros (__APPLE__, __aarch64__) are deliberately NOT
+    // defined: they gate platform-specific headers, intrinsics, and inline asm
+    // that kcc does not support, so announcing them would break otherwise
+    // portable code.  Data-model macros only steer type choices kcc handles.
+    adrp x0, _kcc_pp_pre_lp64@@PAGE
+    add  x0, x0, _kcc_pp_pre_lp64@@PAGEOFF
+    mov  x1, #8                // len("__LP64__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_lp64b@@PAGE
+    add  x0, x0, _kcc_pp_pre_lp64b@@PAGEOFF
+    mov  x1, #5                // len("_LP64")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
     // Replay any command-line -D definitions on top of the built-ins.  The
     // macro table is rebuilt for every translation unit, so this runs each time
     // the preprocessor is (re)initialised, keeping -D macros defined per source.

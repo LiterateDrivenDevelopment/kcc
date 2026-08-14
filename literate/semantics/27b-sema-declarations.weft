@@ -607,8 +607,12 @@ mixed-type packing and zero-width separators are not yet modelled.
     // A struct tag may already exist as an \emph{incomplete} descriptor---from
     // a forward declaration or a forward `typedef struct S S;`---and a later
     // definition must complete that \emph{same} object so every binding (the
-    // typedef, earlier references) sees the members.  Look the tag up first;
-    // four cases follow from (existing tag?) times (this decl has a body?).
+    // typedef, earlier references) sees the members.  Only a tag declared at the
+    // \emph{current} scope depth may be completed, though: a same-named tag from
+    // an enclosing scope is a distinct type that this declaration shadows, so
+    // \texttt{\{ struct T \{ int z; \}; \}} inside a function must \emph{not}
+    // repoint the outer \texttt{struct T} at the inner body.  Four cases follow
+    // from (existing at this depth?) times (this decl has a body?).
     mov x0, x22
     bl _kcc_strlen
     mov x1, x0
@@ -617,10 +621,21 @@ mixed-type packing and zero-width separators are not yet modelled.
     cbz x0, .Lscd_struct_new
     ldr x21, [x0, #SYM_TYPE]       // existing descriptor
     cbz x21, .Lscd_struct_new
-    // Existing tag: a body completes it in place; a bodyless reference is a
-    // no-op---it must not overwrite an existing definition with an empty one.
-    ldr x0, [x19, #AST_F1]         // fields
+    ldr x3, [x0, #SYM_DEPTH]       // remember the tag's scope depth (no calls below
+                                   // clobber x3 before it is compared)
+    // A bodyless occurrence (`struct S s;`, a reference) is a no-op and simply
+    // uses the visible tag---regardless of the scope it was declared in.
+    ldr x0, [x19, #AST_F1]         // fields?
     cbz x0, .Lscd_done
+    // This declaration HAS a body, so it is a definition.  Complete the existing
+    // tag in place only if it was declared at the current scope depth; a
+    // same-named tag from an enclosing scope is a distinct type this definition
+    // shadows, so fall through to create a fresh one.
+    adrp x2, _kcc_sym_depth@@PAGE
+    add  x2, x2, _kcc_sym_depth@@PAGEOFF
+    ldr x2, [x2]
+    cmp x3, x2
+    b.ne .Lscd_struct_new
     str x19, [x21, #TY_F0]         // repoint at the completing decl
     str xzr, [x21, #TY_SIZE]       // reset so layout recomputes
     mov x0, x21

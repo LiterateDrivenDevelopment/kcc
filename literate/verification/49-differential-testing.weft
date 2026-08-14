@@ -600,6 +600,10 @@ difftest "block-scoped-tag" \
     "struct T{int x;}; int main(void){ struct T v; { struct T {int z;} w; w.z=9; } v.x=2; return v.x - 2; }"
 difftest "prefixed-char-literal" \
     "int main(void){ return (L'A' == 65) + (u'B' == 66) + (U'\\n' == 10) + 7; }"
+difftest "variadic-macro" \
+    "#define CALL(F,...) F(__VA_ARGS__)\nint add3(int a,int b,int c){return a+b+c;}\nint main(void){ return CALL(add3, 10, 20, 12); }"
+difftest "variadic-macro-empty" \
+    "#define SUM(base,...) (base)\nint main(void){ return SUM(7); }"
 
 difftest "enum-explicit" \
     "enum E { A, B, C, D = 10, E2 }; int main(void){ return A + B + C + D + E2; }"

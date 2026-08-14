@@ -51,6 +51,7 @@ groups.
 .equ PP_FLAG_FUNCLIKE,   1   // function-like macro
 .equ PP_FLAG_EXPANDING,  2   // currently being expanded (anti-recursion)
 .equ PP_FLAG_BUILTIN,    4   // predefined, cannot #undef
+.equ PP_FLAG_VARIADIC,   8   // function-like macro with a trailing ... (__VA_ARGS__)
 
 // Parameter entry (16 bytes each)
 .equ PP_PARAM_NAME,      0
@@ -993,6 +994,7 @@ _kcc_pp_pre_no_complex: .asciz "__STDC_NO_COMPLEX__"
 _kcc_pp_pre_no_vla:   .asciz "__STDC_NO_VLA__"
 _kcc_pp_pre_lp64:     .asciz "__LP64__"
 _kcc_pp_pre_lp64b:    .asciz "_LP64"
+_kcc_pp_va_args_str:  .asciz "__VA_ARGS__"
 _kcc_pp_pre_one:      .asciz "1"
 _kcc_pp_pre_c17val:   .asciz "201710L"
 

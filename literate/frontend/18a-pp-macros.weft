@@ -94,10 +94,15 @@ _kcc_pp_do_define:
     b.eq .Ldef_params_done
 
 .Ldef_param_loop:
-    // Expect identifier
+    // A `...` here marks a variadic macro: the trailing arguments bind to
+    // __VA_ARGS__ (\stdref{6.10.3}).  It is not a named parameter and must be
+    // the last item, so the next token has to be ')'.
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Ldef_variadic
+    // Expect identifier
     cmp  x0, #TOK_IDENT
     b.ne .Ldef_err_param
 
@@ -131,6 +136,16 @@ _kcc_pp_do_define:
 
 .Ldef_check_rparen:
     cmp  x0, #TOK_RPAREN
+    b.ne .Ldef_err_param
+    b .Ldef_params_done
+
+.Ldef_variadic:
+    orr x21, x21, #PP_FLAG_VARIADIC   // mark variadic; ... consumes no param slot
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN               // ... must be the final parameter
     b.ne .Ldef_err_param
 
 .Ldef_params_done:
@@ -527,6 +542,49 @@ been looked up), which the called routines are obliged to preserve.
     sub  x2, x0, x2            // length
     str  x2, [x1, #8]
     add  x24, x24, #1         // total arg count
+
+    // Variadic macro (\stdref{6.10.3.1}): collapse the trailing arguments past
+    // the fixed parameters into a single __VA_ARGS__ argument---the raw source
+    // span from the first trailing arg to the last, commas and all---and register
+    // "__VA_ARGS__" as the parameter that binds it, so the ordinary substitution
+    // engine replaces __VA_ARGS__ with that text.  Too few args (only fixed ones)
+    // yield an empty __VA_ARGS__.
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    tst  x0, #PP_FLAG_VARIADIC
+    b.eq .Lexp_arg_done_va
+    ldr  x2, [x21, #PP_MACRO_NPARAMS]   // fixed parameter count
+    ldr  x3, [x21, #PP_MACRO_PARAMS]
+    mov  x4, #PP_PARAM_SIZE
+    mul  x5, x2, x4
+    add  x3, x3, x5                     // &params[NPARAMS]
+    adrp x4, _kcc_pp_va_args_str@@PAGE
+    add  x4, x4, _kcc_pp_va_args_str@@PAGEOFF
+    str  x4, [x3, #PP_PARAM_NAME]
+    mov  x4, #11                        // len("__VA_ARGS__")
+    str  x4, [x3, #PP_PARAM_LEN]
+    lsl  x3, x2, #4
+    add  x3, x23, x3                    // &arg[NPARAMS]
+    cmp  x24, x2
+    b.le .Lexp_va_empty                 // no trailing args → empty __VA_ARGS__
+    ldr  x4, [x3, #0]                   // first trailing arg's start
+    sub  x5, x24, #1                    // last arg index
+    lsl  x6, x5, #4
+    add  x6, x23, x6                    // &arg[last]
+    ldr  x7, [x6, #0]                   // last arg start
+    ldr  x9, [x6, #8]                   // last arg len
+    add  x7, x7, x9                     // last arg end
+    sub  x7, x7, x4                     // joined length
+    str  x7, [x3, #8]                   // arg[NPARAMS].len = joined (start kept)
+    b .Lexp_va_setcount
+.Lexp_va_empty:
+    ldr  x4, [x23, #0]                  // any valid readable start; length 0
+    str  x4, [x3, #0]
+    str  xzr, [x3, #8]
+.Lexp_va_setcount:
+    add  x2, x2, #1                     // params/args now include __VA_ARGS__
+    mov  x22, x2                        // param count for substitute
+    mov  x24, x2                        // arg count
+.Lexp_arg_done_va:
 @}
 
 \paragraph{Substitution and expansion context.}

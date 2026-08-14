@@ -650,7 +650,16 @@ a vreg.  The unary \textsc{not} (\texttt{IR\_NOT}) uses
 
 Integer comparisons emit \texttt{CMP\;x9,\;x10} (which is really
 \texttt{SUBS\;xzr,\;x9,\;x10}---subtract and set flags, discard
-result) followed by \texttt{CSET\;x11,\;\textit{cond}}.  The
+result) followed by \texttt{CSET\;x11,\;\textit{cond}}.  The compare
+runs at the operands' common width, taken from the instruction's type:
+a 32-bit type selects a \texttt{w}-register compare (\texttt{sf}=0), a
+64-bit type an \texttt{x}-register one.  This matters because kcc keeps a
+signed value sign-extended and an unsigned value zero-extended in its
+64-bit register; comparing \texttt{int} against a \texttt{0xffffffffu}
+constant at 64~bits would see \texttt{0xffff\_ffff\_ffff\_ffff} against
+\texttt{0x0000\_0000\_ffff\_ffff} and wrongly report inequality, whereas
+the 32-bit compare examines only the low word the standard's usual
+arithmetic conversions produce.  The
 \textsc{cset} pseudo-instruction encodes as
 \texttt{CSINC\;x11,\;xzr,\;xzr,\;inv(cond)}: if the
 \emph{inverted} condition is false, the result is~1; otherwise~0.
@@ -711,10 +720,24 @@ IR opcode & ARM64 cond & Inverted \\
     mov x1, #CG_REG_SRC2
     bl _kcc_cg_load_vreg
 
-    // CMP x9, x10
+    // CMP x9, x10 at the operands' common width.  The IR builder records that
+    // width in the comparison's type: a <=32-bit common type compares at 32
+    // bits (sf=0), so a signed operand (sign-extended in its register) and an
+    // unsigned one (zero-extended) agree on the low word, as C's usual
+    // arithmetic conversions require; anything wider (long, pointer) keeps the
+    // 64-bit compare.  A missing type defaults to 64-bit.
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lcgi_cmp_sf64
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.eq .Lcgi_cmp_sf64
+    mov x2, #0                     // 32-bit compare
+    b .Lcgi_cmp_doenc
+.Lcgi_cmp_sf64:
+    mov x2, #1                     // 64-bit compare
+.Lcgi_cmp_doenc:
     mov x0, #CG_REG_SRC1
     mov x1, #CG_REG_SRC2
-    mov x2, #1                     // sf
     bl _kcc_enc_cmp_reg
     bl _kcc_code_emit32
 

@@ -615,6 +615,16 @@ difftest "proto-in-declarator-list" \
     "int f(int a), g(int a), v; int f(int a){return a;} int g(int a){return a*2;} int main(void){ v=3; return f(1)+g(1)-3-v; }"
 difftest "array-param-qualifiers" \
     "int sum(int n, int a[static 1]){int s=0;int i;for(i=0;i<n;i=i+1)s=s+a[i];return s;} int main(void){ int v[3]; v[0]=10;v[1]=20;v[2]=12; return sum(3,v)-42; }"
+difftest "cmp-int-vs-uint-max" \
+    "int main(void){ int x=0; x=~x; if(x!=0xffffffffU) return 1; if(x>=0) return 2; unsigned u=x; if(u!=4294967295U) return 3; return 0; }"
+difftest "cmp-signed-neg-vs-unsigned" \
+    "int main(void){ int a=-1; unsigned b=1; return (a>b)?7:0; }"
+difftest "cmp-uint-vs-long-signed" \
+    "int main(void){ unsigned a=1; long b=-1; return (a>b)?0:9; }"
+difftest "cmp-int-vs-ulong-unsigned" \
+    "int main(void){ int c=-1; unsigned long d=1; return (c<d)?9:0; }"
+difftest "cmp-promoted-uchar-schar" \
+    "int main(void){ unsigned char uc=200; signed char sc=-1; return (uc>sc)?0:9; }"
 
 difftest "enum-explicit" \
     "enum E { A, B, C, D = 10, E2 }; int main(void){ return A + B + C + D + E2; }"

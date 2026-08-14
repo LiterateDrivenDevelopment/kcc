@@ -3419,7 +3419,29 @@ _kcc_ir_build_binary:
     cbnz x0, .Libb_fp_emit
 
 .Libb_emit_int:
-    // Check left operand type for unsigned — remap signed opcodes
+    // A relational comparison is unsigned when its COMMON type is unsigned
+    // (the usual arithmetic conversions), which depends on BOTH operands ---
+    // `int < unsigned` is an unsigned compare even though the left side is
+    // signed.  Division, modulo and the arithmetic-vs-logical shift instead
+    // key off the left operand alone, handled in the block below.
+    cmp x23, #IR_CMP_SLT
+    b.lo .Libb_int_left
+    cmp x23, #IR_CMP_SGE
+    b.hi .Libb_int_left
+    ldr x0, [x19, #AST_F1]
+    ldr x1, [x19, #AST_F2]
+    bl _kcc_ir_cmp_unsigned
+    cbz x0, .Libb_emit_alloc     // signed common type → keep signed opcode
+    cmp x23, #IR_CMP_SLT
+    b.eq .Libb_u_lt
+    cmp x23, #IR_CMP_SLE
+    b.eq .Libb_u_le
+    cmp x23, #IR_CMP_SGT
+    b.eq .Libb_u_gt
+    b .Libb_u_ge                 // IR_CMP_SGE
+
+.Libb_int_left:
+    // Check left operand type for unsigned — remap signed div/mod/shift.
     ldr x0, [x19, #AST_F1]
     cbz x0, .Libb_emit_alloc
     ldr x0, [x0, #AST_F3]
@@ -3431,14 +3453,6 @@ _kcc_ir_build_binary:
     b.eq .Libb_u_div
     cmp x23, #IR_SMOD
     b.eq .Libb_u_mod
-    cmp x23, #IR_CMP_SLT
-    b.eq .Libb_u_lt
-    cmp x23, #IR_CMP_SLE
-    b.eq .Libb_u_le
-    cmp x23, #IR_CMP_SGT
-    b.eq .Libb_u_gt
-    cmp x23, #IR_CMP_SGE
-    b.eq .Libb_u_ge
     cmp x23, #IR_ASHR
     b.eq .Libb_u_shr
     b .Libb_emit_alloc
@@ -3492,6 +3506,39 @@ _kcc_ir_build_binary:
     str x0, [x24, #IR_TYPE]
     str x21, [x24, #IR_SRC1]
     str x22, [x24, #IR_SRC2]
+
+    // For an integer comparison, record the operands' common width so codegen
+    // compares at 32 or 64 bits.  Two <=32-bit operands compare at 32 bits,
+    // reconciling a sign-extended signed operand with a zero-extended unsigned
+    // one (e.g. `int` against `0xffffffffu`); any wider operand keeps the
+    // 64-bit compare.  An unknown operand width defaults to the wider type, so
+    // pointer and `long` comparisons are unaffected.
+    sub x0, x25, #IR_CMP_EQ
+    cmp x0, #(IR_CMP_ULE - IR_CMP_EQ)
+    b.hi .Libb_cmp_type_done
+    mov x2, #8                   // lhs width (default wide)
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_cmp_w_rhs
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_cmp_w_rhs
+    ldr x2, [x0, #TY_SIZE]
+.Libb_cmp_w_rhs:
+    mov x3, #8                   // rhs width (default wide)
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_cmp_w_max
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_cmp_w_max
+    ldr x3, [x0, #TY_SIZE]
+.Libb_cmp_w_max:
+    cmp x3, x2
+    csel x2, x3, x2, hi          // x2 = max(lhs, rhs) width
+    cmp x2, #4
+    b.ls .Libb_cmp_type_done     // both <=32-bit → keep i32 (32-bit compare)
+    adrp x0, _kcc_type_long_s@@PAGE
+    add  x0, x0, _kcc_type_long_s@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x24, #IR_TYPE]      // 8-byte type → 64-bit compare
+.Libb_cmp_type_done:
 
     bl _kcc_ir_next_vreg
     str x0, [x24, #IR_DEST]
@@ -3574,6 +3621,88 @@ _kcc_ir_build_binary:
     mov x0, x23
     b .Libb_done
 @| _kcc_ir_build_binary
+@}
+
+\paragraph{Signedness of a comparison.}
+Whether a relational comparison uses signed or unsigned condition codes
+follows the \emph{common} type of its two operands, not the left one alone.
+\texttt{\_kcc\_ir\_cmp\_unsigned} implements the sign half of the usual
+arithmetic conversions (\stdref{6.3.1.8}) for two integer operands.  It first
+applies the integer promotions --- an operand narrower than \texttt{int}
+becomes signed \texttt{int} --- then, at equal rank the result is unsigned if
+either operand is unsigned; at unequal rank the wider operand's signedness
+decides, since on this LP64 target a wider signed type represents every value
+of a narrower unsigned one.  Promotion is what makes
+\texttt{(unsigned char)200 > (signed char)-1} a \emph{signed} compare (both
+promote to \texttt{int}), answering true.  It answers
+\texttt{signed} (0) for any non-integer operand --- notably pointers, whose
+relational comparisons kcc keeps signed --- so only genuine integer
+comparisons are remapped.  Without this, \texttt{-1 > 1u} compared the signed
+$-1$ against~$1$ and read false, where C converts $-1$ to a large unsigned
+value and the answer is true.
+
+@d IR: build binary @{
+// -- kcc_ir_cmp_unsigned --------------------------------------------------
+// int kcc_ir_cmp_unsigned(node *lhs, node *rhs)
+//   x0 = lhs AST node, x1 = rhs AST node
+// Returns x0 = 1 when the comparison's common type is unsigned, else 0.
+// Leaf routine: reads operand sema types (AST_F3); integer types carry a
+// signed flag in TY_F0 (1 = signed, 0 = unsigned) and a byte width in TY_SIZE.
+.text
+.p2align 2
+_kcc_ir_cmp_unsigned:
+    cbz x0, .Lcmpu_signed
+    ldr x2, [x0, #AST_F3]        // lhs type
+    cbz x2, .Lcmpu_signed
+    cbz x1, .Lcmpu_signed
+    ldr x3, [x1, #AST_F3]        // rhs type
+    cbz x3, .Lcmpu_signed
+    // Both operands must be integer kinds (TY_BOOL(2)..TY_LLONG(7)).
+    ldr x4, [x2, #TY_KIND]
+    sub x4, x4, #2
+    cmp x4, #5
+    b.hi .Lcmpu_signed
+    ldr x4, [x3, #TY_KIND]
+    sub x4, x4, #2
+    cmp x4, #5
+    b.hi .Lcmpu_signed
+    // Apply the integer promotions first: an operand narrower than int
+    // (char, short, _Bool) promotes to signed int, because int holds all its
+    // values.  Only types of int width or wider keep their own signedness.
+    ldr x4, [x2, #TY_SIZE]       // size_l
+    ldr x6, [x2, #TY_F0]         // sign_l (1=signed, 0=unsigned)
+    cmp x4, #4
+    b.hs .Lcmpu_l_promoted
+    mov x4, #4
+    mov x6, #1                   // promoted int is signed
+.Lcmpu_l_promoted:
+    ldr x5, [x3, #TY_SIZE]       // size_r
+    ldr x7, [x3, #TY_F0]         // sign_r
+    cmp x5, #4
+    b.hs .Lcmpu_r_promoted
+    mov x5, #4
+    mov x7, #1
+.Lcmpu_r_promoted:
+    cmp x4, x5
+    b.hi .Lcmpu_l_wider
+    b.lo .Lcmpu_r_wider
+    // equal rank: unsigned if either operand is unsigned
+    cbz x6, .Lcmpu_unsigned
+    cbz x7, .Lcmpu_unsigned
+    b .Lcmpu_signed
+.Lcmpu_l_wider:
+    cbz x6, .Lcmpu_unsigned      // wider operand unsigned → unsigned
+    b .Lcmpu_signed
+.Lcmpu_r_wider:
+    cbz x7, .Lcmpu_unsigned
+    b .Lcmpu_signed
+.Lcmpu_unsigned:
+    mov x0, #1
+    ret
+.Lcmpu_signed:
+    mov x0, #0
+    ret
+@| _kcc_ir_cmp_unsigned
 @}
 
 \paragraph{Truncating to the declared width.}

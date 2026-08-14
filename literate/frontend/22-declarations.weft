@@ -919,7 +919,11 @@ present, the handler parses it into a \texttt{TYPE\_FUNC} node and walks
 the inner declarator's type chain to replace the base type with the function
 type---implementing C's inside-out declarator semantics.  For instance,
 \texttt{int (*fp)(int, int)} produces a \texttt{VAR\_DECL} whose type is
-\texttt{ptr(func(int,int)->int)}.
+\texttt{ptr(func(int,int)->int)}.  An array suffix \texttt{[N]} after the
+group is handled the same way: the brackets build an array chain whose
+element is the base type, which is then spliced in place of the base, so
+\texttt{char (*p)[4]} becomes \texttt{ptr(array 4 of char)} --- a pointer to
+an array rather than an array of pointers.
 
 @d Decl: parse direct declarator @{
 .Lddecl_function:
@@ -1033,10 +1037,14 @@ type---implementing C's inside-out declarator semantics.  For instance,
     mov x0, #TOK_RPAREN
     bl _kcc_parse_expect
 
-    // Check for function suffix: (params)
+    // A grouped declarator may be followed by a function suffix (params)
+    // making it a function pointer, or by an array suffix [N] making it a
+    // pointer to (or array of) array --- e.g. char (*p)[4].
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACKET
+    b.eq .Lddecl_grouped_array
     cmp  x0, #TOK_LPAREN
     b.ne .Lddecl_grouped_done
 
@@ -1125,6 +1133,66 @@ type---implementing C's inside-out declarator semantics.  For instance,
 .Lddecl_gfunc_walk_next:
     mov x1, x0
     b .Lddecl_gfunc_walk_loop
+
+.Lddecl_grouped_array:
+    // Parse one or more [N] suffixes into an array chain whose element is the
+    // base type, then splice that chain into the inner declarator's type in
+    // place of the base --- inside-out declarator semantics (\stdref{6.7.6}).
+    // For char (*p)[4] the inner declarator is ptr→char; splicing array[4] for
+    // the char yields ptr→array[4]→char, i.e. p is a pointer to an array of 4.
+    mov x24, #0                  // innermost array so far
+    mov x22, #0                  // outermost array (the splice target)
+.Lddecl_ga_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACKET
+    b.ne .Lddecl_ga_splice
+    bl _kcc_pp_next               // consume '['
+    mov x23, #0                  // size expr (default null)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACKET
+    b.eq .Lddecl_ga_rb
+    bl _kcc_parse_assign_expr
+    mov x23, x0
+.Lddecl_ga_rb:
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect
+    mov x0, #AST_TYPE_ARRAY
+    bl _kcc_ast_alloc
+    str x23, [x0, #AST_F1]        // size
+    cbz x24, .Lddecl_ga_first
+    // Nest as the current innermost array's element (later dimension).
+    ldr x1, [x24, #AST_F0]        // base element
+    str x1, [x0, #AST_F0]
+    str x0, [x24, #AST_F0]
+    mov x24, x0
+    b .Lddecl_ga_loop
+.Lddecl_ga_first:
+    str x19, [x0, #AST_F0]        // first dimension: element = base type
+    mov x24, x0                   // innermost
+    mov x22, x0                   // outermost
+    b .Lddecl_ga_loop
+.Lddecl_ga_splice:
+    cbz x22, .Lddecl_grouped_done
+    ldr x0, [x21, #AST_F0]        // inner declarator's type chain root
+    cmp x0, x19
+    b.ne .Lddecl_ga_walk
+    str x22, [x21, #AST_F0]       // base was the root: replace directly
+    b .Lddecl_grouped_done
+.Lddecl_ga_walk:
+    mov x1, x0
+.Lddecl_ga_walk_loop:
+    ldr x0, [x1, #AST_F0]
+    cmp x0, x19
+    b.ne .Lddecl_ga_walk_next
+    str x22, [x1, #AST_F0]        // replace base within the chain
+    b .Lddecl_grouped_done
+.Lddecl_ga_walk_next:
+    mov x1, x0
+    b .Lddecl_ga_walk_loop
 
 .Lddecl_grouped_done:
     mov x0, x21

@@ -626,6 +626,8 @@ difftest "cmp-int-vs-ulong-unsigned" \
 difftest "cmp-promoted-uchar-schar" \
     "int main(void){ unsigned char uc=200; signed char sc=-1; return (uc>sc)?0:9; }"
 
+difftest "ptr-to-array-declarator" \
+    "int main(void){ char arr[2][4]; char (*p)[4]; p=arr; arr[1][3]=2; return (p[1][3]!=2)?1:0; }"
 difftest "enum-in-struct-member" \
     "struct { enum { X = 5 } e; } s; int main(void){ return X; }"
 difftest "enum-explicit" \

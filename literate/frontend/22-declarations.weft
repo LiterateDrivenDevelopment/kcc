@@ -100,7 +100,16 @@ _kcc_parse_decl:
     b .Ldecl_done
 
 .Ldecl_func_proto:
-    // Function prototype (declaration without body)
+    // Function prototype (declaration without body).  A prototype may head a
+    // comma-separated declarator list that shares the base type, as in
+    // \texttt{int f(int), g(int), a;} --- a following ',' therefore continues
+    // into the same multi-declarator loop the variable path uses, with the
+    // prototype node as the first link of the chain.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.eq .Ldecl_more_vars
     mov x0, #TOK_SEMI
     bl _kcc_parse_expect
     mov x0, x21
@@ -116,7 +125,10 @@ optionally parses an initializer after \texttt{=}.  Multiple declarators
 sharing the same specifiers are supported via comma-separated lists, where
 each subsequent declarator is parsed against the original base type in
 \texttt{x19} and linked through \texttt{AST\_F4} into a chain rooted at the
-first declaration node.
+first declaration node.  The first declarator in such a list may itself be a
+function prototype (\texttt{int f(int), g(int), a;}): the prototype path joins
+the very same loop when it sees a comma, so a mixture of prototypes and
+objects under one set of specifiers parses into one chain.
 
 @d Decl: parse declaration @{
 .Ldecl_not_func:
@@ -746,7 +758,13 @@ _kcc_parse_declarator:
 \section{Direct Declarator}
 
 The direct declarator is where the name lives, along with array
-dimensions and function parameter lists.
+dimensions and function parameter lists.  Inside a bracketed array
+dimension the parser also tolerates the parameter-only ornaments of
+\stdref{6.7.6.3} --- a leading type-qualifier list, a \texttt{static}
+keyword, and a \texttt{*} standing for an unspecified variable-length
+bound.  Because kcc decays an array parameter to a pointer regardless,
+these are parsed and discarded rather than modelled, so declarations like
+\texttt{int x[static 5]} or \texttt{int x[const *]} are accepted.
 
 @d Decl: parse direct declarator @{
 // -- kcc_parse_direct_declarator ---------------------------------------
@@ -808,16 +826,44 @@ _kcc_parse_direct_declarator:
     b .Lddecl_build_var
 
 .Lddecl_array:
-    // Array: [ size? ]
+    // Array: [ qualifiers? static? size? ]
     bl _kcc_pp_next               // consume '['
 
+    // A parameter's outermost array may carry type-qualifiers, a `static`
+    // keyword, or a `*` for an unspecified VLA bound (\stdref{6.7.6.3}).  These
+    // affect only the parameter-as-pointer, which kcc already decays, so we
+    // parse and discard them here rather than modelling them.
+.Lddecl_array_quals:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_CONST
+    b.eq .Lddecl_array_skip_qual
+    cmp  x0, #TOK_VOLATILE
+    b.eq .Lddecl_array_skip_qual
+    cmp  x0, #TOK_RESTRICT
+    b.eq .Lddecl_array_skip_qual
+    cmp  x0, #TOK_STATIC
+    b.eq .Lddecl_array_skip_qual
+    b .Lddecl_array_after_quals
+.Lddecl_array_skip_qual:
+    bl _kcc_pp_next               // consume qualifier / static
+    b .Lddecl_array_quals
+
+.Lddecl_array_after_quals:
     mov x21, #0                  // size expr (default null)
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
     cmp  x0, #TOK_RBRACKET
     b.eq .Lddecl_array_close
+    // `[*]`: unspecified VLA size in a prototype behaves as an empty bound.
+    cmp  x0, #TOK_STAR
+    b.ne .Lddecl_array_size
+    bl _kcc_pp_next               // consume '*'
+    b .Lddecl_array_close
 
+.Lddecl_array_size:
     // Parse size expression
     bl _kcc_parse_assign_expr
     mov x21, x0

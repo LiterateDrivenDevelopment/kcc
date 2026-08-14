@@ -611,6 +611,10 @@ difftest "anon-union-member" \
     "struct S{int a; union{int b1;int b2;};}; int main(void){ struct S s; s.a=5; s.b1=12; return s.b2 - 12 + s.a; }"
 difftest "anon-struct-member" \
     "struct S{int a; struct{int c1;int c2;};}; int main(void){ struct S s; s.a=3; s.c1=10; s.c2=2; return s.c1 + s.c2 - s.a - 2; }"
+difftest "proto-in-declarator-list" \
+    "int f(int a), g(int a), v; int f(int a){return a;} int g(int a){return a*2;} int main(void){ v=3; return f(1)+g(1)-3-v; }"
+difftest "array-param-qualifiers" \
+    "int sum(int n, int a[static 1]){int s=0;int i;for(i=0;i<n;i=i+1)s=s+a[i];return s;} int main(void){ int v[3]; v[0]=10;v[1]=20;v[2]=12; return sum(3,v)-42; }"
 
 difftest "enum-explicit" \
     "enum E { A, B, C, D = 10, E2 }; int main(void){ return A + B + C + D + E2; }"

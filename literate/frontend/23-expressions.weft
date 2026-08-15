@@ -1401,26 +1401,39 @@ _kcc_parse_atoi:
 \label{sec:parse-float}
 
 A preprocessing number is a floating constant---rather than an
-integer---when its decimal spelling contains a radix point, a decimal
-exponent (\texttt{e}/\texttt{E}), or a floating suffix
-(\texttt{f}/\texttt{F}).  Hexadecimal integers (\texttt{0x}\ldots) are
-excluded up front so their \texttt{e}/\texttt{f} \emph{hex digits} are
-not mistaken for an exponent or suffix; hexadecimal floating constants
-(\texttt{0x1p4}) are not yet supported.
-\texttt{kcc\_is\_float\_literal} performs this classification on the raw
-token text.
+integer---when its spelling contains a radix point, an exponent, or a
+floating suffix (\texttt{f}/\texttt{F}).  The classification has two
+regimes.  A \emph{decimal} number is a float if it contains
+\texttt{.}, \texttt{e}/\texttt{E}, or \texttt{f}/\texttt{F}.  A
+\emph{hexadecimal} number (\texttt{0x}\ldots) needs its own rule: there
+\texttt{f}/\texttt{F} are ordinary hex \emph{digits} and \texttt{e} is
+too, so only a radix point or a binary exponent \texttt{p}/\texttt{P}
+distinguishes a hex float (\texttt{0x1.fp1}) from a hex integer
+(\texttt{0xff}).  \texttt{kcc\_is\_float\_literal} branches on the
+\texttt{0x} prefix and scans accordingly.
 
 \texttt{kcc\_parse\_atof} then evaluates the constant to an IEEE-754
-\texttt{double} \emph{at compile time}, using the host's own
-floating-point unit: it accumulates the integer part in a running
-\texttt{double}, adds each fractional digit divided by an advancing
-power of ten, and finally scales by $10^{\pm e}$ through repeated
-multiplication or division.  The 64-bit result is returned as its bit
-pattern (via \texttt{fmov}), ready to be stored verbatim in the
+\texttt{double} \emph{at compile time} on the host's own
+floating-point unit.  For a decimal constant it accumulates \emph{all}
+significant digits into a single integer mantissa $M$, counts the
+fractional digits $F$, reads any \texttt{e}-exponent, and reconstructs
+the value as $M \times 10^{\,e-F}$ with one final multiply or divide.
+Folding every digit into a single scaling step keeps the whole
+computation to one rounding: an exactly representable fraction such as
+\texttt{3.875} lands on its exact double, whereas the naive
+digit-by-digit $+\,d/10^{k}$ method rounds at every fraction digit and
+drifts a ULP low.  The power $10^{|e-F|}$ is built by repeated
+multiplication, which is itself exact for $|e-F| \le 22$; only far
+larger magnitudes lose a bit, and those do not occur in real literals.
+
+A hexadecimal constant \texttt{0x}$m$\texttt{.}$f$\texttt{p}$e$ takes a
+parallel path: the mantissa digits accumulate in base sixteen (the
+fraction as $d/16^{k}$) and the value is scaled by a \emph{binary}
+exponent $2^{e}$.  Because the base is a power of two, such constants
+are exact whenever the mantissa fits, which is precisely why the
+standard provides them.  Either way the 64-bit result is returned as
+its bit pattern (via \texttt{fmov}), ready to be stored verbatim in the
 literal's AST node and, later, materialised as an \texttt{IR\_CONST}.
-Repeated decimal scaling is not correctly-rounded for very large
-exponents, but it is exact for the small constants that dominate real
-code.
 
 @d Expr: parse float @{
 // -- kcc_is_float_literal ---------------------------------------------
@@ -1440,7 +1453,7 @@ _kcc_is_float_literal:
     ldrb w2, [x0, #1]
     orr w2, w2, #0x20            // tolower
     cmp w2, #'x'
-    b.eq .Lisf_no
+    b.eq .Lisf_hex              // 0x… → hex; float only if it has '.'/'p'/'P'
 
 .Lisf_scan:
     mov x3, #0                   // index
@@ -1460,6 +1473,21 @@ _kcc_is_float_literal:
     b.eq .Lisf_yes
     add x3, x3, #1
     b .Lisf_loop
+.Lisf_hex:
+    // In a hex literal `f`/`F` are digits, not a float suffix; only a
+    // radix point or a binary exponent `p`/`P` marks a hex float.
+    mov x3, #2                   // skip "0x"
+.Lisf_hex_loop:
+    cmp x3, x1
+    b.hs .Lisf_no
+    ldrb w2, [x0, x3]
+    cmp w2, #'.'
+    b.eq .Lisf_yes
+    orr w2, w2, #0x20
+    cmp w2, #'p'
+    b.eq .Lisf_yes
+    add x3, x3, #1
+    b .Lisf_hex_loop
 .Lisf_yes:
     mov x0, #1
     ret
@@ -1471,55 +1499,70 @@ _kcc_is_float_literal:
 // uint64_t kcc_parse_atof(const char *str, uint64_t len)
 //   x0 = digit string, x1 = length
 // Returns the IEEE-754 double bit pattern of the decimal constant.
-// Leaf function: uses only caller-saved x2-x10 and d0-d4.
+// Leaf function: uses only caller-saved x2-x12 and d0-d5.
 .text
 .globl _kcc_parse_atof
 .p2align 2
 _kcc_parse_atof:
     add x3, x0, x1               // x3 = end
     mov x2, x0                   // x2 = cursor
-    fmov d0, xzr                 // d0 = 0.0 (accumulator)
-    mov x5, #10
-    scvtf d3, x5                 // d3 = 10.0
-
+    // Hexadecimal floating constant `0x<hex>.<hex>p<exp>` (\stdref{6.4.4.2}):
+    // a hex mantissa scaled by a \emph{binary} exponent, e.g. 0x1.fp1 = 3.875.
+    cmp x1, #2
+    b.lo .Latof_dec
+    ldrb w4, [x0]
+    cmp w4, #'0'
+    b.ne .Latof_dec
+    ldrb w4, [x0, #1]
+    orr w4, w4, #0x20
+    cmp w4, #'x'
+    b.eq .Latof_hex
+.Latof_dec:
+    // Accumulate all significant digits into a single integer mantissa
+    // \reg{x5}, counting fractional digits in \reg{x6}.  Reconstructing the
+    // value with one final scale by $10^{\text{net}}$ keeps the whole
+    // computation to a single rounding step, so an exact decimal such as
+    // 3.875 lands on its exact double.  Per-digit \texttt{fdiv} accumulation
+    // (the naive method) rounds at every digit and drifts a ULP low.
+    mov x5, #0                   // M = integer mantissa
+    mov x6, #0                   // F = fractional-digit count
+    mov x8, #0                   // e-exponent magnitude (0 if no 'e' part)
+    mov x9, #0                   // e-exponent sign: 0 = +, 1 = -
+    mov x12, #10
 .Latof_int:
     cmp x2, x3
-    b.hs .Latof_end
-    ldrb w6, [x2]
-    cmp w6, #'.'
+    b.hs .Latof_scale
+    ldrb w7, [x2]
+    cmp w7, #'.'
     b.eq .Latof_frac
-    cmp w6, #'e'
+    cmp w7, #'e'
     b.eq .Latof_exp
-    cmp w6, #'E'
+    cmp w7, #'E'
     b.eq .Latof_exp
-    sub x7, x6, #'0'
-    cmp x7, #9
-    b.hi .Latof_end             // suffix or other → done
-    fmul d0, d0, d3
-    scvtf d1, x7
-    fadd d0, d0, d1
+    sub x10, x7, #'0'
+    cmp x10, #9
+    b.hi .Latof_scale           // suffix or other → done
+    mul x5, x5, x12
+    add x5, x5, x10             // M = M*10 + digit
     add x2, x2, #1
     b .Latof_int
 
 .Latof_frac:
     add x2, x2, #1               // skip '.'
-    mov x5, #1
-    scvtf d4, x5                 // d4 = fractional divisor (1.0, ×10 per digit)
 .Latof_frac_loop:
     cmp x2, x3
-    b.hs .Latof_end
-    ldrb w6, [x2]
-    cmp w6, #'e'
+    b.hs .Latof_scale
+    ldrb w7, [x2]
+    cmp w7, #'e'
     b.eq .Latof_exp
-    cmp w6, #'E'
+    cmp w7, #'E'
     b.eq .Latof_exp
-    sub x7, x6, #'0'
-    cmp x7, #9
-    b.hi .Latof_end
-    fmul d4, d4, d3              // divisor *= 10
-    scvtf d1, x7
-    fdiv d1, d1, d4             // digit / 10^k
-    fadd d0, d0, d1
+    sub x10, x7, #'0'
+    cmp x10, #9
+    b.hi .Latof_scale
+    mul x5, x5, x12
+    add x5, x5, x10
+    add x6, x6, #1             // one more fractional digit
     add x2, x2, #1
     b .Latof_frac_loop
 
@@ -1528,40 +1571,159 @@ _kcc_parse_atof:
     mov x8, #0                   // exponent magnitude
     mov x9, #0                   // sign: 0 = +, 1 = -
     cmp x2, x3
-    b.hs .Latof_exp_apply
-    ldrb w6, [x2]
-    cmp w6, #'+'
+    b.hs .Latof_scale
+    ldrb w7, [x2]
+    cmp w7, #'+'
     b.eq .Latof_exp_skip
-    cmp w6, #'-'
+    cmp w7, #'-'
     b.ne .Latof_exp_digits
     mov x9, #1
 .Latof_exp_skip:
     add x2, x2, #1
 .Latof_exp_digits:
     cmp x2, x3
-    b.hs .Latof_exp_apply
+    b.hs .Latof_scale
+    ldrb w7, [x2]
+    sub x10, x7, #'0'
+    cmp x10, #9
+    b.hi .Latof_scale
+    mov x12, #10
+    mul x8, x8, x12
+    add x8, x8, x10
+    add x2, x2, #1
+    b .Latof_exp_digits
+
+.Latof_scale:
+    // Net power of ten = (signed e-exponent) - (fractional-digit count).
+    cbz x9, .Latof_scale_net
+    neg x8, x8
+.Latof_scale_net:
+    sub x8, x8, x6              // x8 = net decimal exponent (signed)
+    scvtf d0, x5                // d0 = mantissa value
+    mov x9, #10
+    scvtf d3, x9                // d3 = 10.0
+    mov x9, #1
+    scvtf d1, x9                // d1 = 10^0 = 1.0
+    cmp x8, #0
+    b.ge .Latof_scale_mag
+    neg x11, x8                 // |net| for a negative exponent
+    b .Latof_scale_pow
+.Latof_scale_mag:
+    mov x11, x8
+.Latof_scale_pow:
+    cbz x11, .Latof_end
+.Latof_scale_pow_loop:
+    fmul d1, d1, d3             // build 10^|net| (exact for |net| <= 22)
+    subs x11, x11, #1
+    b.ne .Latof_scale_pow_loop
+    cmp x8, #0
+    b.lt .Latof_scale_div
+    fmul d0, d0, d1             // one correctly-rounded scale up
+    b .Latof_end
+.Latof_scale_div:
+    fdiv d0, d0, d1             // one correctly-rounded scale down
+    b .Latof_end
+
+.Latof_hex:
+    add x2, x0, #2               // skip "0x"
+    fmov d0, xzr                 // mantissa accumulator
+    mov x5, #16
+    scvtf d5, x5                 // d5 = 16.0
+.Lhex_int:
+    cmp x2, x3
+    b.hs .Lhex_exp0
+    ldrb w6, [x2]
+    cmp w6, #'.'
+    b.eq .Lhex_frac
+    cmp w6, #'p'
+    b.eq .Lhex_exp
+    cmp w6, #'P'
+    b.eq .Lhex_exp
+    sub x7, x6, #'0'             // decode a hex digit
+    cmp x7, #9
+    b.ls .Lhex_int_add
+    orr w7, w6, #0x20
+    sub x7, x7, #'a'
+    cmp x7, #5
+    b.hi .Lhex_exp0             // not a hex digit → mantissa complete
+    add x7, x7, #10
+.Lhex_int_add:
+    fmul d0, d0, d5
+    scvtf d1, x7
+    fadd d0, d0, d1
+    add x2, x2, #1
+    b .Lhex_int
+.Lhex_frac:
+    add x2, x2, #1               // skip '.'
+    mov x5, #1
+    scvtf d4, x5                 // d4 = 1.0 (running 16^k divisor)
+.Lhex_frac_loop:
+    cmp x2, x3
+    b.hs .Lhex_exp0
+    ldrb w6, [x2]
+    cmp w6, #'p'
+    b.eq .Lhex_exp
+    cmp w6, #'P'
+    b.eq .Lhex_exp
+    sub x7, x6, #'0'
+    cmp x7, #9
+    b.ls .Lhex_frac_add
+    orr w7, w6, #0x20
+    sub x7, x7, #'a'
+    cmp x7, #5
+    b.hi .Lhex_exp0
+    add x7, x7, #10
+.Lhex_frac_add:
+    fmul d4, d4, d5             // divisor *= 16
+    scvtf d1, x7
+    fdiv d1, d1, d4            // digit / 16^k
+    fadd d0, d0, d1
+    add x2, x2, #1
+    b .Lhex_frac_loop
+.Lhex_exp:
+    add x2, x2, #1               // skip 'p'/'P'
+    mov x8, #0                   // exponent magnitude
+    mov x9, #0                   // sign: 0 = +, 1 = -
+    cmp x2, x3
+    b.hs .Lhex_exp_apply
+    ldrb w6, [x2]
+    cmp w6, #'+'
+    b.eq .Lhex_exp_sskip
+    cmp w6, #'-'
+    b.ne .Lhex_exp_digits
+    mov x9, #1
+.Lhex_exp_sskip:
+    add x2, x2, #1
+.Lhex_exp_digits:
+    cmp x2, x3
+    b.hs .Lhex_exp_apply
     ldrb w6, [x2]
     sub x7, x6, #'0'
     cmp x7, #9
-    b.hi .Latof_exp_apply
+    b.hi .Lhex_exp_apply        // suffix (f/l) or end
     mov x10, #10
     mul x8, x8, x10
     add x8, x8, x7
     add x2, x2, #1
-    b .Latof_exp_digits
-
-.Latof_exp_apply:
+    b .Lhex_exp_digits
+.Lhex_exp0:
+    mov x8, #0                   // no binary exponent seen → scale by 2^0
+    mov x9, #0
+.Lhex_exp_apply:
+    // Scale the mantissa by 2^exponent (binary), multiplying/dividing by 2.
+    mov x5, #2
+    scvtf d2, x5                 // d2 = 2.0
     cbz x8, .Latof_end
-    cbnz x9, .Latof_exp_neg
-.Latof_exp_mul:
-    fmul d0, d0, d3
+    cbnz x9, .Lhex_exp_negloop
+.Lhex_exp_mul:
+    fmul d0, d0, d2
     subs x8, x8, #1
-    b.ne .Latof_exp_mul
+    b.ne .Lhex_exp_mul
     b .Latof_end
-.Latof_exp_neg:
-    fdiv d0, d0, d3
+.Lhex_exp_negloop:
+    fdiv d0, d0, d2
     subs x8, x8, #1
-    b.ne .Latof_exp_neg
+    b.ne .Lhex_exp_negloop
 
 .Latof_end:
     fmov x0, d0                  // return the double's bit pattern

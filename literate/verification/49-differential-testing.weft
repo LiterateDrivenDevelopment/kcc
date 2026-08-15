@@ -430,6 +430,18 @@ difftest "float-single-round-chain" \
     "int main(void){ volatile float a=1.0f,b=3.0f,c=7.0f; float r=a/b*c; union { float f; unsigned u; } v; v.f=r; return v.u & 0xFF; }"
 difftest "float-single-round-sum" \
     "int main(void){ volatile float a=1.1f,c=2.2f,d=3.3f,e=0.7f; float r=a*c+d*e; union { float f; unsigned u; } v; v.f=r; return v.u & 0xFF; }"
+# Hexadecimal floating constants (\S\ref{sec:parse-float}, \stdref{6.4.4.2}):
+# a hex mantissa scaled by a binary exponent.  0x1.fp1 = 3.875 exactly, so the
+# reinterpreted low bit must match; a wrong parse drifts the mantissa.
+difftest "hex-float-value" \
+    "int main(void){ double x = 0x1.fp1; return x == 3.875 ? 7 : 0; }"
+difftest "hex-float-bits" \
+    "int main(void){ double x = 0x1.8p0; union { double d; unsigned long u; } v; v.d = x; return (int)(v.u >> 48); }"
+# A decimal fraction that is exactly representable must parse to its exact
+# double.  Digit-by-digit division drifts a ULP low (3.875 -> 0x400eff...ff);
+# accumulating one integer mantissa and dividing once is correctly rounded.
+difftest "decimal-exact-fraction" \
+    "int main(void){ double x = 3.875; union { double d; unsigned long u; } v; v.d = x; return v.u == 0x400f000000000000UL ? 1 : 0; }"
 difftest "float-arith" \
     "int main(void){ float f = 1.5f, g = 2.25f; return (int)((f + g) * 8); }"
 difftest "float-func" \

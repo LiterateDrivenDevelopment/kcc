@@ -2213,6 +2213,13 @@ _kcc_ir_bitfield_load:
     mov x0, #IR_AND
     bl _kcc_ir_emit_binop
     mov x21, x0
+    // An enum bit-field is treated as unsigned (implementation-defined,
+    // \stdref{6.7.2.1}): its enumerators are non-negative and clang
+    // zero-extends, so a value whose top bit is set (e.g. an enum constant
+    // \(\ge 128\) in an 8-bit field) reads back positive, not sign-extended.
+    ldr x0, [x24, #TY_KIND]
+    cmp x0, #TY_ENUM
+    b.eq .Lbfl_done               // already masked → zero-extended
     // signed? sign-extend from `width` bits
     mov x0, x24
     bl _kcc_sema_int_signedness

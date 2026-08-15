@@ -631,6 +631,8 @@ difftest "shift-neg-widen-long" \
     "int main(void){ long b = (-1 << (unsigned)1); return (b == -2) ? 0 : 9; }"
 difftest "unary-minus-narrow-unsigned" \
     "int main(void){ return (-(unsigned short)1 < 0) ? 0 : 9; }"
+difftest "enum-bitfield-unsigned" \
+    "enum E{LOW=148,HIGH}; struct S{enum E c:8;}; int main(void){ struct S s; s.c=HIGH; return (int)s.c - 149; }"
 
 difftest "builtin-line-macro" \
     "int main(void){ int a = __LINE__; return a + __LINE__; }"

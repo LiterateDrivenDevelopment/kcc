@@ -539,6 +539,8 @@ _kcc_ir_build_assign:
     b.eq .Liba_sc_src_subscript
     cmp x1, #AST_UNARY_EXPR
     b.eq .Liba_sc_src_deref
+    cmp x1, #AST_VA_ARG
+    b.eq .Liba_sc_src_va_arg
     cmp x1, #AST_IDENT_EXPR
     b.ne .Liba_done
 
@@ -599,6 +601,13 @@ _kcc_ir_build_assign:
 .Liba_sc_src_call:
     // RHS is a struct-returning call: its value is the result buffer address.
     bl _kcc_ir_build_call
+    mov x24, x0                   // x24 = src base vreg
+    b .Liba_sc_do_copy
+
+.Liba_sc_src_va_arg:
+    // RHS is `va_arg(ap, struct T)`: build_va_arg yields the argument object's
+    // address (and advances the cursor), which is the copy source.
+    bl _kcc_ir_build_va_arg
     mov x24, x0                   // x24 = src base vreg
     b .Liba_sc_do_copy
 
@@ -1238,8 +1247,13 @@ _kcc_ir_build_va_start:
 
 // -- kcc_ir_build_va_arg --------------------------------------------------
 // uint64_t kcc_ir_build_va_arg(node *va_arg)
-//   Loads the 8-byte slot at the va_list cursor, advances the cursor by 8,
-//   and returns the loaded value vreg.
+//   Reads one argument from the va_list cursor and advances it by one 8-byte
+//   slot.  For a scalar the loaded 8 bytes are the value.  A struct/union is
+//   passed through `...` by \emph{address} in kcc's ABI (the caller's
+//   marshal-args stores the object's address in the variadic stack slot, see
+//   \S\ref{sec:aapcs64-marshal}), so the same loaded 8 bytes ARE the object's
+//   address --- exactly what an aggregate rvalue is elsewhere --- and the
+//   caller (a struct copy) reads the object through it.
 .text
 .globl _kcc_ir_build_va_arg
 .p2align 2
@@ -1267,7 +1281,7 @@ _kcc_ir_build_va_arg:
     mov x21, x0                  // p
     mov x0, x22
     bl _kcc_ir_emit
-    // val = *p  (one 8-byte argument slot)
+    // val = *p  (one 8-byte argument slot: a scalar value, or a struct address)
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr
     mov x22, x0
@@ -1323,7 +1337,7 @@ _kcc_ir_build_va_arg:
     str x20, [x22, #IR_SRC2]
     mov x0, x22
     bl _kcc_ir_emit
-    mov x0, x23                  // return val
+    mov x0, x23                  // return val (scalar value, or struct address)
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]

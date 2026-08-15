@@ -603,6 +603,8 @@ difftest "define-multiline-comment" \
     "#define X 5 /* comment that\nspans two lines */\nint main(void){ return X - 5; }"
 difftest "nested-struct-tag" \
     "struct Hash { int count; struct _ht { int n; } *ht; }; int main(void){ struct _ht e; e.n = 42; return e.n - 42; }"
+difftest "va-arg-struct-assign" \
+    "#include <stdarg.h>\nstruct tiny{int c;};\nint sum(int n,...){int t=0;struct tiny x;va_list ap;va_start(ap,n);for(int i=0;i<n;i++){x=va_arg(ap,struct tiny);t+=x.c;}va_end(ap);return t;}\nint main(void){struct tiny a={10},b={11},c={12};return sum(3,a,b,c)-33;}"
 difftest "parenthesized-func-name" \
     "static int (add)(int a, int b){ return a + b; } int (main)(void){ return add(3,4) - 7; }"
 difftest "stdint-signed-mins" \

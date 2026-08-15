@@ -623,13 +623,136 @@ _kcc_sema_check_redef:
     ldp x29, x30, [sp], #32
     ret
 
+// -- kcc_agg_leaf_count ---------------------------------------------------
+// uint64_t kcc_agg_leaf_count(type *ty)
+// Number of scalar leaves a fully brace-elided initializer fills for `ty`
+// (\stdref{6.7.9p20}): 1 for a scalar, length*leaves for an array, the sum of
+// its fields' leaves for a struct, the first member's leaves for a union.
+.text
+.globl _kcc_agg_leaf_count
+.p2align 2
+_kcc_agg_leaf_count:
+    cbz x0, .Lalc_one
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.eq .Lalc_array
+    cmp x1, #TY_STRUCT
+    b.eq .Lalc_struct
+    cmp x1, #TY_UNION
+    b.eq .Lalc_union
+.Lalc_one:
+    mov x0, #1
+    ret
+.Lalc_array:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    ldr x20, [x0, #TY_F1]          // length
+    ldr x0, [x0, #TY_F0]           // element type
+    bl _kcc_agg_leaf_count
+    mul x0, x0, x20
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Lalc_struct:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    ldr x19, [x0, #TY_F0]          // struct decl
+    cbz x19, .Lalc_s_one
+    ldr x19, [x19, #AST_F1]        // first field
+    mov x20, #0                    // leaf accumulator
+.Lalc_s_loop:
+    cbz x19, .Lalc_s_ret
+    ldr x0, [x19, #AST_F0]         // field type spec
+    bl _kcc_sema_resolve_type
+    bl _kcc_agg_leaf_count
+    add x20, x20, x0
+    ldr x19, [x19, #AST_F4]
+    b .Lalc_s_loop
+.Lalc_s_one:
+    mov x20, #1
+.Lalc_s_ret:
+    mov x0, x20
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+.Lalc_union:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    ldr x1, [x0, #TY_F0]           // union decl
+    cbz x1, .Lalc_u_one
+    ldr x1, [x1, #AST_F1]          // first member (elision fills only it)
+    cbz x1, .Lalc_u_one
+    ldr x0, [x1, #AST_F0]          // its type spec
+    bl _kcc_sema_resolve_type
+    bl _kcc_agg_leaf_count
+    ldp x29, x30, [sp], #32
+    ret
+.Lalc_u_one:
+    mov x0, #1
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_infer_arr_elems --------------------------------------------------
+// uint64_t kcc_infer_arr_elems(node *head, type *elem)
+// Count how many array elements a brace-elided initializer list `head..`
+// forms when each element has aggregate type `elem`: an item with its own
+// brace consumes one element, otherwise a run of leaf-count scalars does
+// (\stdref{6.7.9p20}).  Used to size `struct P a[] = { 1,2,3, 4,5,6 }` at 2,
+// not 6.
+.text
+.globl _kcc_infer_arr_elems
+.p2align 2
+_kcc_infer_arr_elems:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                    // item cursor
+    mov x0, x1
+    bl _kcc_agg_leaf_count
+    mov x22, x0                    // leaves per element
+    mov x21, #0                    // element count
+.Liae_loop:
+    cbz x19, .Liae_ret
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_INIT_LIST         // element wrote its own brace → one item
+    b.eq .Liae_braced
+    cmp x0, #AST_DESIGNATOR        // a designator also occupies one slot
+    b.eq .Liae_braced
+    // Brace elision: this element consumes up to `leaves` scalar items.
+    mov x20, x22
+.Liae_skip:
+    cbz x20, .Liae_count
+    cbz x19, .Liae_count
+    ldr x19, [x19, #AST_F4]
+    sub x20, x20, #1
+    b .Liae_skip
+    b .Liae_count
+.Liae_braced:
+    ldr x19, [x19, #AST_F4]
+.Liae_count:
+    add x21, x21, #1
+    b .Liae_loop
+.Liae_ret:
+    mov x0, x21
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- kcc_sema_infer_array_len ---------------------------------------------
 // void kcc_sema_infer_array_len(node *decl)
 // If the declaration's type is an incomplete array (an AST_TYPE_ARRAY with no
 // size expression) and it has an initializer, synthesise an AST_INT_LIT
 // length and hang it on the type node's size-expr slot, so that every later
 // resolve of that node yields a *complete* array type.  A string literal
-// gives strlen+1; a brace list gives its element span (designator-aware).
+// gives strlen+1; a brace list of scalars gives its element span
+// (designator-aware); a brace-elided list of aggregates is grouped by the
+// element's leaf count.
 .globl _kcc_sema_infer_array_len
 .p2align 2
 _kcc_sema_infer_array_len:
@@ -657,8 +780,31 @@ _kcc_sema_infer_array_len:
     add x21, x21, #1              // + terminating NUL
     b .Lial_make
 .Lial_list:
+    // When the array element is itself an aggregate, a brace-elided list groups
+    // several scalars into each element, so a flat count would over-size the
+    // array.  Resolve the element type and, for an aggregate, count grouped
+    // elements; a scalar element keeps the plain designator-aware span.
+    mov x0, x19                    // AST_TYPE_ARRAY node
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lial_list_flat
+    ldr x0, [x0, #TY_F0]           // element type
+    cbz x0, .Lial_list_flat
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.eq .Lial_list_agg
+    cmp x1, #TY_UNION
+    b.eq .Lial_list_agg
+    cmp x1, #TY_ARRAY
+    b.eq .Lial_list_agg
+.Lial_list_flat:
     mov x0, x20
     bl _kcc_ir_initlist_count      // element span (max index + 1)
+    mov x21, x0
+    b .Lial_make
+.Lial_list_agg:
+    mov x1, x0                     // element type
+    ldr x0, [x20, #AST_F0]         // init-list head
+    bl _kcc_infer_arr_elems
     mov x21, x0
 .Lial_make:
     mov x0, #AST_INT_LIT

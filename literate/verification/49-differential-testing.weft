@@ -633,6 +633,8 @@ difftest "unary-minus-narrow-unsigned" \
     "int main(void){ return (-(unsigned short)1 < 0) ? 0 : 9; }"
 difftest "enum-bitfield-unsigned" \
     "enum E{LOW=148,HIGH}; struct S{enum E c:8;}; int main(void){ struct S s; s.c=HIGH; return (int)s.c - 149; }"
+difftest "array-of-struct-elided-length" \
+    "struct P{int a,b,c;}; struct P arr[] = {1,2,3, 4,5,6, 7,8,9}; int main(void){ return (int)(sizeof(arr)/sizeof(arr[0])) - 3 + arr[2].a - 7; }"
 
 difftest "builtin-line-macro" \
     "int main(void){ int a = __LINE__; return a + __LINE__; }"

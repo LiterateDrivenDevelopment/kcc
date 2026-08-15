@@ -1786,8 +1786,12 @@ _kcc_ir_build_cast:
 
     cmp x1, x2
     b.eq .Lbc_same_size          // same width: maybe re-extend for signedness
-    b.lo .Lbc_trunc              // target < source: truncate
-    b .Lbc_extend                // target > source: extend
+    // Both narrowing and widening re-canonicalise to the target: extend the low
+    // target-width bytes by the target's signedness (SEXT/ZEXT below).  A single
+    // SEXT/ZEXT with source-width = target width does the narrow (it ignores the
+    // upper source bytes) and the widen (the low bytes are already the value)
+    // alike, and always leaves the register in the target type's canonical form.
+    b .Lbc_extend
 
 .Lbc_same_size:
     // Equal byte width.  A value narrower than 8 bytes is physically held in a
@@ -1844,8 +1848,15 @@ _kcc_ir_build_cast:
     b .Lbc_done
 
 .Lbc_extend:
-    // Choose SEXT or ZEXT based on source type signedness
-    ldr x0, [x23, #TY_F0]       // 1=signed, 0=unsigned
+    // Re-canonicalise to the TARGET's representation: extend the value per the
+    // TARGET's signedness and width.  The result's low target-width bits are
+    // already correct in the source register, so extending from the target
+    // width by the target's sign gives the right 64-bit value.  Using the
+    // SOURCE's signedness here sign-extended a signed-to-wider-unsigned cast
+    // like (unsigned short)(signed char)-1 to 0xFFFF...FF instead of 65535, so
+    // a following bitwise operation saw dirty upper bits and computed the wrong
+    // result (a char/short xor promoted to int).
+    ldr x0, [x22, #TY_F0]       // TARGET signedness (1=signed, 0=unsigned)
     cbz x0, .Lbc_zext
     mov x0, #IR_SEXT
     b .Lbc_ext_emit
@@ -1858,8 +1869,8 @@ _kcc_ir_build_cast:
 
     str x22, [x20, #IR_TYPE]    // target type
     str x21, [x20, #IR_SRC1]    // source vreg
-    ldr x0, [x23, #TY_SIZE]     // source width in bytes
-    str x0, [x20, #IR_SRC2]     // pass source width to codegen
+    ldr x0, [x22, #TY_SIZE]     // TARGET width in bytes
+    str x0, [x20, #IR_SRC2]     // pass to codegen
 
     bl _kcc_ir_next_vreg
     str x0, [x20, #IR_DEST]

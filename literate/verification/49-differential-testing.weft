@@ -645,6 +645,8 @@ difftest "shift-neg-widen-long" \
     "int main(void){ long b = (-1 << (unsigned)1); return (b == -2) ? 0 : 9; }"
 difftest "unary-minus-narrow-unsigned" \
     "int main(void){ return (-(unsigned short)1 < 0) ? 0 : 9; }"
+difftest "cast-signed-to-wider-unsigned" \
+    "signed char c=(signed char)0xff; int main(void){ return (((unsigned short)c ^ 0)==65535) && ((int)(signed char)200==-56) && ((short)70000==4464) ? 0 : 1; }"
 difftest "predec-unsigned-char-wrap" \
     "int main(void){ unsigned int i=0; unsigned char z=0; do{++i;}while(--z>0); return i - 256; }"
 difftest "preinc-narrow-wrap-value" \

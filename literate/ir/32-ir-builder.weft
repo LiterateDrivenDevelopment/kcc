@@ -1251,6 +1251,12 @@ _kcc_ir_build_func:
     add x20, x20, #1
 .Libf_params_set:
     str x20, [x23, #IRF_PARAMS]  // set param count (incl. hidden sret)
+    // Record whether the function is variadic (bit 0 of the param-list pointer);
+    // codegen needs it to place a register-overflow fixed parameter at the
+    // stack offset the variadic caller used.
+    ldr x0, [x19, #AST_F2]
+    and x0, x0, #1
+    str x0, [x23, #IRF_VARIADIC]
 
     // Record each incoming parameter's AAPCS64 class for the prologue.
     mov x0, x23                   // ir_func

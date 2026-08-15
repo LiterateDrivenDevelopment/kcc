@@ -1496,10 +1496,19 @@ addressed correctly.
     b .Lcgi_done
 
 .Lcgi_va_start:
-    // va_start: DEST = x29 + frame_size (the variadic tail; see prose).
+    // va_start: DEST = x29 + frame_size + max(0, nfixed-8)*8.  The variadic tail
+    // begins at [sp,#0] when nfixed<=8 (the Apple/system layout), and after the
+    // (nfixed-8) register-overflow fixed parameters when nfixed>8.  nfixed rides
+    // in the instruction's SRC2.
     adrp x1, _kcc_cg_frame_size@@PAGE
     add  x1, x1, _kcc_cg_frame_size@@PAGEOFF
     ldr x25, [x1]                 // x25 = frame_size
+    ldr x0, [x19, #IR_SRC2]       // nfixed
+    subs x0, x0, #8               // nfixed - 8
+    b.le .Lcgi_vs_off_ready       // nfixed <= 8: variadic tail at [sp,#0]
+    lsl x0, x0, #3               // (nfixed-8) * 8
+    add x25, x25, x0
+.Lcgi_vs_off_ready:
 
     // MOVZ x11, #(offset & 0xffff)
     mov x0, #CG_REG_DST

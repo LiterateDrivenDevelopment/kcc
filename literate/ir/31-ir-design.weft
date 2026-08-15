@@ -58,7 +58,8 @@ Offset & Field & Description \\
 .equ IRF_LOWPC,     64     // code offset where the function begins (set by codegen)
 .equ IRF_STATIC,    72     // 1 if the function has internal linkage (static)
 .equ IRF_SYMIDX,    80     // linker symbol index (pre-registered by codegen)
-.equ IR_FUNC_SIZE,  88
+.equ IRF_VARIADIC,  88     // 1 if the function is variadic (affects stack-arg layout)
+.equ IR_FUNC_SIZE,  96
 
 // -- BB flags -------------------------------------------------------------
 .equ BB_FLAG_TERMINATED, 1

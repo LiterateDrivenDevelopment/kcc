@@ -569,12 +569,21 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
     b .Lcgf_sa_next
 
 .Lcgf_sa_stack:
-    // Overflow: read from [x29 + frame_size + (base-1)*8] into x9, store to
-    // slot(base); base += 1.  Both offsets can exceed the scaled immediate on a
-    // large frame, so they route through the frame-ldst helper.
+    // Overflow: read from [x29 + frame_size + (base-S)*8] into x9, store to
+    // slot(base); base += 1.  S is the caller's first-stack index: 1 for a
+    // normal call, but 8 for a variadic callee, whose caller placed the
+    // register-overflow fixed parameters at [sp,#(base-8)*8] (before the
+    // variadic tail).  Both offsets can exceed the scaled immediate on a large
+    // frame, so they route through the frame-ldst helper.
     ldr x1, [sp, #96]           // base
-    sub x1, x1, #1               // base - 1
-    lsl x1, x1, #3               // (base-1) * 8
+    ldr x0, [x19, #IRF_VARIADIC]
+    cbz x0, .Lcgf_sa_s1
+    sub x1, x1, #8               // variadic: (base-8)*8
+    b .Lcgf_sa_soff
+.Lcgf_sa_s1:
+    sub x1, x1, #1               // normal: (base-1)*8
+.Lcgf_sa_soff:
+    lsl x1, x1, #3
     add x1, x1, x20              // + frame_size  (x20 = frame_size) = byte offset
     mov x0, #9                   // rt = x9
     mov x2, #0                   // kind = LDR int

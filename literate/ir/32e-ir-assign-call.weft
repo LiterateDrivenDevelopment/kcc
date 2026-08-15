@@ -891,8 +891,12 @@ _kcc_ir_build_call:
     bl _kcc_arena_alloc
     mov x23, x0                    // x23 = args array
 
-    // first_stack_idx: a variadic prototype's fixed-param count (in the callee
-    // func type's TY_QUALS), else 1.  Packed into the high half of args[0].
+    // first_stack_idx: where the caller's stack image begins.  For a variadic
+    // callee it is min(nfixed, 8): with nfixed<=8 the variadic tail starts at
+    // [sp,#0] (the Apple convention the system libc also uses, so interop with
+    // sprintf/printf holds); with nfixed>8 it is 8, so a fixed parameter that
+    // overflowed the eight argument registers lands on the stack BEFORE the
+    // variadic tail rather than colliding with it.  A non-variadic call uses 1.
     ldr x1, [sp, #72]            // callee expr node
     mov x2, #1
     cbz x1, .Libc_fsi_done
@@ -909,7 +913,10 @@ _kcc_ir_build_call:
     b.ne .Libc_fsi_done
     ldr x3, [x1, #TY_QUALS]      // nfixed if variadic, else 0
     cbz x3, .Libc_fsi_done
-    mov x2, x3
+    mov x2, x3                   // fsi = nfixed
+    cmp x2, #8
+    b.ls .Libc_fsi_done
+    mov x2, #8                   // clamp: nfixed>8 → fsi = 8
 .Libc_fsi_done:
     ldr x0, [sp, #104]           // total count
     orr x0, x0, x2, lsl #32

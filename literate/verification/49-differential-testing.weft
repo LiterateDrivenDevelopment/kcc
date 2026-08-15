@@ -625,6 +625,12 @@ difftest "cmp-int-vs-ulong-unsigned" \
     "int main(void){ int c=-1; unsigned long d=1; return (c<d)?9:0; }"
 difftest "cmp-promoted-uchar-schar" \
     "int main(void){ unsigned char uc=200; signed char sc=-1; return (uc>sc)?0:9; }"
+difftest "shift-type-left-operand" \
+    "int main(void){ return ((-1 << (unsigned)1) < 0) ? 0 : 9; }"
+difftest "shift-neg-widen-long" \
+    "int main(void){ long b = (-1 << (unsigned)1); return (b == -2) ? 0 : 9; }"
+difftest "unary-minus-narrow-unsigned" \
+    "int main(void){ return (-(unsigned short)1 < 0) ? 0 : 9; }"
 
 difftest "builtin-line-macro" \
     "int main(void){ int a = __LINE__; return a + __LINE__; }"

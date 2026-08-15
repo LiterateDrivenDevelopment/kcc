@@ -3801,12 +3801,29 @@ _kcc_ir_norm32:
     cmp x0, #3
     b.hi .Lnorm_skip
 
-    // Unsigned result if either operand is unsigned (TY_F0 == 0)
-    ldr x0, [x21, #TY_F0]        // lhs signed flag
-    ldr x1, [x3, #TY_F0]         // rhs signed flag
+    // Signedness of the re-canonicalising extension.  An operand forces an
+    // unsigned (zero-extended) result only if it is `unsigned int` or wider;
+    // a narrower unsigned type (unsigned char/short) promotes to signed int
+    // (§6.3.1.1) and so keeps the result signed.  The test is therefore
+    // `unsigned flag == 0 AND size >= 4`, not the flag alone.  A shift is a
+    // further exception: it takes the signedness of its LEFT operand only
+    // (§6.5.7), so `-1 << 1u` stays signed.  x20 still holds the opcode, so
+    // test it before reusing the register.
+    ldr x0, [x21, #TY_F0]        // lhs signed flag (1 = signed, 0 = unsigned)
+    cbnz x0, .Lnorm_lhs_ok       // signed → does not force an unsigned result
+    ldr x0, [x21, #TY_SIZE]
+    cmp x0, #4
+    b.hs .Lnorm_unsigned         // unsigned int or wider → ZEXT
+.Lnorm_lhs_ok:
+    cmp x20, #IR_SHL
+    b.eq .Lnorm_signed           // shift: the left operand alone decides → SEXT
+    ldr x0, [x3, #TY_F0]         // rhs signed flag
+    cbnz x0, .Lnorm_signed       // signed rhs → SEXT
+    ldr x0, [x3, #TY_SIZE]
+    cmp x0, #4
+    b.hs .Lnorm_unsigned         // unsigned int or wider rhs → ZEXT
+.Lnorm_signed:
     mov x20, #IR_SEXT
-    cbz x0, .Lnorm_unsigned
-    cbz x1, .Lnorm_unsigned
     b .Lnorm_emit
 .Lnorm_unsigned:
     mov x20, #IR_ZEXT

@@ -1105,9 +1105,12 @@ Binary expression type-checking first resolves the types of both
 operands.  Comparison and logical operators always produce
 \texttt{int} (per \stdref{6.5.8--9} and \stdref{6.5.13--14}).  If
 the left operand is a pointer and the operator is additive, the
-result is a pointer type (pointer arithmetic).  Otherwise, the usual
-arithmetic conversions (\texttt{\_kcc\_conv\_usual}) determine the
-common type.
+result is a pointer type (pointer arithmetic).  A shift
+(\texttt{<<}, \texttt{>>}) is special (\stdref{6.5.7}): its result type
+is the \emph{promoted left operand} alone, so the right operand never
+enters the conversions and \texttt{1 << 1u} stays a signed \texttt{int}.
+Otherwise, the usual arithmetic conversions
+(\texttt{\_kcc\_conv\_usual}) determine the common type.
 
 The six relational and equality operators additionally run the
 \texttt{-Wsign-compare} check (\texttt{kcc\_sema\_check\_sign\_compare}).
@@ -1173,6 +1176,14 @@ _kcc_sema_expr_binary:
     cmp x20, #TOK_OR
     b.eq .Lseb_int
 
+    // Shift operators: the result type is the promoted LEFT operand alone
+    // (\stdref{6.5.7}); the right operand does not enter the usual arithmetic
+    // conversions, so `1 << 1u` stays a signed int, not unsigned.
+    cmp x20, #TOK_SHL
+    b.eq .Lseb_shift
+    cmp x20, #TOK_SHR
+    b.eq .Lseb_shift
+
     // Pointer arithmetic: ptr + int or ptr - int
     ldr x0, [x21, #TY_KIND]
     cmp x0, #TY_PTR
@@ -1182,6 +1193,11 @@ _kcc_sema_expr_binary:
     mov x0, x21
     mov x1, x22
     bl _kcc_conv_usual
+    b .Lseb_done
+
+.Lseb_shift:
+    mov x0, x21                    // left operand type
+    bl _kcc_conv_promote           // integer-promote (rank < int → int)
     b .Lseb_done
 
 .Lseb_ptr_arith:
@@ -1345,19 +1361,27 @@ _kcc_sema_expr_unary:
     b.eq .Lseu_deref
     cmp x0, #TOK_BANG              // logical not → int
     b.eq .Lseu_int
-    cmp x0, #TOK_TILDE            // bitwise not → operand type
+    cmp x0, #TOK_TILDE            // bitwise not → promoted operand type
+    b.eq .Lseu_promote
+    cmp x0, #TOK_INC              // increment → operand type (an lvalue)
     b.eq .Lseu_operand
-    cmp x0, #TOK_INC              // increment
+    cmp x0, #TOK_DEC              // decrement → operand type (an lvalue)
     b.eq .Lseu_operand
-    cmp x0, #TOK_DEC              // decrement
-    b.eq .Lseu_operand
-    cmp x0, #TOK_MINUS            // unary minus
-    b.eq .Lseu_operand
-    cmp x0, #TOK_PLUS             // unary plus
-    b.eq .Lseu_operand
+    cmp x0, #TOK_MINUS            // unary minus → promoted operand type
+    b.eq .Lseu_promote
+    cmp x0, #TOK_PLUS             // unary plus → promoted operand type
+    b.eq .Lseu_promote
 
     // Default: operand type
     b .Lseu_operand
+
+.Lseu_promote:
+    // The arithmetic unary operators -, +, ~ apply the integer promotions to
+    // their result (\stdref{6.5.3.3}), so \texttt{-(unsigned short)1} is a
+    // signed \texttt{int}, not an unsigned short.
+    mov x0, x20
+    bl _kcc_conv_promote
+    b .Lseu_done
 
 .Lseu_addr:
     // &expr → pointer to operand type

@@ -4877,6 +4877,35 @@ at a time and scribble the value stack.
     mov x0, x19
     bl _kcc_ir_emit
 
+    // Step 3.5: truncate the new value to the operand's own width, so ++/-- of a
+    // narrow type wraps like the stored value does --- `--(unsigned char)0` is
+    // 255, not the 64-bit -1 the subtraction produced.  The store already
+    // truncates, but a prefix `++`/`--` \emph{returns} this value, so it must be
+    // re-canonicalised: sign- or zero-extend from the operand's byte width.
+    ldr x0, [x26, #TY_KIND]
+    sub x1, x0, #2
+    cmp x1, #5                    // integer kind (TY_BOOL(2)..TY_LLONG(7))?
+    b.hi .Libid_no_trunc
+    ldr x25, [x26, #TY_SIZE]     // width (callee-saved: survives the alloc below)
+    cmp x25, #8
+    b.hs .Libid_no_trunc          // already full width: nothing to truncate
+    ldr x1, [x26, #TY_F0]         // signedness (1 = signed → SEXT, 0 → ZEXT)
+    mov x0, #IR_SEXT
+    cbnz x1, .Libid_tr_emit
+    mov x0, #IR_ZEXT
+.Libid_tr_emit:
+    bl _kcc_ir_alloc_instr
+    mov x19, x0
+    str x26, [x19, #IR_TYPE]
+    str x24, [x19, #IR_SRC1]     // source = untruncated new value
+    str x25, [x19, #IR_SRC2]     // source width (bytes)
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    mov x24, x0                  // x24 = truncated new value
+    mov x0, x19
+    bl _kcc_ir_emit
+.Libid_no_trunc:
+
     // Step 4: store new value back, at the operand's own width.  For a store
     // the access-size code lives in IR_DEST (SRC1/SRC2 are value/address); a
     // wide store would scribble the fields packed next to a narrow one.

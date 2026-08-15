@@ -645,6 +645,10 @@ difftest "shift-neg-widen-long" \
     "int main(void){ long b = (-1 << (unsigned)1); return (b == -2) ? 0 : 9; }"
 difftest "unary-minus-narrow-unsigned" \
     "int main(void){ return (-(unsigned short)1 < 0) ? 0 : 9; }"
+difftest "predec-unsigned-char-wrap" \
+    "int main(void){ unsigned int i=0; unsigned char z=0; do{++i;}while(--z>0); return i - 256; }"
+difftest "preinc-narrow-wrap-value" \
+    "int main(void){ unsigned char z=0; int r=--z; signed char s=127; int t=++s; return (r==255 && t==-128) ? 0 : 1; }"
 difftest "bitfield-promote-signed" \
     "struct X{unsigned int u3:3; signed int s31:31; unsigned int u32:32;}; struct X x; int main(void){ return ((x.u3-2)<0) && ((x.s31-2)<0) && ((x.u32-2)>=0) ? 0 : 1; }"
 difftest "enum-bitfield-unsigned" \

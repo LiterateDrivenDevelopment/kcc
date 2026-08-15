@@ -642,6 +642,8 @@ difftest "sizeof-func-ptr-type" \
 
 difftest "builtin-line-macro" \
     "int main(void){ int a = __LINE__; return a + __LINE__; }"
+difftest "line-directive-macro" \
+    "#define L 500\n#line L\nint main(void){ return __LINE__ - 501; }"
 difftest "compound-literal-addr" \
     "struct S{int a;int b;}; struct S *g = &(struct S){1,2}; int main(void){ return g->a + g->b - 3; }"
 difftest "compound-literal-local" \

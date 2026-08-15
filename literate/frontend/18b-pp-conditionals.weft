@@ -367,6 +367,72 @@ _kcc_pp_do_if:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+
+// -- _kcc_pp_do_line ------------------------------------------------
+// #line N ["file"] (\stdref{6.10.4}): set the presumed line number of the
+// following source line to N, which may itself come from a macro
+// (`#line line`).  We evaluate the operand exactly as an #if expression --
+// macro-expanded, then parsed as an integer -- and store the difference from
+// the physical line in _kcc_line_delta, which __LINE__ then adds.  The optional
+// file-name string is not modelled (__FILE__ is unimplemented) and is ignored.
+.p2align 2
+.globl _kcc_pp_do_line
+_kcc_pp_do_line:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    // Physical line of this #line directive, captured before reading on.
+    adrp x0, _kcc_lex_line@@PAGE
+    add  x0, x0, _kcc_lex_line@@PAGEOFF
+    ldr  x23, [x0]
+
+    // Expand and evaluate the operand as an integer, reusing the #if path.
+    bl _kcc_pp_rest_of_line
+    bl _kcc_pp_prepare_cond
+    mov x19, x0                   // expanded text
+    mov x20, x1                   // length
+
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    ldr  x21, [x0]                // save cursor
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    ldr  x22, [x0]                // save end
+
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x19, [x0]
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    add  x1, x19, x20
+    str  x1, [x0]
+
+    bl _kcc_lex_next
+    bl _kcc_pp_eval_expr          // x0 = N (the presumed line)
+    mov x19, x0
+
+    adrp x0, _kcc_lex_cursor@@PAGE
+    add  x0, x0, _kcc_lex_cursor@@PAGEOFF
+    str  x21, [x0]                // restore cursor
+    adrp x0, _kcc_lex_end@@PAGE
+    add  x0, x0, _kcc_lex_end@@PAGEOFF
+    str  x22, [x0]                // restore end
+
+    // delta so the NEXT physical line (x23 + 1) reports N: N - (x23 + 1).
+    sub  x0, x19, x23
+    sub  x0, x0, #1
+    adrp x1, _kcc_line_delta@@PAGE
+    add  x1, x1, _kcc_line_delta@@PAGEOFF
+    str  x0, [x1]
+
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
 @}
 
 \paragraph{The \texttt{\#elif} directive.}

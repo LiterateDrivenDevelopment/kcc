@@ -387,9 +387,14 @@ _kcc_pp_try_expand:
 .Lexp_line_dyn:
     // Format the current line number as a decimal token and push it as the
     // expansion.  Digits are written from the end of a small arena buffer.
+    // The physical line is offset by any #line adjustment.
     adrp x0, _kcc_lex_line@@PAGE
     add  x0, x0, _kcc_lex_line@@PAGEOFF
-    ldr  x22, [x0]               // current line number
+    ldr  x22, [x0]               // physical line number
+    adrp x0, _kcc_line_delta@@PAGE
+    add  x0, x0, _kcc_line_delta@@PAGEOFF
+    ldr  x0, [x0]
+    add  x22, x22, x0            // presumed line = physical + #line delta
     mov  x0, #24
     bl _kcc_arena_alloc
     mov  x24, x0                 // buffer

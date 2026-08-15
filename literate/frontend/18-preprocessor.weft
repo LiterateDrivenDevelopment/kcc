@@ -512,7 +512,7 @@ callee-saved registers and returns to the preprocessor loop.
     bl _kcc_pp_do_error
     b .Ldir_done
 .Ldir_line_ctrl:
-    bl _kcc_pp_skip_line       // #line: skip for now
+    bl _kcc_pp_do_line         // #line N: adjust the reported line number
     b .Ldir_done
 .Ldir_pragma:
     bl _kcc_pp_skip_line       // #pragma: ignore
@@ -951,6 +951,8 @@ beginning-of-line detection for directive recognition.
 .globl _kcc_pp_macros
 _kcc_pp_macros:      .quad 0     // pointer to macro hash table
 _kcc_pp_eval_depth:  .quad 0     // #if-expression macro recursion guard
+.globl _kcc_line_delta
+_kcc_line_delta:     .quad 0     // #line adjustment: __LINE__ = _kcc_lex_line + this
 _kcc_pp_drain_floor: .quad 0     // >0: pp_next stops when the ctx stack drops below it (argument prescan)
 .globl _kcc_pp_ctx_depth
 _kcc_pp_ctx_depth:   .quad 0     // context stack depth

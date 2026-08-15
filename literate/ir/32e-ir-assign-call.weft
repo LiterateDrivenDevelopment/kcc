@@ -1172,9 +1172,28 @@ _kcc_ir_ident_alloca:
     stp x29, x30, [sp, #-32]!
     mov x29, sp
     stp x19, x20, [sp, #16]
-    cbz x0, .Lia_none
+    cbz x0, .Lia_err
+    // The va_list expression is usually a plain identifier, but the standard
+    // allows any lvalue --- an array element (`aps[4]`) or a struct member
+    // (`a.g`).  Route those to the subscript/member address builders, whose
+    // result is exactly the va_list storage address the callers want.
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_IDENT_EXPR
+    b.eq .Lia_ident
+    cmp x1, #AST_SUBSCRIPT
+    b.eq .Lia_subscript_lv
+    cmp x1, #AST_MEMBER
+    b.eq .Lia_member_lv
+    b .Lia_err
+.Lia_subscript_lv:
+    bl _kcc_ir_build_subscript_addr
+    b .Lia_done
+.Lia_member_lv:
+    bl _kcc_ir_build_member_addr
+    b .Lia_done
+.Lia_ident:
     ldr x19, [x0, #AST_F0]       // name ptr
-    cbz x19, .Lia_none
+    cbz x19, .Lia_err
     mov x0, x19
     bl _kcc_strlen
     mov x2, x0
@@ -1187,8 +1206,28 @@ _kcc_ir_ident_alloca:
     bic x0, x0, #0x8000000000000000
     sub x0, x0, #1
     b .Lia_done
-.Lia_none:
+.Lia_err:
     mov x0, #-1
+    b .Lia_done
+.Lia_none:
+    // Not a local: a file-scope `va_list` (e.g. a global `va_list gap`).  Its
+    // storage address is a global reference, which serves exactly as the local
+    // alloca vreg would --- va_start/va_arg both want the address of the
+    // va_list object.  x19 still holds the interned name.
+    mov x0, #IR_GLOBAL_REF
+    bl _kcc_ir_alloc_instr
+    str x19, [x0, #IR_SRC1]      // symbol name
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    mov x20, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0                  // global-ref vreg
+    mov x0, x20
+    bl _kcc_ir_emit
+    mov x0, x19
 .Lia_done:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32

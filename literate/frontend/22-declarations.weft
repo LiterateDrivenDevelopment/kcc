@@ -1284,7 +1284,13 @@ _kcc_parse_param_decl:
 \section{Abstract Declarator}
 
 An abstract declarator is used in casts and \texttt{sizeof(type)}.
-It is like a regular declarator but without a name.
+It is like a regular declarator but without a name.  Besides pointers and
+array/function suffixes, it may \emph{group} an inner declarator in
+parentheses --- \texttt{void (*)(void)} is a pointer to a function --- which
+this parser handles the same inside-out way as a named grouped declarator:
+it parses the inner \texttt{(*)}, then applies the trailing \texttt{(params)}
+or \texttt{[N]} suffix by splicing it in place of the base type
+(\texttt{\_kcc\_abst\_splice}), yielding \texttt{ptr(func(void)$\rightarrow$void)}.
 
 @d Decl: parse abstract @{
 // -- kcc_parse_abstract_declarator -------------------------------------
@@ -1294,11 +1300,129 @@ It is like a regular declarator but without a name.
 .globl _kcc_parse_abstract_declarator
 .p2align 2
 _kcc_parse_abstract_declarator:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
 
     mov x19, x0                  // x19 = type
+
+    // A '(' that begins the abstract declarator and is followed by '*' or
+    // another '(' groups an inner declarator --- the pointer of a function or
+    // array pointer such as \texttt{void (*)(void)}.  (A '(' followed by a type
+    // or ')' is instead a function parameter list, handled by the suffix code.)
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    b.ne .Labst_ptr_loop
+    bl _kcc_pp_next               // consume the grouping '('
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STAR
+    b.eq .Labst_grouped
+    cmp  x0, #TOK_LPAREN
+    b.eq .Labst_grouped
+    // Not a grouping: the '(' opened a parameter list over the base type
+    // (a bare function type-name); build the function type directly.
+    mov x20, x19                  // "inner" is just the base
+    b .Labst_grp_func_body
+
+.Labst_grouped:
+    // Parse the inner abstract declarator (the '*'), then its closing ')'.
+    mov x0, x19
+    bl _kcc_parse_abstract_declarator
+    mov x20, x0                  // inner declarator (e.g. ptr(base))
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    // A function or array suffix now applies to the group and is spliced in
+    // place of the base type, giving inside-out semantics.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LPAREN
+    b.eq .Labst_grp_func
+    cmp  x0, #TOK_LBRACKET
+    b.eq .Labst_grp_array
+    // No suffix: the group was just a parenthesised inner declarator.
+    mov x19, x20
+    b .Labst_done
+
+.Labst_grp_func:
+    bl _kcc_pp_next               // consume the parameter-list '('
+.Labst_grp_func_body:
+    mov x0, #AST_TYPE_FUNC
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]       // return type = base
+    mov x21, x0                  // x21 = function type node
+    mov x22, #0                  // first param
+    mov x23, #0                  // last param
+.Labst_grp_param_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.eq .Labst_grp_params_done
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Labst_grp_variadic
+    bl _kcc_parse_param_decl
+    cbz x22, .Labst_grp_first
+    str x0, [x23, #AST_F4]
+    mov x23, x0
+    b .Labst_grp_comma
+.Labst_grp_first:
+    mov x22, x0
+    mov x23, x0
+.Labst_grp_comma:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.ne .Labst_grp_params_done
+    bl _kcc_pp_next               // consume ','
+    b .Labst_grp_param_loop
+.Labst_grp_variadic:
+    bl _kcc_pp_next               // consume '...'
+    mov x0, #1
+    str x0, [x21, #AST_F2]       // variadic flag
+.Labst_grp_params_done:
+    str x22, [x21, #AST_F1]       // params
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    // Splice the function type into the inner declarator, replacing the base.
+    mov x0, x20
+    mov x1, x19                   // old base
+    mov x2, x21                   // new (function) type
+    bl _kcc_abst_splice
+    mov x19, x0                   // resulting head
+    b .Labst_done
+
+.Labst_grp_array:
+    bl _kcc_pp_next               // consume '['
+    mov x22, #0                  // size expr
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RBRACKET
+    b.eq .Labst_grp_arr_close
+    bl _kcc_parse_assign_expr
+    mov x22, x0
+.Labst_grp_arr_close:
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect
+    mov x0, #AST_TYPE_ARRAY
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]       // element = base
+    str x22, [x0, #AST_F1]       // size
+    mov x21, x0
+    mov x0, x20
+    mov x1, x19
+    mov x2, x21
+    bl _kcc_abst_splice
+    mov x19, x0                   // resulting head
+    b .Labst_done
 
     // Parse pointer(s)
 .Labst_ptr_loop:
@@ -1376,23 +1500,52 @@ _kcc_parse_abstract_declarator:
     b .Labst_done
 
 .Labst_check_func:
-    // Check for function suffix (params)
+    // A trailing '(' after pointers introduces a parameter list (a pointer to
+    // function whose group was elided, or a bare function type); reuse the same
+    // parameter-parsing path, with the pointer chain as the return-type base.
     cmp  x0, #TOK_LPAREN
     b.ne .Labst_return
-
-    // For abstract declarators, '(' could be grouping or function
-    // Simple heuristic: if next after '(' is a type token, it's function params
-    // Otherwise treat as done (no grouping in abstract declarators for casts)
-    mov x0, x19
-    b .Labst_return
+    bl _kcc_pp_next               // consume '('
+    mov x20, x19                  // inner is the pointer chain / base
+    b .Labst_grp_func_body
 
 .Labst_return:
     mov x0, x19
 
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #64
     ret
-@| _kcc_parse_abstract_declarator
+
+// -- kcc_abst_splice ------------------------------------------------------
+// node *kcc_abst_splice(node *chain, node *old_base, node *new_type)
+// Replace old_base with new_type inside `chain`'s AST_F0 type links (as for a
+// grouped concrete declarator), implementing inside-out declarator semantics
+// for an abstract declarator: void (*)(void) becomes ptr(func(void)->void).
+// Returns the resulting head: `chain` when a pointer wraps the base, or
+// `new_type` itself when the group had no pointer (chain == old_base).
+.text
+.p2align 2
+_kcc_abst_splice:
+    cmp x0, x1
+    b.eq .Labsp_direct            // chain IS the base: the new type is the head
+    mov x3, x0                    // walk with x3, keep x0 = head
+.Labsp_walk:
+    ldr x4, [x3, #AST_F0]
+    cmp x4, x1
+    b.eq .Labsp_here
+    cbz x4, .Labsp_done           // base not found (defensive): head unchanged
+    mov x3, x4
+    b .Labsp_walk
+.Labsp_here:
+    str x2, [x3, #AST_F0]         // relink: this node's pointee = new type
+.Labsp_done:
+    ret                            // x0 still = head
+.Labsp_direct:
+    mov x0, x2                    // head = new_type
+    ret
+@| _kcc_parse_abstract_declarator _kcc_abst_splice
 @}
 
 \section{Struct and Union}
@@ -1830,13 +1983,16 @@ _kcc_parse_type_name:
     bl _kcc_parse_decl_specs
     mov x19, x0                  // x19 = base type
 
-    // Check for abstract declarator (pointer, array)
+    // Check for abstract declarator: a pointer, an array suffix, or a '(' that
+    // groups a function/array-pointer declarator such as void (*)(void).
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
     cmp  x0, #TOK_STAR
     b.eq .Ltname_abstract
     cmp  x0, #TOK_LBRACKET
+    b.eq .Ltname_abstract
+    cmp  x0, #TOK_LPAREN
     b.eq .Ltname_abstract
     // No abstract declarator
     mov x0, x19

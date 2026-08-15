@@ -853,11 +853,103 @@ _kcc_pp_rest_of_line:
 
 .Lrol_start:
     mov  x5, x0               // text start
-    // Find newline or end
+    mov  x7, #0               // state: 0=normal 1=block-comment 2=string 3=char
+    // Scan to the newline that terminates the directive.  A block comment is
+    // whitespace that may span physical lines (\stdref{5.1.1.2} phase 3): the
+    // newline \emph{inside} it does not end the directive, so we keep scanning
+    // to the closing \texttt{*/} --- otherwise the comment's continuation line
+    // (e.g. the second line of a two-line comment after a \texttt{\#define})
+    // would be lexed as code.  String and character literals are tracked so a
+    // \texttt{/*} inside one is not mistaken for a comment.
 .Lrol_scan:
     cmp  x0, x1
     b.hs .Lrol_at_end
     ldrb w3, [x0]
+    cmp  x7, #1
+    b.eq .Lrol_st_block
+    cmp  x7, #2
+    b.eq .Lrol_st_str
+    cmp  x7, #3
+    b.eq .Lrol_st_char
+    // normal state
+    cmp  w3, #0x0A
+    b.eq .Lrol_found_nl
+    cmp  w3, #'"'
+    b.eq .Lrol_enter_str
+    cmp  w3, #0x27            // '
+    b.eq .Lrol_enter_char
+    cmp  w3, #'/'
+    b.ne .Lrol_adv1
+    add  x8, x0, #1
+    cmp  x8, x1
+    b.hs .Lrol_adv1
+    ldrb w9, [x8]
+    cmp  w9, #'*'
+    b.ne .Lrol_adv1
+    mov  x7, #1              // enter block comment
+    add  x0, x0, #2
+    b .Lrol_scan
+.Lrol_enter_str:
+    mov  x7, #2
+    add  x0, x0, #1
+    b .Lrol_scan
+.Lrol_enter_char:
+    mov  x7, #3
+    add  x0, x0, #1
+    b .Lrol_scan
+.Lrol_adv1:
+    add  x0, x0, #1
+    b .Lrol_scan
+.Lrol_st_block:
+    cmp  w3, #'*'
+    b.ne .Lrol_block_adv
+    add  x8, x0, #1
+    cmp  x8, x1
+    b.hs .Lrol_block_adv
+    ldrb w9, [x8]
+    cmp  w9, #'/'
+    b.ne .Lrol_block_adv
+    mov  x7, #0             // close block comment
+    add  x0, x0, #2
+    b .Lrol_scan
+.Lrol_block_adv:
+    cmp  w3, #0x0A          // newline inside comment: keep line count accurate
+    b.ne .Lrol_adv1
+    adrp x8, _kcc_lex_line@@PAGE
+    add  x8, x8, _kcc_lex_line@@PAGEOFF
+    ldr  x9, [x8]
+    add  x9, x9, #1
+    str  x9, [x8]
+    add  x0, x0, #1
+    b .Lrol_scan
+.Lrol_st_str:
+    cmp  w3, #0x5C          // backslash: skip the escaped character
+    b.ne .Lrol_str_q
+    add  x0, x0, #2
+    b .Lrol_scan
+.Lrol_str_q:
+    cmp  w3, #'"'
+    b.ne .Lrol_str_nl
+    mov  x7, #0
+    add  x0, x0, #1
+    b .Lrol_scan
+.Lrol_str_nl:
+    cmp  w3, #0x0A          // an unterminated string still ends at the newline
+    b.eq .Lrol_found_nl
+    add  x0, x0, #1
+    b .Lrol_scan
+.Lrol_st_char:
+    cmp  w3, #0x5C
+    b.ne .Lrol_char_q
+    add  x0, x0, #2
+    b .Lrol_scan
+.Lrol_char_q:
+    cmp  w3, #0x27
+    b.ne .Lrol_char_nl
+    mov  x7, #0
+    add  x0, x0, #1
+    b .Lrol_scan
+.Lrol_char_nl:
     cmp  w3, #0x0A
     b.eq .Lrol_found_nl
     add  x0, x0, #1

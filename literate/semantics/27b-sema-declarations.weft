@@ -599,24 +599,59 @@ mixed-type packing and zero-width separators are not yet modelled.
     // Fall through to .Lscd_struct
 
 .Lscd_struct:
-    // A member's enum type introduces enumerator constants that leak into the
-    // enclosing scope (\stdref{6.2.1}), so `struct { enum { X } x; } s;` makes
-    // `X` visible outside.  Register them by processing each field whose type is
-    // an enum, before (and regardless of) the tag --- an anonymous aggregate
-    // still contributes its enumerators.  A bodyless reference has no fields, so
-    // the walk is a no-op there and constants are never registered twice.
+    // A member may itself \emph{define} a tagged type --- an enum whose
+    // constants leak out (\texttt{struct \{ enum \{ X \} x; \}}, \stdref{6.2.1}),
+    // or a struct/union whose tag has enclosing (file/block) scope in C, not the
+    // member scope of C++ (\texttt{struct Hash \{ struct \_ht \{~\ldots~\} *ht;
+    // \};} makes \texttt{struct \_ht} usable later).  Register each such nested
+    // definition before the tag itself, peeling pointer/array/qualifier wrappers
+    // to reach the core type.  Only a type carrying a \emph{body} is registered,
+    // so a bare reference (including a self-reference like \texttt{struct Hash
+    // *next}) is left alone and no incomplete tag is created prematurely.
     ldr x21, [x19, #AST_F1]        // first field
 .Lscd_struct_efld:
     cbz x21, .Lscd_struct_efld_done
     ldr x0, [x21, #AST_F0]         // field type node
+.Lscd_efld_peel:
     cbz x0, .Lscd_struct_efld_next
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_PTR
+    b.eq .Lscd_efld_deref
+    cmp x1, #AST_TYPE_ARRAY
+    b.eq .Lscd_efld_deref
+    cmp x1, #AST_TYPE_QUALS
+    b.eq .Lscd_efld_deref
+    b .Lscd_efld_core
+.Lscd_efld_deref:
+    ldr x0, [x0, #AST_F0]          // peel to pointee / element / base
+    b .Lscd_efld_peel
+.Lscd_efld_core:
+    // x0 = core type node, x1 = its tag.  Find the underlying decl (whose
+    // AST_F1 holds members/enumerators) and register only if it has a body.
+    cmp x1, #AST_TYPE_STRUCT
+    b.eq .Lscd_efld_wrap
+    cmp x1, #AST_TYPE_UNION
+    b.eq .Lscd_efld_wrap
     cmp x1, #AST_TYPE_ENUM
-    b.eq .Lscd_struct_efld_reg
+    b.eq .Lscd_efld_wrap
+    cmp x1, #AST_STRUCT_DECL
+    b.eq .Lscd_efld_body
+    cmp x1, #AST_UNION_DECL
+    b.eq .Lscd_efld_body
     cmp x1, #AST_ENUM_DECL
-    b.ne .Lscd_struct_efld_next
+    b.eq .Lscd_efld_body
+    b .Lscd_struct_efld_next
+.Lscd_efld_wrap:
+    ldr x2, [x0, #AST_F0]          // wrapper → inner decl node
+    cbz x2, .Lscd_struct_efld_next
+    ldr x3, [x2, #AST_F1]          // its members / enumerators
+    cbz x3, .Lscd_struct_efld_next // bodyless reference: leave it alone
+    b .Lscd_struct_efld_reg
+.Lscd_efld_body:
+    ldr x3, [x0, #AST_F1]          // decl's members / enumerators
+    cbz x3, .Lscd_struct_efld_next
 .Lscd_struct_efld_reg:
-    bl _kcc_sema_check_decl        // field's enum type: registers its enumerators
+    bl _kcc_sema_check_decl        // registers the nested tag / enumerators
 .Lscd_struct_efld_next:
     ldr x21, [x21, #AST_F4]
     b .Lscd_struct_efld

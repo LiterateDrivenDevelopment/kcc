@@ -599,6 +599,10 @@ object, which must agree byte-for-byte with the reference compiler.
 echo ""
 echo "--- Language Features ---"
 
+difftest "define-multiline-comment" \
+    "#define X 5 /* comment that\nspans two lines */\nint main(void){ return X - 5; }"
+difftest "nested-struct-tag" \
+    "struct Hash { int count; struct _ht { int n; } *ht; }; int main(void){ struct _ht e; e.n = 42; return e.n - 42; }"
 difftest "block-scoped-tag" \
     "struct T{int x;}; int main(void){ struct T v; { struct T {int z;} w; w.z=9; } v.x=2; return v.x - 2; }"
 difftest "prefixed-char-literal" \

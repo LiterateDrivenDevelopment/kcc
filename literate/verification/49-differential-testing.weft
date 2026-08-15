@@ -645,6 +645,8 @@ difftest "shift-neg-widen-long" \
     "int main(void){ long b = (-1 << (unsigned)1); return (b == -2) ? 0 : 9; }"
 difftest "unary-minus-narrow-unsigned" \
     "int main(void){ return (-(unsigned short)1 < 0) ? 0 : 9; }"
+difftest "bitfield-promote-signed" \
+    "struct X{unsigned int u3:3; signed int s31:31; unsigned int u32:32;}; struct X x; int main(void){ return ((x.u3-2)<0) && ((x.s31-2)<0) && ((x.u32-2)>=0) ? 0 : 1; }"
 difftest "enum-bitfield-unsigned" \
     "enum E{LOW=148,HIGH}; struct S{enum E c:8;}; int main(void){ struct S s; s.c=HIGH; return (int)s.c - 149; }"
 difftest "array-of-struct-elided-length" \

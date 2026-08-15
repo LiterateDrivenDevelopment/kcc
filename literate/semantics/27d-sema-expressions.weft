@@ -1995,6 +1995,44 @@ _kcc_sema_expr_member:
     ldr x0, [x21, #AST_F0]         // field type node
     cbz x0, .Lsem_found_int
     bl _kcc_sema_resolve_type
+    mov x22, x0                    // declared field type
+    // Bit-field integer promotion (\stdref{6.3.1.1}): a bit-field of width W is
+    // promoted where int can represent all its values, which for a bit-field
+    // narrower than int is \emph{always} --- even an unsigned one --- so
+    // `unsigned f:3` yields a signed int and `(f - 2)` is a signed compare.  A
+    // full-width unsigned bit-field (W == int width) stays unsigned int; wider
+    // (long) bit-fields keep their declared type.  W is the low 16 bits of the
+    // field's packed AST_F2 (0 for a non-bit-field member).
+    ldr x1, [x21, #AST_F2]
+    and x1, x1, #0xFFFF            // bit-field width
+    cbz x1, .Lsem_found_ret
+    cbz x22, .Lsem_found_ret
+    ldr x2, [x22, #TY_KIND]
+    sub x3, x2, #2
+    cmp x3, #5                     // integer kind (TY_BOOL(2)..TY_LLONG(7))?
+    b.hi .Lsem_found_ret
+    ldr x2, [x22, #TY_F0]          // signedness (1 = signed, 0 = unsigned)
+    cbz x2, .Lsem_bf_unsigned
+    cmp x1, #32                    // signed: W<=32 → int, else declared
+    b.hi .Lsem_found_ret
+    b .Lsem_bf_int
+.Lsem_bf_unsigned:
+    cmp x1, #31
+    b.ls .Lsem_bf_int             // unsigned W<=31 → int (int holds all values)
+    cmp x1, #32
+    b.hi .Lsem_found_ret          // unsigned W>32 → keep declared (unsigned long)
+    adrp x0, _kcc_type_int_u@@PAGE // unsigned W==32 → unsigned int
+    add  x0, x0, _kcc_type_int_u@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lsem_found_pret
+.Lsem_bf_int:
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lsem_found_pret
+.Lsem_found_ret:
+    mov x0, x22
+.Lsem_found_pret:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48

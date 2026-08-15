@@ -1116,8 +1116,18 @@ an array rather than an array of pointers.
     ldr x0, [x21, #AST_F0]      // type chain root
     cmp x0, x19                  // directly the base type?
     b.ne .Lddecl_gfunc_walk
-    // No pointer: store func type directly
-    str x24, [x21, #AST_F0]
+    // No pointer wrapper: the group was redundant parentheses around a plain
+    // function name, `(f)(params)` --- as Csmith's FUNC_NAME macro emits.  This
+    // is an ordinary function declarator, not a function-typed variable, so
+    // retag the inner VAR_DECL as a FUNC_DECL (return type, name already set,
+    // params|variadic) so it can head a definition just like `f(params)`.
+    mov x0, #AST_FUNC_DECL
+    str x0, [x21, #AST_TAG]
+    str x19, [x21, #AST_F0]      // return type
+    ldr x1, [x24, #AST_F1]       // params
+    ldr x2, [x24, #AST_F2]       // variadic flag
+    orr x1, x1, x2               // params | variadic (bit 0)
+    str x1, [x21, #AST_F2]
     b .Lddecl_grouped_done
 
 .Lddecl_gfunc_walk:

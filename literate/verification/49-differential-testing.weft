@@ -527,6 +527,14 @@ difftest "uchar-divassign-signed-promote" \
     "int main(void){ unsigned char x = 50; short y = -5; x /= y; return x; }"
 difftest "uchar-modassign-signed-promote" \
     "int main(void){ unsigned char x = 53; short y = -5; x %= y; return x; }"
+# Bitwise AND/OR/XOR pass their operands' upper bits straight through, so mixing
+# a sign-extended operand into an unsigned result must re-canonicalise (ZEXT) the
+# result -- otherwise a later widen or 64-bit compare sees dirty upper bits.
+# `0u ^ (short)-1` is the unsigned int 0xFFFFFFFF, positive when widened to long.
+difftest "xor-mixed-width-unsigned" \
+    "int main(void){ volatile short s = -1; return (0LL > (0u ^ s)) ? 1 : 0; }"
+difftest "or-mixed-width-widen" \
+    "int main(void){ short s = -1; long long v = (0u | s); return v > 0 ? 1 : 0; }"
 difftest "uint-divassign-stays-unsigned" \
     "int main(void){ unsigned x = 50; unsigned s = 4294967291u; x /= s; return (int)x; }"
 

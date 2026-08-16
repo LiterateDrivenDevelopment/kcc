@@ -3851,6 +3851,18 @@ _kcc_ir_norm32:
     b.eq .Lnorm_op_ok
     cmp x20, #IR_NOT
     b.eq .Lnorm_op_ok
+    // Bitwise AND/OR/XOR also need re-canonicalising: they pass their operands'
+    // upper bits straight through, so mixing a sign-extended operand into an
+    // unsigned result leaves dirty upper bits.  `0u ^ (short)-1` is unsigned int
+    // 0xFFFFFFFF, but the short's sign extension made the register
+    // 0xFFFF...FFFF; without a ZEXT here, a later widen or 64-bit compare read
+    // it as -1 (the pr48197 / 960801 mixed-width bug).
+    cmp x20, #IR_AND
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_OR
+    b.eq .Lnorm_op_ok
+    cmp x20, #IR_XOR
+    b.eq .Lnorm_op_ok
     b .Lnorm_skip
 .Lnorm_op_ok:
 

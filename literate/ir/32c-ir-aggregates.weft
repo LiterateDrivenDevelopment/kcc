@@ -1349,6 +1349,8 @@ _kcc_ir_build_var_decl:
     b.eq .Libvd_array
     cmp x0, #TY_STRUCT
     b.eq .Libvd_struct
+    cmp x0, #TY_UNION
+    b.eq .Libvd_struct           // a union is sized like a struct: ceil(TY_SIZE/8)
     b .Libvd_emit_alloca
 
 .Libvd_array:
@@ -1376,7 +1378,10 @@ _kcc_ir_build_var_decl:
     b .Libvd_emit_alloca
 
 .Libvd_struct:
-    // Slot count = ceil(TY_SIZE / 8) over the packed struct size.
+    // Slot count = ceil(TY_SIZE / 8) over the packed struct/union size.  A union
+    // is as large as its widest member, so a 16-byte `union{int i,j[4];}` needs
+    // two slots; without this it fell to the 1-slot default and left the tail
+    // past the first member unallocated and un-zeroed (garbage `t.j[2..3]`).
     mov x0, x21
     bl _kcc_ir_type_slots
     mov x24, x0

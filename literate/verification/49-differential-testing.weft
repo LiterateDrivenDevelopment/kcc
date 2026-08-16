@@ -269,6 +269,13 @@ difftest "array-2d" \
 # not brace elision: `struct A a = {2, b}` copies all of the struct b into a.b.
 # Elision would splice b's fields one scalar at a time and drop everything past
 # the first, so a nested member came back zero.
+# A local union is as large as its widest member; initializing it must allocate
+# and zero the WHOLE object, not just the first member.  A `union { int i; int
+# j[4]; } u = {0}` left j[2]/j[3] (past the first member) as stack garbage.
+difftest "union-init-zeroes-tail" \
+    "union U { int i; int j[4]; }; int main(void){ union U u = {0}; return u.j[0] + u.j[1] + u.j[2] + u.j[3]; }"
+difftest "union-init-empty" \
+    "union U { int i; int j[4]; }; int main(void){ union U u = {}; int s = 0; for (int k = 0; k < 4; k++) s += u.j[k]; return s; }"
 difftest "init-struct-value-element" \
     "struct B { int x; int y; }; struct A { int z; struct B b; }; int main(void){ struct B b = {4,5}; struct A a = {2, b}; return a.z*100 + a.b.x*10 + a.b.y; }"
 difftest "init-array-of-struct-values" \

@@ -269,6 +269,13 @@ difftest "array-2d" \
 # not brace elision: `struct A a = {2, b}` copies all of the struct b into a.b.
 # Elision would splice b's fields one scalar at a time and drop everything past
 # the first, so a nested member came back zero.
+# A 16-byte struct passed BY VALUE consumes two argument registers, so with
+# enough following scalar args the last one spills to the stack.  The callee's
+# overflow read must key off the argument index, not its running register-slot
+# count (which counts the struct as two), or it reads the wrong stack word.
+difftest "struct-byval-arg-spill" \
+    "struct s { int f[4]; }; int foo(struct s s, int a, int b, int c, int d, int e, int g){ return s.f[3] + g; } int main(void){ struct s s = {1,2,3,4}; return (foo(s, 10,20,30,40,50, 70) ) & 255; }"
+
 # A local union is as large as its widest member; initializing it must allocate
 # and zero the WHOLE object, not just the first member.  A `union { int i; int
 # j[4]; } u = {0}` left j[2]/j[3] (past the first member) as stack garbage.

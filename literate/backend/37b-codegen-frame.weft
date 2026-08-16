@@ -575,13 +575,20 @@ than the exact AAPCS64 stack-slot ordering; it is self-consistent for
     // register-overflow fixed parameters at [sp,#(base-8)*8] (before the
     // variadic tail).  Both offsets can exceed the scaled immediate on a large
     // frame, so they route through the frame-ldst helper.
-    ldr x1, [sp, #96]           // base
     ldr x0, [x19, #IRF_VARIADIC]
     cbz x0, .Lcgf_sa_s1
+    ldr x1, [sp, #96]           // base
     sub x1, x1, #8               // variadic: (base-8)*8
     b .Lcgf_sa_soff
 .Lcgf_sa_s1:
-    sub x1, x1, #1               // normal: (base-1)*8
+    // Normal call: the caller keyed its stack image by ARGUMENT index (arg k at
+    // slot k-1), so the overflow read must use the parameter index, not the
+    // running register-slot base.  They differ only when a by-value struct
+    // precedes this parameter: an ST2 struct consumes two registers (base += 2)
+    // but occupies one argument slot, so a base-relative offset read the arg one
+    // slot too high (a 16B struct + enough ints to spill the last read the wrong
+    // stack word).
+    sub x1, x25, #1              // normal: (arg_index - 1)*8
 .Lcgf_sa_soff:
     lsl x1, x1, #3
     add x1, x1, x20              // + frame_size  (x20 = frame_size) = byte offset

@@ -1039,6 +1039,39 @@ _kcc_ir_fill:
     ldr x22, [x22, #AST_F4]      // consumed one element
     b .Lfl_ret
 .Lfl_agg:
+    // A struct/union VALUE element initializes this aggregate sub-object by a
+    // whole-object COPY, not by brace elision: `struct A a = {2, b}` copies all
+    // of the struct `b` into `a.b`.  Elision would instead splice b's fields one
+    // scalar at a time and lose everything past the first.  Sema types init-list
+    // elements, so the element's AST_F3 is its struct/union type; a matching
+    // aggregate sub-object gets the copy.
+    ldr x0, [x22, #AST_TAG]
+    cmp x0, #AST_INIT_LIST
+    b.eq .Lfl_agg_count          // its own braces → recurse/elide as before
+    ldr x0, [x22, #AST_F3]       // element's resolved type
+    cbz x0, .Lfl_agg_count
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_STRUCT
+    b.eq .Lfl_agg_copy
+    cmp x1, #TY_UNION
+    b.ne .Lfl_agg_count
+.Lfl_agg_copy:
+    mov x0, x20                  // base alloca
+    mov x1, x21                  // sub-object byte offset
+    bl _kcc_ir_emit_gep_const    // x0 = destination address vreg
+    mov x23, x0                  // dst
+    mov x0, x22                  // element expression (ident/member/call/…)
+    bl _kcc_ir_build_struct_addr // x0 = source struct base address vreg
+    mov x24, x0                  // src
+    mov x0, x19                  // sub-object type
+    bl _kcc_type_layout          // x0 = exact byte size
+    mov x2, x0
+    mov x0, x24                  // src
+    mov x1, x23                  // dst
+    bl _kcc_ir_emit_struct_copy
+    ldr x22, [x22, #AST_F4]      // consumed one element
+    b .Lfl_ret
+.Lfl_agg_count:
     mov x0, x19
     bl _kcc_ir_agg_count
     mov x23, x0                  // number of sub-objects

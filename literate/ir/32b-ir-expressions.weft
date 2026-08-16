@@ -4760,7 +4760,12 @@ the hoisted storage rather than emitting a reference to an undefined external
     mov x22, x0                  // x22 = mangled name
 
 .Libid_global_ref:
-    // Emit GLOBAL_REF to get address vreg
+    // Emit GLOBAL_REF to get address vreg.  Hold the instruction in x23, NOT
+    // x19: the shared `.Libid_load` tail still expects x19 to be the AST node
+    // so it can read the operand's type (and step a pointer by sizeof(pointee)
+    // in 64-bit).  The member/subscript/deref paths preserve x19; this one once
+    // clobbered it, so `int *b; *b++ = v;` loaded the pointer as a 32-bit int,
+    // stepped it by 1 instead of 4, and stored through the truncated address.
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
     str x22, [x0, #IR_SRC1]     // name ptr
@@ -4768,11 +4773,11 @@ the hoisted storage rather than emitting a reference to an undefined external
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]
     str x1, [x0, #IR_TYPE]
-    mov x19, x0
+    mov x23, x0
     bl _kcc_ir_next_vreg
-    str x0, [x19, #IR_DEST]
+    str x0, [x23, #IR_DEST]
     mov x22, x0                  // x22 = address vreg
-    mov x0, x19
+    mov x0, x23
     bl _kcc_ir_emit
 @}
 

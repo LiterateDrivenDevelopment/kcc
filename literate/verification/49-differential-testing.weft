@@ -486,6 +486,22 @@ difftest "strength-mul-zero" \
 difftest "strength-nonpow2" \
     "unsigned f(unsigned x){ return x*3 + x/5 + x%7; } int main(void){ return (int)f(100); }"
 
+# Post-increment of a GLOBAL pointer through a store (`*b++ = v`): the address
+# must load in the pointer's 64-bit width and step by sizeof(pointee), not 1.
+# The global path once clobbered the AST-node register the shared load-modify-
+# store tail reads its operand type from, so it loaded the pointer as a 32-bit
+# int, stepped by 1, and stored through a truncated address (SIGSEGV).
+difftest "global-ptr-postinc-store" \
+    "int buf[4]; int *b = buf; int main(void){ *b++ = 10; *b++ = 20; return (b - buf) * 100 + buf[0] + buf[1]; }"
+difftest "global-ptr-postinc-neg-index" \
+    "int buf[4]; int *b = buf; int main(void){ *b++ = 7; return b[-1] == 7 ? 42 : 0; }"
+
+# ptr - ptr is a pointer DIFFERENCE, typed ptrdiff_t (a signed integer), not a
+# pointer.  If the result kept a pointer type, a surrounding `(p-q) + n` scaled
+# `n` by the element size, so `(p-a)+a[2]` added `a[2]*sizeof(int)`.
+difftest "ptrdiff-in-arith" \
+    "int a[8] = {0,0,3,4}; int main(void){ int *p = a + 2; return (p - a) + a[2] + a[3]; }"
+
 # Read-only const globals (M5): a const integer scalar/array with a literal
 # initializer is emitted as read-only bytes in __TEXT rather than __common
 # storage.  These verify the byte image reads back correctly (the write-fault

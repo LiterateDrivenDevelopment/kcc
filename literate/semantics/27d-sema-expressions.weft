@@ -1347,8 +1347,26 @@ _kcc_sema_expr_binary:
     b .Lseb_done
 
 .Lseb_ptr_arith:
-    // Result is pointer type
-    mov x0, x21
+    // `ptr + int` and `ptr - int` yield a pointer, but `ptr - ptr` is a pointer
+    // \emph{difference} whose type is the signed integer \texttt{ptrdiff_t}
+    // (\stdref{6.5.6}), here \texttt{long}.  Getting this wrong made the result
+    // of `p - q` carry a pointer type, so a surrounding `(p - q) + n` treated it
+    // as pointer arithmetic and scaled `n` by the element size --- `(p-buf)+buf[2]`
+    // added `buf[2] * sizeof(int)` instead of `buf[2]`.
+    cmp x20, #TOK_MINUS
+    b.ne .Lseb_ptr_result
+    ldr x1, [x22, #TY_KIND]         // RHS kind
+    cmp x1, #TY_PTR
+    b.eq .Lseb_ptrdiff
+    cmp x1, #TY_ARRAY
+    b.eq .Lseb_ptrdiff
+.Lseb_ptr_result:
+    mov x0, x21                    // ptr ± int → pointer type
+    b .Lseb_done
+.Lseb_ptrdiff:
+    adrp x0, _kcc_type_long_s@@PAGE
+    add  x0, x0, _kcc_type_long_s@@PAGEOFF
+    ldr  x0, [x0]
     b .Lseb_done
 
 .Lseb_cmp:

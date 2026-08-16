@@ -77,9 +77,40 @@ _kcc_sema_expr:
     b.eq .Lse_generic
     cmp x20, #AST_COMPOUND_LIT
     b.eq .Lse_compound_lit
+    cmp x20, #AST_INIT_LIST
+    b.eq .Lse_init_list
 
     // Default: int
     b .Lse_default_int
+
+.Lse_init_list:
+    // Type every element of a brace initializer so each leaf expression carries
+    // a resolved type in AST_F3.  Sema otherwise never descends into a list, so
+    // an array-valued element stayed untyped and the IR builder could not tell
+    // it had to decay to a pointer: a local `S s = { arr, ... }` then stored a
+    // loaded int where the pointer member belonged, and the member pointed at
+    // garbage.  Recursion handles nested braces; a designator node types
+    // harmlessly (its value follows in the AST_F4 chain and is typed in turn).
+    ldr x0, [x19, #AST_F0]        // first element
+.Lse_il_loop:
+    cbz x0, .Lse_default_int      // list itself has no scalar type → int
+    mov x20, x0                    // cursor (callee-saved across the recursion)
+    ldr x1, [x20, #AST_TAG]
+    cmp x1, #AST_DESIGNATOR
+    b.ne .Lse_il_type
+    // A designated element (`.m = v` / `[i] = v`) stores its value initializer
+    // on the head designator's AST_F3 (the designator chain links via AST_F2).
+    // Type that value---NOT the designator node, whose AST_F3 would then be
+    // overwritten with the int default, destroying the fill's value pointer.
+    ldr x0, [x20, #AST_F3]        // designated value initializer
+    cbz x0, .Lse_il_next
+    bl _kcc_sema_expr
+    b .Lse_il_next
+.Lse_il_type:
+    bl _kcc_sema_expr
+.Lse_il_next:
+    ldr x0, [x20, #AST_F4]        // next sibling
+    b .Lse_il_loop
 
 .Lse_compound_lit:
     // A compound literal's type is its parenthesised type name; storing it in

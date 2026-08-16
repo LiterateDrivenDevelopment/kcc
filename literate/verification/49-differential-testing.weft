@@ -265,6 +265,16 @@ difftest "ptr-to-ptr" \
     "int main(void){ int x = 42; int *p = &x; int **pp = &p; **pp = 7; return x; }"
 difftest "array-2d" \
     "int main(void){ int a[3][3]; int i; int j; for (i = 0; i < 3; i = i + 1) for (j = 0; j < 3; j = j + 1) a[i][j] = i * 3 + j; return a[2][2]; }"
+# A LOCAL aggregate initialized with an array-valued element must decay the
+# array to its address to fill a pointer member (`S s = {arr, ...}`).  Sema did
+# not type list elements, so the array element was loaded as an int and the
+# pointer member pointed at garbage.  Covers plain, designated, and array-of-ptr.
+difftest "local-init-array-decay" \
+    "struct S { int *p; int n; }; int main(void){ int a[3] = {10,20,30}; struct S s = {a, 3}; return s.p[0] + s.p[2] + s.n; }"
+difftest "local-init-array-decay-designated" \
+    "struct S { int n; int *p; }; int main(void){ int a[2] = {5,6}; struct S s = {.p = a}; s.p[0] = 42; return a[0] + s.n * 0; }"
+difftest "local-init-array-of-ptrs" \
+    "int main(void){ int a[2] = {7,8}; int b[2] = {9,10}; int *pa[2] = {a, b}; return pa[0][1] + pa[1][0]; }"
 difftest "array-2d-nonsquare" \
     "int main(void){ int a[2][5]; int i; int j; for (i = 0; i < 2; i = i + 1) for (j = 0; j < 5; j = j + 1) a[i][j] = i * 5 + j; return a[1][4]; }"
 difftest "array-3d" \

@@ -2888,11 +2888,20 @@ _kcc_ir_build_ident:
     tbnz x0, #63, .Libi_local_ptr
     // Non-pointer local (scalar or array)
     sub x22, x0, #1              // x22 = alloca vreg
-    // Detect array decay: sema sets AST_F3 = TY_PTR for decayed arrays
+    // Detect array decay.  Sema usually rewrites a decayed array's node type to
+    // TY_PTR, but not in every context: as an aggregate-initializer element
+    // (`S s = {a, 0}`) the node keeps its TY_ARRAY type.  An array identifier in
+    // a value position ALWAYS decays to its element-0 address (its alloca vreg)
+    // and is never loaded, so accept both TY_PTR and TY_ARRAY here.  Reading
+    // AST_F3 alone once loaded `a[0]` as the initializer value and stored a
+    // 4-byte int where a pointer field belonged, so the struct member pointed
+    // at garbage.
     ldr x0, [x19, #AST_F3]
     cbz x0, .Libi_local_load
     ldr x1, [x0, #TY_KIND]
     cmp x1, #TY_PTR
+    b.eq .Libi_local_array
+    cmp x1, #TY_ARRAY
     b.eq .Libi_local_array
     b .Libi_local_load
 

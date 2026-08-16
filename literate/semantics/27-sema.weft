@@ -189,13 +189,34 @@ _kcc_sema_resolve_type:
     b .Lsrt_done
 
 .Lsrt_struct:
-    // F0 = struct_decl AST node
-    // If the decl has fields, create a new type from it.
-    // If not (forward ref), look up the tag in the symbol table.
+    // F0 = struct_decl AST node.  A bodyless reference looks up the tag; a body
+    // resolves to a descriptor for that definition.
     ldr x20, [x19, #AST_F0]        // AST_STRUCT_DECL
     cbz x20, .Lsrt_fallback
     ldr x0, [x20, #AST_F1]         // fields
-    cbnz x0, .Lsrt_struct_new
+    cbz x0, .Lsrt_struct_fwd       // no body → forward-ref tag lookup
+    // Body present.  If it is NAMED and the tag already resolves to THIS same
+    // decl, reuse that descriptor rather than minting a second one.  A duplicate
+    // descriptor shares the field AST nodes, and laying it out again re-runs
+    // bit-field packing over an AST_F2 the first layout already replaced with a
+    // packed (bit_offset<<16 | width) integer -- dereferencing that small value
+    // as a width-expression pointer and crashing.  SQLite's `struct sqlite3`
+    // nests a named `struct sqlite3InitInfo {...}` bit-field member exactly so.
+    ldr x0, [x20, #AST_F0]         // tag name_ptr
+    cbz x0, .Lsrt_struct_new       // anonymous body → must create fresh
+    bl _kcc_strlen
+    mov x1, x0                     // len
+    ldr x0, [x20, #AST_F0]         // name
+    bl _kcc_symtab_lookup_tag
+    cbz x0, .Lsrt_struct_new       // tag not registered yet → create it
+    ldr x1, [x0, #SYM_TYPE]
+    cbz x1, .Lsrt_struct_new
+    ldr x2, [x1, #TY_F0]           // registered descriptor's decl node
+    cmp x2, x20                    // same definition as this one?
+    b.ne .Lsrt_struct_new          // shadowing / different → fresh
+    mov x0, x1                     // reuse the registered, already-laid-out desc
+    b .Lsrt_done
+.Lsrt_struct_fwd:
     // No fields: look up tag
     ldr x0, [x20, #AST_F0]         // tag name_ptr
     cbz x0, .Lsrt_struct_new
@@ -213,11 +234,28 @@ _kcc_sema_resolve_type:
     b .Lsrt_done
 
 .Lsrt_union:
-    // Same logic as struct: look up tag if no fields
+    // Same logic as struct: a named body already registered as this same decl is
+    // reused (avoiding a duplicate descriptor that would re-pack bit-fields); a
+    // bodyless reference looks up the tag.
     ldr x20, [x19, #AST_F0]
     cbz x20, .Lsrt_fallback
     ldr x0, [x20, #AST_F1]
-    cbnz x0, .Lsrt_union_new
+    cbz x0, .Lsrt_union_fwd        // no body → forward-ref tag lookup
+    ldr x0, [x20, #AST_F0]         // tag name_ptr
+    cbz x0, .Lsrt_union_new        // anonymous body → fresh
+    bl _kcc_strlen
+    mov x1, x0
+    ldr x0, [x20, #AST_F0]
+    bl _kcc_symtab_lookup_tag
+    cbz x0, .Lsrt_union_new
+    ldr x1, [x0, #SYM_TYPE]
+    cbz x1, .Lsrt_union_new
+    ldr x2, [x1, #TY_F0]           // registered descriptor's decl node
+    cmp x2, x20
+    b.ne .Lsrt_union_new           // shadowing / different → fresh
+    mov x0, x1                     // reuse registered descriptor
+    b .Lsrt_done
+.Lsrt_union_fwd:
     ldr x0, [x20, #AST_F0]
     cbz x0, .Lsrt_union_new
     mov x20, x0

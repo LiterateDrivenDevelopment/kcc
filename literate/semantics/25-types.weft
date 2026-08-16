@@ -567,6 +567,19 @@ _kcc_type_struct:
 
     mov x19, x0                     // decl node
 
+    // Memoise one descriptor per struct-definition AST node (cached in the
+    // decl's spare AST_F2, zero-initialised by ast_alloc).  Re-resolving the
+    // same definition---especially an ANONYMOUS one, which has no tag to dedup
+    // through---must return the SAME descriptor.  A second descriptor would
+    // share the field AST nodes, and laying it out would re-run destructive
+    // bit-field packing, dereferencing an AST_F2 the first layout already
+    // replaced with a packed (bit_offset<<16 | width) integer as if it were a
+    // width-expression pointer.  SQLite's `struct SrcItem` has an anonymous
+    // `struct {...} fg` of bit-fields accessed as `pItem->fg.isTabFunc`.
+    cbz x19, .Lts_alloc
+    ldr x0, [x19, #AST_F2]          // cached descriptor?
+    cbnz x0, .Lts_ret
+.Lts_alloc:
     mov x0, #TY_DESC_SIZE
     bl _kcc_arena_alloc
     mov x1, #TY_STRUCT
@@ -576,7 +589,9 @@ _kcc_type_struct:
     str xzr, [x0, #TY_QUALS]
     str x19, [x0, #TY_F0]          // AST decl node
     str xzr, [x0, #TY_F1]          // member vec (populated by sema)
-
+    cbz x19, .Lts_ret
+    str x0, [x19, #AST_F2]          // cache on the decl node
+.Lts_ret:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
@@ -592,6 +607,11 @@ _kcc_type_union:
 
     mov x19, x0
 
+    // Memoise one descriptor per union-definition node (see kcc_type_struct).
+    cbz x19, .Ltu_alloc
+    ldr x0, [x19, #AST_F2]
+    cbnz x0, .Ltu_ret
+.Ltu_alloc:
     mov x0, #TY_DESC_SIZE
     bl _kcc_arena_alloc
     mov x1, #TY_UNION
@@ -601,7 +621,9 @@ _kcc_type_union:
     str xzr, [x0, #TY_QUALS]
     str x19, [x0, #TY_F0]
     str xzr, [x0, #TY_F1]
-
+    cbz x19, .Ltu_ret
+    str x0, [x19, #AST_F2]
+.Ltu_ret:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret

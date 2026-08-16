@@ -525,10 +525,65 @@ _kcc_ir_convert:
     cbz x0, .Licv_done
     ldr x0, [x0, #TY_KIND]
     cmp x0, #TY_BOOL
-    b.ne .Licv_done
+    b.ne .Licv_int_resize
     mov x0, x19
     bl _kcc_ir_emit_bool_norm
     mov x19, x0
+    b .Licv_done
+
+.Licv_int_resize:
+    // An integer-to-integer implicit conversion must re-canonicalise the value
+    // to the target width and signedness, exactly as an explicit cast does.
+    // Convert used to no-op here and rely on the register invariant, but the
+    // \emph{value} an assignment yields is this converted result: a chained
+    // `ul = us = l2 = -1` has to narrow -1 to `unsigned short` (0xFFFF) before
+    // widening it to `ul`, not store the raw -1 into all three lvalues.  The
+    // narrowing is the load-bearing step (ZEXT/SEXT to the target width masks
+    // the high bytes); a widening from an already-canonical source is a no-op.
+    ldr x1, [sp, #40]           // to type
+    cbz x1, .Licv_done
+    ldr x0, [x1, #TY_KIND]
+    cmp x0, #TY_BOOL            // 2
+    b.lo .Licv_done             // void/invalid target → leave as-is
+    cmp x0, #TY_LLONG           // 7
+    b.hi .Licv_done             // float/pointer/aggregate target → not this path
+    ldr x2, [sp, #32]           // from type
+    cbz x2, .Licv_done
+    ldr x0, [x2, #TY_KIND]
+    cmp x0, #TY_BOOL
+    b.lo .Licv_done
+    cmp x0, #TY_LLONG
+    b.hi .Licv_done             // from not an integer → leave as-is
+    ldr x3, [x1, #TY_SIZE]      // to size
+    ldr x4, [x2, #TY_SIZE]      // from size
+    cmp x3, x4
+    b.ne .Licv_ir_emit          // different width → resize
+    cmp x3, #8
+    b.hs .Licv_done             // same width, full 8 bytes → nothing to do
+    ldr x5, [x1, #TY_F0]        // to signedness
+    ldr x6, [x2, #TY_F0]        // from signedness
+    cmp x5, x6
+    b.eq .Licv_done             // same width and signedness → nothing to do
+.Licv_ir_emit:
+    ldr x0, [x1, #TY_F0]        // target signedness (1 = signed → SEXT)
+    mov x20, #IR_SEXT
+    cbnz x0, .Licv_ir_have_op
+    mov x20, #IR_ZEXT
+.Licv_ir_have_op:
+    mov x0, x20
+    bl _kcc_ir_alloc_instr
+    mov x20, x0
+    ldr x1, [sp, #40]           // to type
+    str x1, [x20, #IR_TYPE]
+    str x19, [x20, #IR_SRC1]    // source vreg
+    ldr x0, [x1, #TY_SIZE]      // target width in bytes
+    str x0, [x20, #IR_SRC2]
+    bl _kcc_ir_next_vreg
+    str x0, [x20, #IR_DEST]
+    mov x19, x0
+    mov x0, x20
+    bl _kcc_ir_emit
+
 .Licv_done:
     mov x0, x19
     ldp x19, x20, [sp, #16]

@@ -531,6 +531,14 @@ difftest "uchar-modassign-signed-promote" \
 # a sign-extended operand into an unsigned result must re-canonicalise (ZEXT) the
 # result -- otherwise a later widen or 64-bit compare sees dirty upper bits.
 # `0u ^ (short)-1` is the unsigned int 0xFFFFFFFF, positive when widened to long.
+# A chained assignment yields, at each link, the source CONVERTED to that
+# lvalue's type -- not the raw source.  `ul = us = l2 = -1` must narrow -1 to
+# unsigned short (0xFFFF) before widening it to ul; storing the raw -1 into all
+# three left ul = -1.  The implicit int-to-int conversion must materialise.
+difftest "chained-assign-narrowing" \
+    "int main(void){ unsigned short us; long long l2; unsigned long long ul; short s2; ul = us = l2 = s2 = -1; return ul == 65535 ? 1 : 0; }"
+difftest "chained-assign-truncate" \
+    "int main(void){ int a; unsigned char c; a = c = 300; return a; }"
 difftest "xor-mixed-width-unsigned" \
     "int main(void){ volatile short s = -1; return (0LL > (0u ^ s)) ? 1 : 0; }"
 difftest "or-mixed-width-widen" \

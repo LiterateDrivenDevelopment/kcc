@@ -2073,20 +2073,40 @@ _kcc_ir_compound_apply:
     bl _kcc_ir_emit_binop        // rhs * stride (long_u)
     mov x22, x0                  // scaled rhs
 .Lca_notptr:
-    // The compound-op table hands us the SIGNED opcode (SDIV/SMOD/ASHR).  For an
-    // unsigned integer lvalue the unsigned form is required: SDIV→UDIV,
-    // SMOD→UMOD, ASHR→LSHR.  Without this, `count /= (unsigned)step` in Lua's
-    // integer `forprep` ran a signed divide, so a full-range unsigned count read
-    // as −1 and the loop's trip count collapsed (`for i=mini,maxi,maxi` ran once
-    // instead of three times).  Only plain integer kinds are remapped; enum,
-    // floating, and the pointer path handled above keep the table default.
-    ldr x9, [x21, #TY_KIND]
+    // The compound-op table hands us the SIGNED opcode (SDIV/SMOD/ASHR).  The
+    // unsigned form is required when the OPERATION is unsigned---and the
+    // operation follows `E1 op E2`'s rules, NOT the lvalue's own type.  Division
+    // and remainder run in the common type of the promoted operands (usual
+    // arithmetic conversions); a shift runs in the promoted left operand.  A
+    // narrow unsigned lvalue promotes to signed int, so `unsigned char uc /=
+    // short` divides SIGNED (50 / -5 == -10); reading `uc`'s own unsigned-ness
+    // made it an unsigned divide that folded 50 / (unsigned)-5 to 0.  Lua's
+    // `count /= (unsigned)step` stays unsigned because there the lvalue is
+    // already an unsigned int, whose promotion and common type are unsigned.
+    cmp x19, #IR_ASHR
+    b.eq .Lca_sign_shift
+    cmp x19, #IR_SDIV
+    b.eq .Lca_sign_arith
+    cmp x19, #IR_SMOD
+    b.eq .Lca_sign_arith
+    b .Lca_signdone             // add/sub/mul/and/or/xor/shl: no signed variant
+.Lca_sign_arith:
+    mov x0, x21                  // L
+    mov x1, x23                  // R
+    bl _kcc_conv_usual           // common type of the promoted operands
+    b .Lca_sign_check
+.Lca_sign_shift:
+    mov x0, x21                  // L
+    bl _kcc_conv_promote         // promoted left operand
+.Lca_sign_check:
+    cbz x0, .Lca_signdone
+    ldr x9, [x0, #TY_KIND]
     cmp x9, #TY_BOOL             // 2
     b.lo .Lca_signdone
     cmp x9, #TY_LLONG            // 7
-    b.hi .Lca_signdone          // enum/float/aggregate → keep default
-    ldr x9, [x21, #TY_F0]       // 1 = signed, 0 = unsigned
-    cbnz x9, .Lca_signdone
+    b.hi .Lca_signdone          // float/aggregate → keep default (fp path remaps)
+    ldr x9, [x0, #TY_F0]        // 1 = signed, 0 = unsigned
+    cbnz x9, .Lca_signdone      // signed operation → keep the signed opcode
     cmp x19, #IR_SDIV
     b.ne .Lca_chk_smod
     mov x19, #IR_UDIV
@@ -2097,9 +2117,7 @@ _kcc_ir_compound_apply:
     mov x19, #IR_UMOD
     b .Lca_signdone
 .Lca_chk_ashr:
-    cmp x19, #IR_ASHR
-    b.ne .Lca_signdone
-    mov x19, #IR_LSHR
+    mov x19, #IR_LSHR           // only ASHR reaches here
 .Lca_signdone:
 
     mov x0, x21
@@ -3516,10 +3534,14 @@ _kcc_ir_build_binary:
     b .Libb_u_ge                 // IR_CMP_SGE
 
 .Libb_int_left:
-    // Check left operand type for unsigned — remap signed div/mod/shift.
-    ldr x0, [x19, #AST_F1]
-    cbz x0, .Libb_emit_alloc
-    ldr x0, [x0, #AST_F3]
+    // Remap signed div/mod/shift to unsigned by the RESULT type's signedness,
+    // not the raw left operand's.  Division and remainder use the operands'
+    // common type after the usual arithmetic conversions, and a shift uses the
+    // promoted left operand (\stdref{6.5.5}, \stdref{6.5.7}); both promote a
+    // narrow operand to (signed) int first.  So `unsigned char / short` divides
+    // in signed int -- reading the raw `unsigned char` here made it an unsigned
+    // divide, and 50 / (unsigned)-5 folded to 0 instead of -10.
+    ldr x0, [x19, #AST_F3]      // result type sema assigned to this expression
     cbz x0, .Libb_emit_alloc
     ldr x0, [x0, #TY_F0]
     cbnz x0, .Libb_emit_alloc

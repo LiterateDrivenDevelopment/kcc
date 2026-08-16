@@ -485,6 +485,19 @@ cases round out the corpus.
 echo ""
 echo "--- Operators and Edge Cases ---"
 
+# A narrow UNSIGNED operand promotes to signed int, so `/`, `%`, and `/=` on it
+# are SIGNED even though the operand was unsigned: 50 / (short)-5 == -10, not 0.
+# The signedness must come from the promoted operation type, not the raw operand
+# or the compound-assign lvalue.  Genuine unsigned-int division stays unsigned.
+difftest "uchar-div-signed-promote" \
+    "int main(void){ unsigned char x = 50; short y = -5; return (unsigned char)(x / y); }"
+difftest "uchar-divassign-signed-promote" \
+    "int main(void){ unsigned char x = 50; short y = -5; x /= y; return x; }"
+difftest "uchar-modassign-signed-promote" \
+    "int main(void){ unsigned char x = 53; short y = -5; x %= y; return x; }"
+difftest "uint-divassign-stays-unsigned" \
+    "int main(void){ unsigned x = 50; unsigned s = 4294967291u; x /= s; return (int)x; }"
+
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct
 # (they are NOT reduced, precisely because a shift would round differently).

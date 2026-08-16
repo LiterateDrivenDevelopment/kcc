@@ -4415,14 +4415,39 @@ _kcc_ir_build_unary:
     b .Libu_done
 
 .Libu_lnot:
-    // Logical not: cmp_eq operand, 0
-    // First emit const 0
+    // Logical not: the result is (operand == 0).  A floating operand needs a
+    // FLOATING compare against 0.0 so the back end selects FCMP; typing the
+    // compare as int compared the float's raw bit pattern as an integer, so
+    // `!1.0f` tested 0x3F800000 in the wrong domain and came out 1.  The
+    // compare and its zero constant are typed `double` (the FP working format,
+    // matching how a binary `c < x` compare is lowered); the operand is
+    // fcvt'd to double by the FCMP path.
+    // Decide the compare/const type: `double` for a floating operand, else int.
+    // Reuse x19 (saved by the prologue) to hold that type -- the operand node is
+    // no longer needed once we have read its type -- rather than a scratch the
+    // prologue does not preserve, which would corrupt the caller.
+    ldr x9, [x19, #AST_F1]       // operand node
+    cbz x9, .Libu_lnot_int_ty
+    ldr x9, [x9, #AST_F3]        // operand type
+    cbz x9, .Libu_lnot_int_ty
+    ldr x10, [x9, #TY_KIND]
+    cmp x10, #TY_FLOAT           // 8
+    b.lo .Libu_lnot_int_ty
+    cmp x10, #TY_LDOUBLE         // 10
+    b.hi .Libu_lnot_int_ty       // not floating → int compare
+    adrp x19, _kcc_type_double@@PAGE
+    add  x19, x19, _kcc_type_double@@PAGEOFF
+    ldr x19, [x19]               // floating operand → compare in double
+    b .Libu_lnot_emit
+.Libu_lnot_int_ty:
+    adrp x19, _kcc_type_int_s@@PAGE
+    add  x19, x19, _kcc_type_int_s@@PAGEOFF
+    ldr x19, [x19]               // int_s
+.Libu_lnot_emit:
+    // Emit const 0 (int 0, or double 0.0 -- both are all-zero bits)
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_TYPE]
     str xzr, [x0, #IR_SRC1]
     mov x22, x0
     bl _kcc_ir_next_vreg
@@ -4431,13 +4456,10 @@ _kcc_ir_build_unary:
     mov x0, x22
     bl _kcc_ir_emit
 
-    // Now cmp_eq
+    // Now cmp_eq, typed like the constant so a floating operand uses FCMP.
     mov x0, #IR_CMP_EQ
     bl _kcc_ir_alloc_instr
-    adrp x1, _kcc_type_int_s@@PAGE
-    add  x1, x1, _kcc_type_int_s@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_TYPE]
     str x21, [x0, #IR_SRC1]
     str x20, [x0, #IR_SRC2]
     mov x22, x0

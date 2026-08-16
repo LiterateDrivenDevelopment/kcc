@@ -459,6 +459,15 @@ difftest "hex-float-bits" \
 # accumulating one integer mantissa and dividing once is correctly rounded.
 difftest "decimal-exact-fraction" \
     "int main(void){ double x = 3.875; union { double d; unsigned long u; } v; v.d = x; return v.u == 0x400f000000000000UL ? 1 : 0; }"
+# Logical NOT of a floating operand is `x == 0.0`, a FLOATING compare (FCMP),
+# not an integer test of the raw bit pattern: !1.0f is 0, and 1.0f's bits
+# (0x3F800000) are nonzero, so a raw-integer test came out backwards.
+difftest "lognot-float-nonzero" \
+    "int main(void){ float c = 1.0f; return !c; }"
+difftest "lognot-float-zero" \
+    "int main(void){ float c = 0.0f; return !c; }"
+difftest "lognot-double-in-expr" \
+    "int test(float c){ return !!c * 7LL == 0; } int main(void){ return test(1.0f); }"
 difftest "float-arith" \
     "int main(void){ float f = 1.5f, g = 2.25f; return (int)((f + g) * 8); }"
 difftest "float-func" \

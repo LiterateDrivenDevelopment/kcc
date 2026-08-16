@@ -347,6 +347,13 @@ difftest "struct-short-field-sum" \
     "struct P { short a; short b; int c; }; int main(void){ struct P p; p.a = 300; p.b = 12; p.c = 7; return p.a + p.b + p.c; }"
 difftest "struct-array-oddsize" \
     "struct P { int a; int b; int c; }; int main(void){ struct P v[3]; int i = 0; for (i = 0; i < 3; i = i + 1){ v[i].a = i; v[i].b = i + 1; v[i].c = i + 2; } return v[2].a + v[2].b + v[2].c + sizeof(v); }"
+# Arrow access on a global ARRAY (`g->m` == `g[0].m`): the array name is already
+# the element-0 address, so member access must not load it as a pointer.  A
+# static initializer taking the address of such a member exercises the same path.
+difftest "global-array-arrow" \
+    "struct F { int a; int b; }; struct F g[2] = {{5,6},{7,8}}; int main(void){ return g->b + (&(g->a))[0]; }"
+difftest "global-array-member-addr-init" \
+    "struct F { int id; char *n; }; struct F t[] = {{1,\"a\"},{2,\"b\"}}; int *q = (int *)&((t+1)->id); int *r = (int *)&((t)->id); int main(void){ return *q * 10 + *r; }"
 difftest "struct-array-stride-ptrdiff" \
     "struct P { int a; int b; int c; }; int main(void){ struct P v[4]; return (int)(&v[3] - &v[0]); }"
 difftest "struct-nested-layout" \

@@ -1511,8 +1511,15 @@ Global structs require a separate path from local structs.  When
 the identifier is not found in the locals hash table, the builder
 emits \texttt{IR\_GLOBAL\_REF} to materialise the struct's address.
 For dot access, this address is the base for \texttt{IR\_GEP}
-directly.  For arrow access on a global pointer, an additional
-\texttt{IR\_LOAD} fetches the pointer value before the GEP.
+directly.  For arrow access on a global \emph{pointer}, an additional
+\texttt{IR\_LOAD} fetches the pointer value before the GEP---but arrow
+access on a global \emph{array} (\texttt{T a[]; a->m}, i.e.\ \texttt{a[0].m})
+must \emph{not} load: the array name already denotes its element-0
+address.  Sema decays the array to \texttt{TY\_PTR} in \texttt{AST\_F3},
+so the pre-decay array-ness is recovered from the symbol table, exactly
+as the subscript address builder recovers it for \texttt{a[i]}.  Without
+this, the constant initializer \texttt{\&((Upgrade\_items)->uaattrid)}
+loaded element~0's \texttt{int} and dereferenced it as an address.
 
 Parentheses around the object are transparent: \texttt{(p->m).f} is
 \texttt{p->m.f}.  Because the object is inspected by tag to choose the
@@ -1632,9 +1639,31 @@ _kcc_ir_build_member_addr:
     mov x20, x0                  // global address vreg
     mov x0, x22
     bl _kcc_ir_emit
-    // Arrow on global: also load the pointer value
+    // Arrow on global: also load the pointer value---UNLESS the global is an
+    // array.  An array name decays to its own address (there is no stored
+    // pointer to follow), so `T a[]; a->m` must use the global_ref address
+    // directly, exactly as the local path does via the alloca tag.  Loading
+    // here read the array's first bytes as a bogus pointer: the static
+    // initializer `&((Upgrade_items)->uaattrid)` dereferenced element 0's int
+    // as an address and faulted.  Sema decays arrays to TY_PTR in AST_F3, so
+    // the pre-decay type must come from the symbol table (as the subscript
+    // address builder does for `a[i]` on a global array).
     ldr x1, [x19, #AST_F2]
     cbz x1, .Libma_find_index    // dot → address is the base
+    ldr x0, [x19, #AST_F0]       // object ident node
+    ldr x21, [x0, #AST_F0]       // name ptr (x21 is re-derived by find_index)
+    mov x0, x21
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x21
+    bl _kcc_symtab_lookup
+    cbz x0, .Libma_glob_load     // no symbol info → keep the load
+    ldr x0, [x0, #SYM_TYPE]
+    cbz x0, .Libma_glob_load
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_ARRAY
+    b.eq .Libma_find_index       // array base → global_ref IS the address
+.Libma_glob_load:
     // arrow → load pointer from global address
     mov x0, #IR_LOAD
     bl _kcc_ir_alloc_instr

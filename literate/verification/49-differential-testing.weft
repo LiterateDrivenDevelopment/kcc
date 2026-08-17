@@ -299,6 +299,11 @@ difftest "init-array-of-struct-values" \
 # (C17 6.7.9): {2,3,4} must fill a, b, c -- not the anonymous padding member.
 difftest "bitfield-init-skip-anon" \
     "struct { int a:4; int :4; int b:4; int c:4; } x = { 2,3,4 }; int main(void){ return x.a*100 + x.b*10 + x.c; }"
+# ++/-- on a bit-field must go through the shift-and-mask RMW, not a container-
+# wide +/-1 (which would hit the field at bit offset 0). `--b.j` must decrement
+# j, not i.
+difftest "bitfield-inc-dec" \
+    "struct { unsigned int i:6, j:11, k:15; } b; int main(void){ b.i=51; b.j=636; b.k=31278; b.i++; --b.j; b.k++; return (b.i==52) && (b.j==635) && (b.k==31279); }"
 # A zero-size aggregate element (empty struct member from a call) copies no
 # bytes, but the call's side effect must still run (C17 6.5.2.2/6.7.9).
 difftest "zero-size-struct-init-side-effect" \

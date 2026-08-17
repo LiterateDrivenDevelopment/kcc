@@ -4941,12 +4941,13 @@ keeps the \texttt{int} default.
 .globl _kcc_ir_build_inc_dec
 .p2align 2
 _kcc_ir_build_inc_dec:
-    stp x29, x30, [sp, #-80]!
+    stp x29, x30, [sp, #-96]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
     stp x25, x26, [sp, #64]
+    str xzr, [sp, #80]           // bit-field decl (0 unless a bit-field member)
 
     mov x19, x0                  // AST node
 
@@ -5011,8 +5012,19 @@ _kcc_ir_build_inc_dec:
 
 .Libid_member:
     // Member lvalue (`p->m++` / `s.m++`): its GEP address is what we modify.
+    // build_member_addr publishes the matched field; if it is a bit-field
+    // (packed AST_F2 non-zero) the RMW must go through the bit-field
+    // load/store, not a plain container load---otherwise `--b.j` subtracts 1
+    // from the whole container's low bit (the field at offset 0), not from j.
     bl _kcc_ir_build_member_addr
     mov x22, x0
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libid_load
+    ldr x1, [x0, #AST_F2]        // packed (bit_offset<<16)|width; 0 if not a bit-field
+    cbz x1, .Libid_load
+    str x0, [sp, #80]            // remember the bit-field decl for .Libid_load
     b .Libid_load
 
 .Libid_subscript:
@@ -5101,8 +5113,54 @@ lvalue the whole sequence also runs in the pointer's 64-bit type, since a
 \texttt{L->top.p++} (Lua's per-push \texttt{api\_incr\_top}) crawl one byte
 at a time and scribble the value stack.
 
+A \emph{bit-field} member is the one lvalue this plain sequence cannot touch:
+its value lives in a sub-word slice of a container, reachable only through the
+shift-and-mask load and the read--modify--write store that the compound
+operators already use.  A container-wide \texttt{+1} lands on the container's
+\emph{lowest} bit---the field at offset zero---so \texttt{b.i++} happened to
+work while \texttt{-{}-b.j} silently decremented \texttt{i} instead of
+\texttt{j}, leaving \texttt{j} untouched.  When \texttt{build\_member\_addr}
+reports the operand is a bit-field, the increment therefore takes a dedicated
+path: \texttt{\_kcc\_ir\_bitfield\_load} extracts the old value, an ordinary
+\texttt{int} \texttt{$\pm$1} forms the new one, and
+\texttt{\_kcc\_ir\_bitfield\_store} masks it back into the container.  Postfix
+still returns the old value, prefix the new.
+
 @d IR: build increment/decrement @{
 .Libid_load:
+    // A bit-field member reaches its value only through the shift-and-mask
+    // load/store, never a plain container access: `--b.j` must subtract 1 from
+    // j, not from the container's low bit.  old = bitfield_load; new = old ± 1
+    // typed as an ordinary int; bitfield_store masks it back into place.
+    ldr x9, [sp, #80]           // bit-field decl (0 for a non-bit-field lvalue)
+    cbz x9, .Libid_load_scalar
+    mov x0, x22                  // container address
+    mov x1, x9
+    bl _kcc_ir_bitfield_load     // x0 = old value (extracted, sign/zero-extended)
+    mov x23, x0                  // old value
+    mov x0, #1
+    bl _kcc_ir_emit_const
+    mov x1, x23                  // old
+    mov x2, x0                   // step 1
+    cmp x20, #TOK_INC
+    mov x0, #IR_ADD
+    b.eq .Libid_bf_op
+    mov x0, #IR_SUB
+.Libid_bf_op:
+    bl _kcc_ir_emit_binop        // x0 = new value
+    mov x24, x0
+    ldr x9, [sp, #80]            // reload field decl (emit calls clobber x9)
+    mov x0, x22                  // container address
+    mov x1, x24                  // new value
+    mov x2, x9                   // field decl
+    bl _kcc_ir_bitfield_store
+    cbnz x21, .Libid_bf_prefix
+    mov x0, x23                  // postfix → old value
+    b .Libid_done
+.Libid_bf_prefix:
+    mov x0, x24                  // prefix → new value
+    b .Libid_done
+.Libid_load_scalar:
     // For a pointer lvalue, `++`/`--` steps by sizeof(pointee), not 1, and the
     // load/add/store must run in the pointer's 64-bit type or a 32-bit add would
     // truncate the address.  x26 = working type (the pointer type, else int);
@@ -5252,7 +5310,7 @@ at a time and scribble the value stack.
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #80
+    ldp x29, x30, [sp], #96
     ret
 @}
 

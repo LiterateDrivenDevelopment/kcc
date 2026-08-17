@@ -2011,6 +2011,18 @@ bit-field made volatile only through a volatile \emph{object}
 (\texttt{volatile struct S s}) is not yet distinguished, the same broader
 gap that non-bit-field members share.
 
+One further subtlety concerns the \emph{value} of a bit-field assignment
+expression.  For \texttt{l.m = j} the standard (\stdref{6.5.16.1}) says the
+result is the value of the left operand \emph{after} the store---and a store
+into an \(n\)-bit field keeps only its low \(n\) bits.  So \texttt{(signed
+int:11) = 1081} does not yield \texttt{1081}; it yields \(1081 - 2048 = -967\),
+the eleven-bit two's-complement truncation.  \texttt{\_kcc\_ir\_bf\_trunc\_%
+value} recomputes this from the stored value in registers---masking to the
+width and sign-extending a signed field---rather than reloading the container,
+so a \texttt{volatile} bit-field is not read twice.  Both the simple and the
+compound bit-field store paths of \texttt{\_kcc\_ir\_assign\_through} route
+their result through it.
+
 @d IR: bitfield access @{
 // -- kcc_ir_emit_const ----------------------------------------------------
 // uint64_t kcc_ir_emit_const(uint64_t value) → result vreg
@@ -2771,6 +2783,70 @@ _kcc_ir_tok_to_binop:
 .Ltb_shr: mov x0, #IR_ASHR
     ret
 
+// -- kcc_ir_bf_trunc_value ------------------------------------------------
+// uint64_t kcc_ir_bf_trunc_value(uint64_t value_vreg, node *field) → vreg
+// The value of a bit-field assignment expression is what was *stored* --- the
+// low `width` bits of the assigned value, read back at the field's type
+// (\stdref{6.5.16.1}, \stdref{6.7.2.1}).  Truncate `value` to the field width
+// in-register (AND with the width mask; sign-extend with SHL/ASHR when the
+// field is signed), avoiding a memory reload that a volatile bit-field would
+// forbid.  An enum bit-field is treated as unsigned.
+.globl _kcc_ir_bf_trunc_value
+.p2align 2
+_kcc_ir_bf_trunc_value:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+    mov x21, x0                  // value vreg
+    mov x19, x1                  // field decl
+    ldr x0, [x19, #AST_F2]       // packed (bit_offset<<16)|width
+    and x22, x0, #0xffff         // width
+    ldr x0, [x19, #AST_F0]       // field type spec
+    bl _kcc_sema_resolve_type
+    mov x23, x0                  // field type
+    // masked = value AND ((1<<width)-1)
+    mov x0, x22
+    bl _kcc_ir_bf_mask
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_AND
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+    ldr x0, [x23, #TY_KIND]
+    cmp x0, #TY_ENUM
+    b.eq .Lbtv_done              // enum bit-field: unsigned (already zero-ext)
+    mov x0, x23
+    bl _kcc_sema_int_signedness
+    cmp x0, #1
+    b.ne .Lbtv_done              // unsigned: masked value is the result
+    // signed: sign-extend from `width` bits via SHL then ASHR by 64-width.
+    mov x0, #64
+    sub x0, x0, x22
+    mov x20, x0                  // shift amount = 64 - width
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_SHL
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+    mov x0, x20
+    bl _kcc_ir_emit_const
+    mov x1, x21
+    mov x2, x0
+    mov x0, #IR_ASHR
+    bl _kcc_ir_emit_binop
+    mov x21, x0
+.Lbtv_done:
+    mov x0, x21
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // -- kcc_ir_assign_through ------------------------------------------------
 // uint64_t kcc_ir_assign_through(addr, rhs, op_tok, field, type) → result vreg
 // Stores `rhs` (simple `=`) or `old op rhs` (compound) through the address
@@ -2814,7 +2890,7 @@ _kcc_ir_assign_through:
     mov x1, x20
     mov x2, x22
     bl _kcc_ir_bitfield_store
-    b .Lat_ret
+    b .Lat_bf_result
 .Lat_compound:
     // load the current value
     cbnz x24, .Lat_load_bf
@@ -2851,6 +2927,13 @@ _kcc_ir_assign_through:
     mov x1, x20
     mov x2, x22
     bl _kcc_ir_bitfield_store
+.Lat_bf_result:
+    // The assignment expression's value is the truncated stored value, not the
+    // raw operand: `(signed:11) = 1081` yields -967, not 1081.
+    mov x0, x20
+    mov x1, x22                  // field
+    bl _kcc_ir_bf_trunc_value
+    mov x20, x0
 .Lat_ret:
     mov x0, x20                  // result of the assignment expression
     ldp x23, x24, [sp, #48]
@@ -4001,10 +4084,16 @@ conditional branch on the LHS vreg: true falls through to
 branches to \emph{merge\_bb}), false jumps to \emph{short\_bb}
 (which stores zero and branches to \emph{merge\_bb}).  The returned
 vreg is a load from the temporary, ensuring a defined value on
-both paths.
+both paths.  Crucially the value of \texttt{a \&\& b} is the \texttt{int}
+\texttt{0} or \texttt{1} (\stdref{6.5.13}), \emph{not} the raw right operand:
+\emph{rhs\_bb} normalises the RHS with \texttt{\_kcc\_ir\_emit\_bool\_norm}
+(an \texttt{IR\_CMP\_NE} against zero) before storing it, so \texttt{4 \&\& 2}
+yields \texttt{1}, not \texttt{2}.
 
 The short-circuit \texttt{||} mirrors this logic with the branch
-targets swapped and the short-circuit value set to one.
+targets swapped and the short-circuit value set to one; its
+\emph{rhs\_bb} likewise normalises the RHS to \texttt{0}/\texttt{1}
+(\stdref{6.5.14}).
 
 @d IR: build binary @{
 // -- Short-circuit && ----------------------------------------------------
@@ -4092,7 +4181,10 @@ targets swapped and the short-circuit value set to one.
     bl _kcc_ir_set_bb
     ldr x0, [x19, #AST_F2]
     bl _kcc_ir_build_expr
-    mov x21, x0                  // rhs vreg
+    // The result of `a && b` is the int 0 or 1 (\stdref{6.5.13}), never the
+    // raw operand: normalise the RHS to (rhs != 0) before storing.
+    bl _kcc_ir_emit_bool_norm
+    mov x21, x0                  // rhs vreg, normalised to 0/1
     // store rhs to tmp alloca
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr
@@ -4216,6 +4308,9 @@ targets swapped and the short-circuit value set to one.
     bl _kcc_ir_set_bb
     ldr x0, [x19, #AST_F2]
     bl _kcc_ir_build_expr
+    // The result of `a || b` is the int 0 or 1 (\stdref{6.5.14}), never the
+    // raw operand: normalise the RHS to (rhs != 0) before storing.
+    bl _kcc_ir_emit_bool_norm
     mov x21, x0
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr

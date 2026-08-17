@@ -529,6 +529,15 @@ cases round out the corpus.
 echo ""
 echo "--- Operators and Edge Cases ---"
 
+# && and || yield the int 0 or 1 (C17 6.5.13/6.5.14), never the raw operand:
+# 4 && 2 is 1, not 2; 0 || 2 is 1, not 2.
+difftest "logical-and-or-normalize" \
+    "int main(void){ int c = 4; int e = 2; return (c && e) * 100 + (c || 0) * 10 + (0 || e); }"
+# The value of a bit-field assignment is the TRUNCATED stored value, not the raw
+# RHS: (signed int:11) = 1081 yields 1081-2048 = -967, so (l.m=j)==j is false.
+difftest "bitfield-assign-result-trunc" \
+    "struct { signed int m:11; } l; int main(void){ int j = 1081; return (l.m = j) == j; }"
+
 # A narrow UNSIGNED operand promotes to signed int, so `/`, `%`, and `/=` on it
 # are SIGNED even though the operand was unsigned: 50 / (short)-5 == -10, not 0.
 # The signedness must come from the promoted operation type, not the raw operand

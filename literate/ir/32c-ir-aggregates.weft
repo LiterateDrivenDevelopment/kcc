@@ -1399,7 +1399,11 @@ _kcc_ir_build_var_decl:
     str x0, [x22, #IR_DEST]
     mov x23, x0                  // x23 = alloca vreg number
     mov x0, x22
-    bl _kcc_ir_emit
+    // Hoist the storage reservation to the entry block: a local's address must
+    // dominate every use, but a switch case or goto label after this
+    // declaration (yet inside the same block) can be entered directly, past
+    // this point.  The initialising stores below stay where they are.
+    bl _kcc_ir_emit_entry
 
     // Record in locals: name -> alloca vreg (bit 63 tags pointer variables)
     mov x0, x20

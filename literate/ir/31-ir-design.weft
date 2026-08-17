@@ -359,6 +359,24 @@ The emit helper appends an instruction to the current basic block's linked
 list.  It also sets the instruction's \texttt{BB} field so validation can
 check that every instruction belongs to exactly one block.
 
+A companion helper, \texttt{\_kcc\_ir\_emit\_entry}, instead inserts an
+instruction at the \emph{head} of the current function's entry block.  It
+exists for one purpose: the \textsc{alloca} that reserves a local variable's
+stack storage must \emph{dominate} every use of that variable's address.  If
+the alloca were emitted at the lexical declaration point---as the natural
+statement walk would do---a \texttt{switch} case label or a \texttt{goto}
+target lying \emph{after} the declaration but inside the same block could be
+entered directly, jumping past the alloca and leaving the address vreg
+undefined.  This is exactly the shape of \mbox{SQLite}'s
+\texttt{sqlite3VdbeExec}, where \texttt{case OP\_OpenRead:} sits inside the
+brace block opened at \texttt{case OP\_ReopenIdx:} and dispatch jumps straight
+to it, past the declarations of \texttt{p2} and its siblings.  Because an
+\textsc{alloca} takes no vreg operands---its only source is a constant slot
+count---placing it at the very front of the entry block is always
+dominance-correct, and the entry block dominates the whole function.  The
+initialising store stays at the declaration point; only the address
+reservation moves.
+
 @d IR: emit @{
 // -- kcc_ir_emit ----------------------------------------------------------
 // void kcc_ir_emit(ir_instr *instr)
@@ -402,7 +420,45 @@ _kcc_ir_emit:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
-@| _kcc_ir_emit
+
+// -- kcc_ir_emit_entry ----------------------------------------------------
+// void kcc_ir_emit_entry(ir_instr *instr)
+// Inserts an instruction at the HEAD of the current function's entry block,
+// ahead of everything already there.  Used for allocas, whose address must
+// dominate every use regardless of goto/switch control flow.
+.text
+.globl _kcc_ir_emit_entry
+.p2align 2
+_kcc_ir_emit_entry:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+
+    mov x19, x0              // x19 = instr
+
+    // Get current function, then its entry BB.
+    adrp x1, _kcc_ir_cur_func@@PAGE
+    add  x1, x1, _kcc_ir_cur_func@@PAGEOFF
+    ldr x1, [x1]
+    cbz x1, .Lien_done
+    ldr x1, [x1, #IRF_ENTRY]  // entry basic block
+    cbz x1, .Lien_done
+
+    // Head-insert: instr->next = bb->first; bb->first = instr.
+    ldr x2, [x1, #BB_FIRST]
+    str x2, [x19, #IR_NEXT]
+    str x19, [x1, #BB_FIRST]
+
+    // If the block was empty, instr is also the last.
+    ldr x2, [x1, #BB_LAST]
+    cbnz x2, .Lien_done
+    str x19, [x1, #BB_LAST]
+
+.Lien_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_ir_emit _kcc_ir_emit_entry
 @}
 
 \section{Virtual Register Allocation}

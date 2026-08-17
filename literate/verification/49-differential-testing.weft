@@ -192,6 +192,14 @@ difftest "break-continue" \
     "int main(void){ int s = 0; int i = 0; while (i < 20) { i = i + 1; if (i == 5) continue; if (i == 12) break; s = s + i; } return s; }"
 difftest "nested-loops" \
     "int main(void){ int c = 0; int i = 0; for (i = 0; i < 5; i = i + 1) { int j = 0; for (j = 0; j < 5; j = j + 1) c = c + 1; } return c; }"
+# A local declared inside a switch block, whose address escapes, must have its
+# storage reserved in the entry block: dispatching straight to a later case
+# (here case 2) enters the block PAST the declaration.  When kcc emitted the
+# alloca at the declaration point, the direct entry left the address vreg
+# undefined and stores through it crashed -- this is exactly SQLite's
+# OP_OpenRead handler, whose locals are declared at case OP_ReopenIdx.
+difftest "switch-into-scope-addr-local" \
+    "int sink; int probe(int w, int v){ int r = -1; switch (w) { case 1: { int acc; sink = (int)(long)&acc; acc = 111; if (acc == v) { r = acc; break; } case 2: acc = v; r = acc; } } return r; } int main(void){ return (probe(2, 55) + probe(1, 111)) & 255; }"
 @}
 
 \section{Functions and Recursion}

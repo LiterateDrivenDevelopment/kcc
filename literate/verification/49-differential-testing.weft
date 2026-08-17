@@ -601,6 +601,14 @@ difftest "or-mixed-width-widen" \
     "int main(void){ short s = -1; long long v = (0u | s); return v > 0 ? 1 : 0; }"
 difftest "uint-divassign-stays-unsigned" \
     "int main(void){ unsigned x = 50; unsigned s = 4294967291u; x /= s; return (int)x; }"
+# A struct-returning call REUSES its sret-buffer alloca as the call's DEST vreg;
+# the linear-scan allocator must not treat that write as a fresh definition, or
+# it re-allocates the vreg at the call site to a register freed since the alloca
+# --- clobbering a still-live local (here `a`, needed as the next call's arg)
+# whose address the alloca already emitted into the original register.  gcc.c-
+# torture 20030613-1 in miniature: struct returned/copied through a temporary.
+difftest "struct-return-regalloc-live-arg" \
+    "struct S { long x, y; }; static struct S id(struct S s){ struct S r; r.x=s.x; r.y=s.y; return r; } static struct S pw(struct S s, int n){ struct S a=s; while(--n>0) a=id(a); return a; } int main(void){ struct S x; x.x=-7; x.y=-7; struct S a=pw(x,2); struct S b=id(pw(a,2)); return b.x==b.y ? 0 : 1; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

@@ -91,6 +91,21 @@ occupant's last use has passed, then claims a free one from the permitted bank
 (map entry~0) behaves exactly as in the all-spill model, so the change is
 transparent wherever the allocator declines to act.
 
+One instruction writes a candidate vreg without \emph{defining} it: a
+struct- or union-returning call.  Its \texttt{DEST} is the pre-existing
+sret-buffer alloca (the call writes the aggregate result \emph{through} that
+buffer address), so the vreg was already given a register at the alloca.  The
+scan must therefore skip a struct-returning call's \texttt{DEST}, exactly as
+pass~1 does---a struct result never reaches the def-recording arm.  Were the
+scan to treat the call as a def, it would re-run for a vreg already live,
+handing it a register freed since the alloca; the alloca's address, meanwhile,
+was already emitted into the \emph{original} register, so the two mappings
+diverge and the earlier register's current occupant is silently clobbered.
+This is precisely the failure \texttt{gcc.c-torture}'s \texttt{20030613-1}
+provoked: a struct returned in a loop, copied through a temporary whose buffer
+shared a register with a still-live local.  A scalar-returning call, by
+contrast, produces a fresh result vreg and is allocated normally.
+
 The use-marking helper reads the pass's array bases from the stable
 callee-saved registers the scan keeps live (\texttt{x20}--\texttt{x24}) and
 takes the per-instruction varying values---the used vreg, current block,
@@ -722,6 +737,29 @@ _kcc_cg_regalloc:
     b.eq .Lp2_next
     cmp x9, #IR_RET
     b.eq .Lp2_next
+    // A struct/union-returning call does not DEFINE its DEST vreg: the vreg is
+    // the pre-existing sret-buffer alloca, already assigned a register at the
+    // alloca.  The call merely writes THROUGH that buffer address.  Treating the
+    // call as a def here would re-run the linear scan for the same vreg at the
+    // call site and hand it a register freed since the alloca --- clobbering
+    // whatever now lives there while the alloca's address was already emitted
+    // into the ORIGINAL register.  Skip it, exactly as pass 1 does (a struct
+    // result never reaches .Lp1_defok).  Scalar-returning calls define a fresh
+    // vreg and are allocated normally.
+    cmp x9, #IR_CALL
+    b.eq .Lp2_chkstructret
+    cmp x9, #IR_CALL_IND
+    b.eq .Lp2_chkstructret
+    b .Lp2_defcand
+.Lp2_chkstructret:
+    ldr x1, [x26, #IR_TYPE]
+    cbz x1, .Lp2_defcand
+    ldr x1, [x1]                  // TY_KIND
+    cmp x1, #14                   // STRUCT
+    b.eq .Lp2_next
+    cmp x1, #15                   // UNION
+    b.eq .Lp2_next
+.Lp2_defcand:
     ldr x0, [x26, #IR_DEST]
     cmp x0, x20
     b.hs .Lp2_next

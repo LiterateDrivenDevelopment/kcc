@@ -397,8 +397,15 @@ copies no bytes and has no sub-objects, so the elision loop would drop the node
 altogether.  But the element expression may carry a side effect
 (\texttt{.raw = one\_raw\_spinlock()} increments a counter), so \texttt{fill}
 still \emph{evaluates} it (emitting the call) before consuming it, rather than
-discarding it with the empty copy.  String initialisers for character arrays
-(\texttt{char s[] = "abc"}) take their own byte-copy path above.
+discarding it with the empty copy.  A string literal landing on a
+\emph{char-array sub-object}---a member \texttt{char p[3] = "cq"}, or a row of
+\texttt{char m[][N]}---is a third special case: \texttt{fill} copies the
+string's bytes into the array (truncated to the field's capacity, the NUL and
+tail supplied by the surrounding zero-fill), because a scalar store would
+instead deposit the string's \emph{address}, as it correctly does for a
+\texttt{char *} member.  A top-level \texttt{char s[] = "abc"} declaration takes
+its own byte-copy path in the variable-declaration builder above; this handles
+the same initialiser one level down, inside an aggregate.
 File-scope aggregates share this exact machinery: their emitter
 (\texttt{\_kcc\_ir\_emit\_aggregate\_init}, \S\ref{sec:global-inits}) is a
 thin adapter that calls \texttt{\_kcc\_ir\_fill\_list} against the global's
@@ -1073,6 +1080,38 @@ _kcc_ir_fill:
     ldr x22, [x22, #AST_F4]      // consumed one element
     b .Lfl_ret
 .Lfl_agg_sized:
+    // A string literal initialising a char-array sub-object --- `char p[2] =
+    // "cq"` as a struct member, or a row of `char m[][N]` --- copies the
+    // string's BYTES into the array.  A plain scalar store would instead store
+    // the string's address (as for `char *p`), leaving garbage in the array.
+    mov x25, x0                  // capacity (bytes), from the layout above
+    ldr x0, [x22, #AST_TAG]
+    cmp x0, #AST_STR_LIT
+    b.ne .Lfl_agg_typed
+    ldr x0, [x19, #TY_KIND]
+    cmp x0, #TY_ARRAY
+    b.ne .Lfl_agg_typed
+    ldr x23, [x22, #AST_F0]      // string bytes
+    ldr x24, [x22, #AST_F1]      // string length (no NUL)
+    cmp x24, x25
+    csel x24, x24, x25, ls       // len = min(length, capacity)
+    mov x19, #0                  // byte index (sub-object type no longer needed)
+.Lfl_str_loop:
+    cmp x19, x24
+    b.ge .Lfl_str_done
+    ldrb w0, [x23, x19]
+    bl _kcc_ir_emit_const
+    mov x2, x0                   // value
+    mov x0, x20                  // base
+    add x1, x21, x19             // byte offset = sub-object offset + i
+    mov x3, #1                   // one byte
+    bl _kcc_ir_emit_indexed_store
+    add x19, x19, #1
+    b .Lfl_str_loop
+.Lfl_str_done:
+    ldr x22, [x22, #AST_F4]      // consumed one element
+    b .Lfl_ret
+.Lfl_agg_typed:
     ldr x0, [x22, #AST_F3]       // element's resolved type
     cbz x0, .Lfl_agg_count
     ldr x1, [x0, #TY_KIND]

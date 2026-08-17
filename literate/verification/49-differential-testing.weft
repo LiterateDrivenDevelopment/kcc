@@ -314,6 +314,13 @@ difftest "local-init-array-decay-designated" \
     "struct S { int n; int *p; }; int main(void){ int a[2] = {5,6}; struct S s = {.p = a}; s.p[0] = 42; return a[0] + s.n * 0; }"
 difftest "local-init-array-of-ptrs" \
     "int main(void){ int a[2] = {7,8}; int b[2] = {9,10}; int *pa[2] = {a, b}; return pa[0][1] + pa[1][0]; }"
+# A char-ARRAY struct member (or a row of a 2-D char array) initialized with a
+# string literal copies the string's BYTES, not its address (which is what a
+# scalar store would leave, as for a char* member).
+difftest "struct-char-array-member-string" \
+    "struct A { char c; char p[3]; } a = { 'v', \"cq\" }; int main(void){ return a.c==( 'v') && a.p[0]=='c' && a.p[1]=='q' && a.p[2]==0; }"
+difftest "char-array-2d-string-rows" \
+    "char m[2][3] = { \"ab\", \"cd\" }; int main(void){ return m[0][0]=='a' && m[0][1]=='b' && m[1][0]=='c' && m[1][1]=='d'; }"
 difftest "array-2d-nonsquare" \
     "int main(void){ int a[2][5]; int i; int j; for (i = 0; i < 2; i = i + 1) for (j = 0; j < 5; j = j + 1) a[i][j] = i * 5 + j; return a[1][4]; }"
 difftest "array-3d" \

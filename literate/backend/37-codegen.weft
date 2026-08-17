@@ -204,7 +204,106 @@ for an ordinary cross-object extern (the linker simply points the slot at
 the local definition), so all external references take it uniformly; only
 the load, not the code generator, pays for the extra indirection.
 
+One wrinkle in sizing a global's storage is the \emph{flexible array member}
+(\stdref{6.7.2.1}): \texttt{struct \{ char c; char p[]; \} a = \{'o', "wx"\}}
+occupies more than the struct's nominal size, because the trailing \texttt{p[]}
+is laid out with length zero but its initializer supplies real bytes.  Before
+reserving storage, \texttt{\_kcc\_cg\_fam\_extra} inspects the declaration: if
+the type is a struct whose last member is an unsized \texttt{[]} array and a
+matching initializer element supplies its contents, it returns those bytes (a
+string's length plus its NUL, or a brace list's element count times the member
+size), which the pre-registration adds to the reserved size.  The initializer
+itself is copied by the shared aggregate-fill machinery
+(\S\ref{sec:ir-aggregate-init}), which now recognises a string landing on the
+flexible member.
+
 @d CodeGen: preregister globals @{
+// -- kcc_cg_fam_extra ---------------------------------------------------------
+// uint64_t kcc_cg_fam_extra(node *decl, type *ty)
+// The extra storage bytes an initialized trailing flexible array member needs
+// beyond the struct's nominal size.  Returns 0 unless `ty` is a struct, `decl`
+// has a brace initializer, the struct's last member is an unsized `[]` array,
+// and a matching initializer element supplies its contents.  A string element
+// contributes its length + 1 (the NUL); a brace list contributes its element
+// count times the member's element size.
+.text
+.p2align 2
+_kcc_cg_fam_extra:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+    mov x19, x0                    // decl
+    mov x21, #0                    // result
+    ldr x0, [x1, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.ne .Lfam_ret
+    ldr x22, [x19, #AST_F2]        // initializer
+    cbz x22, .Lfam_ret
+    ldr x0, [x22, #AST_TAG]
+    cmp x0, #AST_INIT_LIST
+    b.ne .Lfam_ret
+    ldr x0, [x1, #TY_F0]           // struct decl AST
+    cbz x0, .Lfam_ret
+    ldr x23, [x0, #AST_F1]         // first field
+    cbz x23, .Lfam_ret
+    mov x20, #1                    // field count
+.Lfam_lastf:
+    ldr x0, [x23, #AST_F4]
+    cbz x0, .Lfam_havef
+    mov x23, x0
+    add x20, x20, #1
+    b .Lfam_lastf
+.Lfam_havef:
+    // Last field must be an unsized array (a flexible array member).
+    ldr x0, [x23, #AST_F0]
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lfam_ret
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lfam_ret
+    ldr x1, [x0, #TY_F1]           // declared length
+    cbnz x1, .Lfam_ret             // sized array: not flexible
+    ldr x0, [x0, #TY_F0]           // element type
+    bl _kcc_type_layout            // element byte size
+    mov x23, x0
+    // Seek the initializer element at the FAM's position (field count - 1).
+    ldr x0, [x22, #AST_F0]         // first element
+    sub x1, x20, #1
+.Lfam_seek:
+    cbz x0, .Lfam_ret              // fewer elements than fields: FAM uninitialized
+    cbz x1, .Lfam_gote
+    ldr x0, [x0, #AST_F4]
+    sub x1, x1, #1
+    b .Lfam_seek
+.Lfam_gote:
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_STR_LIT
+    b.ne .Lfam_list
+    ldr x21, [x0, #AST_F1]         // string length
+    add x21, x21, #1               // + NUL
+    b .Lfam_ret
+.Lfam_list:
+    cmp x1, #AST_INIT_LIST
+    b.ne .Lfam_ret                 // other FAM init forms: conservatively 0
+    ldr x0, [x0, #AST_F0]          // first sub-element
+    mov x1, #0
+.Lfam_cnt:
+    cbz x0, .Lfam_cntd
+    add x1, x1, #1
+    ldr x0, [x0, #AST_F4]
+    b .Lfam_cnt
+.Lfam_cntd:
+    mul x21, x1, x23               // element count * element size
+.Lfam_ret:
+    mov x0, x21
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // -- kcc_preregister_globals --------------------------------------------------
 // void kcc_preregister_globals(node *trans_unit)
 //   x0 = AST_TRANS_UNIT node
@@ -245,9 +344,16 @@ _kcc_preregister_globals:
 
     // Reserve the type's real byte size, floored at 8 and rounded up to a
     // whole 8-byte slot.  Rounding keeps slot-granular struct copies (which
-    // move ceil(size/8) eight-byte chunks) inside the reserved storage.
+    // move ceil(size/8) eight-byte chunks) inside the reserved storage.  An
+    // initialized trailing flexible array member extends the object past its
+    // nominal size, so its initializer's bytes are added here.
+    mov x22, x0                // resolved type (survives type_layout)
     bl _kcc_type_layout        // x0 = real TY_SIZE
     mov x21, x0
+    mov x0, x19                // decl
+    mov x1, x22                // type
+    bl _kcc_cg_fam_extra       // x0 = flexible-array-member init bytes (0 if none)
+    add x21, x21, x0
     cmp x21, #8
     b.ge .Lprg_round
     mov x21, #8

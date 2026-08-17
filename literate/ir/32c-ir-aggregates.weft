@@ -398,14 +398,20 @@ altogether.  But the element expression may carry a side effect
 (\texttt{.raw = one\_raw\_spinlock()} increments a counter), so \texttt{fill}
 still \emph{evaluates} it (emitting the call) before consuming it, rather than
 discarding it with the empty copy.  A string literal landing on a
-\emph{char-array sub-object}---a member \texttt{char p[3] = "cq"}, or a row of
-\texttt{char m[][N]}---is a third special case: \texttt{fill} copies the
-string's bytes into the array (truncated to the field's capacity, the NUL and
-tail supplied by the surrounding zero-fill), because a scalar store would
-instead deposit the string's \emph{address}, as it correctly does for a
-\texttt{char *} member.  A top-level \texttt{char s[] = "abc"} declaration takes
-its own byte-copy path in the variable-declaration builder above; this handles
-the same initialiser one level down, inside an aggregate.
+\emph{char-array sub-object}---a member \texttt{char p[3] = "cq"}, a row of
+\texttt{char m[][N]}, or a trailing \emph{flexible} \texttt{char p[] = "wx"}---is
+a third special case: \texttt{fill} copies the string's bytes into the array
+(truncated to a fixed field's capacity, or the whole string for a flexible
+member, whose layout size is zero; the NUL and tail come from the surrounding
+zero-fill), because a scalar store would instead deposit the string's
+\emph{address}, as it correctly does for a \texttt{char *} member.  This string
+test is made \emph{before} the zero-size test so a flexible member is copied
+rather than mistaken for an empty aggregate.  A top-level \texttt{char s[] =
+"abc"} declaration takes its own byte-copy path in the variable-declaration
+builder above; this handles the same initialiser one level down, inside an
+aggregate.  For a file-scope object the flexible member also grows the reserved
+storage (\texttt{\_kcc\_cg\_fam\_extra}, \S\ref{sec:global-inits}) so the copied
+tail has somewhere to live.
 File-scope aggregates share this exact machinery: their emitter
 (\texttt{\_kcc\_ir\_emit\_aggregate\_init}, \S\ref{sec:global-inits}) is a
 thin adapter that calls \texttt{\_kcc\_ir\_fill\_list} against the global's
@@ -1067,34 +1073,27 @@ _kcc_ir_fill:
     ldr x0, [x22, #AST_TAG]
     cmp x0, #AST_INIT_LIST
     b.eq .Lfl_agg_count          // its own braces → recurse/elide as before
-    // A zero-size aggregate (an empty struct/union) copies no bytes and has no
-    // sub-objects, so the ordinary elision loop would drop the element node
-    // entirely --- along with any side effect its expression carries, such as
-    // `.raw = one_raw_spinlock()`.  Evaluate the element for its effects, then
-    // consume it.
-    mov x0, x19
-    bl _kcc_type_layout          // sub-object byte size
-    cbnz x0, .Lfl_agg_sized
-    mov x0, x22
-    bl _kcc_ir_build_struct_addr // evaluate (emits a struct-returning call)
-    ldr x22, [x22, #AST_F4]      // consumed one element
-    b .Lfl_ret
-.Lfl_agg_sized:
-    // A string literal initialising a char-array sub-object --- `char p[2] =
-    // "cq"` as a struct member, or a row of `char m[][N]` --- copies the
-    // string's BYTES into the array.  A plain scalar store would instead store
-    // the string's address (as for `char *p`), leaving garbage in the array.
-    mov x25, x0                  // capacity (bytes), from the layout above
-    ldr x0, [x22, #AST_TAG]
+    // A string literal initialising a char-array sub-object --- `char p[3] =
+    // "cq"` as a struct member, a row of `char m[][N]`, or a trailing FLEXIBLE
+    // `char p[] = "wx"` --- copies the string's BYTES into the array.  A plain
+    // scalar store would leave the string's address (right for `char *`, wrong
+    // for an array).  This precedes the zero-size test below so a flexible (or
+    // zero-length) member, whose layout size is 0, still copies the whole
+    // string instead of being mistaken for an empty aggregate.
     cmp x0, #AST_STR_LIT
-    b.ne .Lfl_agg_typed
-    ldr x0, [x19, #TY_KIND]
-    cmp x0, #TY_ARRAY
-    b.ne .Lfl_agg_typed
+    b.ne .Lfl_agg_nonstr
+    ldr x1, [x19, #TY_KIND]
+    cmp x1, #TY_ARRAY
+    b.ne .Lfl_agg_nonstr
+    mov x0, x19
+    bl _kcc_type_layout          // capacity (0 for a flexible member)
+    mov x25, x0
     ldr x23, [x22, #AST_F0]      // string bytes
     ldr x24, [x22, #AST_F1]      // string length (no NUL)
+    cbz x25, .Lfl_str_go         // flexible member: copy the whole string
     cmp x24, x25
     csel x24, x24, x25, ls       // len = min(length, capacity)
+.Lfl_str_go:
     mov x19, #0                  // byte index (sub-object type no longer needed)
 .Lfl_str_loop:
     cmp x19, x24
@@ -1109,6 +1108,19 @@ _kcc_ir_fill:
     add x19, x19, #1
     b .Lfl_str_loop
 .Lfl_str_done:
+    ldr x22, [x22, #AST_F4]      // consumed one element
+    b .Lfl_ret
+.Lfl_agg_nonstr:
+    // A zero-size aggregate (an empty struct/union) copies no bytes and has no
+    // sub-objects, so the ordinary elision loop would drop the element node
+    // entirely --- along with any side effect its expression carries, such as
+    // `.raw = one_raw_spinlock()`.  Evaluate the element for its effects, then
+    // consume it.
+    mov x0, x19
+    bl _kcc_type_layout          // sub-object byte size
+    cbnz x0, .Lfl_agg_typed
+    mov x0, x22
+    bl _kcc_ir_build_struct_addr // evaluate (emits a struct-returning call)
     ldr x22, [x22, #AST_F4]      // consumed one element
     b .Lfl_ret
 .Lfl_agg_typed:

@@ -321,6 +321,10 @@ difftest "struct-char-array-member-string" \
     "struct A { char c; char p[3]; } a = { 'v', \"cq\" }; int main(void){ return a.c==( 'v') && a.p[0]=='c' && a.p[1]=='q' && a.p[2]==0; }"
 difftest "char-array-2d-string-rows" \
     "char m[2][3] = { \"ab\", \"cd\" }; int main(void){ return m[0][0]=='a' && m[0][1]=='b' && m[1][0]=='c' && m[1][1]=='d'; }"
+# A trailing flexible array member initialized with a string grows the object's
+# storage and copies the string's bytes into the tail.
+difftest "flexible-array-member-string" \
+    "struct S { char c; char p[]; } a = { 'o', \"wx\" }; int main(void){ return a.c=='o' && a.p[0]=='w' && a.p[1]=='x' && a.p[2]==0; }"
 difftest "array-2d-nonsquare" \
     "int main(void){ int a[2][5]; int i; int j; for (i = 0; i < 2; i = i + 1) for (j = 0; j < 5; j = j + 1) a[i][j] = i * 5 + j; return a[1][4]; }"
 difftest "array-3d" \

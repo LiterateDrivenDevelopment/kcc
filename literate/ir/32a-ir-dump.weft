@@ -270,6 +270,8 @@ _kcc_ir_dump_instr:
     b.eq .Lidi_bitcast
     cmp x20, #IR_SITOFP
     b.eq .Lidi_sitofp
+    cmp x20, #IR_UITOFP
+    b.eq .Lidi_uitofp
     cmp x20, #IR_FPTOSI
     b.eq .Lidi_fptosi
     cmp x20, #IR_CONST
@@ -453,6 +455,10 @@ the backend can select the correct ARM64 widening instruction
 .Lidi_sitofp:
     adrp x0, _kcc_ir_op_sitofp@@PAGE
     add  x0, x0, _kcc_ir_op_sitofp@@PAGEOFF
+    b .Lidi_unop
+.Lidi_uitofp:
+    adrp x0, _kcc_ir_op_uitofp@@PAGE
+    add  x0, x0, _kcc_ir_op_uitofp@@PAGEOFF
     b .Lidi_unop
 .Lidi_fptosi:
     adrp x0, _kcc_ir_op_fptosi@@PAGE

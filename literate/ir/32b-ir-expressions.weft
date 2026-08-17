@@ -420,6 +420,67 @@ _kcc_ir_emit_sitofp:
     ldp x29, x30, [sp], #32
     ret
 
+// -- kcc_ir_emit_uitofp ---------------------------------------------------
+// uint64_t kcc_ir_emit_uitofp(uint64_t src_vreg)
+// Emits IR_UITOFP: converts an UNSIGNED integer vreg to a double vreg.  The
+// only difference from sitofp is the opcode; codegen picks UCVTF over SCVTF so
+// a 64-bit value with its top bit set (e.g. 0xFFFF...FF) becomes ~1.8e19, not
+// -1.
+.text
+.globl _kcc_ir_emit_uitofp
+.p2align 2
+_kcc_ir_emit_uitofp:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                  // src vreg
+    mov x0, #IR_UITOFP
+    bl _kcc_ir_alloc_instr
+    adrp x1, _kcc_type_double@@PAGE
+    add  x1, x1, _kcc_type_double@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x0, #IR_TYPE]
+    str x19, [x0, #IR_SRC1]
+    mov x19, x0
+    bl _kcc_ir_next_vreg
+    str x0, [x19, #IR_DEST]
+    str x0, [sp, #24]
+    mov x0, x19
+    bl _kcc_ir_emit
+    ldr x0, [sp, #24]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_emit_int_to_fp ------------------------------------------------
+// uint64_t kcc_ir_emit_int_to_fp(uint64_t src_vreg, type *int_type)
+// Converts an integer vreg to double, choosing signed (SCVTF) or unsigned
+// (UCVTF) widening by the SOURCE integer's signedness.  A null type falls back
+// to signed, preserving the historical behaviour for callers without a type.
+.text
+.globl _kcc_ir_emit_int_to_fp
+.p2align 2
+_kcc_ir_emit_int_to_fp:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                  // src vreg
+    mov x20, x1                  // int type
+    cbz x20, .Litf_signed        // no type → signed (default)
+    mov x0, x20
+    bl _kcc_sema_int_signedness  // 1 = signed, 0 = unsigned
+    cbnz x0, .Litf_signed
+    mov x0, x19
+    bl _kcc_ir_emit_uitofp
+    b .Litf_ret
+.Litf_signed:
+    mov x0, x19
+    bl _kcc_ir_emit_sitofp
+.Litf_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
 // -- kcc_ir_emit_fpround --------------------------------------------------
 // uint64_t kcc_ir_emit_fpround(uint64_t src_vreg)
 // Emits IR_FPROUND: rounds a double vreg to single precision (float type).
@@ -507,7 +568,8 @@ _kcc_ir_convert:
     b .Licv_maybe_round
 .Licv_to_fp:
     mov x0, x19
-    bl _kcc_ir_emit_sitofp       // int → double
+    ldr x1, [sp, #32]            // source integer type (for signed vs unsigned)
+    bl _kcc_ir_emit_int_to_fp    // int → double (SCVTF or UCVTF by signedness)
     mov x19, x0
 .Licv_maybe_round:
     // Converting to float truncates the value to single precision.
@@ -657,7 +719,7 @@ _kcc_ir_fill_param_classes:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
-@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_classify_type _kcc_ir_emit_sitofp _kcc_ir_emit_fptosi _kcc_ir_emit_fpround _kcc_ir_convert _kcc_ir_fill_param_classes
+@| _kcc_ir_build_int_lit _kcc_ir_build_float_lit _kcc_ir_type_is_fp _kcc_ir_classify_type _kcc_ir_emit_sitofp _kcc_ir_emit_uitofp _kcc_ir_emit_int_to_fp _kcc_ir_emit_fptosi _kcc_ir_emit_fpround _kcc_ir_convert _kcc_ir_fill_param_classes
 @}
 
 \subsection{Sizeof Expression}
@@ -3810,16 +3872,20 @@ _kcc_ir_build_binary:
     ldr x0, [x0, #AST_F3]
     bl _kcc_ir_type_is_fp
     cbnz x0, .Libb_fp_rhs
+    ldr x0, [x19, #AST_F1]
+    ldr x1, [x0, #AST_F3]         // lhs integer type (signedness)
     mov x0, x21
-    bl _kcc_ir_emit_sitofp
+    bl _kcc_ir_emit_int_to_fp
     mov x21, x0
 .Libb_fp_rhs:
     ldr x0, [x19, #AST_F2]
     ldr x0, [x0, #AST_F3]
     bl _kcc_ir_type_is_fp
     cbnz x0, .Libb_fp_do
+    ldr x0, [x19, #AST_F2]
+    ldr x1, [x0, #AST_F3]         // rhs integer type (signedness)
     mov x0, x22
-    bl _kcc_ir_emit_sitofp
+    bl _kcc_ir_emit_int_to_fp
     mov x22, x0
 .Libb_fp_do:
     mov x0, x23                  // opcode (ADD/SUB/MUL/SDIV or CMP_*)

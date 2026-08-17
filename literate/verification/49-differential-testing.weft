@@ -529,6 +529,12 @@ cases round out the corpus.
 echo ""
 echo "--- Operators and Edge Cases ---"
 
+# Unsigned 64-bit -> floating point must use UCVTF, not SCVTF: a value with its
+# top bit set (0xFFFF...FF) becomes ~1.8e19, not -1.
+difftest "unsigned64-to-double" \
+    "int main(void){ unsigned long long u = 0xFFFFFFFFFFFFFFFFULL; double d = (double)u; return d > 1.8e19 && d < 1.9e19; }"
+difftest "unsigned-to-double-arith" \
+    "int main(void){ unsigned long long u = 0x8000000000000000ULL; double d = u + 0.0; return d > 9.2e18 && d < 9.3e18; }"
 # && and || yield the int 0 or 1 (C17 6.5.13/6.5.14), never the raw operand:
 # 4 && 2 is 1, not 2; 0 || 2 is 1, not 2.
 difftest "logical-and-or-normalize" \

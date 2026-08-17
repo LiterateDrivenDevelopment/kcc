@@ -194,6 +194,8 @@ _kcc_codegen_instr:
     b.eq .Lcgi_zext
     cmp x22, #IR_SITOFP
     b.eq .Lcgi_sitofp
+    cmp x22, #IR_UITOFP
+    b.eq .Lcgi_uitofp
     cmp x22, #IR_FPTOSI
     b.eq .Lcgi_fptosi
     cmp x22, #IR_VA_START
@@ -982,7 +984,13 @@ conditions---\texttt{<} tests \texttt{MI} (via inverted \texttt{PL}) and
 case, so they were correct.  The conversions bridge the two
 register files---\textsc{scvtf} reads an integer slot and writes a
 double slot, \textsc{fcvtzs} does the reverse with round-toward-zero,
-matching C's truncating cast.
+matching C's truncating cast.  A \emph{signed} source uses \textsc{scvtf};
+an \emph{unsigned} one (\texttt{IR\_UITOFP}) uses \textsc{ucvtf}, which differs
+only in the opcode field.  The distinction is invisible for values that fit in
+63 bits but decisive at the top: \texttt{(double)0xFFFFFFFFFFFFFFFF} is
+\(\approx 1.8\times10^{19}\) under \textsc{ucvtf}, but \(-1\) under
+\textsc{scvtf}.  The producer (\texttt{\_kcc\_ir\_emit\_int\_to\_fp}) picks the
+opcode from the source integer's signedness.
 
 @d CodeGen: floating point @{
 // ---- Floating-point arithmetic: src1→d0, src2→d1, fOP→d2, store ----
@@ -1064,6 +1072,19 @@ matching C's truncating cast.
     mov x0, #0                     // Rd = d0
     mov x1, #CG_REG_SRC1           // Rn = x9
     bl _kcc_enc_scvtf
+    bl _kcc_code_emit32
+    ldr x0, [x19, #IR_DEST]
+    mov x1, #0                     // d0
+    bl _kcc_cg_store_vreg_fp
+    b .Lcgi_done
+
+.Lcgi_uitofp:
+    ldr x0, [x19, #IR_SRC1]
+    mov x1, #CG_REG_SRC1           // x9
+    bl _kcc_cg_load_vreg
+    mov x0, #0                     // Rd = d0
+    mov x1, #CG_REG_SRC1           // Rn = x9
+    bl _kcc_enc_ucvtf              // unsigned 64-bit → double
     bl _kcc_code_emit32
     ldr x0, [x19, #IR_DEST]
     mov x1, #0                     // d0

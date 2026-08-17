@@ -688,6 +688,19 @@ _kcc_enc_scvtf:
     mov w0, w2
     ret
 
+// -- kcc_enc_ucvtf ------------------------------------------------------------
+// UCVTF Dd, Xn — UNSIGNED 64-bit integer → double.  x0=Rd(fp), x1=Rn(int)
+// Identical to SCVTF but for the opcode field (011 vs 010): base 0x9E63.
+.text
+.globl _kcc_enc_ucvtf
+.p2align 2
+_kcc_enc_ucvtf:
+    movz w2, #0x9E63, lsl #16
+    orr w2, w2, w1, lsl #5        // Rn
+    orr w2, w2, w0                // Rd
+    mov w0, w2
+    ret
+
 // -- kcc_enc_fcvtzs -----------------------------------------------------------
 // FCVTZS Xd, Dn — double → signed 64-bit integer (round toward zero).
 //   x0=Rd(int), x1=Rn(fp)
@@ -846,7 +859,7 @@ _kcc_enc_str_fp_s:
     orr w3, w3, w0                // Rt
     mov w0, w3
     ret
-@| _kcc_enc_fp_dp2 _kcc_enc_scvtf _kcc_enc_fcvtzs _kcc_enc_fcvt_s_d _kcc_enc_fcvt_d_s _kcc_enc_fcmp _kcc_enc_ldr_fp _kcc_enc_str_fp _kcc_enc_ldr_fp_s _kcc_enc_str_fp_s
+@| _kcc_enc_fp_dp2 _kcc_enc_scvtf _kcc_enc_ucvtf _kcc_enc_fcvtzs _kcc_enc_fcvt_s_d _kcc_enc_fcvt_d_s _kcc_enc_fcmp _kcc_enc_ldr_fp _kcc_enc_str_fp _kcc_enc_ldr_fp_s _kcc_enc_str_fp_s
 @}
 
 \section{Branch Encoding}

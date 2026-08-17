@@ -295,6 +295,10 @@ difftest "init-struct-value-element" \
     "struct B { int x; int y; }; struct A { int z; struct B b; }; int main(void){ struct B b = {4,5}; struct A a = {2, b}; return a.z*100 + a.b.x*10 + a.b.y; }"
 difftest "init-array-of-struct-values" \
     "struct P { int a; int b; }; int main(void){ struct P p = {3,4}; struct P v[2] = {p, {5,6}}; return v[0].a*1000 + v[0].b*100 + v[1].a*10 + v[1].b; }"
+# An unnamed bit-field (int :4) reserves layout bits but takes NO initializer
+# (C17 6.7.9): {2,3,4} must fill a, b, c -- not the anonymous padding member.
+difftest "bitfield-init-skip-anon" \
+    "struct { int a:4; int :4; int b:4; int c:4; } x = { 2,3,4 }; int main(void){ return x.a*100 + x.b*10 + x.c; }"
 
 # A LOCAL aggregate initialized with an array-valued element must decay the
 # array to its address to fill a pointer member (`S s = {arr, ...}`).  Sema did

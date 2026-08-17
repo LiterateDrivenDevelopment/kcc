@@ -385,7 +385,13 @@ Because the region was zero-filled first, a sparse list such as
 \texttt{int a[6] = \{ [5] = 9 \}} still leaves the gaps at zero, and a
 bit-field leaf keeps its read--modify--write because
 \texttt{\_kcc\_ir\_subobj} publishes the resolved field for
-\texttt{\_kcc\_ir\_store\_elem}.  String initialisers for character arrays
+\texttt{\_kcc\_ir\_store\_elem}.  An \emph{unnamed} bit-field
+(\texttt{int :4}) is a layout-only member that reserves bits but takes no
+initializer (\stdref{6.7.9}): the positional walk steps over its cursor
+position without consuming an element, so \texttt{\{2,3,4\}} against
+\texttt{struct \{int a:4; int :4; int b:4; int c:4;\}} fills
+\texttt{a},~\texttt{b},~\texttt{c}---not the padding member---and the anonymous
+slot stays zero.  String initialisers for character arrays
 (\texttt{char s[] = "abc"}) take their own byte-copy path above.
 File-scope aggregates share this exact machinery: their emitter
 (\texttt{\_kcc\_ir\_emit\_aggregate\_init}, \S\ref{sec:global-inits}) is a
@@ -1157,6 +1163,18 @@ _kcc_ir_fill_list:
     adrp x0, _kcc_ir_member_field@@PAGE
     add  x0, x0, _kcc_ir_member_field@@PAGEOFF
     ldr x26, [x0]                // leaf field for this position
+    // An unnamed bit-field (no name, non-zero width) reserves layout bits but
+    // takes NO initializer (C17 6.7.9): step over its position without
+    // consuming the current element, so `{2,3,4}` fills a, b, c -- not the
+    // anonymous padding member in between.
+    cbz x26, .Lfll_notanon
+    ldr x0, [x26, #AST_F1]       // field name
+    cbnz x0, .Lfll_notanon
+    ldr x0, [x26, #AST_F2]       // packed bit-field width (0 = not a bit-field)
+    cbz x0, .Lfll_notanon
+    add x23, x23, #1             // advance the cursor, keep the element
+    b .Lfll_loop
+.Lfll_notanon:
     cbz x25, .Lfll_skip          // ran past the aggregate: ignore the element
     // Elision only when the sub-object is an aggregate AND the element is
     // not its own brace; otherwise one element fills this sub-object.

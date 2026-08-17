@@ -1067,9 +1067,18 @@ when the block re-executes, so no live value ever shares a slot.  A value that
 escapes its block is given a \emph{dedicated} slot that is never freed; that is
 trivially correct and keeps the pass from needing any cross-block liveness.
 
-Incoming parameters have no defining instruction---their vregs are live from
-entry and are always slot-needing (never marked candidates)---so a final
-straggler sweep gives every still-unassigned such vreg a fresh dedicated slot.
+Incoming parameters need a subtler rule.  The prologue spills all of them to
+their slots at function \emph{entry}, where they are simultaneously live, so two
+parameters must never share a slot even if the reuse test would otherwise permit
+it---were \texttt{db} to expire (in the single-block sense) before \texttt{mx}
+is defined, the free-list would hand \texttt{mx} the slot the prologue is about
+to reuse for \texttt{db}, and the later spill would clobber the earlier one
+before the body ever reads it.  This is exactly how \mbox{SQLite}'s
+\texttt{sqlite3StrAccumInit} lost its \texttt{db} argument to \texttt{mx}.  The
+incoming parameters are the first \texttt{IRF\_PARAMS} vregs, so the reuse test
+short-circuits for them straight to a dedicated slot.  Parameters that never
+reach a defining instruction at all are still caught by a final straggler sweep,
+which gives every such vreg its own fresh dedicated slot.
 The
 high-water mark of the slot counter becomes \texttt{\_kcc\_cg\_max\_slot}, the
 size of the frame's vreg-value area, and the vreg$\rightarrow$slot array is
@@ -1209,6 +1218,15 @@ _kcc_cg_color_slots:
     ldr x2, [x1, x28, lsl #3]
     cbnz x2, .Lcs_adv            // promoted local (register)
 .Lcs_spilled:
+    // Parameters are spilled to their slots by the prologue at function ENTRY,
+    // where all of them are simultaneously live, so two parameters must never
+    // share a slot -- otherwise the later spill clobbers the earlier one before
+    // the body runs (SQLite's sqlite3StrAccumInit lost its `db` argument to the
+    // `mx` argument this way).  The incoming parameters are the first IRF_PARAMS
+    // vregs; give each a dedicated, never-reused slot.
+    ldr x1, [x19, #IRF_PARAMS]
+    cmp x28, x1
+    b.lo .Lcs_dedicated
     ldr x1, [x22, x28, lsl #3]    // flags[d]
     tst x1, #2                    // escapes its block?
     b.ne .Lcs_dedicated

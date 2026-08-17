@@ -100,10 +100,25 @@ _kcc_sema_check_decl:
     // resolving, exactly as for a typedef.  Without this a block-scoped
     // `struct S { ... } x;` (or a bare `struct S { ... };`) never registers the
     // `struct S` tag, so a later `struct S` / `sizeof(struct S)` / `(struct S*)`
-    // resolves to the int fallback and member access fails.
+    // resolves to the int fallback and member access fails.  Peel ARRAY and
+    // qualifier wrappers first so an inline definition behind them registers
+    // too: `struct T { ... } a[2];` and `static const struct EncName {...}
+    // encnames[];` (SQLite's PRAGMA encoding table) must register the tag just
+    // like the scalar form.  Pointer wrappers are NOT peeled --- `struct T *p;`
+    // is normally a forward reference, not a definition to register.
     ldr x0, [x19, #AST_F0]         // type node
     cbz x0, .Lscd_var_resolve
+.Lscd_var_peel:
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_ARRAY
+    b.eq .Lscd_var_peel1
+    cmp x1, #AST_TYPE_QUALS
+    b.ne .Lscd_var_tagchk
+.Lscd_var_peel1:
+    ldr x0, [x0, #AST_F0]          // peel to element / base type
+    cbnz x0, .Lscd_var_peel
+    b .Lscd_var_resolve
+.Lscd_var_tagchk:
     cmp x1, #AST_TYPE_STRUCT
     b.eq .Lscd_var_pretag
     cmp x1, #AST_TYPE_UNION
@@ -111,7 +126,7 @@ _kcc_sema_check_decl:
     cmp x1, #AST_TYPE_ENUM
     b.ne .Lscd_var_resolve
 .Lscd_var_pretag:
-    ldr x0, [x19, #AST_F0]
+    // x0 = the (peeled) struct/union/enum type node
     bl _kcc_sema_check_decl        // declares/completes the tag
 
 .Lscd_var_resolve:

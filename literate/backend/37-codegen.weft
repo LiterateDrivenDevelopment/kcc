@@ -318,17 +318,24 @@ _kcc_preregister_globals:
     ldr x0, [x19, #AST_TAG]
     cmp x0, #AST_FUNC_DECL
     b.ne .Lprg_fn_next
-    ldr x0, [x19, #AST_F3]      // function body
+    ldr x0, [x19, #AST_F3]      // function body (compound statement)
     cbz x0, .Lprg_fn_next
-    ldr x20, [x0, #AST_F0]      // first body statement
-.Lprg_st_loop:
-    cbz x20, .Lprg_fn_next
-    ldr x0, [x20, #AST_TAG]
-    cmp x0, #AST_VAR_DECL
-    b.ne .Lprg_st_next
-    ldr x0, [x20, #AST_F3]      // storage class (3 = static)
-    cmp x0, #3
-    b.ne .Lprg_st_next
+    bl _kcc_cg_prereg_stmt       // recurse the whole body, at any block depth
+    b .Lprg_fn_next
+
+// -- kcc_cg_prereg_static -------------------------------------------------
+// void kcc_cg_prereg_static(node *decl)
+//   Reserve backing storage for one `static` local (block-scoped, static
+//   storage duration) and record it as defined in this TU.
+.globl _kcc_cg_prereg_static
+.p2align 2
+_kcc_cg_prereg_static:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+    mov x20, x0                  // decl (the reservation body below uses x20)
 
     mov x0, x20
     bl _kcc_ir_static_name
@@ -406,9 +413,12 @@ _kcc_preregister_globals:
     mov x3, #1
     bl _kcc_ht_put
 
-.Lprg_st_next:
-    ldr x20, [x20, #AST_F4]
-    b .Lprg_st_loop
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 .Lprg_fn_next:
     ldr x19, [x19, #AST_F4]
     b .Lprg_fn_loop
@@ -419,7 +429,80 @@ _kcc_preregister_globals:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
-@| _kcc_preregister_globals
+
+// -- kcc_cg_prereg_stmt ---------------------------------------------------
+// void kcc_cg_prereg_stmt(node *stmt)
+//   Walk a statement (and its AST_F4 sibling chain) and reserve storage for
+//   every `static` local declaration at any block depth, descending into
+//   compound blocks, if/switch/while/do/for bodies, and case/default/label
+//   statements.  Without descending, a static declared inside a nested block
+//   -- e.g. SQLite's `static const struct EncName encnames[]` inside a switch
+//   case -- got an IR_GLOBAL_REF but no storage, leaving the symbol undefined.
+.globl _kcc_cg_prereg_stmt
+.p2align 2
+_kcc_cg_prereg_stmt:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                    // stmt cursor
+.Lprs_loop:
+    cbz x19, .Lprs_ret
+    ldr x20, [x19, #AST_TAG]
+    cmp x20, #AST_VAR_DECL
+    b.ne .Lprs_notvar
+    ldr x0, [x19, #AST_F3]         // storage class (3 = static)
+    cmp x0, #3
+    b.ne .Lprs_next
+    mov x0, x19
+    bl _kcc_cg_prereg_static
+    b .Lprs_next
+.Lprs_notvar:
+    cmp x20, #AST_COMPOUND
+    b.eq .Lprs_body_f0
+    cmp x20, #AST_IF_STMT
+    b.eq .Lprs_if
+    cmp x20, #AST_SWITCH_STMT
+    b.eq .Lprs_body_f1
+    cmp x20, #AST_WHILE_STMT
+    b.eq .Lprs_body_f1
+    cmp x20, #AST_DO_STMT
+    b.eq .Lprs_body_f0
+    cmp x20, #AST_FOR_STMT
+    b.eq .Lprs_for
+    cmp x20, #AST_CASE_STMT
+    b.eq .Lprs_body_f1
+    cmp x20, #AST_LABEL_STMT
+    b.eq .Lprs_body_f1
+    cmp x20, #AST_DEFAULT_STMT
+    b.eq .Lprs_body_f0
+    b .Lprs_next
+.Lprs_if:
+    ldr x0, [x19, #AST_F1]         // then branch
+    bl _kcc_cg_prereg_stmt
+    ldr x0, [x19, #AST_F2]         // else branch
+    bl _kcc_cg_prereg_stmt
+    b .Lprs_next
+.Lprs_for:
+    ldr x0, [x19, #AST_F0]         // init clause
+    bl _kcc_cg_prereg_stmt
+    ldr x0, [x19, #AST_F3]         // body
+    bl _kcc_cg_prereg_stmt
+    b .Lprs_next
+.Lprs_body_f1:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_cg_prereg_stmt
+    b .Lprs_next
+.Lprs_body_f0:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_cg_prereg_stmt
+.Lprs_next:
+    ldr x19, [x19, #AST_F4]        // next sibling in the statement list
+    b .Lprs_loop
+.Lprs_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_preregister_globals _kcc_cg_prereg_static _kcc_cg_prereg_stmt
 @}
 
 \subsection{Read-Only Const Globals}

@@ -289,6 +289,20 @@ Signed modulo requires two instructions: \texttt{sdiv\;x11,\;x9,\;x10}
 followed by \texttt{msub\;x11,\;x11,\;x10,\;x9}, which computes
 $x_9 - (x_9 / x_{10}) \times x_{10}$.  Negation is \texttt{sub\;x11,\;xzr,\;x9}.
 
+The \emph{unsigned} divide and remainder are the one place operation width
+must be honoured, because the high half of a register is not don't-care: an
+unsigned divide reads all 64 bits, so a sign-extended signed operand
+(\texttt{i \% u} with \texttt{i} negative, converted to \texttt{unsigned int})
+would poison a 64-bit \textsc{udiv}.  The handlers therefore pick the
+\texttt{sf} bit from the result type's size---\texttt{0} (32-bit) for an
+\texttt{unsigned int} remainder, \texttt{1} (64-bit) for \texttt{unsigned
+long}---so a 32-bit \textsc{udiv} ignores the sign-extension exactly as C's
+conversion to \texttt{unsigned int} demands.  (Signed \textsc{sdiv}/\textsc{smod}
+are width-agnostic: sign-extended operands give the right low word at either
+width, so they stay 64-bit.)  The IR builder cooperates by recording the
+operands' common width on the divide's type, the same width it already computes
+for a comparison.
+
 The bitwise operations (\textsc{and}, \textsc{orr}, \textsc{eor},
 shifts, and \textsc{not}) use the same load--compute--store pattern
 with logical-class encoders.
@@ -383,10 +397,23 @@ with logical-class encoders.
     mov x1, #CG_REG_SRC2
     bl _kcc_cg_load_vreg
 
+    // An unsigned divide must run at the operation's own width.  A 32-bit
+    // `unsigned int` divide done in 64 bits sees the sign-extended high half of
+    // a signed operand (`i % u` with i<0) and yields a wildly wrong quotient; a
+    // 32-bit UDIV ignores the high half, matching C's conversion to unsigned
+    // int.  sf = (result type is 8 bytes) ? 1 : 0.
+    ldr x0, [x19, #IR_TYPE]
+    mov x23, #1
+    cmp x0, #0x1000
+    b.lo .Lcgi_udiv_sf
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    cset x23, hs
+.Lcgi_udiv_sf:
     mov x0, #CG_REG_DST
     mov x1, #CG_REG_SRC1
     mov x2, #CG_REG_SRC2
-    mov x3, #1
+    mov x3, x23
     bl _kcc_enc_udiv
     bl _kcc_code_emit32
 
@@ -435,11 +462,21 @@ with logical-class encoders.
     mov x1, #CG_REG_SRC2
     bl _kcc_cg_load_vreg
 
+    // Like UDIV, a 32-bit unsigned modulo must run in 32 bits so the sign
+    // extension of a signed dividend (`i % u`, i<0) does not corrupt it.
+    ldr x0, [x19, #IR_TYPE]
+    mov x23, #1
+    cmp x0, #0x1000
+    b.lo .Lcgi_umod_sf
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    cset x23, hs
+.Lcgi_umod_sf:
     // udiv x11, x9, x10
     mov x0, #CG_REG_DST
     mov x1, #CG_REG_SRC1
     mov x2, #CG_REG_SRC2
-    mov x3, #1
+    mov x3, x23
     bl _kcc_enc_udiv
     bl _kcc_code_emit32
 
@@ -448,7 +485,7 @@ with logical-class encoders.
     mov x1, #CG_REG_DST
     mov x2, #CG_REG_SRC2
     mov x3, #CG_REG_SRC1
-    mov x4, #1
+    mov x4, x23
     bl _kcc_enc_msub
     bl _kcc_code_emit32
 

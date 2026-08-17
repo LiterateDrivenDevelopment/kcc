@@ -570,6 +570,15 @@ difftest "bitfield-assign-result-trunc" \
 # or the compound-assign lvalue.  Genuine unsigned-int division stays unsigned.
 difftest "uchar-div-signed-promote" \
     "int main(void){ unsigned char x = 50; short y = -5; return (unsigned char)(x / y); }"
+# An unsigned divide/remainder runs at the operation's own width. `int % unsigned`
+# converts to unsigned INT (32-bit): -13 % 61u = 44, not (2^64-13)%61. And an
+# unsigned LONG remainder must stay 64-bit: (unsigned long)-13 % 61 = 3.
+difftest "int-mod-unsigned-int-width" \
+    "int main(void){ int i = -13; unsigned u = 61; return (int)(i % u); }"
+difftest "unsigned-long-mod-width" \
+    "int main(void){ unsigned long a = 0xFFFFFFFFFFFFFFF3UL, b = 61; return (int)(a % b); }"
+difftest "unsigned-int-div-negative" \
+    "int main(void){ int i = -100; unsigned u = 7; return (int)(i / u); }"
 difftest "uchar-divassign-signed-promote" \
     "int main(void){ unsigned char x = 50; short y = -5; x /= y; return x; }"
 difftest "uchar-modassign-signed-promote" \

@@ -3804,15 +3804,21 @@ _kcc_ir_build_binary:
     str x21, [x24, #IR_SRC1]
     str x22, [x24, #IR_SRC2]
 
-    // For an integer comparison, record the operands' common width so codegen
-    // compares at 32 or 64 bits.  Two <=32-bit operands compare at 32 bits,
-    // reconciling a sign-extended signed operand with a zero-extended unsigned
-    // one (e.g. `int` against `0xffffffffu`); any wider operand keeps the
-    // 64-bit compare.  An unknown operand width defaults to the wider type, so
-    // pointer and `long` comparisons are unaffected.
+    // For an integer comparison OR a divide/remainder, record the operands'
+    // common width so codegen runs at 32 or 64 bits.  Two <=32-bit operands use
+    // 32 bits, reconciling a sign-extended signed operand with a zero-extended
+    // unsigned one (e.g. `int` against `0xffffffffu`); any wider operand keeps
+    // the 64-bit width.  Width matters for a divide because a 64-bit unsigned
+    // divide sees a signed operand's sign-extension (`i % u`, i<0) --- so an
+    // `unsigned int` remainder MUST run in 32 bits, and an `unsigned long` one
+    // in 64.  An unknown operand width defaults to the wider type.
     sub x0, x25, #IR_CMP_EQ
     cmp x0, #(IR_CMP_ULE - IR_CMP_EQ)
-    b.hi .Libb_cmp_type_done
+    b.ls .Libb_want_width        // comparison
+    sub x0, x25, #IR_SDIV
+    cmp x0, #(IR_UMOD - IR_SDIV)
+    b.hi .Libb_cmp_type_done     // neither compare nor div/mod → keep i32
+.Libb_want_width:
     mov x2, #8                   // lhs width (default wide)
     ldr x0, [x19, #AST_F1]
     cbz x0, .Libb_cmp_w_rhs

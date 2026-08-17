@@ -515,7 +515,7 @@ callee-saved registers and returns to the preprocessor loop.
     bl _kcc_pp_do_line         // #line N: adjust the reported line number
     b .Ldir_done
 .Ldir_pragma:
-    bl _kcc_pp_skip_line       // #pragma: ignore
+    bl _kcc_pp_do_pragma       // push_macro/pop_macro; other pragmas ignored
     b .Ldir_done
 .Ldir_null:
     bl _kcc_pp_skip_line
@@ -1042,6 +1042,7 @@ beginning-of-line detection for directive recognition.
 .p2align 3
 .globl _kcc_pp_macros
 _kcc_pp_macros:      .quad 0     // pointer to macro hash table
+_kcc_pp_macro_stack: .quad 0     // head of the #pragma push_macro save stack
 _kcc_pp_eval_depth:  .quad 0     // #if-expression macro recursion guard
 .globl _kcc_line_delta
 _kcc_line_delta:     .quad 0     // #line adjustment: __LINE__ = _kcc_lex_line + this
@@ -1076,6 +1077,8 @@ _kcc_pp_s_include:   .asciz "include"
 _kcc_pp_s_error:     .asciz "error"
 _kcc_pp_s_line:      .asciz "line"
 _kcc_pp_s_pragma:    .asciz "pragma"
+_kcc_pp_s_push_macro: .asciz "push_macro"
+_kcc_pp_s_pop_macro:  .asciz "pop_macro"
 _kcc_pp_s_defined:   .asciz "defined"
 
 // -- Predefined macro name strings ----------------------------------

@@ -199,6 +199,7 @@ The directives below route code fragments to their physical assembly files under
 @<PP: expand@>
 @<PP: define@>
 @<PP: undef@>
+@<PP: pragma@>
 @<PP: conditional@>
 @<PP: resolve include@>
 @<PP: include path@>

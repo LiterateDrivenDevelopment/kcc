@@ -275,6 +275,184 @@ _kcc_pp_do_undef:
     ret
 @}
 
+\section{The \texttt{push\_macro} and \texttt{pop\_macro} Pragmas}
+
+Most \texttt{\#pragma} directives are implementation-defined and kcc ignores
+them, but two are worth honouring because real headers lean on them to
+save and restore a macro around a local redefinition:
+\texttt{\#pragma push\_macro("NAME")} remembers \texttt{NAME}'s current
+definition, and a later \texttt{\#pragma pop\_macro("NAME")} restores it,
+undoing any intervening \texttt{\#undef}/\texttt{\#define}.  Because a
+redefinition never mutates the old macro object---\texttt{\#define} installs a
+\emph{fresh} entry and the arena keeps the previous one alive---saving is just
+capturing the current hash-table value (a macro pointer, possibly null for an
+undefined name) and restoring is putting it back.
+
+The save records live on a small stack of arena nodes, each holding the
+next link, the macro name and length, and the saved macro pointer.  A push
+prepends a node; a pop scans from the head for the newest node whose name
+matches and reinstalls its saved pointer, unlinking that node.  A single
+global head, \texttt{\_kcc\_pp\_macro\_stack}, roots the stack, and the whole
+mechanism reuses the same \texttt{\_kcc\_pp\_macros} table that
+\texttt{\#define} and \texttt{\#undef} manipulate.
+
+@d PP: pragma @{
+// -- _kcc_pp_do_pragma ----------------------------------------------
+// Handles `#pragma push_macro("X")` / `#pragma pop_macro("X")`; any other
+// pragma is skipped.  Called with the `pragma` keyword already consumed.
+.text
+.p2align 2
+_kcc_pp_do_pragma:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    // Read the pragma verb.
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr x0, [x0]
+    cmp x0, #TOK_IDENT
+    b.ne .Lprag_skip
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr x19, [x0]                // verb start
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr x20, [x0]                // verb length
+    // push_macro?  (10 characters)
+    cmp x20, #10
+    b.ne .Lprag_try_pop
+    mov x0, x19
+    adrp x1, _kcc_pp_s_push_macro@@PAGE
+    add  x1, x1, _kcc_pp_s_push_macro@@PAGEOFF
+    mov x2, #10
+    bl _kcc_memcmp
+    cbz x0, .Lprag_push
+.Lprag_try_pop:
+    cmp x20, #9                  // pop_macro (9 characters)
+    b.ne .Lprag_skip
+    mov x0, x19
+    adrp x1, _kcc_pp_s_pop_macro@@PAGE
+    add  x1, x1, _kcc_pp_s_pop_macro@@PAGEOFF
+    mov x2, #9
+    bl _kcc_memcmp
+    cbz x0, .Lprag_pop
+    b .Lprag_skip
+
+.Lprag_push:
+    bl _kcc_pp_pragma_name       // x0=name ptr, x1=len (0 on parse failure)
+    cbz x1, .Lprag_skip
+    mov x19, x0                  // name
+    mov x20, x1                  // len
+    // saved = ht_get(macros, name, len)
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_ht_get               // x0 = current macro (or 0)
+    str x0, [sp, #-16]!          // stash saved across arena_alloc (x2 is caller-saved)
+    // node = arena_alloc(32); {next, name, len, saved}
+    mov x0, #32
+    bl _kcc_arena_alloc
+    ldr x2, [sp], #16            // reload saved
+    str x19, [x0, #8]            // name
+    str x20, [x0, #16]           // len
+    str x2, [x0, #24]            // saved macro pointer
+    adrp x1, _kcc_pp_macro_stack@@PAGE
+    add  x1, x1, _kcc_pp_macro_stack@@PAGEOFF
+    ldr x2, [x1]                 // old head
+    str x2, [x0, #0]             // node.next = head
+    str x0, [x1]                 // head = node
+    b .Lprag_skip
+
+.Lprag_pop:
+    bl _kcc_pp_pragma_name       // x0=name, x1=len
+    cbz x1, .Lprag_skip
+    mov x19, x0                  // name
+    mov x20, x1                  // len
+    // Scan the stack for the newest node with a matching name.
+    adrp x0, _kcc_pp_macro_stack@@PAGE
+    add  x0, x0, _kcc_pp_macro_stack@@PAGEOFF
+    mov x3, x0                   // x3 = address of the link to update (head first)
+.Lprag_pop_scan:
+    ldr x4, [x3]                 // x4 = current node
+    cbz x4, .Lprag_skip          // no matching push: nothing to restore
+    ldr x1, [x4, #16]            // node.len
+    cmp x1, x20
+    b.ne .Lprag_pop_next
+    mov x0, x19                  // name
+    ldr x1, [x4, #8]             // node.name
+    mov x2, x20                  // len
+    stp x3, x4, [sp, #-16]!      // preserve link addr + node across memcmp
+    bl _kcc_memcmp
+    ldp x3, x4, [sp], #16
+    cbz x0, .Lprag_pop_found
+.Lprag_pop_next:
+    add x3, x4, #0               // link to update = &node.next (offset 0)
+    b .Lprag_pop_scan
+.Lprag_pop_found:
+    // Restore: ht_put(macros, name, len, node.saved).
+    adrp x0, _kcc_pp_macros@@PAGE
+    add  x0, x0, _kcc_pp_macros@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19
+    mov x2, x20
+    ldr x5, [x4, #24]            // saved macro pointer
+    stp x3, x4, [sp, #-16]!
+    mov x3, x5
+    bl _kcc_ht_put
+    ldp x3, x4, [sp], #16
+    // Unlink node: *link = node.next.
+    ldr x0, [x4, #0]
+    str x0, [x3]
+    b .Lprag_skip
+
+.Lprag_skip:
+    bl _kcc_pp_skip_line
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- _kcc_pp_pragma_name --------------------------------------------
+// Parse `( "NAME" )` following a push_macro/pop_macro verb.  Returns
+// x0 = pointer to NAME's bytes (inside the string literal), x1 = its length,
+// or x1 = 0 on any parse failure.  The macro name is the string-literal
+// content without its surrounding quotes.
+.text
+.p2align 2
+_kcc_pp_pragma_name:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    bl _kcc_lex_next             // (
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr x0, [x0]
+    cmp x0, #TOK_LPAREN
+    b.ne .Lpname_fail
+    bl _kcc_lex_next             // "NAME"
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr x0, [x0]
+    cmp x0, #TOK_STRING_LIT
+    b.ne .Lpname_fail
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr x1, [x1]
+    add x0, x0, #1               // skip opening quote
+    sub x1, x1, #2               // drop both quotes
+    ldp x29, x30, [sp], #16
+    ret
+.Lpname_fail:
+    mov x1, #0
+    ldp x29, x30, [sp], #16
+    ret
+@| _kcc_pp_do_pragma _kcc_pp_pragma_name
+@}
+
 \section{Macro Expansion}
 
 When \texttt{kcc\_pp\_next} encounters an identifier, it checks

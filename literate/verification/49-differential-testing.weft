@@ -734,6 +734,10 @@ echo "--- Language Features ---"
 
 difftest "define-multiline-comment" \
     "#define X 5 /* comment that\nspans two lines */\nint main(void){ return X - 5; }"
+# #pragma push_macro / pop_macro save and restore a macro around a local
+# redefinition; after the pop, X is 10 again despite the intervening define.
+difftest "pragma-push-pop-macro" \
+    "#define X 10\n#pragma push_macro(\"X\")\n#undef X\n#define X 20\n#pragma pop_macro(\"X\")\nint main(void){ return X; }"
 difftest "nested-struct-tag" \
     "struct Hash { int count; struct _ht { int n; } *ht; }; int main(void){ struct _ht e; e.n = 42; return e.n - 42; }"
 # A struct defined inline in an ARRAY (or qualified) declaration must register

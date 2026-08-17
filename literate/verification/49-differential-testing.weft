@@ -299,6 +299,10 @@ difftest "init-array-of-struct-values" \
 # (C17 6.7.9): {2,3,4} must fill a, b, c -- not the anonymous padding member.
 difftest "bitfield-init-skip-anon" \
     "struct { int a:4; int :4; int b:4; int c:4; } x = { 2,3,4 }; int main(void){ return x.a*100 + x.b*10 + x.c; }"
+# A zero-size aggregate element (empty struct member from a call) copies no
+# bytes, but the call's side effect must still run (C17 6.5.2.2/6.7.9).
+difftest "zero-size-struct-init-side-effect" \
+    "int ii; typedef struct {} R; typedef struct { R raw; } S; R mk(void){ R r; ii++; return r; } int main(void){ S lock = (S){ .raw = mk() }; return ii; }"
 
 # A LOCAL aggregate initialized with an array-valued element must decay the
 # array to its address to fill a pointer member (`S s = {arr, ...}`).  Sema did

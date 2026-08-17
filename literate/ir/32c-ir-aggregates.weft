@@ -391,7 +391,13 @@ initializer (\stdref{6.7.9}): the positional walk steps over its cursor
 position without consuming an element, so \texttt{\{2,3,4\}} against
 \texttt{struct \{int a:4; int :4; int b:4; int c:4;\}} fills
 \texttt{a},~\texttt{b},~\texttt{c}---not the padding member---and the anonymous
-slot stays zero.  String initialisers for character arrays
+slot stays zero.  A \emph{zero-size} aggregate element---an empty
+\texttt{struct \{\}} member initialised from a call---is the mirror image: it
+copies no bytes and has no sub-objects, so the elision loop would drop the node
+altogether.  But the element expression may carry a side effect
+(\texttt{.raw = one\_raw\_spinlock()} increments a counter), so \texttt{fill}
+still \emph{evaluates} it (emitting the call) before consuming it, rather than
+discarding it with the empty copy.  String initialisers for character arrays
 (\texttt{char s[] = "abc"}) take their own byte-copy path above.
 File-scope aggregates share this exact machinery: their emitter
 (\texttt{\_kcc\_ir\_emit\_aggregate\_init}, \S\ref{sec:global-inits}) is a
@@ -1054,6 +1060,19 @@ _kcc_ir_fill:
     ldr x0, [x22, #AST_TAG]
     cmp x0, #AST_INIT_LIST
     b.eq .Lfl_agg_count          // its own braces → recurse/elide as before
+    // A zero-size aggregate (an empty struct/union) copies no bytes and has no
+    // sub-objects, so the ordinary elision loop would drop the element node
+    // entirely --- along with any side effect its expression carries, such as
+    // `.raw = one_raw_spinlock()`.  Evaluate the element for its effects, then
+    // consume it.
+    mov x0, x19
+    bl _kcc_type_layout          // sub-object byte size
+    cbnz x0, .Lfl_agg_sized
+    mov x0, x22
+    bl _kcc_ir_build_struct_addr // evaluate (emits a struct-returning call)
+    ldr x22, [x22, #AST_F4]      // consumed one element
+    b .Lfl_ret
+.Lfl_agg_sized:
     ldr x0, [x22, #AST_F3]       // element's resolved type
     cbz x0, .Lfl_agg_count
     ldr x1, [x0, #TY_KIND]

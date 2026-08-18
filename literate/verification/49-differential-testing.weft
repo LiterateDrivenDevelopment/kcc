@@ -632,6 +632,11 @@ difftest "block-scope-extern-shadows-local" \
 # pr42691 depended on this (`double table[2] = { inf, 23 }`).
 difftest "double-array-int-element-convert" \
     "int main(void){ double a[3] = { 1, 2, 3 }; int n = 5; double b[2] = { n, 7 }; return (a[0]==1.0 && a[2]==3.0 && b[0]==5.0 && b[1]==7.0) ? 0 : 1; }"
+# `++`/`--` on a floating lvalue must step by 1.0 through the FP unit, not do an
+# integer +1 on the raw double bits (which turned 0.0 into a denormal, so
+# `for (double x=0; x<20; x++)` spun forever -- gcc.c-torture 20000731-1).
+difftest "float-inc-dec" \
+    "int main(void){ double x = 0; int n = 0; for (x = 0; x < 20; x++) n++; float f = 2.5f; f++; double d = 10.0; double old = d--; return (n==20 && x==20.0 && f==3.5f && old==10.0 && d==9.0) ? 0 : 1; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

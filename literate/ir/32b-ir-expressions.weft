@@ -4934,8 +4934,15 @@ packs \texttt{nups}, \texttt{nactvar}, and \texttt{freereg} as adjacent
 \texttt{\_ENV} upvalue landed a megabyte away and every global read as
 \texttt{nil}.  So the builder reads the operand's resolved type and works in
 it: a pointer (stepping by the pointee size), or an integer/enum (stepping
-by one, at the true width).  Only a floating or otherwise unranked operand
-keeps the \texttt{int} default.
+by one, at the true width).  A \emph{floating} operand works in its own
+\texttt{float}/\texttt{double} type, and its step is a genuine \texttt{1.0}:
+we build an integer one and convert it (\texttt{SITOFP}), so the add or
+subtract lowers to \texttt{fadd}/\texttt{fsub} through the floating-point
+unit.  Keeping the \texttt{int} default here---as an earlier version did---made
+\texttt{x++} add one to the \emph{raw bits} of the double (\texttt{0.0}'s
+all-zero pattern became the smallest denormal), so a loop as ordinary as
+\texttt{for (double x = 0; x < 20; x++)} never advanced.  Only an aggregate or
+otherwise unranked operand keeps the \texttt{int} default.
 
 @d IR: build increment/decrement @{
 // -- kcc_ir_build_inc_dec -------------------------------------------------
@@ -4954,6 +4961,7 @@ _kcc_ir_build_inc_dec:
     stp x23, x24, [sp, #48]
     stp x25, x26, [sp, #64]
     str xzr, [sp, #80]           // bit-field decl (0 unless a bit-field member)
+    str xzr, [sp, #88]           // floating-operand flag (0 unless float/double)
 
     mov x19, x0                  // AST node
 
@@ -5196,9 +5204,23 @@ still returns the old value, prefix the new.
     b.ls .Libid_int_width      // 2..7 = bool/char/short/int/long/llong
     cmp  x10, #TY_ENUM          // 16
     b.eq .Libid_int_width
-    b .Libid_typed              // float/double/aggregate → keep int default
+    cmp  x10, #TY_FLOAT         // 8
+    b.eq .Libid_fp_width
+    cmp  x10, #TY_DOUBLE        // 9
+    b.eq .Libid_fp_width
+    b .Libid_typed              // aggregate → keep int default
 .Libid_int_width:
     mov  x26, x9                 // work in the operand's integer type; step = 1
+    b .Libid_typed
+.Libid_fp_width:
+    // Floating lvalue: work in the operand's own FP type so the load, add/sub,
+    // and store all run through the FP unit.  The step (below) becomes 1.0, not
+    // integer 1 --- otherwise `x++` did an INTEGER +1 on the raw double bits
+    // (0.0's bits + 1 = a denormal), so `for (double x=0; x<20; x++)` never
+    // advanced and spun forever (gcc.c-torture 20000731-1).
+    mov  x26, x9                 // work in the operand's floating type
+    mov  x0, #1
+    str  x0, [sp, #88]           // mark the step as floating
     b .Libid_typed
 .Libid_ptr_step:
     mov  x26, x9                 // pointer lvalue → work in the pointer type
@@ -5227,7 +5249,21 @@ still returns the old value, prefix the new.
     mov x0, x19
     bl _kcc_ir_emit
 
-    // Step 2: constant step (1, or sizeof(pointee))
+    // Step 2: constant step.  A floating lvalue steps by 1.0: build integer 1
+    // and convert it (SITOFP) to the operand's FP type, so Step 3's add/sub runs
+    // as fadd/fsub.  Otherwise the step is 1 (or sizeof(pointee) for a pointer).
+    ldr x9, [sp, #88]           // floating-operand flag
+    cbz x9, .Libid_int_step
+    mov x0, #1
+    bl _kcc_ir_emit_const        // x0 = integer 1 vreg
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]                 // from = int
+    mov x2, x26                  // to   = the operand's FP type
+    bl _kcc_ir_convert           // SITOFP → 1.0
+    mov x24, x0                  // x24 = FP step vreg
+    b .Libid_step_done
+.Libid_int_step:
     mov x0, #IR_CONST
     bl _kcc_ir_alloc_instr
     str x26, [x0, #IR_TYPE]
@@ -5238,6 +5274,7 @@ still returns the old value, prefix the new.
     mov x24, x0                  // x24 = step vreg
     mov x0, x19
     bl _kcc_ir_emit
+.Libid_step_done:
 
     // Step 3: add (++) or sub (--)
     cmp x20, #TOK_INC

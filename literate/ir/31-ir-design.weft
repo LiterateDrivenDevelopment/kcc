@@ -582,12 +582,30 @@ _kcc_ir_labels:      .quad 0     // hash table: label name → target basic bloc
 _kcc_ir_loop_stack:  .quad 0     // vec of (continue_bb, break_bb) pairs
 .globl _kcc_ir_bb_counter
 _kcc_ir_bb_counter:  .quad 0     // global BB id counter
+.globl _kcc_ir_scope_jdepth
+_kcc_ir_scope_jdepth: .quad 0    // live entries in the scope-shadowing journal
+.globl _kcc_ir_scope_sp
+_kcc_ir_scope_sp:    .quad 0     // open block scopes on the scope stack
 .globl _kcc_modinit_present
 _kcc_modinit_present: .quad 0    // 1 if this TU synthesised a module-init function
 .globl _kcc_modinit_sym
 _kcc_modinit_sym:    .quad 0     // module-init symbol index + 1 (0 = none), set by codegen
 .globl _kcc_modinit_fileoff
 _kcc_modinit_fileoff: .quad 0    // file offset of the __mod_init_func pointer, set by the writer
+
+// Block-scope shadowing journal (zero-filled, so .bss keeps it out of the
+// object image).  Each open block records, per name it declares or shadows, a
+// {name, keylen, previous locals-map value} triple; leaving the block replays
+// them in reverse to restore the enclosing bindings.  16384 live entries and
+// 1024 nested scopes comfortably exceed any real function.
+.bss
+.p2align 3
+.globl _kcc_ir_scope_journal
+_kcc_ir_scope_journal: .space 16384*24
+.globl _kcc_ir_scope_stack
+_kcc_ir_scope_stack:  .space 1024*8
+.data
+@| _kcc_ir_scope_journal _kcc_ir_scope_stack _kcc_ir_scope_jdepth _kcc_ir_scope_sp
 @| _kcc_ir_cur_func
 @| _kcc_ir_cur_bb
 @| _kcc_ir_funcs

@@ -1054,6 +1054,14 @@ _kcc_ir_emit_modinit:
     add  x1, x1, _kcc_ir_labels@@PAGEOFF
     str x0, [x1]
 
+    // Fresh block-scope shadowing journal for this function.
+    adrp x0, _kcc_ir_scope_jdepth@@PAGE
+    add  x0, x0, _kcc_ir_scope_jdepth@@PAGEOFF
+    str xzr, [x0]
+    adrp x0, _kcc_ir_scope_sp@@PAGE
+    add  x0, x0, _kcc_ir_scope_sp@@PAGEOFF
+    str xzr, [x0]
+
     // Entry basic block
     bl _kcc_ir_alloc_bb
     mov x20, x0
@@ -1782,12 +1790,151 @@ statements (if, while, do, for) and break/continue have
 dedicated builders in \S\ref{sec:ir-control-flow}; labels and
 \texttt{goto} use the helpers of \S\ref{sec:ir-goto}.
 
+\paragraph{Block scope.}
+A compound statement opens a name scope.  The locals map, though, is one
+flat name~$\to$~vreg hash table for the whole function, so a nested
+\texttt{\{ int v; \}} that redeclares an outer \texttt{v} would overwrite
+the outer binding and leave it overwritten after the block---the outer
+read would then see the inner value.  Rather than give the table a scope
+chain, we \emph{journal} it: \texttt{kcc\_ir\_locals\_put} records, before
+each write, the name's previous value; \texttt{kcc\_ir\_scope\_enter}
+remembers the journal's depth on block entry, and
+\texttt{kcc\_ir\_scope\_leave} replays every entry logged since, restoring
+the enclosing bindings exactly.  Because the compound handler brackets its
+body between an enter and a leave, arbitrary nesting and shadowing come out
+right with no per-scope allocation.  The same mechanism gives a block-scope
+\texttt{extern} its meaning: it binds the name to the ``resolve as a
+global'' marker (value~0) for the block, shadowing any enclosing local so a
+reference lowers to a \texttt{GLOBAL\_REF}, then the outer binding returns
+on exit.  The journal lives in \texttt{.bss} and is reset per function.
+
 @d IR: build statement @{
+// -- kcc_ir_locals_put ----------------------------------------------------
+// void kcc_ir_locals_put(char *name, size_t keylen, uint64_t value)
+//   Records name → value in the locals map, first journalling the name's
+//   PREVIOUS value so the enclosing block scope can be restored on exit.  A
+//   value of 0 means "resolve as a global" (a block-scope `extern`), which
+//   shadows any enclosing local of the same name for the block's duration.
+.text
+.globl _kcc_ir_locals_put
+.p2align 2
+_kcc_ir_locals_put:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                   // name
+    mov x20, x1                   // keylen
+    mov x21, x2                   // value
+
+    // old = ht_get(locals, name, keylen)  --- 0 if the name is unbound
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_ht_get
+    mov x22, x0                   // previous value
+
+    // journal[jdepth] = {name, keylen, old};  jdepth++
+    adrp x0, _kcc_ir_scope_jdepth@@PAGE
+    add  x0, x0, _kcc_ir_scope_jdepth@@PAGEOFF
+    ldr x1, [x0]
+    adrp x2, _kcc_ir_scope_journal@@PAGE
+    add  x2, x2, _kcc_ir_scope_journal@@PAGEOFF
+    mov x3, #24
+    madd x2, x1, x3, x2           // entry = journal + jdepth*24
+    str x19, [x2]
+    str x20, [x2, #8]
+    str x22, [x2, #16]
+    add x1, x1, #1
+    str x1, [x0]
+
+    // ht_put(locals, name, keylen, value)
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x19
+    mov x2, x20
+    mov x3, x21
+    bl _kcc_ht_put
+
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_ir_scope_enter ---------------------------------------------------
+// void kcc_ir_scope_enter(void)
+//   Marks the start of a block scope by pushing the journal's current depth.
+.globl _kcc_ir_scope_enter
+.p2align 2
+_kcc_ir_scope_enter:
+    adrp x0, _kcc_ir_scope_jdepth@@PAGE
+    add  x0, x0, _kcc_ir_scope_jdepth@@PAGEOFF
+    ldr x1, [x0]                  // current jdepth
+    adrp x2, _kcc_ir_scope_sp@@PAGE
+    add  x2, x2, _kcc_ir_scope_sp@@PAGEOFF
+    ldr x3, [x2]                  // scope sp
+    adrp x4, _kcc_ir_scope_stack@@PAGE
+    add  x4, x4, _kcc_ir_scope_stack@@PAGEOFF
+    str x1, [x4, x3, lsl #3]
+    add x3, x3, #1
+    str x3, [x2]
+    ret
+
+// -- kcc_ir_scope_leave ---------------------------------------------------
+// void kcc_ir_scope_leave(void)
+//   Ends the current block scope: replays every journal entry recorded since
+//   the matching enter, restoring each name's previous locals-map binding.
+.globl _kcc_ir_scope_leave
+.p2align 2
+_kcc_ir_scope_leave:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+
+    adrp x0, _kcc_ir_scope_sp@@PAGE
+    add  x0, x0, _kcc_ir_scope_sp@@PAGEOFF
+    ldr x1, [x0]
+    sub x1, x1, #1
+    str x1, [x0]                  // pop scope stack
+    adrp x2, _kcc_ir_scope_stack@@PAGE
+    add  x2, x2, _kcc_ir_scope_stack@@PAGEOFF
+    ldr x19, [x2, x1, lsl #3]     // x19 = saved jdepth (scope floor)
+
+    adrp x20, _kcc_ir_scope_jdepth@@PAGE
+    add  x20, x20, _kcc_ir_scope_jdepth@@PAGEOFF
+.Lscl_loop:
+    ldr x1, [x20]                 // jdepth
+    cmp x1, x19
+    b.ls .Lscl_done
+    sub x1, x1, #1
+    str x1, [x20]                 // pop journal entry
+    adrp x2, _kcc_ir_scope_journal@@PAGE
+    add  x2, x2, _kcc_ir_scope_journal@@PAGEOFF
+    mov x3, #24
+    madd x21, x1, x3, x2          // entry = journal + jdepth*24
+    // ht_put(locals, key, keylen, old_value) --- restores the enclosing binding
+    adrp x0, _kcc_ir_locals@@PAGE
+    add  x0, x0, _kcc_ir_locals@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x21]                 // key
+    ldr x2, [x21, #8]             // keylen
+    ldr x3, [x21, #16]            // previous value
+    bl _kcc_ht_put
+    b .Lscl_loop
+.Lscl_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
 // -- kcc_ir_build_stmt ----------------------------------------------------
 // void kcc_ir_build_stmt(node *stmt)
 //   x0 = AST statement node
 // Dispatches to the appropriate lowering based on AST_TAG.
-.text
 .globl _kcc_ir_build_stmt
 .p2align 2
 _kcc_ir_build_stmt:
@@ -1889,14 +2036,20 @@ _kcc_ir_build_stmt:
     b .Libs_done
 
 .Libs_compound:
+    // A block introduces a name scope: names it declares (or `extern`-shadows)
+    // are undone on exit so an enclosing local of the same name is restored.
+    bl _kcc_ir_scope_enter
     // Walk all items in compound statement
     ldr x19, [x19, #AST_F0]     // first item
 .Libs_compound_loop:
-    cbz x19, .Libs_done
+    cbz x19, .Libs_compound_end
     mov x0, x19
     bl _kcc_ir_build_stmt
     ldr x19, [x19, #AST_F4]
     b .Libs_compound_loop
+.Libs_compound_end:
+    bl _kcc_ir_scope_leave
+    b .Libs_done
 
 .Libs_expr:
     ldr x0, [x19, #AST_F0]      // expression

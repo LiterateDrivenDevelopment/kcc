@@ -616,6 +616,16 @@ difftest "struct-return-regalloc-live-arg" \
 # and write the wrong offsets.  gcc.c-torture pr49419 turned on exactly this.
 difftest "struct-def-with-pointer-declarator" \
     "struct S { int w, x, y; } *t; int main(void){ struct S b[3] = { {1,1,2}, {0,0,0}, {0,0,0} }; int *p = (int*)b; int s = 0; for (int i=0;i<9;i++) s = s*10 + p[i]; return s == 112000000 ? 0 : 1; }"
+# A nested block introduces a name scope: an inner declaration shadows an outer
+# local of the same name only for the block, and the outer binding is restored
+# on exit.  The IR builder's name→vreg map must be scoped, or the inner vreg
+# leaks out and the outer read sees the inner value.
+difftest "block-scope-shadow-restore" \
+    "int main(void){ int v = 4; { int v = 5; if (v != 5) return 1; } return v == 4 ? 0 : 2; }"
+# A block-scope `extern int v;` refers to the FILE-SCOPE object, not the
+# enclosing local of the same name; the reference must lower to a global.
+difftest "block-scope-extern-shadows-local" \
+    "int v = 3; int main(void){ int v = 4; { extern int v; if (v != 3) return 1; } return v == 4 ? 0 : 2; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

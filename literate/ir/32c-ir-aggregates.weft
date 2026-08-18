@@ -875,6 +875,20 @@ _kcc_ir_fill_one:
     mov x0, x22
     bl _kcc_ir_build_expr
     mov x24, x0                  // value vreg
+    // Convert the initializer value to the target element type before storing.
+    // A brace element carries its own type (\stdref{6.7.9}: each is assigned to
+    // the corresponding object), so `double a[] = {1, 2}` must deposit 1.0/2.0,
+    // not the raw integer bits of 1 and 2 --- an integer store into a double
+    // slot.  build_expr yields the element in its own type; _kcc_ir_convert
+    // bridges int<->float and integer widths, and is a no-op when they match.
+    ldr x1, [x22, #AST_F3]       // from = element expression's resolved type
+    cbz x1, .Lfo_scalar_store
+    cbz x19, .Lfo_scalar_store   // no target type (bare designator): store as-is
+    mov x0, x24                  // value vreg
+    mov x2, x19                  // to = target element type
+    bl _kcc_ir_convert
+    mov x24, x0                  // converted value
+.Lfo_scalar_store:
     adrp x0, _kcc_ir_member_field@@PAGE
     add  x0, x0, _kcc_ir_member_field@@PAGEOFF
     str x23, [x0]                // republish field (build_expr may clear it)

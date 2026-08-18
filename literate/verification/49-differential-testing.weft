@@ -626,6 +626,12 @@ difftest "block-scope-shadow-restore" \
 # enclosing local of the same name; the reference must lower to a global.
 difftest "block-scope-extern-shadows-local" \
     "int v = 3; int main(void){ int v = 4; { extern int v; if (v != 3) return 1; } return v == 4 ? 0 : 2; }"
+# Each brace-list element is assigned to its object (6.7.9), so an integer
+# element of a double array must be CONVERTED (int->double), not stored as raw
+# integer bits.  `double a[] = {1,2,3}` must hold 1.0/2.0/3.0.  gcc.c-torture
+# pr42691 depended on this (`double table[2] = { inf, 23 }`).
+difftest "double-array-int-element-convert" \
+    "int main(void){ double a[3] = { 1, 2, 3 }; int n = 5; double b[2] = { n, 7 }; return (a[0]==1.0 && a[2]==3.0 && b[0]==5.0 && b[1]==7.0) ? 0 : 1; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

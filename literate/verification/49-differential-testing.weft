@@ -609,6 +609,13 @@ difftest "uint-divassign-stays-unsigned" \
 # torture 20030613-1 in miniature: struct returned/copied through a temporary.
 difftest "struct-return-regalloc-live-arg" \
     "struct S { long x, y; }; static struct S id(struct S s){ struct S r; r.x=s.x; r.y=s.y; return r; } static struct S pw(struct S s, int n){ struct S a=s; while(--n>0) a=id(a); return a; } int main(void){ struct S x; x.x=-7; x.y=-7; struct S a=pw(x,2); struct S b=id(pw(a,2)); return b.x==b.y ? 0 : 1; }"
+# A struct DEFINED together with a pointer declarator --- `struct S {...} *t;`,
+# the ubiquitous `struct Node {...} *head;` form --- is still a definition of the
+# tag.  If the tag is not registered (its layout computed), a later `struct S`
+# resolves to a member-less descriptor, so field access and aggregate inits read
+# and write the wrong offsets.  gcc.c-torture pr49419 turned on exactly this.
+difftest "struct-def-with-pointer-declarator" \
+    "struct S { int w, x, y; } *t; int main(void){ struct S b[3] = { {1,1,2}, {0,0,0}, {0,0,0} }; int *p = (int*)b; int s = 0; for (int i=0;i<9;i++) s = s*10 + p[i]; return s == 112000000 ? 0 : 1; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

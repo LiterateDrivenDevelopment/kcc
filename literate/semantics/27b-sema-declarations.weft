@@ -104,8 +104,12 @@ _kcc_sema_check_decl:
     // qualifier wrappers first so an inline definition behind them registers
     // too: `struct T { ... } a[2];` and `static const struct EncName {...}
     // encnames[];` (SQLite's PRAGMA encoding table) must register the tag just
-    // like the scalar form.  Pointer wrappers are NOT peeled --- `struct T *p;`
-    // is normally a forward reference, not a definition to register.
+    // like the scalar form.  A bodyless pointer wrapper (`struct T *p;`) is a
+    // forward reference we must NOT register --- but a pointer to an inline
+    // DEFINITION (`struct S { ... } *t;`, the ubiquitous `struct Node {...}
+    // *head;`) still defines the tag and must register its layout, or a later
+    // `struct S` resolves to a member-less descriptor and every field access and
+    // aggregate initialiser silently reads/writes the wrong offsets.
     ldr x0, [x19, #AST_F0]         // type node
     cbz x0, .Lscd_var_resolve
 .Lscd_var_peel:
@@ -113,11 +117,38 @@ _kcc_sema_check_decl:
     cmp x1, #AST_TYPE_ARRAY
     b.eq .Lscd_var_peel1
     cmp x1, #AST_TYPE_QUALS
-    b.ne .Lscd_var_tagchk
+    b.eq .Lscd_var_peel1
+    cmp x1, #AST_TYPE_PTR
+    b.eq .Lscd_var_ptr             // pointer: peel only toward a bodied def
+    b .Lscd_var_tagchk
 .Lscd_var_peel1:
     ldr x0, [x0, #AST_F0]          // peel to element / base type
     cbnz x0, .Lscd_var_peel
     b .Lscd_var_resolve
+.Lscd_var_ptr:
+    // Peel pointer/array/qualifier wrappers toward the ultimate base type, then
+    // register it ONLY if it is a struct/union carrying a body (a definition).
+    // A bodyless base stays a forward reference: skip to resolve so we never
+    // overwrite a complete tag with an incomplete descriptor.
+    ldr x0, [x0, #AST_F0]          // pointee
+    cbz x0, .Lscd_var_resolve
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_TYPE_ARRAY
+    b.eq .Lscd_var_ptr
+    cmp x1, #AST_TYPE_QUALS
+    b.eq .Lscd_var_ptr
+    cmp x1, #AST_TYPE_PTR
+    b.eq .Lscd_var_ptr
+    cmp x1, #AST_TYPE_STRUCT
+    b.eq .Lscd_var_ptrbody
+    cmp x1, #AST_TYPE_UNION
+    b.ne .Lscd_var_resolve
+.Lscd_var_ptrbody:
+    ldr x2, [x0, #AST_F0]          // struct_decl node
+    cbz x2, .Lscd_var_resolve
+    ldr x2, [x2, #AST_F1]          // fields (body present iff non-zero)
+    cbz x2, .Lscd_var_resolve      // bodyless → forward reference, do not register
+    b .Lscd_var_pretag             // bodied → register the tag and lay it out
 .Lscd_var_tagchk:
     cmp x1, #AST_TYPE_STRUCT
     b.eq .Lscd_var_pretag

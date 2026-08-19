@@ -212,8 +212,12 @@ file-scope struct), a call yields the address of its own result buffer
 (the struct-return path already returns exactly that), and
 \texttt{.f}/\texttt{[i]} lvalues reuse the member and subscript address
 builders.  A parenthesised expression is unwrapped and re-dispatched.
-Anything else falls back to \texttt{build\_expr}, which for a pointer
-operand already produces an address.
+A comma operator evaluates its discarded left side and takes the address of
+its aggregate right; a nested assignment is built (performing its copy) and
+yields the assigned object's address---so \texttt{f((setup(), s))} and
+\texttt{f((a = s))} pass \texttt{s} by value rather than reading it loaded as a
+scalar and faulting on it as an address.  Anything else falls back to
+\texttt{build\_expr}, which for a pointer operand already produces an address.
 
 @d IR: struct address helper @{
 // -- kcc_ir_build_struct_addr ---------------------------------------------
@@ -250,8 +254,31 @@ _kcc_ir_build_struct_addr:
     b.eq .Libsad_deref
     cmp x1, #AST_COMPOUND_LIT
     b.eq .Libsad_compound
+    cmp x1, #AST_COMMA_EXPR
+    b.eq .Libsad_comma
+    cmp x1, #AST_ASSIGN_EXPR
+    b.eq .Libsad_assign
     mov x0, x19
     bl _kcc_ir_build_expr        // fallback: operand already yields an address
+    b .Libsad_done
+
+.Libsad_comma:
+    // `f((setup(), s))`: a comma operator whose value is the aggregate `s`.
+    // Evaluate the discarded left side for its effects, then take the address of
+    // the right (recursively, in case it is itself an lvalue shape).  Without
+    // this the comma matched no case and build_expr returned the union LOADED as
+    // a scalar; the caller then read that value as an address and faulted.
+    ldr x0, [x19, #AST_F0]       // comma LHS
+    bl _kcc_ir_build_expr        // side effects, discarded
+    ldr x0, [x19, #AST_F1]       // comma RHS = the aggregate
+    bl _kcc_ir_build_struct_addr
+    b .Libsad_done
+
+.Libsad_assign:
+    // `f((a = s))`: the value is the object just assigned; build the assignment
+    // (which performs the copy and returns that object's address).
+    mov x0, x19
+    bl _kcc_ir_build_assign
     b .Libsad_done
 
 .Libsad_compound:

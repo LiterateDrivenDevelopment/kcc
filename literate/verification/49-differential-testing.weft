@@ -671,6 +671,12 @@ difftest "struct-assign-comma-rhs" \
 # testing (a silent miscompile, UB-free per MSan + ASan/UBSan).
 difftest "struct-assign-chained" \
     "struct S { int a; long b; }; static struct S w = {0,0}, x = {0,0}, y = {0,0}, z = {9, 0x123456789}; int main(void){ w = x = y = z; return (w.a==9 && w.b==0x123456789 && x.a==9 && y.b==0x123456789) ? 0 : 1; }"
+# A struct/union passed BY VALUE whose argument is a comma or nested assignment
+# must copy the aggregate.  The argument-address builder had no case for a comma
+# or assign-expr, so `f((x, s))` / `f((a = s))` read the aggregate loaded as a
+# scalar and used it as an address -- a fault.  Found by csmith (bitfields on).
+difftest "struct-arg-comma-assign" \
+    "struct S { int a; long b; }; static struct S d = {0,0}, s = {5, 0x99}; static int t; static int take(struct S x){ return x.a + (int)x.b; } int main(void){ int r1 = take((t = 1, s)); int r2 = take((d = s)); return (r1 == 158 && r2 == 158 && d.a == 5) ? 0 : 1; }"
 # A STORE's IR_DEST holds its access-size code, not a vreg.  The spill-slot
 # colourer read IR_DEST as a freshly-defined vreg for every instruction, so a
 # narrow store's access-size code (e.g. 2 for a 16-bit store) posed as "vreg 2"

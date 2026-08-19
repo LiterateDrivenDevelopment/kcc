@@ -1384,9 +1384,17 @@ _kcc_ir_build_func:
     bl _kcc_ir_emit
     b .Libf_impret_done
 .Libf_impret_void:
+    // A function that falls off its end returns no value.  For a void function
+    // that is correct; for a value-returning one it is undefined behaviour the
+    // caller must not rely on --- but the implicit return must still carry NO
+    // type, not the declared one.  Tagging it with a struct/union return type
+    // (while leaving SRC1 = 0) made the backend marshal a return value that was
+    // never produced: it read vreg 0 (which happens to be the first parameter)
+    // as the aggregate's address and faulted.  A null IR_TYPE makes the backend
+    // emit a bare RET, returning whatever is in the result registers.
     mov x0, #IR_RET
     bl _kcc_ir_alloc_instr
-    str x22, [x0, #IR_TYPE]     // ret type
+    str xzr, [x0, #IR_TYPE]     // no value: a bare return
     bl _kcc_ir_emit
 .Libf_impret_done:
 

@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+ <key>clang_version</key>
+<string>Apple clang version 17.0.0 (clang-1700.6.3.2)</string>
+ <key>diagnostics</key>
+ <array>
+  <dict>
+   <key>path</key>
+   <array>
+    <dict>
+     <key>kind</key><string>event</string>
+     <key>location</key>
+     <dict>
+      <key>line</key><integer>35</integer>
+      <key>col</key><integer>35</integer>
+      <key>file</key><integer>0</integer>
+     </dict>
+     <key>ranges</key>
+     <array>
+       <array>
+        <dict>
+         <key>line</key><integer>35</integer>
+         <key>col</key><integer>42</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+        <dict>
+         <key>line</key><integer>35</integer>
+         <key>col</key><integer>57</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+       </array>
+     </array>
+     <key>depth</key><integer>0</integer>
+     <key>extended_message</key>
+     <string>Although the value stored to &apos;l_22&apos; is used in the enclosing expression, the value is never actually read from &apos;l_22&apos;</string>
+     <key>message</key>
+     <string>Although the value stored to &apos;l_22&apos; is used in the enclosing expression, the value is never actually read from &apos;l_22&apos;</string>
+    </dict>
+   </array>
+   <key>description</key><string>Although the value stored to &apos;l_22&apos; is used in the enclosing expression, the value is never actually read from &apos;l_22&apos;</string>
+   <key>category</key><string>Unused code</string>
+   <key>type</key><string>Dead nested assignment</string>
+   <key>check_name</key><string>deadcode.DeadStores</string>
+   <!-- This hash is experimental and going to change! -->
+   <key>issue_hash_content_of_line_in_context</key><string>f344e2368451d15e67f586436b010416</string>
+  <key>issue_context_kind</key><string>function</string>
+  <key>issue_context</key><string>func_3</string>
+  <key>issue_hash_function_offset</key><string>5</string>
+  <key>location</key>
+  <dict>
+   <key>line</key><integer>35</integer>
+   <key>col</key><integer>35</integer>
+   <key>file</key><integer>0</integer>
+  </dict>
+  <key>ExecutedLines</key>
+  <dict>
+   <key>0</key>
+   <array>
+    <integer>35</integer>
+   </array>
+  </dict>
+  </dict>
+ </array>
+ <key>files</key>
+ <array>
+  <string>/private/tmp/claude-501/-Users-temo-Desktop-PROYECTOS-C/59dd12d1-623e-4a7c-9003-ff5c947d6598/scratchpad/reduced.c</string>
+ </array>
+</dict>
+</plist>

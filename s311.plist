@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+ <key>clang_version</key>
+<string>Apple clang version 17.0.0 (clang-1700.6.3.2)</string>
+ <key>diagnostics</key>
+ <array>
+  <dict>
+   <key>path</key>
+   <array>
+    <dict>
+     <key>kind</key><string>event</string>
+     <key>location</key>
+     <dict>
+      <key>line</key><integer>130</integer>
+      <key>col</key><integer>21</integer>
+      <key>file</key><integer>0</integer>
+     </dict>
+     <key>ranges</key>
+     <array>
+       <array>
+        <dict>
+         <key>line</key><integer>130</integer>
+         <key>col</key><integer>28</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+        <dict>
+         <key>line</key><integer>130</integer>
+         <key>col</key><integer>31</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+       </array>
+     </array>
+     <key>depth</key><integer>0</integer>
+     <key>extended_message</key>
+     <string>Value stored to &apos;l_48&apos; is never read</string>
+     <key>message</key>
+     <string>Value stored to &apos;l_48&apos; is never read</string>
+    </dict>
+   </array>
+   <key>description</key><string>Value stored to &apos;l_48&apos; is never read</string>
+   <key>category</key><string>Unused code</string>
+   <key>type</key><string>Dead assignment</string>
+   <key>check_name</key><string>deadcode.DeadStores</string>
+   <!-- This hash is experimental and going to change! -->
+   <key>issue_hash_content_of_line_in_context</key><string>3aa2812906e2611770ae4303dfc61082</string>
+  <key>issue_context_kind</key><string>function</string>
+  <key>issue_context</key><string>func_1</string>
+  <key>issue_hash_function_offset</key><string>50</string>
+  <key>location</key>
+  <dict>
+   <key>line</key><integer>130</integer>
+   <key>col</key><integer>21</integer>
+   <key>file</key><integer>0</integer>
+  </dict>
+  <key>ExecutedLines</key>
+  <dict>
+   <key>0</key>
+   <array>
+    <integer>130</integer>
+   </array>
+  </dict>
+  </dict>
+  <dict>
+   <key>path</key>
+   <array>
+    <dict>
+     <key>kind</key><string>event</string>
+     <key>location</key>
+     <dict>
+      <key>line</key><integer>189</integer>
+      <key>col</key><integer>18</integer>
+      <key>file</key><integer>0</integer>
+     </dict>
+     <key>ranges</key>
+     <array>
+       <array>
+        <dict>
+         <key>line</key><integer>189</integer>
+         <key>col</key><integer>18</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+        <dict>
+         <key>line</key><integer>189</integer>
+         <key>col</key><integer>22</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+       </array>
+       <array>
+        <dict>
+         <key>line</key><integer>189</integer>
+         <key>col</key><integer>26</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+        <dict>
+         <key>line</key><integer>189</integer>
+         <key>col</key><integer>34</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+       </array>
+     </array>
+     <key>depth</key><integer>0</integer>
+     <key>extended_message</key>
+     <string>Value stored to &apos;l_299&apos; during its initialization is never read</string>
+     <key>message</key>
+     <string>Value stored to &apos;l_299&apos; during its initialization is never read</string>
+    </dict>
+   </array>
+   <key>description</key><string>Value stored to &apos;l_299&apos; during its initialization is never read</string>
+   <key>category</key><string>Unused code</string>
+   <key>type</key><string>Dead initialization</string>
+   <key>check_name</key><string>deadcode.DeadStores</string>
+   <!-- This hash is experimental and going to change! -->
+   <key>issue_hash_content_of_line_in_context</key><string>017d54522fced6db12afc0dc2c874836</string>
+  <key>issue_context_kind</key><string>function</string>
+  <key>issue_context</key><string>func_1</string>
+  <key>issue_hash_function_offset</key><string>109</string>
+  <key>location</key>
+  <dict>
+   <key>line</key><integer>189</integer>
+   <key>col</key><integer>18</integer>
+   <key>file</key><integer>0</integer>
+  </dict>
+  <key>ExecutedLines</key>
+  <dict>
+   <key>0</key>
+   <array>
+    <integer>189</integer>
+   </array>
+  </dict>
+  </dict>
+  <dict>
+   <key>path</key>
+   <array>
+    <dict>
+     <key>kind</key><string>event</string>
+     <key>location</key>
+     <dict>
+      <key>line</key><integer>225</integer>
+      <key>col</key><integer>35</integer>
+      <key>file</key><integer>0</integer>
+     </dict>
+     <key>ranges</key>
+     <array>
+       <array>
+        <dict>
+         <key>line</key><integer>225</integer>
+         <key>col</key><integer>42</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+        <dict>
+         <key>line</key><integer>225</integer>
+         <key>col</key><integer>57</integer>
+         <key>file</key><integer>0</integer>
+        </dict>
+       </array>
+     </array>
+     <key>depth</key><integer>0</integer>
+     <key>extended_message</key>
+     <string>Although the value stored to &apos;l_22&apos; is used in the enclosing expression, the value is never actually read from &apos;l_22&apos;</string>
+     <key>message</key>
+     <string>Although the value stored to &apos;l_22&apos; is used in the enclosing expression, the value is never actually read from &apos;l_22&apos;</string>
+    </dict>
+   </array>
+   <key>description</key><string>Although the value stored to &apos;l_22&apos; is used in the enclosing expression, the value is never actually read from &apos;l_22&apos;</string>
+   <key>category</key><string>Unused code</string>
+   <key>type</key><string>Dead nested assignment</string>
+   <key>check_name</key><string>deadcode.DeadStores</string>
+   <!-- This hash is experimental and going to change! -->
+   <key>issue_hash_content_of_line_in_context</key><string>f344e2368451d15e67f586436b010416</string>
+  <key>issue_context_kind</key><string>function</string>
+  <key>issue_context</key><string>func_3</string>
+  <key>issue_hash_function_offset</key><string>17</string>
+  <key>location</key>
+  <dict>
+   <key>line</key><integer>225</integer>
+   <key>col</key><integer>35</integer>
+   <key>file</key><integer>0</integer>
+  </dict>
+  <key>ExecutedLines</key>
+  <dict>
+   <key>0</key>
+   <array>
+    <integer>225</integer>
+   </array>
+  </dict>
+  </dict>
+ </array>
+ <key>files</key>
+ <array>
+  <string>/private/tmp/claude-501/-Users-temo-Desktop-PROYECTOS-C/59dd12d1-623e-4a7c-9003-ff5c947d6598/scratchpad/s311.c</string>
+ </array>
+</dict>
+</plist>

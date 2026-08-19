@@ -665,6 +665,12 @@ difftest "empty-union-return" \
 # csmith differential testing (a silent miscompile, UB-free).
 difftest "struct-assign-comma-rhs" \
     "struct S { unsigned short a; unsigned long long b; }; static struct S x = { 7, 0xAABBCCDDEEFF }, y = { 0, 0 }; int main(void){ y = (1, 2, x); return (y.a == 7 && y.b == 0xAABBCCDDEEFF) ? 0 : 1; }"
+# A chained struct assignment `a = b = c` copies c into b and then b into a.  The
+# struct-copy path had no case for an ASSIGN_EXPR right side, so the outer copy
+# was silently skipped and `a` kept its old value.  Found by csmith differential
+# testing (a silent miscompile, UB-free per MSan + ASan/UBSan).
+difftest "struct-assign-chained" \
+    "struct S { int a; long b; }; static struct S w = {0,0}, x = {0,0}, y = {0,0}, z = {9, 0x123456789}; int main(void){ w = x = y = z; return (w.a==9 && w.b==0x123456789 && x.a==9 && y.b==0x123456789) ? 0 : 1; }"
 # A STORE's IR_DEST holds its access-size code, not a vreg.  The spill-slot
 # colourer read IR_DEST as a freshly-defined vreg for every instruction, so a
 # narrow store's access-size code (e.g. 2 for a 16-bit store) posed as "vreg 2"

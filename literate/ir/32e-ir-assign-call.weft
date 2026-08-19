@@ -56,13 +56,15 @@ shapes: a plain variable, an aggregate-typed member, an array element
 \texttt{a[i]}, or a dereferenced pointer \texttt{*p}, whose pointer
 \emph{value} is the aggregate's address.  The destination must recognise
 each of these just as the source does---otherwise the copy is silently
-dropped, leaving the target uninitialised.  The \emph{source} accepts two
+dropped, leaving the target uninitialised.  The \emph{source} accepts three
 more shapes that carry an aggregate value without naming an lvalue directly:
-a parenthesised expression, and a comma operator whose right operand is the
-aggregate (\texttt{g = (setup(), s)}).  The builder peels the parentheses and
-evaluates a comma's discarded left side for its side effects before reading
-the real source shape; matching no case for the comma node is what let
-\texttt{g = (1, other)} type-check yet copy nothing.
+a parenthesised expression; a comma operator whose right operand is the
+aggregate (\texttt{g = (setup(), s)}); and a nested assignment
+(\texttt{a = b = c}), whose value is the object it just assigned.  The builder
+peels the parentheses, evaluates a comma's discarded left side for its side
+effects, and \emph{builds} a nested assignment---performing the inner copy---then
+takes the address it returns as the source.  Matching no case for these is what
+let \texttt{g = (1, other)} and \texttt{a = b = c} type-check yet copy nothing.
 
 The compound path uses callee-saved registers \texttt{x23} (current
 value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
@@ -560,6 +562,8 @@ _kcc_ir_build_assign:
     b .Liba_sc_unwrap
 .Liba_sc_shape:
     ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_ASSIGN_EXPR
+    b.eq .Liba_sc_src_assign
     cmp x1, #AST_CALL_EXPR
     b.eq .Liba_sc_src_call
     cmp x1, #AST_MEMBER
@@ -625,6 +629,16 @@ _kcc_ir_build_assign:
     ldr x0, [x0, #AST_F1]       // pointer operand
     bl _kcc_ir_build_expr
     mov x24, x0
+    b .Liba_sc_do_copy
+
+.Liba_sc_src_assign:
+    // RHS is a nested assignment `dst2 = src2` (a chain `a = b = c`): build it,
+    // performing the inner aggregate copy, then use its result --- the address
+    // of the just-assigned object --- as this copy's source.  A struct
+    // assignment returns that address, so `a = (b = c)` copies c into b and then
+    // b into a; without this the chained copy matched no case and did nothing.
+    bl _kcc_ir_build_assign
+    mov x24, x0                   // x24 = assigned object's address vreg
     b .Liba_sc_do_copy
 
 .Liba_sc_src_call:

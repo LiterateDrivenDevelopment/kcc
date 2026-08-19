@@ -658,6 +658,19 @@ difftest "int-float-common-type-rounds-to-single" \
 # torture pr23324 (a function returning `union {}`) crashed on exactly this.
 difftest "empty-union-return" \
     "union E {}; static union E g = {}; union E f(int x){ (void)x; return g; } int main(void){ union E r; r = f(5); (void)r; return (int)sizeof(union E); }"
+# A STORE's IR_DEST holds its access-size code, not a vreg.  The spill-slot
+# colourer read IR_DEST as a freshly-defined vreg for every instruction, so a
+# narrow store's access-size code (e.g. 2 for a 16-bit store) posed as "vreg 2"
+# and stole a slot mid-block --- under enough register pressure a local's
+# address and the value stored into it aliased one slot, and `l = 1` became a
+# store of 1 THROUGH the value 1 (a write to address 1) and faulted.  Found by
+# csmith differential testing; reduced.  The colourer must skip non-defining
+# opcodes exactly as pass 1 does.
+difftest "spill-slot-store-access-code-not-vreg" \
+    "#include <stdint.h>
+static int16_t g_182 = -3; static int16_t * volatile g_181 = &g_182;
+static int16_t func_1(void){ int8_t *l_13[10]; const uint16_t l_15 = 1UL; int32_t l_56 = 0x9123EBAAL; uint32_t l_94[8] = {0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L}; int32_t l_106 = 3L, l_110 = 0x16EC97F7L, l_124 = 0x55A8A431L, l_125 = (-9L); int32_t l_126[2][6] = {{6L,0xE54C48CFL,0xE54C48CFL,6L,7L,6L},{6L,7L,6L,0xE54C48CFL,0xE54C48CFL,6L}}; uint8_t l_178 = 253UL; int32_t *l_229 = &l_125, *l_232 = &l_124, *l_233 = &l_106, *l_234 = &l_110; return (*g_181); }
+int main(void){ return func_1() == -3 ? 0 : 1; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

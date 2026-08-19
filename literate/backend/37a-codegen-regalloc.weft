@@ -1137,7 +1137,17 @@ A single linear scan over the instructions, in the same order and with the same
 position numbering pass~1 used, does the work.  At each position it first
 \emph{expires} every active single-block vreg whose last use lies strictly
 before the current position, returning its slot to a free list; then, if the
-instruction defines a slot-needing vreg, it hands that vreg a slot.  A value
+instruction defines a slot-needing vreg, it hands that vreg a slot.  ``Defines a
+vreg'' is the load-bearing qualifier: only value-producing opcodes carry a vreg
+in \texttt{IR\_DEST}.  A \texttt{STORE} keeps its \emph{access-size code} there,
+a \texttt{BR\_COND} its condition (a use, not a def); reading either as a fresh
+definition would slot a bogus number.  This was not hypothetical---a 16-bit
+store's access code~2 posed as ``vreg~2'' and pulled a slot off the free list
+mid-block, so under enough pressure a local's address and the constant stored
+into it aliased one slot and \texttt{l = 1} became a store of~1 \emph{through}
+the value~1, faulting at address~1.  So the scan skips the non-defining opcodes
+(\texttt{STORE}, \texttt{BR}, \texttt{BR\_COND}, \texttt{RET}) exactly as pass~1
+does before it looks at \texttt{IR\_DEST}.  A value
 confined to one basic block (the escape flag clear) is a \emph{reuse}
 candidate: it takes a slot off the free list when one is available, and joins
 the active set so its slot is recycled once it dies.  This is safe irrespective
@@ -1276,6 +1286,24 @@ _kcc_cg_color_slots:
     str x10, [sp, #104]          // active_count = kept
 
     // --- assign a slot to a spilled DEST ---
+    // Only instructions that DEFINE a vreg have a vreg in IR_DEST.  A STORE
+    // keeps its access-size code there, a BR_COND its condition vreg (a use, not
+    // a def), and BR/RET carry unrelated fields --- reading any of these as a
+    // freshly-defined vreg would assign a slot to a bogus (or already-slotted)
+    // number and derail the colouring.  A store's access-size code 2 masquerading
+    // as "vreg 2", for one, stole a slot mid-block: the address `&l` and the
+    // constant it stored aliased one slot, so `l = 1` wrote 1 through the value 1
+    // (a store to address 1) and faulted.  Skip the non-defining opcodes exactly
+    // as pass 1 does.
+    ldr x9, [x27, #IR_OP]
+    cmp x9, #IR_STORE
+    b.eq .Lcs_adv
+    cmp x9, #IR_BR
+    b.eq .Lcs_adv
+    cmp x9, #IR_BR_COND
+    b.eq .Lcs_adv
+    cmp x9, #IR_RET
+    b.eq .Lcs_adv
     ldr x0, [x27, #IR_DEST]
     cbz x0, .Lcs_adv             // no dest
     cmp x0, x20

@@ -1808,6 +1808,9 @@ returning a \texttt{union \{\}} faulted---the very crash
 .Lcgi_ret_struct:
     // Small struct (<=16 bytes): x23 = struct address vreg, x25 = struct type.
     // Load [addr] into x0, and [addr+8] into x1 when the struct exceeds 8 bytes.
+    // (x23 may legitimately be vreg 0 -- the first alloca -- so it is NOT a
+    // "no value" sentinel; a valueless aggregate return is caught by the size-0
+    // guard below or simply loads an unused register, never faulting here.)
     ldr x0, [x25, #TY_SIZE]
     cbz x0, .Lcgi_ret_epilogue     // empty struct/union (GNU ext): return nothing
     mov x0, x23

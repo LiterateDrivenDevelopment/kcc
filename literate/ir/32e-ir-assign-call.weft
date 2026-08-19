@@ -850,15 +850,20 @@ _kcc_ir_build_call:
     b .Libc_count_args
 .Libc_count_done:
 
-    // Struct return-by-value: if the callee returns a struct, allocate a
-    // result buffer whose address becomes a hidden trailing argument and
-    // the call's own result value.
+    // Aggregate return-by-value: if the callee returns a struct OR union,
+    // allocate a result buffer whose address becomes a hidden trailing argument
+    // and the call's own result value.  A union return needs this just as much
+    // as a struct: without the buffer the backend still unpacks x0(-x1) into
+    // DEST, storing through a never-materialised (garbage) address and faulting.
     ldr x0, [x19, #AST_F3]       // call result type (sema-resolved)
     cbz x0, .Libc_alloc_args
     ldr x1, [x0, #TY_KIND]
     cmp x1, #TY_STRUCT
+    b.eq .Libc_ret_agg
+    cmp x1, #TY_UNION
     b.ne .Libc_alloc_args
-    str x0, [sp, #88]            // result struct type
+.Libc_ret_agg:
+    str x0, [sp, #88]            // result aggregate type
     bl _kcc_ir_type_slots        // x0 = slot count
     str x0, [sp, #96]            // slot count
     mov x0, #IR_ALLOCA

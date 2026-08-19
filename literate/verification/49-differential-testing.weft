@@ -671,6 +671,15 @@ difftest "spill-slot-store-access-code-not-vreg" \
 static int16_t g_182 = -3; static int16_t * volatile g_181 = &g_182;
 static int16_t func_1(void){ int8_t *l_13[10]; const uint16_t l_15 = 1UL; int32_t l_56 = 0x9123EBAAL; uint32_t l_94[8] = {0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L,0x275CA956L}; int32_t l_106 = 3L, l_110 = 0x16EC97F7L, l_124 = 0x55A8A431L, l_125 = (-9L); int32_t l_126[2][6] = {{6L,0xE54C48CFL,0xE54C48CFL,6L,7L,6L},{6L,7L,6L,0xE54C48CFL,0xE54C48CFL,6L}}; uint8_t l_178 = 253UL; int32_t *l_229 = &l_125, *l_232 = &l_124, *l_233 = &l_106, *l_234 = &l_110; return (*g_181); }
 int main(void){ return func_1() == -3 ? 0 : 1; }"
+# A UNION returns by value exactly like a struct: the call allocates a result
+# buffer and the callee passes the union's ADDRESS (not a scalar load of member
+# zero).  Both were only wired for TY_STRUCT, so a union return unpacked x0 into
+# a never-materialised buffer (fault) and the callee `return u` loaded 4 bytes
+# as an int.  Also: a value-returning function that falls off its end with the
+# result discarded must not fault.  Found by csmith differential testing.
+difftest "union-return-by-value" \
+    "#include <stdint.h>
+union U { uint64_t a; int b; }; union U mk(int x){ union U u; u.a = x; return u; } int main(void){ union U r = mk(42); return r.a == 42 ? 0 : 1; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

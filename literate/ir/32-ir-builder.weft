@@ -2138,7 +2138,13 @@ and \texttt{.f}/\texttt{[i]} lvalues reuse the member and subscript
 address builders.  \texttt{\_kcc\_type\_layout} gives the exact byte
 size to copy through the hidden \texttt{sret} pointer; copying the exact
 size (rather than rounding up to whole slots) avoids overrunning the
-caller's result buffer.
+caller's result buffer.  A \texttt{union} return takes this same aggregate
+path---it too is passed by its address, not squeezed into a register---so the
+kind test admits \texttt{TY\_UNION} alongside \texttt{TY\_STRUCT}; routing a
+union down the scalar path instead loaded four bytes of member~0 and returned
+that in place of the object.  The caller side mirrors this: the call builder
+reserves the result buffer for a union return just as for a struct, or the
+backend unpacks the returned registers into a never-materialised address.
 
 @d IR: build return @{
 // -- kcc_ir_build_return --------------------------------------------------
@@ -2166,6 +2172,8 @@ _kcc_ir_build_return:
     ldr x1, [x1, #TY_KIND]
     cmp x1, #TY_STRUCT
     b.eq .Libret_struct
+    cmp x1, #TY_UNION            // a union returns by value exactly like a struct:
+    b.eq .Libret_struct         // pass its ADDRESS, not a scalar load of member 0
 
 .Libret_scalar:
     // Build the return expression

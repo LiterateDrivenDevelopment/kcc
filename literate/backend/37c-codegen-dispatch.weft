@@ -1763,6 +1763,15 @@ paths finish with \textsc{ret}.  The
 ($\mathit{frame}/8$) fits in a signed 7-bit field whose positive
 range is $0$--$63$.
 
+A struct or union return of \emph{zero} size---an empty \texttt{struct \{\}}
+or \texttt{union \{\}}, a GNU extension kcc accepts---carries no value.  The
+callee must load nothing (its object occupies no bytes, so reading the first
+eight would dereference past it) and the caller must unpack nothing; both the
+return path here and the two call-return unpackers guard on a zero
+\texttt{TY\_SIZE} and skip straight to the epilogue / done.  Without the guard,
+returning a \texttt{union \{\}} faulted---the very crash
+\texttt{gcc.c-torture}'s \texttt{pr23324} hit.
+
 @d CodeGen: instruction dispatch @{
 .Lcgi_ret:
     // Return: load the value to x0 (scalar), d0 (floating), or x0(-x1) for a
@@ -1799,6 +1808,8 @@ range is $0$--$63$.
 .Lcgi_ret_struct:
     // Small struct (<=16 bytes): x23 = struct address vreg, x25 = struct type.
     // Load [addr] into x0, and [addr+8] into x1 when the struct exceeds 8 bytes.
+    ldr x0, [x25, #TY_SIZE]
+    cbz x0, .Lcgi_ret_epilogue     // empty struct/union (GNU ext): return nothing
     mov x0, x23
     mov x1, #9                     // x9 = struct address
     bl _kcc_cg_load_vreg
@@ -1977,6 +1988,7 @@ described in \S\ref{sec:emit-strings}.
     // unpack x0(-x1) into the buffer whose address is in DEST (x24).
     ldr x1, [x19, #IR_TYPE]
     ldr x1, [x1, #TY_SIZE]
+    cbz x1, .Lcgi_call_ret_done   // empty struct/union (GNU ext): nothing to unpack
     cmp x1, #16
     b.gt .Lcgi_call_ret_done
     mov x0, x24                    // buffer vreg → x9 = its address
@@ -2069,6 +2081,7 @@ described in \S\ref{sec:emit-strings}.
 .Lcgi_cind_ret_struct:
     ldr x1, [x19, #IR_TYPE]
     ldr x1, [x1, #TY_SIZE]
+    cbz x1, .Lcgi_cind_ret_done   // empty struct/union (GNU ext): nothing to unpack
     cmp x1, #16
     b.gt .Lcgi_cind_ret_done
     mov x0, x24

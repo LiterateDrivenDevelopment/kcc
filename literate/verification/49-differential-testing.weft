@@ -652,6 +652,12 @@ typedef struct { int a; } T; T f(int x, ...){ va_list ap; T r; va_start(ap,x); r
 # compare unequal.  gcc.c-torture 920710-1.
 difftest "int-float-common-type-rounds-to-single" \
     "int main(void){ return (16777217L != (float)16777217e0) ? 1 : 0; }"
+# An empty struct/union (GNU extension) has size 0: returning one carries no
+# value, so the callee must load nothing and the caller unpack nothing.  Loading
+# from the 0-byte object's address dereferenced garbage and faulted.  gcc.c-
+# torture pr23324 (a function returning `union {}`) crashed on exactly this.
+difftest "empty-union-return" \
+    "union E {}; static union E g = {}; union E f(int x){ (void)x; return g; } int main(void){ union E r; r = f(5); (void)r; return (int)sizeof(union E); }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

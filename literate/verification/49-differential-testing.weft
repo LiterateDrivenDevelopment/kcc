@@ -658,6 +658,13 @@ difftest "int-float-common-type-rounds-to-single" \
 # torture pr23324 (a function returning `union {}`) crashed on exactly this.
 difftest "empty-union-return" \
     "union E {}; static union E g = {}; union E f(int x){ (void)x; return g; } int main(void){ union E r; r = f(5); (void)r; return (int)sizeof(union E); }"
+# A struct assignment whose right side is a comma (or parenthesised) expression
+# still copies the struct: `g = (1, s)` copies `s`.  The struct-copy path
+# dispatched on the RHS shape and matched no case for a comma/paren node, so the
+# copy was silently skipped and the destination kept its old value.  Found by
+# csmith differential testing (a silent miscompile, UB-free).
+difftest "struct-assign-comma-rhs" \
+    "struct S { unsigned short a; unsigned long long b; }; static struct S x = { 7, 0xAABBCCDDEEFF }, y = { 0, 0 }; int main(void){ y = (1, 2, x); return (y.a == 7 && y.b == 0xAABBCCDDEEFF) ? 0 : 1; }"
 # A STORE's IR_DEST holds its access-size code, not a vreg.  The spill-slot
 # colourer read IR_DEST as a freshly-defined vreg for every instruction, so a
 # narrow store's access-size code (e.g. 2 for a 16-bit store) posed as "vreg 2"

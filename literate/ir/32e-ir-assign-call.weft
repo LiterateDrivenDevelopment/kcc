@@ -56,7 +56,13 @@ shapes: a plain variable, an aggregate-typed member, an array element
 \texttt{a[i]}, or a dereferenced pointer \texttt{*p}, whose pointer
 \emph{value} is the aggregate's address.  The destination must recognise
 each of these just as the source does---otherwise the copy is silently
-dropped, leaving the target uninitialised.
+dropped, leaving the target uninitialised.  The \emph{source} accepts two
+more shapes that carry an aggregate value without naming an lvalue directly:
+a parenthesised expression, and a comma operator whose right operand is the
+aggregate (\texttt{g = (setup(), s)}).  The builder peels the parentheses and
+evaluates a comma's discarded left side for its side effects before reading
+the real source shape; matching no case for the comma node is what let
+\texttt{g = (1, other)} type-check yet copy nothing.
 
 The compound path uses callee-saved registers \texttt{x23} (current
 value vreg) and \texttt{x24} (IR opcode), so the frame must be 64
@@ -530,6 +536,29 @@ _kcc_ir_build_assign:
     // call's result buffer.
     ldr x0, [x19, #AST_F2]
     cbz x0, .Liba_done
+.Liba_sc_unwrap:
+    // Peel parentheses, and evaluate the discarded left side of any comma
+    // operator, before reading the RHS's real shape.  A struct assignment whose
+    // right side is `(x , s)` still copies the struct `s`; without this the comma
+    // (and paren) node matched no case below and the copy was silently skipped
+    // --- `g = (1, other)` left `g` unchanged.  x20 holds the node across the
+    // side-effect build (it is callee-saved, so build_expr preserves it).
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_PAREN_EXPR
+    b.ne .Liba_sc_chkcomma
+    ldr x0, [x0, #AST_F0]       // unwrap parentheses
+    cbz x0, .Liba_done
+    b .Liba_sc_unwrap
+.Liba_sc_chkcomma:
+    cmp x1, #AST_COMMA_EXPR
+    b.ne .Liba_sc_shape
+    mov x20, x0                 // save the comma node
+    ldr x0, [x20, #AST_F0]      // comma LHS: evaluate for side effects, discard
+    bl _kcc_ir_build_expr
+    ldr x0, [x20, #AST_F1]      // comma RHS is the struct source
+    cbz x0, .Liba_done
+    b .Liba_sc_unwrap
+.Liba_sc_shape:
     ldr x1, [x0, #AST_TAG]
     cmp x1, #AST_CALL_EXPR
     b.eq .Liba_sc_src_call

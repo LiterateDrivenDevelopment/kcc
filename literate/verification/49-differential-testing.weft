@@ -645,6 +645,13 @@ difftest "float-inc-dec" \
 difftest "discarded-struct-return-buffer-survives-call" \
     "#include <stdarg.h>
 typedef struct { int a; } T; T f(int x, ...){ va_list ap; T r; va_start(ap,x); r = va_arg(ap,T); va_end(ap); return r; } int main(void){ T v; v.a = 42; f(1, v); return 0; }"
+# When an integer and a `float` mix, the common type is float (6.3.1.8): the
+# integer rounds to single precision before the operation.  `16777217L !=
+# (float)16777217e0` is FALSE because the long rounds to 16777216.0f, exactly
+# as the float does.  Promoting the integer only to double (exact) made it
+# compare unequal.  gcc.c-torture 920710-1.
+difftest "int-float-common-type-rounds-to-single" \
+    "int main(void){ return (16777217L != (float)16777217e0) ? 1 : 0; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

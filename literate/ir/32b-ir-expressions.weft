@@ -3391,6 +3391,18 @@ before multiplying, matching \texttt{clang} to the last bit; a comparison
 expression (result type \texttt{double}, full precision kept) are both
 correctly left un-rounded.
 
+Result-rounding is not enough for a \emph{comparison} whose operands are
+\texttt{float}: its result is \texttt{int}, so nothing rounds the operands,
+yet the usual arithmetic conversions (\stdref{6.3.1.8}) put the comparison in
+the \emph{float} domain when neither operand is \texttt{double}.  An integer
+promoted only to \texttt{double} would keep more precision than a \texttt{float}
+holds---\texttt{16777217L != (float)16777217e0} would read \emph{true} because
+the long stayed the exact \texttt{16777217.0} while the float rounded to
+\texttt{16777216.0f}.  So when the \emph{other} operand is \texttt{float}, the
+emitter rounds the just-promoted integer to single before the operation; when
+the other operand is \texttt{double}, the common type is \texttt{double} and the
+exact value is right, so it is left alone.
+
 @d IR: build binary @{
 // -- kcc_ir_build_binary --------------------------------------------------
 // uint64_t kcc_ir_build_binary(node *expr)
@@ -3883,6 +3895,23 @@ _kcc_ir_build_binary:
     mov x0, x21
     bl _kcc_ir_emit_int_to_fp
     mov x21, x0
+    // If the OTHER operand is `float` (single), the operands' common type is
+    // float, so this integer must round to single precision before the compare
+    // --- `16777217L != (float)16777217e0` is false because the long rounds to
+    // 16777216.0f, exactly as the float does.  A comparison's own result type is
+    // int, so the result-rounding below never covers it; the operand must round
+    // here.  When the other operand is `double`, the common type is double and
+    // the exact integer-to-double value is correct, so we leave it.
+    ldr x0, [x19, #AST_F2]
+    cbz x0, .Libb_fp_rhs
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_fp_rhs
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #8                    // TY_FLOAT
+    b.ne .Libb_fp_rhs
+    mov x0, x21
+    bl _kcc_ir_emit_fpround
+    mov x21, x0
 .Libb_fp_rhs:
     ldr x0, [x19, #AST_F2]
     ldr x0, [x0, #AST_F3]
@@ -3892,6 +3921,17 @@ _kcc_ir_build_binary:
     ldr x1, [x0, #AST_F3]         // rhs integer type (signedness)
     mov x0, x22
     bl _kcc_ir_emit_int_to_fp
+    mov x22, x0
+    // Symmetric single-rounding when the LHS operand is `float`.
+    ldr x0, [x19, #AST_F1]
+    cbz x0, .Libb_fp_do
+    ldr x0, [x0, #AST_F3]
+    cbz x0, .Libb_fp_do
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #8                    // TY_FLOAT
+    b.ne .Libb_fp_do
+    mov x0, x22
+    bl _kcc_ir_emit_fpround
     mov x22, x0
 .Libb_fp_do:
     mov x0, x23                  // opcode (ADD/SUB/MUL/SDIV or CMP_*)

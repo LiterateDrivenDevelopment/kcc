@@ -106,6 +106,19 @@ provoked: a struct returned in a loop, copied through a temporary whose buffer
 shared a register with a still-live local.  A scalar-returning call, by
 contrast, produces a fresh result vreg and is allocated normally.
 
+The mirror concern is keeping that same buffer alive \emph{across} the call.
+A \(\le\)16-byte struct result comes back in \texttt{x0}(--\texttt{x1}) and is
+unpacked into the buffer \emph{after} the call returns---a use of the buffer's
+address vreg that no operand field records (\texttt{DEST} is not an operand).
+When the result is assigned, the following copy-out reads the buffer and keeps
+it live; but when the result is \emph{discarded} nothing does, so the buffer's
+address could take a caller-saved register the call clobbers, and the unpack
+would store through a stale (often null) pointer.  Pass~1 therefore records the
+\texttt{DEST} of a struct/union-returning call as a use at the just-incremented
+call count, marking it call-crossing so it lands in a callee-saved register that
+survives the call.  \texttt{gcc.c-torture}'s \texttt{920908-1}---a variadic
+function returning a struct, invoked purely for effect---faulted here until then.
+
 The use-marking helper reads the pass's array bases from the stable
 callee-saved registers the scan keeps live (\texttt{x20}--\texttt{x24}) and
 takes the per-instruction varying values---the used vreg, current block,
@@ -368,6 +381,35 @@ _kcc_cg_regalloc:
     b .Lp1_arg
 .Lp1_call_inc:
     add x28, x28, #1             // a call clobbers the caller-saved pool
+    // A struct/union-returning call whose result is <=16B is unpacked from
+    // x0(-x1) into the DEST buffer AFTER the call returns.  That post-call write
+    // is a use of DEST the operand scan never sees (DEST is not an IR operand
+    // field), so without help the buffer's address vreg looks dead at the call
+    // and may take a caller-saved register the call then clobbers --- the unpack
+    // stores through a stale (often 0) pointer and faults.  This bit only when
+    // the result is discarded: an assigned result already reads the buffer after
+    // the call (`r = f()` copies it out), which keeps it live.  Record DEST as a
+    // use at the just-incremented call count so it is marked call-crossing and
+    // lands in a callee-saved register that survives the call.
+    ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_CALL
+    b.eq .Lp1_ci_structret
+    cmp x9, #IR_CALL_IND
+    b.ne .Lp1_defck
+.Lp1_ci_structret:
+    ldr x9, [x26, #IR_TYPE]
+    cbz x9, .Lp1_defck
+    ldr x9, [x9]                  // TY_KIND
+    cmp x9, #14                   // STRUCT
+    b.eq .Lp1_ci_use
+    cmp x9, #15                   // UNION
+    b.ne .Lp1_defck
+.Lp1_ci_use:
+    ldr x0, [x26, #IR_DEST]      // sret buffer vreg
+    ldr x1, [sp, #96]            // cur_bb
+    mov x2, x27                  // pos
+    mov x3, x28                  // call count (already incremented → crossing)
+    bl _kcc_ra_use
     b .Lp1_defck
 
 .Lp1_defck:

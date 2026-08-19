@@ -637,6 +637,14 @@ difftest "double-array-int-element-convert" \
 # `for (double x=0; x<20; x++)` spun forever -- gcc.c-torture 20000731-1).
 difftest "float-inc-dec" \
     "int main(void){ double x = 0; int n = 0; for (x = 0; x < 20; x++) n++; float f = 2.5f; f++; double d = 10.0; double old = d--; return (n==20 && x==20.0 && f==3.5f && old==10.0 && d==9.0) ? 0 : 1; }"
+# A <=16B struct-returning call unpacks its result into the DEST buffer AFTER
+# the call.  When the result is DISCARDED, that buffer's address must still
+# survive the call (callee-saved), or the post-call unpack stores through a
+# clobbered pointer and faults.  gcc.c-torture 920908-1 (a variadic function
+# returning a struct, called for effect) crashed on exactly this.
+difftest "discarded-struct-return-buffer-survives-call" \
+    "#include <stdarg.h>
+typedef struct { int a; } T; T f(int x, ...){ va_list ap; T r; va_start(ap,x); r = va_arg(ap,T); va_end(ap); return r; } int main(void){ T v; v.a = 42; f(1, v); return 0; }"
 
 # Strength reduction: mul/udiv/umod by powers of two become shifts/masks.
 # The signed div/mod and negative cases must stay numerically correct

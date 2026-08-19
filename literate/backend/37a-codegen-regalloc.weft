@@ -410,6 +410,21 @@ _kcc_cg_regalloc:
     mov x2, x27                  // pos
     mov x3, x28                  // call count (already incremented → crossing)
     bl _kcc_ra_use
+    // Also give the buffer a DEDICATED spill slot.  Marking it call-crossing
+    // steers the register allocator, but a buffer that still spills (a nested
+    // aggregate-returning call inside a busy expression) is coloured by the slot
+    // pass, which recycles a single-block value's slot once its recorded last
+    // use passes.  The post-call unpack reads the buffer's address from that
+    // slot AFTER the call, a use the operand scan cannot see, so a constant or
+    // GEP evaluated for a later argument could seize the slot and the unpack
+    // would store through it (the address became a small integer and faulted).
+    // The escape bit forces the colourer to dedicate the slot and never reuse it.
+    ldr x0, [x26, #IR_DEST]
+    cmp x0, x20
+    b.hs .Lp1_defck
+    ldr x1, [x24, x0, lsl #3]
+    orr x1, x1, #2               // escapes → dedicated slot
+    str x1, [x24, x0, lsl #3]
     b .Lp1_defck
 
 .Lp1_defck:

@@ -123,10 +123,19 @@ _kcc_driver_compile:
     // 14b. Append string literal data to code section
     bl _kcc_codegen_emit_strings
 
-    // 14z. Optional textual `.s` emission (the assemble-with-`as` backend).
-    // When KCC_EMIT_ASM=<path> is set, also render the generated code as
-    // assembly to <path>.  This is a side effect for bring-up and testing of
-    // the second emission strategy; the Mach-O path below is unaffected.
+    // 14z. Emission strategy.  Under --emit-asm the object is produced through
+    // the textual `.s` + platform `as` back end; otherwise the direct Mach-O
+    // writer runs (with an optional KCC_EMIT_ASM=<path> side-render for
+    // bring-up, which leaves the Mach-O path unaffected).
+    adrp x0, _kcc_emit_asm@@PAGE
+    add  x0, x0, _kcc_emit_asm@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Ldc_macho
+    mov x0, x20                    // out_path
+    bl _kcc_driver_emit_asm_object
+    b .Ldc_return
+
+.Ldc_macho:
     adrp x0, _kcc_as_s_env@@PAGE
     add  x0, x0, _kcc_as_s_env@@PAGEOFF
     mov x1, #12
@@ -157,7 +166,67 @@ _kcc_driver_compile:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
-@| _kcc_driver_compile
+
+// -- kcc_driver_emit_asm_object -----------------------------------------------
+// int kcc_driver_emit_asm_object(const char *out_path)
+// Renders the generated code to "<out_path>.s", then runs the platform
+// assembler (`as -o <out_path> <out_path>.s`) to produce the object file.
+// Returns 0 on success, 1 on error.
+.globl _kcc_driver_emit_asm_object
+.p2align 2
+_kcc_driver_emit_asm_object:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                    // out_path
+    // Build "<out_path>.s" (out_len + 3 bytes for ".s\0").
+    bl _kcc_strlen
+    mov x20, x0                    // out_len
+    add x0, x20, #3
+    bl _kcc_arena_alloc
+    mov x21, x0                    // out_s buffer
+    mov x0, x21
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_memcpy                 // copy out_path
+    add x0, x21, x20              // &out_s[out_len]
+    adrp x1, _kcc_str_dot_s@@PAGE
+    add  x1, x1, _kcc_str_dot_s@@PAGEOFF
+    mov x2, #3                     // ".s\0"
+    bl _kcc_memcpy
+    // Render the assembly to out_s.
+    mov x0, x21
+    bl _kcc_as_render
+    cbnz x0, .Leao_err
+    // Build argv = { "as", "-o", out_path, out_s, 0 } and run /usr/bin/as.
+    mov x0, #48                    // 6 pointers
+    bl _kcc_arena_alloc
+    mov x22, x0
+    adrp x0, _kcc_str_as_argv0@@PAGE
+    add  x0, x0, _kcc_str_as_argv0@@PAGEOFF
+    str x0, [x22, #0]
+    adrp x0, _kcc_opt_o@@PAGE
+    add  x0, x0, _kcc_opt_o@@PAGEOFF
+    str x0, [x22, #8]
+    str x19, [x22, #16]           // out_path
+    str x21, [x22, #24]           // out_s
+    str xzr, [x22, #32]           // NULL terminator
+    adrp x0, _kcc_str_as_path@@PAGE
+    add  x0, x0, _kcc_str_as_path@@PAGEOFF
+    mov x1, x22
+    bl _kcc_driver_spawn           // returns child exit status
+    cbnz x0, .Leao_err
+    mov x0, #0
+    b .Leao_done
+.Leao_err:
+    mov x0, #1
+.Leao_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_driver_compile _kcc_driver_emit_asm_object
 @}
 
 \section{Compiling Several Translation Units}
@@ -418,6 +487,11 @@ _kcc_driver_compile_all:
     bl _kcc_strcmp
     cbz x0, .Lca_scan_wall
     ldr x0, [x20, x23, lsl #3]     // argv[i]
+    adrp x1, _kcc_opt_emitasm@@PAGE
+    add  x1, x1, _kcc_opt_emitasm@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_scan_emitasm
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
     adrp x1, _kcc_opt_g@@PAGE
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
@@ -478,6 +552,14 @@ _kcc_driver_compile_all:
     str  x1, [x0]
     add x23, x23, #1
     b .Lca_scan
+.Lca_scan_emitasm:
+    // "--emit-asm": produce the object through the `.s` + `as` back end
+    adrp x0, _kcc_emit_asm@@PAGE
+    add  x0, x0, _kcc_emit_asm@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x23, x23, #1
+    b .Lca_scan
 .Lca_scan_o:
     add x23, x23, #1               // step to the -o value
     cmp x23, x19
@@ -505,6 +587,11 @@ _kcc_driver_compile_all:
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lca_skip_wall         // -g: same as -Wall, skip (already handled)
+    mov x0, x25
+    adrp x1, _kcc_opt_emitasm@@PAGE
+    add  x1, x1, _kcc_opt_emitasm@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_skip_wall         // --emit-asm: handled in pass 1
     mov x0, x25
     adrp x1, _kcc_opt_o@@PAGE
     add  x1, x1, _kcc_opt_o@@PAGEOFF
@@ -785,6 +872,11 @@ _kcc_driver_link_all:
     bl _kcc_strcmp
     cbz x0, .Lla_pre_wall
     ldr x0, [x20, x21, lsl #3]
+    adrp x1, _kcc_opt_emitasm@@PAGE
+    add  x1, x1, _kcc_opt_emitasm@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_pre_emitasm
+    ldr x0, [x20, x21, lsl #3]
     adrp x1, _kcc_opt_g@@PAGE
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
@@ -837,6 +929,13 @@ _kcc_driver_link_all:
     str  x1, [x0]
     add x21, x21, #1
     b .Lla_pre
+.Lla_pre_emitasm:
+    adrp x0, _kcc_emit_asm@@PAGE
+    add  x0, x0, _kcc_emit_asm@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x21, x21, #1
+    b .Lla_pre
 .Lla_pre_done:
 
     // Linker argv: at most argc + 12 pointers.
@@ -881,6 +980,11 @@ _kcc_driver_link_all:
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lla_skipopt
+    mov x0, x27
+    adrp x1, _kcc_opt_emitasm@@PAGE
+    add  x1, x1, _kcc_opt_emitasm@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_skipopt           // --emit-asm: handled in pass 1
     // -Idir / -I dir: skip (registered in pass 1)
     mov x0, x27
     mov x1, #0
@@ -1054,6 +1158,14 @@ _kcc_opt_incdir:
     .asciz "-I"
 _kcc_opt_defmac:
     .asciz "-D"
+_kcc_opt_emitasm:
+    .asciz "--emit-asm"
+_kcc_str_as_argv0:
+    .asciz "as"
+_kcc_str_as_path:
+    .asciz "/usr/bin/as"
+_kcc_str_dot_s:
+    .asciz ".s"
 _kcc_driver_err_noinput:
     .asciz "kcc: error: no input files\n"
 _kcc_str_ld_argv0:
@@ -1085,6 +1197,9 @@ _kcc_str_sdk_xcode:
 .p2align 3
 .globl _kcc_envp
 _kcc_envp:
+    .quad 0
+.globl _kcc_emit_asm
+_kcc_emit_asm:               // 1 = produce the object via `.s` + `as` (--emit-asm)
     .quad 0
 @| _kcc_envp
 @}

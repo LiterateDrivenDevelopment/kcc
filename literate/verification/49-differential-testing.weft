@@ -677,6 +677,18 @@ difftest "struct-assign-chained" \
 # scalar and used it as an address -- a fault.  Found by csmith (bitfields on).
 difftest "struct-arg-comma-assign" \
     "struct S { int a; long b; }; static struct S d = {0,0}, s = {5, 0x99}; static int t; static int take(struct S x){ return x.a + (int)x.b; } int main(void){ int r1 = take((t = 1, s)); int r2 = take((d = s)); return (r1 == 158 && r2 == 158 && d.a == 5) ? 0 : 1; }"
+# GNU __attribute__((...)) (and __extension__, and the __x__ spellings of standard
+# keywords) must be accepted wherever they appear, or real system headers do not
+# parse.  kcc consumes and ignores them (layout attributes packed/aligned are a
+# later refinement); the point here is that the surrounding declarations parse and
+# run.  clang accepts the same, so this is a valid differential test.
+difftest "gnu-attributes-parse" \
+    "extern int f(int) __attribute__((const));
+struct __attribute__((unused)) S { int x __attribute__((aligned(4))); };
+__extension__ typedef long long ll;
+static __inline__ __attribute__((always_inline)) int g(__const int x __attribute__((unused))){ return x + 1; }
+int f(int y){ return y; }
+int main(void){ struct S s; s.x = 41; ll v = 100; return (g(s.x) == 42 && f(0) == 0 && v == 100) ? 0 : 1; }"
 # A STORE's IR_DEST holds its access-size code, not a vreg.  The spill-slot
 # colourer read IR_DEST as a freshly-defined vreg for every instruction, so a
 # narrow store's access-size code (e.g. 2 for a 16-bit store) posed as "vreg 2"

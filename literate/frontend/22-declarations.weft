@@ -71,6 +71,11 @@ _kcc_parse_decl:
     mov x21, x0                  // x21 = declarator result node
     cbz x21, .Ldecl_error_recovery
 
+    // GNU attributes may trail a declarator: `int f(void) __attribute__((...))`,
+    // `int x __attribute__((aligned)) = 5;`.  Consume them before deciding
+    // whether a definition body, initialiser, comma, or ';' follows.
+    bl _kcc_parse_skip_attributes
+
     // Check what kind of declaration this is
     ldr x22, [x21, #AST_TAG]    // x22 = node tag
 
@@ -287,6 +292,68 @@ alignments past sixteen, dynamically realigning the stack pointer; that
 refinement is deferred.
 
 @d Decl: parse specifiers @{
+// -- kcc_parse_skip_attributes -----------------------------------------
+// void kcc_parse_skip_attributes(void)
+// GNU attributes (\texttt{\_\_attribute\_\_((...))}) and \texttt{\_\_extension\_\_}
+// may appear at many points in a declaration; real system headers use them
+// pervasively.  kcc parses and DISCARDS them: every attribute it would honour
+// (\texttt{noinline}, \texttt{format}, \texttt{unused}, ...) is a hint that does
+// not change the observable result, and the layout-affecting ones
+// (\texttt{packed}, \texttt{aligned}) are a later refinement.  The point here is
+// to consume the syntax so the surrounding declaration parses.  Each attribute
+// is \texttt{\_\_attribute\_\_} followed by a balanced parenthesised group (the
+// characteristic double parens plus arbitrarily nested argument lists); several
+// may stack, and \texttt{\_\_extension\_\_} is a bare skippable prefix.
+.globl _kcc_parse_skip_attributes
+.p2align 2
+_kcc_parse_skip_attributes:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]           // x19 = paren depth (callee-saved: _kcc_pp_next
+                                 // clobbers caller-saved regs across the loop)
+.Lpsa_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_EXTENSION        // __extension__: a bare skippable prefix
+    b.ne .Lpsa_chk_attr
+    bl _kcc_pp_next
+    b .Lpsa_loop
+.Lpsa_chk_attr:
+    cmp x0, #TOK_ATTRIBUTE
+    b.ne .Lpsa_done
+    bl _kcc_pp_next              // consume __attribute__
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_LPAREN
+    b.ne .Lpsa_done             // no '(' after __attribute__ → give up gracefully
+    mov x19, #0                  // paren depth
+.Lpsa_paren:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz x0, .Lpsa_done          // TOK_EOF: never spin past end of input
+    cmp x0, #TOK_LPAREN
+    b.ne .Lpsa_not_lp
+    add x19, x19, #1
+    b .Lpsa_padv
+.Lpsa_not_lp:
+    cmp x0, #TOK_RPAREN
+    b.ne .Lpsa_padv
+    sub x19, x19, #1
+.Lpsa_padv:
+    bl _kcc_pp_next
+    cbnz x19, .Lpsa_paren       // still inside the group → keep consuming
+    b .Lpsa_loop                // balanced: this attribute done, check for another
+.Lpsa_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_parse_skip_attributes
+@}
+
+@d Decl: parse specifiers @{
 // -- kcc_parse_decl_specs ----------------------------------------------
 // (node*, uint64_t) kcc_parse_decl_specs(void)
 // Parses declaration specifiers.
@@ -384,8 +451,18 @@ _kcc_parse_decl_specs:
     cmp x0, #TOK__THREAD_LOCAL
     b.eq .Ldecl_skip_spec
 
+    // GNU __attribute__((...)) / __extension__ interleaved with specifiers
+    cmp x0, #TOK_ATTRIBUTE
+    b.eq .Ldecl_attrs
+    cmp x0, #TOK_EXTENSION
+    b.eq .Ldecl_attrs
+
     // Not a specifier, done
     b .Ldecl_specs_done
+
+.Ldecl_attrs:
+    bl _kcc_parse_skip_attributes
+    b .Ldecl_specs_loop
 
 .Ldecl_sc_typedef:
     mov x19, #1
@@ -1266,6 +1343,8 @@ _kcc_parse_param_decl:
     bl _kcc_parse_declarator
     mov x20, x0                  // x20 = decl node
 
+    bl _kcc_parse_skip_attributes  // GNU attrs on a parameter: `int x __attribute__((..))`
+
     // Convert to PARAM_DECL
     mov x0, #AST_PARAM_DECL
     bl _kcc_ast_alloc
@@ -1611,6 +1690,10 @@ _kcc_parse_struct_or_union:
 .Lstruct_after_tag:
     bl _kcc_pp_next               // consume 'struct' or 'union'
 
+    // GNU attributes may sit between the keyword and the tag/brace:
+    // `struct __attribute__((packed)) Pk { ... }`.
+    bl _kcc_parse_skip_attributes
+
     // Optional tag name
     mov x20, #0                  // x20 = name_ptr (default null)
     adrp x0, _kcc_tok_type@@PAGE
@@ -1630,6 +1713,10 @@ _kcc_parse_struct_or_union:
     mov x20, x0
 
     bl _kcc_pp_next               // consume tag name
+
+    // GNU attributes may also sit between the tag and the brace:
+    // `struct Pk __attribute__((packed)) { ... }`.
+    bl _kcc_parse_skip_attributes
 
 .Lstruct_check_brace:
     // Check for '{'
@@ -1699,6 +1786,8 @@ singly-linked list anchored by the first field node.
     str x0, [x24, #AST_TAG]      // retag as a struct/union field
     str xzr, [x24, #AST_F2]      // bitwidth default 0
     str xzr, [x24, #AST_F4]      // no sibling yet
+
+    bl _kcc_parse_skip_attributes  // GNU attrs on a member: `int x __attribute__((..))`
 
     // Optional bitfield ': width'
     adrp x0, _kcc_tok_type@@PAGE
@@ -1841,6 +1930,8 @@ _kcc_parse_enum:
 
     // Consume 'enum'
     bl _kcc_pp_next
+
+    bl _kcc_parse_skip_attributes  // `enum __attribute__((..)) E { ... }`
 
     // Optional tag name
     mov x19, #0                  // x19 = name_ptr

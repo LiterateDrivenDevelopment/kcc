@@ -80,6 +80,15 @@ We assign a unique integer code to each.  Codes 0--9 are structural,
 .equ TOK__STATIC_ASSERT, 52
 .equ TOK__THREAD_LOCAL,  53
 
+// GNU/common extension keywords (codes 54-59), recognised so real system
+// headers---which lean on them heavily---parse.  `__inline`, `__const`, and the
+// other `__x__` spellings of standard keywords are registered as ALIASES that
+// lex to the standard keyword's own code, so no parser change is needed for them.
+.equ TOK_ATTRIBUTE,   54      // __attribute__ / __attribute
+.equ TOK_TYPEOF,      55      // typeof / __typeof__ / __typeof
+.equ TOK_ASM,         56      // asm / __asm__ / __asm
+.equ TOK_EXTENSION,   57      // __extension__ (a no-op prefix)
+
 // Punctuators (section 6.4.6) — codes 60+
 .equ TOK_LPAREN,      60      // (
 .equ TOK_RPAREN,      61      // )
@@ -1905,6 +1914,27 @@ _kcc_kw_s_imaginary:  .asciz "_Imaginary"
 _kcc_kw_s_noreturn:   .asciz "_Noreturn"
 _kcc_kw_s_sassert:    .asciz "_Static_assert"
 _kcc_kw_s_tlocal:     .asciz "_Thread_local"
+// GNU/common extension spellings.  The `__x__`/`__x` forms alias standard
+// keywords (same token code); the rest get their own codes above.
+_kcc_kw_s_attr1:      .asciz "__attribute__"
+_kcc_kw_s_attr2:      .asciz "__attribute"
+_kcc_kw_s_typeof1:    .asciz "typeof"
+_kcc_kw_s_typeof2:    .asciz "__typeof__"
+_kcc_kw_s_typeof3:    .asciz "__typeof"
+_kcc_kw_s_asm1:       .asciz "asm"
+_kcc_kw_s_asm2:       .asciz "__asm__"
+_kcc_kw_s_asm3:       .asciz "__asm"
+_kcc_kw_s_ext:        .asciz "__extension__"
+_kcc_kw_s_inline1:    .asciz "__inline"
+_kcc_kw_s_inline2:    .asciz "__inline__"
+_kcc_kw_s_const1:     .asciz "__const"
+_kcc_kw_s_const2:     .asciz "__const__"
+_kcc_kw_s_signed1:    .asciz "__signed"
+_kcc_kw_s_signed2:    .asciz "__signed__"
+_kcc_kw_s_vol1:       .asciz "__volatile"
+_kcc_kw_s_vol2:       .asciz "__volatile__"
+_kcc_kw_s_restr1:     .asciz "__restrict"
+_kcc_kw_s_restr2:     .asciz "__restrict__"
 
 // -- Keyword registration table -------------------------------------
 // Each entry: (string_ptr, string_len, token_type) = 24 bytes
@@ -1955,8 +1985,27 @@ _kcc_kw_reg_table:
     .quad _kcc_kw_s_noreturn,   9,  51
     .quad _kcc_kw_s_sassert,    14, 52
     .quad _kcc_kw_s_tlocal,     13, 53
+    .quad _kcc_kw_s_attr1,      13, 54    // __attribute__ → TOK_ATTRIBUTE
+    .quad _kcc_kw_s_attr2,      11, 54    // __attribute
+    .quad _kcc_kw_s_typeof1,     6, 55    // typeof → TOK_TYPEOF
+    .quad _kcc_kw_s_typeof2,    10, 55    // __typeof__
+    .quad _kcc_kw_s_typeof3,     8, 55    // __typeof
+    .quad _kcc_kw_s_asm1,        3, 56    // asm → TOK_ASM
+    .quad _kcc_kw_s_asm2,        7, 56    // __asm__
+    .quad _kcc_kw_s_asm3,        5, 56    // __asm
+    .quad _kcc_kw_s_ext,        13, 57    // __extension__ → TOK_EXTENSION
+    .quad _kcc_kw_s_inline1,     8, 26    // __inline → TOK_INLINE
+    .quad _kcc_kw_s_inline2,    10, 26    // __inline__
+    .quad _kcc_kw_s_const1,      7, 14    // __const → TOK_CONST
+    .quad _kcc_kw_s_const2,      9, 14    // __const__
+    .quad _kcc_kw_s_signed1,     8, 33    // __signed → TOK_SIGNED
+    .quad _kcc_kw_s_signed2,    10, 33    // __signed__
+    .quad _kcc_kw_s_vol1,       10, 42    // __volatile → TOK_VOLATILE
+    .quad _kcc_kw_s_vol2,       12, 42    // __volatile__
+    .quad _kcc_kw_s_restr1,     10, 30    // __restrict → TOK_RESTRICT
+    .quad _kcc_kw_s_restr2,     12, 30    // __restrict__
 
-.equ KW_COUNT, 44
+.equ KW_COUNT, 63
 .equ KW_ENTRY_BYTES, 24       // 3 quads per entry
 @| _kcc_kw_s_auto
 @| _kcc_kw_s_break

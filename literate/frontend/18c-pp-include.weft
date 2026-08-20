@@ -539,6 +539,17 @@ ships them as the ordinary \texttt{.h} files below, tangled to
 \verb|<errno.h>|---is then a matter of writing a file, not editing the
 compiler: a new header fragment and its \texttt{@@o} route, no assembly.
 
+Each of \verb|<stdio.h>|, \verb|<stdlib.h>|, and \verb|<string.h>| opens with
+\verb|typedef unsigned long size_t;|, because \stdref{7.21}, \stdref{7.22}, and
+\stdref{7.24} each require the header to define \texttt{size\_t} independently of
+\verb|<stddef.h>|.  Real code leans on this constantly---\texttt{malloc((size\_t)n)},
+\texttt{memcpy(d, s, (size\_t)len)}---so without it a cast to \texttt{size\_t}
+fails to parse as a type name.  The typedef is intentionally repeated across the
+headers rather than guarded behind a shared macro: an identical
+\texttt{typedef} is a legal redefinition (\stdref{6.7}), and the front end
+accepts it, so a translation unit that includes several of these headers sees
+one consistent \texttt{size\_t} with no conflict.
+
 The standard streams \texttt{stdin}, \texttt{stdout}, and \texttt{stderr} are
 included.  They are not functions but \emph{data} objects imported from
 \texttt{libSystem} (\verb|__stdinp| and friends), which the header exposes as
@@ -649,6 +660,7 @@ dylib-imported datum through the global offset table, so
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
+typedef unsigned long size_t;
 typedef void FILE;
 extern FILE *__stdinp;
 extern FILE *__stdoutp;
@@ -708,6 +720,7 @@ int rename(char *oldp, char *newp);
 @d Header: stdlib @{
 #ifndef _STDLIB_H
 #define _STDLIB_H
+typedef unsigned long size_t;
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 #define RAND_MAX 2147483647
@@ -740,6 +753,7 @@ int system(char *cmd);
 @d Header: string @{
 #ifndef _STRING_H
 #define _STRING_H
+typedef unsigned long size_t;
 unsigned long strlen(char *s);
 int strcmp(char *a, char *b);
 int strncmp(char *a, char *b, unsigned long n);

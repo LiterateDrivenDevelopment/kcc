@@ -644,6 +644,10 @@ run_diag "vla-param"          err "variable-length arrays are not supported" \
 int main(void){ return f(3); }"
 run_diag "fixed-array-ok"     clean "" \
     "enum { N = 4 }; int g[N]; int main(void){ int a[10]; a[0]=1; return a[0]+g[0]+(int)sizeof(a); }"
+run_diag "complex-type"       err "complex types (_Complex/_Imaginary) are not supported" \
+    "int main(void){ double _Complex z; return 0; }"
+run_diag "atomic-qual-ok"     clean "" \
+    "_Atomic int x; int main(void){ x = 5; return x; }"
 
 echo ""
 echo "=== diagtest: $PASS ok, $FAIL fail ==="

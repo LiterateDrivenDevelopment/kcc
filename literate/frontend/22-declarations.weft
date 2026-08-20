@@ -324,6 +324,7 @@ _kcc_attr_s_packed:   .asciz "packed"
 _kcc_attr_s_packed2:  .asciz "__packed__"
 _kcc_attr_s_aligned:  .asciz "aligned"
 _kcc_attr_s_aligned2: .asciz "__aligned__"
+_kcc_decl_msg_complex: .asciz "complex types (_Complex/_Imaginary) are not supported"
 .text
 .globl _kcc_parse_skip_attributes
 .p2align 2
@@ -756,6 +757,8 @@ while typedef names are looked up in the typedef table and interned.
     b.eq .Ldecl_bit_bool
     cmp x0, #TOK__COMPLEX
     b.eq .Ldecl_bit_complex
+    cmp x0, #TOK__IMAGINARY
+    b.eq .Ldecl_bit_complex
     b .Ldecl_bit_done
 
 .Ldecl_bit_void:
@@ -795,6 +798,19 @@ while typedef names are looked up in the typedef table and interned.
     orr x23, x23, #(1 << 10)
     b .Ldecl_bit_done
 .Ldecl_bit_complex:
+    // _Complex / _Imaginary: kcc has no complex-number type.  Treating a
+    // complex as its real part would silently miscompile complex arithmetic, so
+    // reject it (see Appendix, Known Limitations).  The specifier is still
+    // consumed below so parsing can recover; the error count fails the compile.
+    adrp x0, _kcc_tok_line@@PAGE
+    add  x0, x0, _kcc_tok_line@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_col@@PAGE
+    add  x1, x1, _kcc_tok_col@@PAGEOFF
+    ldr  x1, [x1]
+    adrp x2, _kcc_decl_msg_complex@@PAGE
+    add  x2, x2, _kcc_decl_msg_complex@@PAGEOFF
+    bl _kcc_diag_error
     orr x23, x23, #(1 << 11)
 
 .Ldecl_bit_done:

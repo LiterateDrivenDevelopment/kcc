@@ -153,12 +153,23 @@ Option & Effect \\
                         & defines it as \emph{val} (also separated \texttt{-D \emph{name}}) \\
 \texttt{-Wall}          & enable the warning family (\S\ref{sec:um-warnings}) \\
 \texttt{-g}             & emit DWARF debug information for a debugger \\
+\texttt{-{}-emit-asm}   & build the object through textual assembly: emit a \\
+                        & \texttt{.s} file and run the platform \texttt{as} on it \\
 \hline
 \end{tabular}
 \end{center}
 
 Options may appear in any order relative to the source files.  A word that
 is not an option and not a mode flag is treated as a source file.
+
+\texttt{-{}-emit-asm} selects \kcc{}'s second code-emission strategy.  The
+default back end encodes each instruction and writes the Mach-O object
+directly; with \texttt{-{}-emit-asm} \kcc{} instead renders the generated code
+as assembly text (\texttt{.s}) and invokes the system assembler to produce the
+object.  The two produce equivalent objects for ordinary code, but the textual
+path is what makes \emph{inline assembly} (\S\ref{sec:um-inline-asm}) possible,
+because the direct encoder cannot assemble an arbitrary \texttt{asm} template.
+It works in both the default (link) and \texttt{-c} modes.
 
 \section{Compiling and Linking in Separate Steps}
 \label{sec:um-separate}
@@ -199,6 +210,31 @@ alongside the code, so that a debugger can map machine addresses back to
 functions and source lines.  The information is function-granular: it
 records where each function begins, which is enough for a backtrace to name
 the right functions.
+
+\section{Inline Assembly}
+\label{sec:um-inline-asm}
+
+\kcc{} accepts basic GNU inline assembly---\texttt{asm("\emph{template}");}
+(also spelled \texttt{\_\_asm\_\_}, and with an ignored \texttt{volatile},
+\texttt{inline}, or \texttt{goto} qualifier)---where \emph{template} is a
+string literal containing one or more assembler instructions.  Because the
+default back end encodes only the fixed instruction set \kcc{} itself selects,
+inline assembly requires the textual back end: compile with
+\texttt{-{}-emit-asm} (\S\ref{sec:um-commands}), which renders the code as
+\texttt{.s} and lets the system assembler assemble the template verbatim.
+
+\begin{verbatim}
+int main(void) {
+    asm("mov x16, #1");   /* SYS_exit */
+    asm("mov x0, #7");
+    asm("svc #0x80");     /* exit(7) */
+    return 0;
+}
+\end{verbatim}
+
+Only the \emph{basic} form is supported: a single template with no operand
+lists.  Extended assembly with operand constraints
+(\texttt{asm("..." : outputs : inputs : clobbers)}) is not yet accepted.
 
 \section{Reading Diagnostics}
 \label{sec:um-diagnostics}

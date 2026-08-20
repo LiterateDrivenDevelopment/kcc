@@ -123,6 +123,7 @@ Offset & Field & Description \\
 .equ IR_NOP,     61
 .equ IR_GLOBAL_REF, 63
 .equ IR_STRING_LIT, 64
+.equ IR_ASM,     65        // inline asm: SRC1=template ptr, SRC2=template len
 @}
 
 \section{IR Initialization}

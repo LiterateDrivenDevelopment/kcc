@@ -78,6 +78,10 @@ _kcc_parse_stmt:
     cmp x0, #TOK_DEFAULT
     b.eq .Lstmt_default
 
+    // Inline assembly: asm / __asm__ ( "template" ) ;
+    cmp x0, #TOK_ASM
+    b.eq .Lstmt_asm
+
     // Could be label (ident ':') or expression statement
     // Check: if it's an identifier, peek ahead for ':'
     cmp x0, #TOK_IDENT
@@ -161,6 +165,41 @@ of an expression statement, requiring one-token lookahead.
 
 .Lstmt_default:
     bl _kcc_parse_default
+    b .Lstmt_done
+
+.Lstmt_asm:
+    // Inline assembly: `asm [volatile|inline|goto] ( "template" ) ;`.  Only the
+    // basic form (a single template string, no operand lists) is handled: the
+    // template is captured verbatim and later spliced into the textual `.s`
+    // stream for the platform assembler.  Extended asm (with `:` operand lists)
+    // is not yet supported and stops at the `expected ')'` below.
+    bl _kcc_pp_next               // consume 'asm' / '__asm__'
+.Lstmt_asm_quals:
+    // Skip optional volatile/inline/goto qualifiers up to the '('.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_LPAREN
+    b.eq .Lstmt_asm_lp
+    cbz x0, .Lstmt_asm_lp         // EOF safety
+    bl _kcc_pp_next
+    b .Lstmt_asm_quals
+.Lstmt_asm_lp:
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+    bl _kcc_strlit_gather         // x0 = template ptr, x1 = len
+    mov x19, x0
+    mov x20, x1
+    mov x0, #AST_ASM_STMT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]        // template ptr
+    str x20, [x0, #AST_F1]        // template len
+    mov x19, x0                   // save node
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect
+    mov x0, x19
     b .Lstmt_done
 
 .Lstmt_check_label:

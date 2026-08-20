@@ -129,6 +129,7 @@ Offset & Field & Description \\
 .equ AST_FLOAT_LIT,      71   // F0=double bit pattern, F3=type(float/double)
 .equ AST_VA_ARG,         72   // F0=va_list expr, F1=type node, F3=resolved type
 .equ AST_STMT_EXPR,      73   // GNU ({...}): F0=compound, F3=resolved type
+.equ AST_ASM_STMT,       74   // inline asm: F0=template ptr, F1=template len
 @}
 
 \section{AST Node Allocation}

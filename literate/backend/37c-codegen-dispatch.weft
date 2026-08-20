@@ -202,8 +202,26 @@ _kcc_codegen_instr:
     b.eq .Lcgi_va_start
     cmp x22, #IR_FPROUND
     b.eq .Lcgi_fpround
+    cmp x22, #IR_ASM
+    b.eq .Lcgi_asm
 
     // Unknown opcode: skip
+    b .Lcgi_done
+
+.Lcgi_asm:
+    // Inline assembly.  The direct encoder cannot assemble an arbitrary
+    // template, so it records the snippet (template pointer/length keyed by the
+    // current code offset) for the textual `.s` renderer and emits a single NOP
+    // placeholder to occupy the slot.  Object files produced by the direct
+    // Mach-O path therefore carry a NOP where the asm should be; a program using
+    // inline asm must be compiled through the `.s`+`as` backend, which splices
+    // the real template at that offset.
+    bl _kcc_code_current_pos      // x0 = offset
+    ldr x1, [x19, #IR_SRC1]       // template ptr
+    ldr x2, [x19, #IR_SRC2]       // template len
+    bl _kcc_as_add_snip
+    bl _kcc_enc_nop
+    bl _kcc_code_emit32
     b .Lcgi_done
 @| _kcc_codegen_instr
 @}

@@ -99,7 +99,7 @@ _kcc_ir_validate:
     b.hi .Lirv_fail_loop
     ldr x0, [x24, #IR_OP]
     cbz x0, .Lirv_fail_op        // opcode 0 = uninitialised
-    cmp x0, #IR_STRING_LIT       // highest defined opcode
+    cmp x0, #IR_ASM              // highest defined opcode
     b.hi .Lirv_fail_op
     ldr x24, [x24, #IR_NEXT]
     b .Lirv_ins_loop

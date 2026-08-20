@@ -1987,8 +1987,23 @@ _kcc_ir_build_stmt:
     b.eq .Libs_default
     cmp x0, #AST_NULL_STMT
     b.eq .Libs_done
+    cmp x0, #AST_ASM_STMT
+    b.eq .Libs_asm
 
     // Unhandled statement type — skip
+    b .Libs_done
+
+.Libs_asm:
+    // Inline assembly: emit an IR_ASM carrying the template pointer (SRC1) and
+    // its length (SRC2).  It yields no value; the back end splices the template
+    // verbatim into the textual `.s` stream.
+    mov x0, #IR_ASM
+    bl _kcc_ir_alloc_instr
+    ldr x1, [x19, #AST_F0]      // template ptr
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x19, #AST_F1]      // template len
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
     b .Libs_done
 
 .Libs_label:

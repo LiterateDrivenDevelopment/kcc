@@ -1,0 +1,107 @@
+% E-limitations.weft — The catalogue of what kcc does NOT (yet) do.
+%
+% A production compiler earns trust as much from an honest boundary as from
+% its features.  This appendix is the single place that records every known
+% limitation: what is unsupported, how kcc behaves when it meets that
+% construct (refuse cleanly vs. not-yet-implemented), and why the boundary
+% sits where it does.  The guiding rule throughout kcc is that an
+% unsupported construct is REFUSED, never silently miscompiled.
+
+\chapter{Known Limitations}
+\label{ch:limitations}
+
+\kcc{} compiles the large majority of real C17, but it is not complete.  This
+appendix catalogues what it does \emph{not} do.  The list is deliberately
+exhaustive and blunt: a compiler is only trustworthy if its boundary is
+stated as plainly as its capabilities.  The invariant behind every entry is
+that \kcc{} \emph{refuses} an unsupported construct with a diagnostic rather
+than emitting wrong code---a clean error is a feature, silent miscompilation
+never is.
+
+\section{Language Features}
+
+\paragraph{Variable-length arrays (VLAs).}
+An array whose size is a run-time value, \texttt{int a[n]}, is not supported.
+VLAs require the object's size to be computed at run time and the stack frame
+to grow dynamically (a run-time \texttt{alloca}), plus run-time \texttt{sizeof}
+and pointer arithmetic against a size that is not a compile-time constant.
+\kcc{}'s frame layout is fixed at compile time, so a VLA declaration is
+rejected.  Fixed-size and flexible-array-member forms are fully supported;
+only the run-time-bound automatic array is not.
+
+\paragraph{\texttt{\_Atomic} and \texttt{\_Complex}.}
+The atomic type qualifier \texttt{\_Atomic} and the complex type specifiers
+\texttt{\_Complex}/\texttt{\_Imaginary} (\stdref{6.7.2.4}, \stdref{6.2.5}) are
+not implemented.  \texttt{\_Atomic} needs the lock-free atomic instruction
+selection (load-acquire / store-release, \textsc{ldxr}/\textsc{stxr} loops) and
+the \texttt{<stdatomic.h>} generic machinery; \texttt{\_Complex} needs a
+two-component value representation and complex arithmetic lowering.  Both are
+rejected in the declaration specifiers.
+
+\paragraph{Extended inline assembly beyond two operands.}
+Basic inline assembly and the common two-operand extended forms
+(\texttt{"=r"}, \texttt{"r"}, \texttt{"+r"}, \texttt{"i"}, with
+\texttt{"memory"}/\texttt{"cc"} clobbers) work through the textual back end
+(\S\ref{sec:um-inline-asm}).  Three or more live operands, memory
+(\texttt{"m"}) or specific-register constraints, and \texttt{asm goto} are
+refused with a diagnostic.  The obstacle is that an asm operand's virtual
+register is carried on the AST node rather than in an instruction's operand
+fields, so it is invisible to the middle-end passes (copy propagation,
+common-subexpression elimination, dead-code elimination) and to the register
+allocator.  Making \texttt{IR\_ASM} a first-class multi-operand instruction ---
+operand vregs stored in an array that every pass iterates, with real
+use/def/clobber sets --- is the deliberate future project that lifts this
+ceiling (and also fixes the IR dumper, which currently faults on
+\texttt{IR\_ASM}).
+
+\paragraph{Attribute layout at member granularity.}
+\texttt{\_\_attribute\_\_((packed))} and \texttt{aligned(N)} are honoured at the
+aggregate level, but not on an individual member (\texttt{int x
+\_\_attribute\_\_((packed));}).  Other attributes are parsed and ignored, which
+is correct for the hint attributes but means member-level layout control is
+absent.
+
+\paragraph{Computed \texttt{goto}.}
+The GNU label-address (\texttt{\&\&label}) and computed-goto (\texttt{goto
+*p}) extension, used by some interpreter dispatch loops, is not supported.
+
+\section{Standard Library and Headers}
+
+\kcc{} ships a set of freestanding built-in headers (\texttt{stddef.h},
+\texttt{stdint.h}, \texttt{stdarg.h}, \texttt{stdbool.h}, \texttt{limits.h},
+\texttt{float.h}) and enough of \texttt{stdio.h}, \texttt{stdlib.h},
+\texttt{string.h}, \texttt{math.h}, \texttt{fcntl.h}, and \texttt{unistd.h} to
+build real programs against the system libraries.  It does \emph{not} provide a
+full hosted standard library: many \texttt{<...>} headers are incomplete or
+absent, and POSIX headers beyond the handful above are not modelled.  A program
+that includes an unmodelled header, or uses a declaration \kcc{}'s headers do
+not declare, will not compile until the missing declarations are supplied
+(via \texttt{-I} and the real system headers, or by extending \kcc{}'s built-in
+set).
+
+\section{Code Generation and Targets}
+
+\paragraph{Single target.}
+\kcc{} targets ARM64 / Apple-silicon macOS (Mach-O) only.  The textual
+\texttt{.s}-emission back end (\S\ref{ch:emit-asm}) is the groundwork for a
+second target, but no other architecture or object format is implemented yet.
+
+\paragraph{Optimisation scope.}
+The optimiser performs constant folding, dead-code elimination, common-subexpression
+elimination, a scalar mem2reg promotion, strength reduction, and copy
+propagation.  It does \emph{not} perform loop optimisations, inlining,
+vectorisation, or global (inter-procedural) analysis.  Generated code is
+correct but not aggressively optimised.
+
+\paragraph{Debug information granularity.}
+Under \texttt{-g}, DWARF is emitted at function granularity (each function's
+start), which is enough to name functions in a backtrace but not to map
+individual statements or to describe local variables.
+
+\section{The Standing Rule}
+
+Every item above shares one property: when \kcc{} cannot compile a construct,
+it says so.  It does not guess, it does not emit a plausible-looking wrong
+instruction, and it does not silently drop the construct.  The boundary moves
+outward as features land; until then, an honest refusal keeps every program
+\kcc{} \emph{does} accept trustworthy.

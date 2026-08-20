@@ -693,6 +693,25 @@ int main(void){ struct S s; s.x = 41; ll v = 100; return (g(s.x) == 42 && f(0) =
 # expression.  Used in declarations, casts, and sizeof; __typeof__ is the alias.
 difftest "gnu-typeof" \
     "struct S { int a; long b; }; static struct S g = { 1, 0x99 }; int main(void){ int x = 5; typeof(x) y = x + 1; __typeof__(&x) p = &x; typeof(g) c = g; unsigned u = 4000000000u; typeof(u) v = u; return (y == 6 && *p == 5 && c.b == 0x99 && v == 4000000000u && sizeof(typeof(double)) == 8) ? 0 : 1; }"
+# typeof of an *expression* must keep that expression's real type, not silently
+# fall back to int.  These cases would all pass with an int fallback if the
+# operands were int, so each names a wider type: `double` (8 bytes, distinct
+# codegen) and a `long` sum.  The block-local uses also exercise resolving the
+# operand name after its scope is gone (see the memoisation in resolve-type).
+difftest "gnu-typeof-expr-type" \
+    "int main(void){ double d = 2.5; __typeof__(d) x = d; typeof(d + d) s = d + d; long a = 3, b = 4; __typeof__(a * b) p = a * b; return (sizeof(x) == 8 && (int)(s * 2.0) == 10 && sizeof(p) == 8 && p == 12) ? 0 : 1; }"
+# GNU statement expressions `({ ... })`: the value is the final expression-
+# statement.  Covers a plain value, an intermediate declaration whose local
+# feeds the result, a loop that accumulates, and the canonical typeof-based
+# `max` idiom written inline (statement expression + typeof together).
+difftest "gnu-statement-expr" \
+    "int main(void){ int a = ({ int t = 3; t * t + 1; }); int b = ({ 5; }); int c = ({ int s = 0; for (int i = 0; i < 4; i++) s += i; s; }); int m = ({ __typeof__(a) _x = a; __typeof__(b) _y = b; _x > _y ? _x : _y; }); return (a == 10 && b == 5 && c == 6 && m == 10) ? 0 : 1; }"
+# The identifier-led expression statement `a > b ? a : b;` must parse its whole
+# operator chain and trailing ternary --- a bare multiplicative-then-additive
+# chain (`t * t + 1;`) and a relational-then-ternary both begin with an
+# identifier consumed for label look-ahead.
+difftest "expr-stmt-operator-chain" \
+    "int main(void){ int t = 3, r = 0; t * t + 1; r = t * t + 1; int m; t > r ? (m = t) : (m = r); return (r == 10 && m == 10) ? 0 : 1; }"
 # A STORE's IR_DEST holds its access-size code, not a vreg.  The spill-slot
 # colourer read IR_DEST as a freshly-defined vreg for every instruction, so a
 # narrow store's access-size code (e.g. 2 for a 16-bit store) posed as "vreg 2"

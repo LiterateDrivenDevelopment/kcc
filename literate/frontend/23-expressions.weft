@@ -529,6 +529,15 @@ _kcc_parse_cast_expr:
     // Consume '('
     bl _kcc_pp_next
 
+    // GNU statement expression: `({ statements })`.  A brace immediately
+    // after the opening parenthesis is unambiguous -- no type-name or
+    // ordinary expression can begin with `{` in this position.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_LBRACE
+    b.eq .Lcast_stmt_expr
+
     // Check if next token starts a type
     bl _kcc_parse_is_type_token
     cbz x0, .Lcast_paren_expr
@@ -585,6 +594,24 @@ _kcc_parse_cast_expr:
     str x19, [x0, #AST_F0]
 
     // Apply postfix operations (call, subscript, member access, etc.)
+    bl _kcc_parse_postfix_tail
+    b .Lcast_done
+
+.Lcast_stmt_expr:
+    // GNU statement expression: the `(` is consumed and a compound statement
+    // follows.  `_kcc_parse_compound` consumes the whole `{ ... }` block; the
+    // value of the construct is that of its final expression-statement,
+    // determined later in semantic analysis.  Suffixes may chain onto it, so
+    // it too runs through the postfix tail.
+    bl _kcc_parse_compound        // consumes `{ ... }`
+    mov x19, x0
+
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+
+    mov x0, #AST_STMT_EXPR
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]        // F0 = compound statement
     bl _kcc_parse_postfix_tail
     b .Lcast_done
 

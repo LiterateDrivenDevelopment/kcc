@@ -294,15 +294,25 @@ _kcc_parse_expr_rest:
     b .Lexpr_rest_check_comma
 
 .Lexpr_rest_check_binary:
-    // Check for binary operators via precedence
+    // Precedence-climbing loop over binary operators.  We treat the running
+    // result in x19 as the left operand and, for each operator, parse a
+    // right operand at the next-higher precedence.  Looping back here after
+    // building each node---rather than falling straight through to the comma
+    // check---is what makes an operator *chain* (`a - b - c`) and, crucially,
+    // a trailing ternary (`a > b ? a : b`) parse correctly at statement
+    // position: the earlier code built a single binary node and skipped both
+    // the remaining operators and the `?` check, so `a > b ? a : b;` failed
+    // with `expected ';'`.  When no binary operator follows, x0 is 0 and we
+    // fall through to the ternary check.  We reload the current token into x0
+    // here because \texttt{\_kcc\_prec\_lookup} reads its argument from x0, and
+    // on the loop-back edge x0 still holds the binary node just built --- not
+    // the next token.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
     bl _kcc_prec_lookup
     cbz x0, .Lexpr_rest_check_ternary
 
-    // We have a binary op. Need to handle this properly.
-    // The cleanest approach: treat x19 as the LHS and continue
-    // with precedence climbing from here.
-    // Build a wrapper that simulates: we already have LHS, now
-    // enter the binary loop.
     mov x20, x0                  // x20 = prec of current op
 
     adrp x0, _kcc_tok_type@@PAGE
@@ -313,7 +323,7 @@ _kcc_parse_expr_rest:
 
     add x0, x20, #1
     bl _kcc_parse_binary_expr    // parse rhs with prec+1
-    mov x22, x0                  // x22 = rhs (callee-saved)
+    mov x22, x0                  // x22 = rhs
 
     mov x0, #AST_BINARY_EXPR
     bl _kcc_ast_alloc
@@ -322,8 +332,8 @@ _kcc_parse_expr_rest:
     str x22, [x0, #AST_F2]      // rhs
     mov x19, x0
 
-    // Continue checking for more binary/ternary
-    b .Lexpr_rest_check_comma
+    // Continue climbing: more binary operators, then a ternary, then comma.
+    b .Lexpr_rest_check_binary
 
 .Lexpr_rest_check_ternary:
     // Check for '?'

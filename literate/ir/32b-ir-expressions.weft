@@ -75,9 +75,16 @@ _kcc_ir_build_expr:
     b.eq .Libe_generic
     cmp x0, #AST_COMPOUND_LIT
     b.eq .Libe_compound_lit
+    cmp x0, #AST_STMT_EXPR
+    b.eq .Libe_stmt_expr
 
     // Unhandled expression — return 0
     b .Libe_zero
+
+.Libe_stmt_expr:
+    mov x0, x19
+    bl _kcc_ir_build_stmt_expr
+    b .Libe_done
 
 .Libe_compound_lit:
     // A compound literal materialises an anonymous object; its address is the
@@ -215,6 +222,74 @@ _kcc_ir_build_expr:
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_ir_build_expr
+@}
+
+\subsection{Statement Expression}
+
+The GNU statement expression \texttt{(\{ \emph{stmt} \ldots \})} evaluates a
+compound block and takes as its value that of the block's final
+expression-statement.  We build every item in order --- the same walk that
+\texttt{.Libs\_compound} performs, bracketed by a scope enter/leave so inner
+declarations do not leak --- but treat the \emph{last} item specially: when it
+is an expression-statement its expression is built directly with
+\texttt{\_kcc\_ir\_build\_expr} so its result vreg becomes the value of the
+whole construct.  If the block is empty, or ends in a declaration or a
+control-flow statement, the construct is \texttt{void} and we return the
+null vreg.  Because SSA vregs are function-global, the returned vreg remains
+valid after the block's names go out of scope.
+
+@d IR: build expression @{
+// -- kcc_ir_build_stmt_expr -----------------------------------------------
+// uint64_t kcc_ir_build_stmt_expr(node *se)
+//   x0 = AST_STMT_EXPR (F0 = compound statement)
+// Returns the value vreg of the final expression-statement (0 if void).
+.text
+.globl _kcc_ir_build_stmt_expr
+.p2align 2
+_kcc_ir_build_stmt_expr:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+
+    mov x22, #0                  // default value: void → null vreg
+    ldr x20, [x0, #AST_F0]       // compound node
+    cbz x20, .Libse_done
+
+    bl _kcc_ir_scope_enter
+    ldr x21, [x20, #AST_F0]      // first item in the block
+    cbz x21, .Libse_leave        // empty block → void
+
+.Libse_loop:
+    ldr x19, [x21, #AST_F4]      // next sibling (callee-saved across the call)
+    cbz x19, .Libse_last         // x21 is the final item
+    mov x0, x21
+    bl _kcc_ir_build_stmt        // ordinary non-value statement
+    mov x21, x19
+    b .Libse_loop
+
+.Libse_last:
+    ldr x0, [x21, #AST_TAG]
+    cmp x0, #AST_EXPR_STMT
+    b.ne .Libse_last_stmt
+    // Value-producing tail: build the expression itself, keep its vreg.
+    ldr x0, [x21, #AST_F0]       // the expression
+    bl _kcc_ir_build_expr
+    mov x22, x0
+    b .Libse_leave
+.Libse_last_stmt:
+    mov x0, x21
+    bl _kcc_ir_build_stmt        // non-expression tail → void
+
+.Libse_leave:
+    bl _kcc_ir_scope_leave
+.Libse_done:
+    mov x0, x22
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_ir_build_stmt_expr
 @}
 
 \subsection{Integer Literal}

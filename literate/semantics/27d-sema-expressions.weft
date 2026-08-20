@@ -79,6 +79,8 @@ _kcc_sema_expr:
     b.eq .Lse_compound_lit
     cmp x20, #AST_INIT_LIST
     b.eq .Lse_init_list
+    cmp x20, #AST_STMT_EXPR
+    b.eq .Lse_stmt_expr
 
     // Default: int
     b .Lse_default_int
@@ -217,6 +219,38 @@ _kcc_sema_expr:
 .Lse_paren:
     ldr x0, [x19, #AST_F0]
     bl _kcc_sema_expr
+    b .Lse_store
+
+.Lse_stmt_expr:
+    // GNU statement expression `({ ... })`.  Type-check the compound block ---
+    // this recursively types every inner statement, including the value-yielding
+    // final expression.  The construct's type is that of its last item when that
+    // item is an expression-statement; otherwise (a declaration, a control-flow
+    // statement, or an empty block) it is void.
+    ldr x0, [x19, #AST_F0]         // compound node
+    cbz x0, .Lse_stmt_void
+    mov x20, x0
+    bl _kcc_sema_check_stmt        // types all inner statements
+    ldr x1, [x20, #AST_F0]         // first item in the block
+    cbz x1, .Lse_stmt_void
+.Lse_se_last:
+    ldr x2, [x1, #AST_F4]          // walk the sibling chain to the last item
+    cbz x2, .Lse_se_have_last
+    mov x1, x2
+    b .Lse_se_last
+.Lse_se_have_last:
+    ldr x2, [x1, #AST_TAG]
+    cmp x2, #AST_EXPR_STMT
+    b.ne .Lse_stmt_void
+    ldr x0, [x1, #AST_F0]          // the final expression
+    cbz x0, .Lse_stmt_void
+    ldr x0, [x0, #AST_F3]          // its resolved type
+    cbz x0, .Lse_stmt_void
+    b .Lse_store
+.Lse_stmt_void:
+    adrp x0, _kcc_type_void@@PAGE
+    add  x0, x0, _kcc_type_void@@PAGEOFF
+    ldr  x0, [x0]
     b .Lse_store
 
 .Lse_default_int:

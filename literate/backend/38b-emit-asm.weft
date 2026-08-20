@@ -51,6 +51,9 @@ _kcc_asm_snips:      .quad 0
 _kcc_asm_snip_count: .quad 0
 .globl _kcc_asm_snip_cap
 _kcc_asm_snip_cap:   .quad 0
+// Per-word byte flags: 1 = a branch target that needs a synthetic label.
+.globl _kcc_as_targets
+_kcc_as_targets:     .quad 0
 .section __TEXT,__cstring,cstring_literals
 _kcc_as_s_sect:   .asciz "\t.section __TEXT,__text,regular\n"
 _kcc_as_s_p2a:    .asciz "\t.p2align 2\n"
@@ -66,6 +69,13 @@ _kcc_as_s_pageoff:.asciz "@@PAGEOFF"
 _kcc_as_s_gotpage:.asciz "@@GOTPAGE"
 _kcc_as_s_gotoff: .asciz "@@GOTPAGEOFF"
 _kcc_as_s_hexdig: .asciz "0123456789abcdef"
+_kcc_as_s_bdot:   .asciz "\tb."
+_kcc_as_s_b:      .asciz "\tb\t"
+_kcc_as_s_cbz:    .asciz "\tcbz\t"
+_kcc_as_s_cbnz:   .asciz "\tcbnz\t"
+_kcc_as_s_lc:     .asciz "Lc"
+// Condition names indexed by cond*3 (two chars + NUL each).
+_kcc_as_s_conds:  .ascii "eq\0ne\0hs\0lo\0mi\0pl\0vs\0vc\0hi\0ls\0ge\0lt\0gt\0le\0al\0nv\0"
 .globl _kcc_as_s_env
 _kcc_as_s_env:    .asciz "KCC_EMIT_ASM"
 .text
@@ -644,6 +654,325 @@ _kcc_as_reloc_line:
     ldp x29, x30, [sp], #48
     ret
 
+// -- kcc_as_wreg --------------------------------------------------------------
+// void kcc_as_wreg(uint32_t n) — append a w-register name (31 → wzr).
+.globl _kcc_as_wreg
+.p2align 2
+_kcc_as_wreg:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov w19, w0
+    mov w0, #'w'
+    bl _kcc_as_ch
+    cmp w19, #31
+    b.ne .Laswr_num
+    mov w0, #'z'
+    bl _kcc_as_ch
+    mov w0, #'r'
+    bl _kcc_as_ch
+    b .Laswr_done
+.Laswr_num:
+    mov x0, x19
+    bl _kcc_as_dec
+.Laswr_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_as_sym_at ------------------------------------------------------------
+// uint64_t kcc_as_sym_at(uint64_t off) — name pointer of a text symbol defined
+// at `off`, or 0.  Used to reference a branch/call target by its real name.
+.globl _kcc_as_sym_at
+.p2align 2
+_kcc_as_sym_at:
+    adrp x1, _kcc_linker_syms@@PAGE
+    add  x1, x1, _kcc_linker_syms@@PAGEOFF
+    ldr x1, [x1]
+    ldr x2, [x1, #VEC_COUNT]
+    ldr x3, [x1, #VEC_DATA]
+    mov x4, #0
+.Lsyat_loop:
+    cmp x4, x2
+    b.hs .Lsyat_none
+    mov x5, #SYM_ENTRY_SIZE
+    madd x6, x4, x5, x3
+    ldr x7, [x6, #SYM_SECTION]
+    cmp x7, #1
+    b.ne .Lsyat_next
+    ldr x7, [x6, #SYM_VALUE]
+    cmp x7, x0
+    b.ne .Lsyat_next
+    ldr x0, [x6, #SYM_NAME]
+    ret
+.Lsyat_next:
+    add x4, x4, #1
+    b .Lsyat_loop
+.Lsyat_none:
+    mov x0, #0
+    ret
+
+// -- kcc_as_branch_kind -------------------------------------------------------
+// uint64_t kcc_as_branch_kind(uint32_t word)
+//   0 = not a branch, 1 = b, 2 = bl, 3 = b.cond, 4 = cbz, 5 = cbnz.
+.globl _kcc_as_branch_kind
+.p2align 2
+_kcc_as_branch_kind:
+    lsr w1, w0, #26
+    cmp w1, #0x05                 // b
+    b.eq .Lbk_b
+    cmp w1, #0x25                 // bl
+    b.eq .Lbk_bl
+    lsr w1, w0, #24
+    and w2, w1, #0xff
+    cmp w2, #0x54                 // b.cond (bits[31:24]=0x54, bit4=0)
+    b.ne .Lbk_cb
+    tst w0, #0x10
+    b.ne .Lbk_none
+    mov x0, #3
+    ret
+.Lbk_cb:
+    and w2, w1, #0x7f
+    cmp w2, #0x34                 // cbz
+    b.eq .Lbk_cbz
+    cmp w2, #0x35                 // cbnz
+    b.eq .Lbk_cbnz
+.Lbk_none:
+    mov x0, #0
+    ret
+.Lbk_b:
+    mov x0, #1
+    ret
+.Lbk_bl:
+    mov x0, #2
+    ret
+.Lbk_cbz:
+    mov x0, #4
+    ret
+.Lbk_cbnz:
+    mov x0, #5
+    ret
+
+// -- kcc_as_branch_target -----------------------------------------------------
+// uint64_t kcc_as_branch_target(uint32_t word, uint64_t off)
+//   Byte offset the branch targets, or (uint64_t)-1 if not a branch.
+.globl _kcc_as_branch_target
+.p2align 2
+_kcc_as_branch_target:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov w19, w0                   // word
+    mov x20, x1                   // off
+    bl _kcc_as_branch_kind        // (x0=word already) → kind
+    cbz x0, .Lbt_none
+    cmp x0, #2
+    b.gt .Lbt_imm19               // kinds 3,4,5 use imm19; 1,2 use imm26
+    and w1, w19, #0x03FFFFFF       // imm26
+    lsl w1, w1, #6               // sign-extend from bit 25
+    asr w1, w1, #6
+    b .Lbt_compute
+.Lbt_imm19:
+    lsr w1, w19, #5
+    and w1, w1, #0x7FFFF           // imm19
+    lsl w1, w1, #13             // sign-extend from bit 18
+    asr w1, w1, #13
+.Lbt_compute:
+    sxtw x1, w1
+    lsl x1, x1, #2               // instructions → bytes
+    add x0, x20, x1
+    b .Lbt_done
+.Lbt_none:
+    mov x0, #-1
+.Lbt_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_as_label_ref ---------------------------------------------------------
+// void kcc_as_label_ref(uint64_t target) — append the target's symbol name if
+// one is defined there, else a synthetic `Lc<target>` label.
+.globl _kcc_as_label_ref
+.p2align 2
+_kcc_as_label_ref:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    bl _kcc_as_sym_at             // (x0=target) → name or 0
+    cbz x0, .Llr_synth
+    bl _kcc_as_str
+    b .Llr_done
+.Llr_synth:
+    adrp x0, _kcc_as_s_lc@@PAGE
+    add  x0, x0, _kcc_as_s_lc@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_as_dec
+.Llr_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_as_render_branch -----------------------------------------------------
+// void kcc_as_render_branch(uint32_t word, uint64_t off) — emit the symbolic
+// form of an internal (non-relocated) branch, so `as` recomputes its distance.
+.globl _kcc_as_render_branch
+.p2align 2
+_kcc_as_render_branch:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov w19, w0                   // word
+    mov x20, x1                   // off
+    bl _kcc_as_branch_kind        // (x0=word) → kind
+    mov x21, x0
+    mov w0, w19
+    mov x1, x20
+    bl _kcc_as_branch_target
+    mov x22, x0                   // target
+    cmp x21, #1
+    b.eq .Lrb_b
+    cmp x21, #2
+    b.eq .Lrb_bl
+    cmp x21, #3
+    b.eq .Lrb_bcond
+    cmp x21, #4
+    b.eq .Lrb_cbz
+    b .Lrb_cbnz
+.Lrb_b:
+    adrp x0, _kcc_as_s_b@@PAGE
+    add  x0, x0, _kcc_as_s_b@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x22
+    bl _kcc_as_label_ref
+    b .Lrb_nl
+.Lrb_bl:
+    adrp x0, _kcc_as_s_bl@@PAGE
+    add  x0, x0, _kcc_as_s_bl@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x22
+    bl _kcc_as_label_ref
+    b .Lrb_nl
+.Lrb_bcond:
+    adrp x0, _kcc_as_s_bdot@@PAGE
+    add  x0, x0, _kcc_as_s_bdot@@PAGEOFF
+    bl _kcc_as_str
+    and w0, w19, #0xf             // cond
+    mov w1, #3
+    mul w0, w0, w1
+    adrp x1, _kcc_as_s_conds@@PAGE
+    add  x1, x1, _kcc_as_s_conds@@PAGEOFF
+    add x0, x1, x0
+    bl _kcc_as_str
+    mov w0, #'\t'
+    bl _kcc_as_ch
+    mov x0, x22
+    bl _kcc_as_label_ref
+    b .Lrb_nl
+.Lrb_cbz:
+    adrp x0, _kcc_as_s_cbz@@PAGE
+    add  x0, x0, _kcc_as_s_cbz@@PAGEOFF
+    bl _kcc_as_str
+    b .Lrb_cbcommon
+.Lrb_cbnz:
+    adrp x0, _kcc_as_s_cbnz@@PAGE
+    add  x0, x0, _kcc_as_s_cbnz@@PAGEOFF
+    bl _kcc_as_str
+.Lrb_cbcommon:
+    // register: x if sf(bit31)=1 else w
+    and w0, w19, #0x1f
+    tst w19, #0x80000000
+    b.eq .Lrb_cbw
+    bl _kcc_as_xreg
+    b .Lrb_cbsep
+.Lrb_cbw:
+    bl _kcc_as_wreg
+.Lrb_cbsep:
+    mov w0, #','
+    bl _kcc_as_ch
+    mov w0, #' '
+    bl _kcc_as_ch
+    mov x0, x22
+    bl _kcc_as_label_ref
+.Lrb_nl:
+    mov w0, #'\n'
+    bl _kcc_as_ch
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_as_mark_targets ------------------------------------------------------
+// void kcc_as_mark_targets(uint64_t code_size) — allocate the per-word target
+// flag array and mark the target of every internal (non-relocated) branch that
+// lands where no symbol is defined, so the renderer can emit a synthetic label.
+.globl _kcc_as_mark_targets
+.p2align 2
+_kcc_as_mark_targets:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                   // code_size
+    lsr x20, x19, #2              // number of words
+    add x0, x20, #1
+    bl _kcc_arena_alloc
+    mov x21, x0                   // flag array
+    adrp x1, _kcc_as_targets@@PAGE
+    add  x1, x1, _kcc_as_targets@@PAGEOFF
+    str x21, [x1]
+    // zero it
+    mov x2, #0
+.Lmt_zero:
+    cmp x2, x20
+    b.hs .Lmt_scan
+    strb wzr, [x21, x2]
+    add x2, x2, #1
+    b .Lmt_zero
+.Lmt_scan:
+    mov x22, #0                   // offset
+.Lmt_loop:
+    cmp x22, x19
+    b.hs .Lmt_done
+    // Skip relocated words (calls/data refs go through the reloc path).
+    mov x0, x22
+    bl _kcc_as_reloc_at
+    cbnz x0, .Lmt_next
+    adrp x0, _kcc_code_buf@@PAGE
+    add  x0, x0, _kcc_code_buf@@PAGEOFF
+    ldr x0, [x0]
+    ldr w0, [x0, x22]            // word
+    mov w23, w0
+    bl _kcc_as_branch_kind
+    cbz x0, .Lmt_next
+    mov w0, w23
+    mov x1, x22
+    bl _kcc_as_branch_target      // x0 = target
+    cmn x0, #1
+    b.eq .Lmt_next               // -1
+    mov x24, x0                   // save target
+    bl _kcc_as_sym_at             // (x0=target) → name or 0
+    cbnz x0, .Lmt_next           // has a real symbol → no synthetic label
+    // mark flag[target/4] = 1
+    adrp x0, _kcc_as_targets@@PAGE
+    add  x0, x0, _kcc_as_targets@@PAGEOFF
+    ldr x0, [x0]
+    lsr x1, x24, #2
+    mov w2, #1
+    strb w2, [x0, x1]
+.Lmt_next:
+    add x22, x22, #4
+    b .Lmt_loop
+.Lmt_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // -- kcc_as_render_text -------------------------------------------------------
 // void kcc_as_render_text(void) — emit the __text section.  The code buffer is
 // [ instructions | string-literal bytes ]: emit_strings appended the cstring
@@ -674,6 +1003,9 @@ _kcc_as_render_text:
     add  x0, x0, _kcc_cstr_pos@@PAGEOFF
     ldr x0, [x0]                  // cstring size
     sub x20, x22, x0              // code_size = code_pos - cstr_pos
+    // Mark internal branch targets so they get synthetic labels.
+    mov x0, x20
+    bl _kcc_as_mark_targets
     mov x19, #0                   // offset
 .Lasrt_loop:
     cmp x19, x20
@@ -681,6 +1013,24 @@ _kcc_as_render_text:
     // Emit any labels at this offset.
     mov x0, x19
     bl _kcc_as_labels_at
+    // Synthetic branch-target label (only where no real symbol is defined).
+    lsr x0, x19, #2
+    adrp x1, _kcc_as_targets@@PAGE
+    add  x1, x1, _kcc_as_targets@@PAGEOFF
+    ldr x1, [x1]
+    cbz x1, .Lasrt_nolabel
+    ldrb w2, [x1, x0]
+    cbz w2, .Lasrt_nolabel
+    adrp x0, _kcc_as_s_lc@@PAGE
+    add  x0, x0, _kcc_as_s_lc@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_as_dec
+    mov w0, #':'
+    bl _kcc_as_ch
+    mov w0, #'\n'
+    bl _kcc_as_ch
+.Lasrt_nolabel:
     // Inline-asm snippet at this offset?  Splice the template verbatim in place
     // of the NOP placeholder the codegen emitted.
     mov x0, x19
@@ -710,6 +1060,16 @@ _kcc_as_render_text:
     bl _kcc_as_reloc_line
     b .Lasrt_advance
 .Lasrt_raw:
+    // Internal (non-relocated) branch → symbolic form so `as` recomputes the
+    // distance (robust to inline-asm templates that change the word count).
+    mov w0, w21
+    bl _kcc_as_branch_kind
+    cbz x0, .Lasrt_rawlong
+    mov w0, w21
+    mov x1, x19
+    bl _kcc_as_render_branch
+    b .Lasrt_advance
+.Lasrt_rawlong:
     adrp x0, _kcc_as_s_long@@PAGE
     add  x0, x0, _kcc_as_s_long@@PAGEOFF
     bl _kcc_as_str

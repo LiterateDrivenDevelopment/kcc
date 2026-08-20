@@ -74,6 +74,9 @@ _kcc_as_s_b:      .asciz "\tb\t"
 _kcc_as_s_cbz:    .asciz "\tcbz\t"
 _kcc_as_s_cbnz:   .asciz "\tcbnz\t"
 _kcc_as_s_lc:     .asciz "Lc"
+_kcc_as_s_zerofill:.asciz "\t.zerofill __DATA,__common,"
+_kcc_as_s_a3nl:   .asciz ",3\n"
+_kcc_as_s_modsect:.asciz "\t.section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad "
 // Condition names indexed by cond*3 (two chars + NUL each).
 _kcc_as_s_conds:  .ascii "eq\0ne\0hs\0lo\0mi\0pl\0vs\0vc\0hi\0ls\0ge\0lt\0gt\0le\0al\0nv\0"
 .globl _kcc_as_s_env
@@ -1112,6 +1115,129 @@ The top-level entry initialises the buffer, renders the text section, and
 writes the accumulated bytes to the given path in a single \texttt{write}.
 
 @d Emit-asm: render @{
+// -- kcc_as_common_size -------------------------------------------------------
+// uint64_t kcc_as_common_size(uint64_t off) — size of the __common global at
+// `off`: the gap to the next section-2 symbol offset, or to the end of the
+// __common region.  (kcc stores only offsets, not per-symbol sizes.)
+.globl _kcc_as_common_size
+.p2align 2
+_kcc_as_common_size:
+    mov x8, x0                    // this offset
+    adrp x1, _kcc_globals_size@@PAGE
+    add  x1, x1, _kcc_globals_size@@PAGEOFF
+    ldr x9, [x1]                  // best = total common size
+    adrp x1, _kcc_linker_syms@@PAGE
+    add  x1, x1, _kcc_linker_syms@@PAGEOFF
+    ldr x1, [x1]
+    ldr x2, [x1, #VEC_COUNT]
+    ldr x3, [x1, #VEC_DATA]
+    mov x4, #0
+.Lcs_loop:
+    cmp x4, x2
+    b.hs .Lcs_done
+    mov x5, #SYM_ENTRY_SIZE
+    madd x6, x4, x5, x3
+    ldr x7, [x6, #SYM_SECTION]
+    cmp x7, #2
+    b.ne .Lcs_next
+    ldr x7, [x6, #SYM_VALUE]
+    cmp x7, x8
+    b.ls .Lcs_next               // <= this: not a successor
+    cmp x7, x9
+    b.hs .Lcs_next               // not smaller than best
+    mov x9, x7
+.Lcs_next:
+    add x4, x4, #1
+    b .Lcs_loop
+.Lcs_done:
+    sub x0, x9, x8
+    ret
+
+// -- kcc_as_render_common -----------------------------------------------------
+// void kcc_as_render_common(void) — emit a `.zerofill __DATA,__common` entry for
+// every zero-storage global (section 2).  Their initialisers, if any, run as
+// ordinary code in the module-init function.
+.globl _kcc_as_render_common
+.p2align 2
+_kcc_as_render_common:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    adrp x0, _kcc_linker_syms@@PAGE
+    add  x0, x0, _kcc_linker_syms@@PAGEOFF
+    ldr x0, [x0]
+    ldr x19, [x0, #VEC_COUNT]
+    ldr x20, [x0, #VEC_DATA]
+    mov x21, #0
+.Lrc_loop:
+    cmp x21, x19
+    b.hs .Lrc_done
+    mov x0, #SYM_ENTRY_SIZE
+    madd x22, x21, x0, x20        // &sym[i]
+    ldr x0, [x22, #SYM_SECTION]
+    cmp x0, #2                    // __common?
+    b.ne .Lrc_next
+    // .globl if external
+    ldr x0, [x22, #SYM_FLAGS]
+    tst x0, #N_EXT
+    b.eq .Lrc_zf
+    adrp x0, _kcc_as_s_globl@@PAGE
+    add  x0, x0, _kcc_as_s_globl@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x22, #SYM_NAME]
+    bl _kcc_as_str
+    mov w0, #'\n'
+    bl _kcc_as_ch
+.Lrc_zf:
+    adrp x0, _kcc_as_s_zerofill@@PAGE
+    add  x0, x0, _kcc_as_s_zerofill@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x22, #SYM_NAME]
+    bl _kcc_as_str
+    mov w0, #','
+    bl _kcc_as_ch
+    ldr x0, [x22, #SYM_VALUE]
+    bl _kcc_as_common_size
+    bl _kcc_as_dec
+    adrp x0, _kcc_as_s_a3nl@@PAGE
+    add  x0, x0, _kcc_as_s_a3nl@@PAGEOFF
+    bl _kcc_as_str
+.Lrc_next:
+    add x21, x21, #1
+    b .Lrc_loop
+.Lrc_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_as_render_modinit ----------------------------------------------------
+// void kcc_as_render_modinit(void) — when this TU synthesised a module-init
+// function, emit the __mod_init_func pointer so dyld runs it before main (this
+// is what initialises non-const globals).
+.globl _kcc_as_render_modinit
+.p2align 2
+_kcc_as_render_modinit:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    adrp x0, _kcc_modinit_sym@@PAGE
+    add  x0, x0, _kcc_modinit_sym@@PAGEOFF
+    ldr x19, [x0]                 // symbol index + 1 (0 = none)
+    cbz x19, .Lrmi_done
+    adrp x0, _kcc_as_s_modsect@@PAGE
+    add  x0, x0, _kcc_as_s_modsect@@PAGEOFF
+    bl _kcc_as_str
+    sub x0, x19, #1
+    bl _kcc_as_symname
+    mov w0, #'\n'
+    bl _kcc_as_ch
+.Lrmi_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
 // -- kcc_as_render ------------------------------------------------------------
 // int kcc_as_render(const char *path) — render the current translation unit's
 // generated code as `.s` text and write it to `path`.  Returns 0 on success.
@@ -1124,6 +1250,8 @@ _kcc_as_render:
     mov x19, x0                   // path
     bl _kcc_as_init
     bl _kcc_as_render_text
+    bl _kcc_as_render_common      // __common zero-storage globals
+    bl _kcc_as_render_modinit     // __mod_init_func (global initialisers)
     // Open the output file (O_WRONLY|O_CREAT|O_TRUNC = 0x601, mode 0644).
     mov x0, x19
     mov x1, #0x601

@@ -101,9 +101,27 @@ _kcc_sema_resolve_type:
     b.eq .Lsrt_name
     cmp x0, #AST_TYPE_QUALS
     b.eq .Lsrt_quals
+    cmp x0, #AST_TYPE_TYPEOF
+    b.eq .Lsrt_typeof
 
     // Unknown type node → return int as fallback
     b .Lsrt_fallback
+
+.Lsrt_typeof:
+    // GNU typeof: F1=1 means the operand is a type-name (resolve it directly);
+    // F1=0 means it is an expression, whose type is obtained by type-checking it
+    // in this unevaluated context (sema does not emit code, so no side effects).
+    ldr x1, [x19, #AST_F1]      // is_type
+    ldr x0, [x19, #AST_F0]      // operand
+    cbz x0, .Lsrt_fallback
+    cbz x1, .Lsrt_typeof_expr
+    bl _kcc_sema_resolve_type   // type-name → resolve
+    cbz x0, .Lsrt_fallback
+    b .Lsrt_done
+.Lsrt_typeof_expr:
+    bl _kcc_sema_expr           // expression → its resolved type
+    cbz x0, .Lsrt_fallback
+    b .Lsrt_done
 
 .Lsrt_builtin:
     // F0 = specifier bitmask

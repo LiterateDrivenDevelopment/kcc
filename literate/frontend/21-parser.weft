@@ -85,6 +85,7 @@ Offset & Field & Description \\
 .equ AST_TYPE_UNION,     26   // F0=union_decl
 .equ AST_TYPE_ENUM,      27   // F0=enum_decl
 .equ AST_TYPE_QUALS,     28   // F0=base_type, F1=quals
+.equ AST_TYPE_TYPEOF,    29   // F0=operand (type-name or expr), F1=is_type (1/0)
 
 // Statements (30-44)
 .equ AST_COMPOUND,       30   // F0=first_item

@@ -350,7 +350,53 @@ _kcc_parse_skip_attributes:
     ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
-@| _kcc_parse_skip_attributes
+
+// -- kcc_parse_typeof --------------------------------------------------
+// node *kcc_parse_typeof(void)
+// GNU \texttt{typeof} (and \texttt{\_\_typeof\_\_}): a type-specifier whose value
+// is the type of a parenthesised type-name or expression.  It disambiguates the
+// two forms exactly as \texttt{sizeof} does---peeking past \texttt{(} for a
+// type-start token---and wraps the operand in an \texttt{AST\_TYPE\_TYPEOF} node
+// (\texttt{F1}=1 for a type-name, 0 for an expression) that the type resolver
+// unwraps later, when full semantic type information is available.
+.globl _kcc_parse_typeof
+.p2align 2
+_kcc_parse_typeof:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    bl _kcc_pp_next               // consume 'typeof'
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+    // type-name or expression?
+    bl _kcc_parse_is_type_token
+    cbz x0, .Lpto_expr
+    // typeof(type-name)
+    bl _kcc_parse_type_name
+    mov x19, x0
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, #AST_TYPE_TYPEOF
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    mov x1, #1
+    str x1, [x0, #AST_F1]        // is_type = 1
+    b .Lpto_done
+.Lpto_expr:
+    // typeof(expression)
+    bl _kcc_parse_expr
+    mov x19, x0
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, #AST_TYPE_TYPEOF
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str xzr, [x0, #AST_F1]       // is_type = 0
+.Lpto_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_parse_skip_attributes _kcc_parse_typeof
 @}
 
 @d Decl: parse specifiers @{
@@ -442,6 +488,10 @@ _kcc_parse_decl_specs:
     b.eq .Ldecl_type_union
     cmp x0, #TOK_ENUM
     b.eq .Ldecl_type_enum
+
+    // GNU typeof(...) — a complete type specifier
+    cmp x0, #TOK_TYPEOF
+    b.eq .Ldecl_type_typeof
 
     // Typedef name (identifier that is a typedef)
     cmp x0, #TOK_IDENT
@@ -645,6 +695,12 @@ while typedef names are looked up in the typedef table and interned.
 
 .Ldecl_type_enum:
     bl _kcc_parse_enum
+    mov x20, x0
+    add x22, x22, #1
+    b .Ldecl_specs_loop
+
+.Ldecl_type_typeof:
+    bl _kcc_parse_typeof
     mov x20, x0
     add x22, x22, #1
     b .Ldecl_specs_loop
@@ -2162,6 +2218,10 @@ _kcc_parse_is_type_token:
     cmp x0, #TOK_UNION
     b.eq .Lis_type_yes
     cmp x0, #TOK_ENUM
+    b.eq .Lis_type_yes
+
+    // GNU typeof(...) starts a type just like a builtin
+    cmp x0, #TOK_TYPEOF
     b.eq .Lis_type_yes
 
     // Type qualifiers (can start a type specifier list)

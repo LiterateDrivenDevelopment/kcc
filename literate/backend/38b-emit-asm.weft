@@ -44,10 +44,11 @@ _kcc_as_pos:   .quad 0        // bytes used
 _kcc_as_cap:   .quad 0        // capacity
 _kcc_as_fd:    .quad 0        // open .s file descriptor
 .section __TEXT,__cstring,cstring_literals
-_kcc_as_s_sect:   .asciz "\t.section __TEXT,__text,regular,pure_instructions\n"
+_kcc_as_s_sect:   .asciz "\t.section __TEXT,__text,regular\n"
 _kcc_as_s_p2a:    .asciz "\t.p2align 2\n"
 _kcc_as_s_globl:  .asciz "\t.globl "
 _kcc_as_s_long:   .asciz "\t.long 0x"
+_kcc_as_s_byte:   .asciz "\t.byte 0x"
 _kcc_as_s_bl:     .asciz "\tbl\t"
 _kcc_as_s_adrp:   .asciz "\tadrp\t"
 _kcc_as_s_add:    .asciz "\tadd\t"
@@ -210,6 +211,29 @@ _kcc_as_hex8:
     subs w20, w20, #4
     b.ge .Lashex_loop
     ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_as_hex2 --------------------------------------------------------------
+// void kcc_as_hex2(uint32_t b) — append exactly 2 hex digits (low byte of b).
+.globl _kcc_as_hex2
+.p2align 2
+_kcc_as_hex2:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    and w19, w0, #0xff
+    lsr w0, w19, #4
+    adrp x1, _kcc_as_s_hexdig@@PAGE
+    add  x1, x1, _kcc_as_s_hexdig@@PAGEOFF
+    ldrb w0, [x1, x0]
+    bl _kcc_as_ch
+    and w0, w19, #0xf
+    adrp x1, _kcc_as_s_hexdig@@PAGE
+    add  x1, x1, _kcc_as_s_hexdig@@PAGEOFF
+    ldrb w0, [x1, x0]
+    bl _kcc_as_ch
+    ldr x19, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
 
@@ -494,14 +518,20 @@ _kcc_as_reloc_line:
     ret
 
 // -- kcc_as_render_text -------------------------------------------------------
-// void kcc_as_render_text(void) — emit the whole __text section as assembly.
+// void kcc_as_render_text(void) — emit the __text section.  The code buffer is
+// [ instructions | string-literal bytes ]: emit_strings appended the cstring
+// region and advanced code_pos, so the instructions occupy the first
+// (code_pos - cstr_pos) bytes and the string data the rest.  Instructions are
+// rendered four bytes at a time (symbolic if relocated, else `.long`); the
+// string region is rendered byte at a time as `.byte`, so a literal whose length
+// is not a multiple of four, or a label that lands mid-word, is still exact.
 .globl _kcc_as_render_text
 .p2align 2
 _kcc_as_render_text:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
-    str x21, [sp, #32]
+    stp x21, x22, [sp, #32]
     // Section header + alignment.
     adrp x0, _kcc_as_s_sect@@PAGE
     add  x0, x0, _kcc_as_s_sect@@PAGEOFF
@@ -509,14 +539,18 @@ _kcc_as_render_text:
     adrp x0, _kcc_as_s_p2a@@PAGE
     add  x0, x0, _kcc_as_s_p2a@@PAGEOFF
     bl _kcc_as_str
-    // Walk the code buffer, four bytes at a time.
-    mov x19, #0                   // offset
+    // x22 = total buffer size (code + strings); x20 = code/string boundary.
     adrp x0, _kcc_code_pos@@PAGE
     add  x0, x0, _kcc_code_pos@@PAGEOFF
-    ldr x20, [x0]                 // code size in bytes
+    ldr x22, [x0]
+    adrp x0, _kcc_cstr_pos@@PAGE
+    add  x0, x0, _kcc_cstr_pos@@PAGEOFF
+    ldr x0, [x0]                  // cstring size
+    sub x20, x22, x0              // code_size = code_pos - cstr_pos
+    mov x19, #0                   // offset
 .Lasrt_loop:
     cmp x19, x20
-    b.hs .Lasrt_done
+    b.hs .Lasrt_strings
     // Emit any labels at this offset.
     mov x0, x19
     bl _kcc_as_labels_at
@@ -543,10 +577,29 @@ _kcc_as_render_text:
 .Lasrt_advance:
     add x19, x19, #4
     b .Lasrt_loop
+.Lasrt_strings:
+    // String-literal region [code_size, code_pos): one `.byte` per byte, with
+    // any string-literal label emitted at its exact offset.
+    cmp x19, x22
+    b.hs .Lasrt_done
+    mov x0, x19
+    bl _kcc_as_labels_at
+    adrp x0, _kcc_as_s_byte@@PAGE
+    add  x0, x0, _kcc_as_s_byte@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_code_buf@@PAGE
+    add  x0, x0, _kcc_code_buf@@PAGEOFF
+    ldr x0, [x0]
+    ldrb w0, [x0, x19]           // the byte
+    bl _kcc_as_hex2
+    mov w0, #'\n'
+    bl _kcc_as_ch
+    add x19, x19, #1
+    b .Lasrt_strings
 .Lasrt_done:
-    ldr x21, [sp, #32]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #64
     ret
 @}
 

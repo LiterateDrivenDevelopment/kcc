@@ -252,9 +252,17 @@ _kcc_pp_next:
     b .Lpp_loop
 
 .Lpp_not_directive:
-    // Check for macro expansion
+    // Check for macro expansion.  A macro name may have been #defined over a
+    // keyword spelling (e.g. `#define __inline__` in system headers), so any
+    // keyword-class token [10, TOK_LPAREN) is also a candidate; try_expand's
+    // hash lookup harmlessly returns 0 for the overwhelming majority that are
+    // not macros.
     cmp  x20, #TOK_IDENT
-    b.ne .Lpp_return
+    b.eq .Lpp_maybe_expand
+    sub  x0, x20, #10          // keyword-class tokens occupy [10, 60)
+    cmp  x0, #50               // 60-10; hs → not expandable
+    b.hs .Lpp_return
+.Lpp_maybe_expand:
     bl _kcc_pp_try_expand
     cbnz x0, .Lpp_loop        // expanded → loop to get token from expansion
 

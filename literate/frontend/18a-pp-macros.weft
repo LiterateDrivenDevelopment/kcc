@@ -26,13 +26,21 @@ _kcc_pp_do_define:
     stp x23, x24, [sp, #48]
     stp x25, x26, [sp, #64]
 
-    // Read macro name
+    // Read macro name.  During preprocessing (translation phase 4) there are
+    // no keywords yet (\stdref{6.4.1}): `int`, `inline`, even `__attribute__`
+    // are ordinary identifiers that a portability header may legally #define.
+    // The lexer, however, eagerly classifies them as keyword tokens, so we
+    // accept both TOK_IDENT and any keyword-class code [10, TOK_LPAREN) here.
     bl _kcc_lex_next
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
     cmp  x0, #TOK_IDENT
-    b.ne .Ldef_err_name
+    b.eq .Ldef_name_ok
+    sub  x1, x0, #10           // keyword-class tokens occupy [10, 60)
+    cmp  x1, #50               // 60-10; hs → neither identifier nor keyword
+    b.hs .Ldef_err_name
+.Ldef_name_ok:
 
     // Save macro name (callee-saved)
     adrp x0, _kcc_tok_start@@PAGE

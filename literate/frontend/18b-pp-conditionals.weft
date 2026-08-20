@@ -1624,6 +1624,7 @@ applied one precedence level up.
 @d PP: eval @{
 // -- _kcc_pp_atoi ---------------------------------------------------
 // Integer-constant to value (hex/octal/decimal): x0=ptr, x1=len → x0=value
+.globl _kcc_pp_atoi
 .p2align 2
 _kcc_pp_atoi:
     mov  x2, #0                // accumulator

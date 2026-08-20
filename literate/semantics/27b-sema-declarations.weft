@@ -426,6 +426,8 @@ _kcc_type_layout:
     cset x20, eq                // x20 = is_union
     ldr x21, [x19, #TY_F0]      // AST_STRUCT_DECL
     cbz x21, .Ltl_zero
+    ldr x0, [x21, #AST_F3]      // layout word: (aligned(N) << 1) | packed
+    str x0, [sp, #104]          // stash across the field loop
     ldr x21, [x21, #AST_F1]     // first field
     cbz x21, .Ltl_zero          // opaque (no body): cannot size
     mov x22, #0                 // running offset (struct)
@@ -454,6 +456,12 @@ _kcc_type_layout:
     mov x2, #8                  // unresolved: assume one 8-byte slot
     mov x3, #8
 .Ltl_field_have:
+    // __attribute__((packed)): every member (and bit-field container) aligns at
+    // 1, so there is no inter-member padding and the aggregate alignment stays 1.
+    ldr x6, [sp, #104]
+    tbz x6, #0, .Ltl_fh_unpacked
+    mov x3, #1
+.Ltl_fh_unpacked:
     // A bit-field is marked by a non-null width in AST_F2 (an expression node).
     // Everything else is a whole-byte member.
     ldr x5, [x21, #AST_F2]
@@ -483,6 +491,11 @@ _kcc_type_layout:
     cbz x20, .Ltl_total
     mov x22, x24                // union total = largest member
 .Ltl_total:
+    // __attribute__((aligned(N))): raise the aggregate's alignment to at least N.
+    ldr x6, [sp, #104]
+    lsr x6, x6, #1              // requested alignment (0 = none)
+    cmp x6, x23
+    csel x23, x6, x23, gt
     // pad total size up to the aggregate alignment
     sub x4, x23, #1
     add x22, x22, x4

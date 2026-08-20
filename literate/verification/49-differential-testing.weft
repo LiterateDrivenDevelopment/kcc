@@ -712,6 +712,15 @@ difftest "gnu-statement-expr" \
 # identifier consumed for label look-ahead.
 difftest "expr-stmt-operator-chain" \
     "int main(void){ int t = 3, r = 0; t * t + 1; r = t * t + 1; int m; t > r ? (m = t) : (m = r); return (r == 10 && m == 10) ? 0 : 1; }"
+# __attribute__((packed)): no inter-member padding, aggregate alignment 1.  Both
+# the before-tag and after-brace spellings, and a packed struct nested inside
+# another, must match clang's sizes and offsets exactly; the unaligned int must
+# also read and write back correctly at run time.
+difftest "gnu-packed-layout" \
+    "struct __attribute__((packed)) P { char c; int i; short s; }; struct Q { char c; int i; } __attribute__((packed)); struct __attribute__((packed)) N { char c; struct P p; }; int main(void){ struct P p; p.c = 1; p.i = 0x12345678; p.s = 0x2222; unsigned long oi = (unsigned long)((char*)&p.i - (char*)&p); return (sizeof(struct P) == 7 && oi == 1 && sizeof(struct Q) == 5 && sizeof(struct N) == 8 && p.i == 0x12345678 && p.s == 0x2222) ? 0 : 1; }"
+# __attribute__((aligned(N))) raises the aggregate's size and alignment.
+difftest "gnu-aligned-attribute" \
+    "struct __attribute__((aligned(16))) A { int x; }; int main(void){ return (sizeof(struct A) == 16 && _Alignof(struct A) == 16) ? 0 : 1; }"
 # A STORE's IR_DEST holds its access-size code, not a vreg.  The spill-slot
 # colourer read IR_DEST as a freshly-defined vreg for every instruction, so a
 # narrow store's access-size code (e.g. 2 for a 16-bit store) posed as "vreg 2"

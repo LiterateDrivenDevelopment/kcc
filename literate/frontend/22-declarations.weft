@@ -296,21 +296,51 @@ refinement is deferred.
 // void kcc_parse_skip_attributes(void)
 // GNU attributes (\texttt{\_\_attribute\_\_((...))}) and \texttt{\_\_extension\_\_}
 // may appear at many points in a declaration; real system headers use them
-// pervasively.  kcc parses and DISCARDS them: every attribute it would honour
-// (\texttt{noinline}, \texttt{format}, \texttt{unused}, ...) is a hint that does
-// not change the observable result, and the layout-affecting ones
-// (\texttt{packed}, \texttt{aligned}) are a later refinement.  The point here is
-// to consume the syntax so the surrounding declaration parses.  Each attribute
-// is \texttt{\_\_attribute\_\_} followed by a balanced parenthesised group (the
-// characteristic double parens plus arbitrarily nested argument lists); several
-// may stack, and \texttt{\_\_extension\_\_} is a bare skippable prefix.
+// pervasively.  Most attributes are hints that do not change the observable
+// result (\texttt{noinline}, \texttt{format}, \texttt{unused}, ...), so kcc
+// consumes and discards them: the point is to let the surrounding declaration
+// parse.  Each attribute is \texttt{\_\_attribute\_\_} followed by a balanced
+// parenthesised group (the characteristic double parens plus arbitrarily nested
+// argument lists); several may stack, and \texttt{\_\_extension\_\_} is a bare
+// skippable prefix.
+//
+// Two attributes \emph{do} change layout and must not be silently dropped:
+// \texttt{packed} (drop inter-member padding, aggregate alignment~1) and
+// \texttt{aligned(N)} (raise the aggregate's alignment).  While skipping, this
+// routine records what it sees into two globals---\texttt{\_kcc\_attr\_packed}
+// and \texttt{\_kcc\_attr\_align}---reset at entry so each call reports only its
+// own findings.  A caller that cares (the struct/union parser) reads them
+// immediately after the call and stamps the result onto the aggregate node; all
+// other callers ignore them.  Both the bare and \texttt{\_\_packed\_\_} /
+// \texttt{\_\_aligned\_\_} spellings are recognised.
+.data
+.p2align 3
+.globl _kcc_attr_packed
+_kcc_attr_packed:  .quad 0      // set to 1 when the last attribute run named `packed`
+.globl _kcc_attr_align
+_kcc_attr_align:   .quad 0      // set to N when it named `aligned(N)` (0 = none)
+.section __TEXT,__cstring,cstring_literals
+_kcc_attr_s_packed:   .asciz "packed"
+_kcc_attr_s_packed2:  .asciz "__packed__"
+_kcc_attr_s_aligned:  .asciz "aligned"
+_kcc_attr_s_aligned2: .asciz "__aligned__"
+.text
 .globl _kcc_parse_skip_attributes
 .p2align 2
 _kcc_parse_skip_attributes:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
-    str x19, [sp, #16]           // x19 = paren depth (callee-saved: _kcc_pp_next
-                                 // clobbers caller-saved regs across the loop)
+    stp x19, x20, [sp, #16]      // x19 = paren depth, x20 = "next number is an
+    str x21, [sp, #32]           // aligned() value" flag (both callee-saved:
+                                 // _kcc_pp_next clobbers caller-saved across loops)
+    // Reset the layout-attribute output channel for this run.
+    adrp x0, _kcc_attr_packed@@PAGE
+    add  x0, x0, _kcc_attr_packed@@PAGEOFF
+    str  xzr, [x0]
+    adrp x0, _kcc_attr_align@@PAGE
+    add  x0, x0, _kcc_attr_align@@PAGEOFF
+    str  xzr, [x0]
+    mov  x20, #0
 .Lpsa_loop:
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
@@ -340,15 +370,41 @@ _kcc_parse_skip_attributes:
     b .Lpsa_padv
 .Lpsa_not_lp:
     cmp x0, #TOK_RPAREN
-    b.ne .Lpsa_padv
+    b.ne .Lpsa_chk_ident
     sub x19, x19, #1
+    b .Lpsa_padv
+.Lpsa_chk_ident:
+    // Identifier inside the group: is it a layout attribute we honour?
+    cmp x0, #TOK_IDENT
+    b.eq .Lpsa_ident
+    cmp x0, #TOK_NUMBER
+    b.eq .Lpsa_number
+    b .Lpsa_padv
+.Lpsa_ident:
+    @<Decl: classify layout attribute@>
+    b .Lpsa_padv
+.Lpsa_number:
+    // A number token right after `aligned` supplies the alignment value.
+    cbz x20, .Lpsa_padv
+    mov x20, #0
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_pp_atoi              // x0 = parsed value
+    adrp x1, _kcc_attr_align@@PAGE
+    add  x1, x1, _kcc_attr_align@@PAGEOFF
+    str  x0, [x1]
 .Lpsa_padv:
     bl _kcc_pp_next
     cbnz x19, .Lpsa_paren       // still inside the group → keep consuming
     b .Lpsa_loop                // balanced: this attribute done, check for another
 .Lpsa_done:
-    ldr x19, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 
 // -- kcc_parse_typeof --------------------------------------------------
@@ -397,6 +453,71 @@ _kcc_parse_typeof:
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_parse_skip_attributes _kcc_parse_typeof
+@}
+
+\paragraph{Recognising the layout attributes.}
+The identifier inside an attribute group is matched against the layout-affecting
+names by length and then bytes.  A match on \texttt{packed} (or the
+\texttt{\_\_packed\_\_} spelling) sets the packed flag immediately; a match on
+\texttt{aligned} instead arms \texttt{x20}, so the next number token inside the
+group---the \texttt{N} in \texttt{aligned(N)}---is read as the alignment.  The
+token text pointer is held in the callee-saved \texttt{x21} because
+\texttt{\_kcc\_memcmp} clobbers the argument registers.
+
+@d Decl: classify layout attribute @{
+    adrp x21, _kcc_tok_start@@PAGE
+    add  x21, x21, _kcc_tok_start@@PAGEOFF
+    ldr  x21, [x21]              // token text ptr (survives memcmp)
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x0, [x0]               // token length
+    cmp x0, #6
+    b.ne .Lcla_pk2
+    mov x0, x21
+    adrp x1, _kcc_attr_s_packed@@PAGE
+    add  x1, x1, _kcc_attr_s_packed@@PAGEOFF
+    mov x2, #6
+    bl _kcc_memcmp
+    cbz x0, .Lcla_set_packed
+    b .Lcla_done
+.Lcla_pk2:
+    cmp x0, #10
+    b.ne .Lcla_al
+    mov x0, x21
+    adrp x1, _kcc_attr_s_packed2@@PAGE
+    add  x1, x1, _kcc_attr_s_packed2@@PAGEOFF
+    mov x2, #10
+    bl _kcc_memcmp
+    cbz x0, .Lcla_set_packed
+    b .Lcla_done
+.Lcla_al:
+    cmp x0, #7
+    b.ne .Lcla_al2
+    mov x0, x21
+    adrp x1, _kcc_attr_s_aligned@@PAGE
+    add  x1, x1, _kcc_attr_s_aligned@@PAGEOFF
+    mov x2, #7
+    bl _kcc_memcmp
+    cbz x0, .Lcla_arm_align
+    b .Lcla_done
+.Lcla_al2:
+    cmp x0, #11
+    b.ne .Lcla_done
+    mov x0, x21
+    adrp x1, _kcc_attr_s_aligned2@@PAGE
+    add  x1, x1, _kcc_attr_s_aligned2@@PAGEOFF
+    mov x2, #11
+    bl _kcc_memcmp
+    cbnz x0, .Lcla_done
+.Lcla_arm_align:
+    mov x20, #1                  // next number token is the aligned() value
+    b .Lcla_done
+.Lcla_set_packed:
+    adrp x0, _kcc_attr_packed@@PAGE
+    add  x0, x0, _kcc_attr_packed@@PAGEOFF
+    mov x1, #1
+    str x1, [x0]
+.Lcla_done:
 @}
 
 @d Decl: parse specifiers @{
@@ -1712,11 +1833,19 @@ specifier loop can accumulate.
 .globl _kcc_parse_struct_or_union
 .p2align 2
 _kcc_parse_struct_or_union:
-    stp x29, x30, [sp, #-64]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    // Layout-attribute accumulators live in STACK slots, not callee-saved
+    // registers: the member-list parse calls deep into the parser and some of
+    // those hand-written routines clobber high registers without saving them,
+    // whereas a stack slot always survives a call.  [sp,#64] = packed (bit),
+    // [sp,#72] = strongest aligned(N).  They also survive a nested struct in the
+    // body, whose own parse would otherwise reset the shared attribute globals.
+    str xzr, [sp, #64]
+    str xzr, [sp, #72]
 
     // Determine struct vs union
     adrp x0, _kcc_tok_type@@PAGE
@@ -1749,6 +1878,7 @@ _kcc_parse_struct_or_union:
     // GNU attributes may sit between the keyword and the tag/brace:
     // `struct __attribute__((packed)) Pk { ... }`.
     bl _kcc_parse_skip_attributes
+    @<Decl: fold layout attrs into x25/x26@>
 
     // Optional tag name
     mov x20, #0                  // x20 = name_ptr (default null)
@@ -1773,6 +1903,7 @@ _kcc_parse_struct_or_union:
     // GNU attributes may also sit between the tag and the brace:
     // `struct Pk __attribute__((packed)) { ... }`.
     bl _kcc_parse_skip_attributes
+    @<Decl: fold layout attrs into x25/x26@>
 
 .Lstruct_check_brace:
     // Check for '{'
@@ -1904,7 +2035,14 @@ singly-linked list anchored by the first field node.
 After the closing brace terminates the member list, the parser allocates the
 aggregate declaration node with tag \texttt{AST\_STRUCT\_DECL} or
 \texttt{AST\_UNION\_DECL}, storing the tag name in \texttt{AST\_F0} and the
-field chain in \texttt{AST\_F1}.  The declaration is then wrapped in a
+field chain in \texttt{AST\_F1}.  A third GNU-attribute site follows the closing
+brace---\texttt{struct S \{ ... \} \_\_attribute\_\_((packed))}, the most common
+spelling of all---so we run one more attribute skip here and fold its result
+into the accumulator before stamping the combined layout word onto the
+declaration's \texttt{AST\_F2}: bit~0 is \texttt{packed}, and the remaining bits
+hold the \texttt{aligned(N)} value.  A zero word (the \texttt{\_kcc\_ast\_alloc}
+default) means an ordinary aggregate, so nothing downstream changes for structs
+without these attributes.  The declaration is then wrapped in a
 \texttt{TYPE\_STRUCT} or \texttt{TYPE\_UNION} node so it can be consumed by
 the specifier accumulator.  Forward declarations (a tag without a body) follow
 the same wrapping logic but produce an empty node with no field list.
@@ -1914,11 +2052,22 @@ the same wrapping logic but produce an empty node with no field list.
     mov x0, #TOK_RBRACE
     bl _kcc_parse_expect
 
+    // Third attribute site: after the closing brace, before the declarator.
+    bl _kcc_parse_skip_attributes
+    @<Decl: fold layout attrs into x25/x26@>
+
     // Build struct/union node
     mov x0, x19                  // tag (AST_STRUCT_DECL or AST_UNION_DECL)
     bl _kcc_ast_alloc
     str x20, [x0, #AST_F0]      // name_ptr
     str x21, [x0, #AST_F1]      // fields
+    // Stamp the layout word: (aligned(N) << 1) | packed.  It goes in AST_F3, not
+    // AST_F2 --- the latter is `_kcc_type_struct`'s per-definition descriptor
+    // cache, and a non-null value there is taken for a cached type descriptor.
+    ldr x1, [sp, #64]           // packed bit
+    ldr x2, [sp, #72]           // aligned(N)
+    orr x1, x1, x2, lsl #1
+    str x1, [x0, #AST_F3]
 
     // Wrap in TYPE_STRUCT or TYPE_UNION
     mov x23, x0                  // save decl node
@@ -1956,8 +2105,33 @@ the same wrapping logic but produce an empty node with no field list.
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
+    ldp x29, x30, [sp], #80
     ret
+@}
+
+\paragraph{Folding the attribute channel into the accumulator.}
+Each attribute skip resets the two globals and then fills them with what that
+call saw.  This helper OR-s a \texttt{packed} finding into the \texttt{[sp,\#64]}
+slot and takes the larger of any \texttt{aligned(N)} value into
+\texttt{[sp,\#72]}, so the three attribute sites around one aggregate (before the
+tag, after the tag, after the brace) combine.  The accumulator lives in stack
+slots because the member-list parse both clobbers high registers and, for a
+nested struct, resets the shared attribute globals mid-parse.
+
+@d Decl: fold layout attrs into x25/x26 @{
+    adrp x0, _kcc_attr_packed@@PAGE
+    add  x0, x0, _kcc_attr_packed@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [sp, #64]
+    orr  x1, x1, x0             // packed is sticky
+    str  x1, [sp, #64]
+    adrp x0, _kcc_attr_align@@PAGE
+    add  x0, x0, _kcc_attr_align@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [sp, #72]
+    cmp  x0, x1
+    csel x1, x0, x1, gt         // keep the strongest requested alignment
+    str  x1, [sp, #72]
 @}
 
 \section{Enum}

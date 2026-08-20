@@ -261,6 +261,7 @@ The directives below route code fragments to their physical assembly files under
 @<Lexer: token constants@>
 @<Parser: AST constants@>
 @<Stmt: parse statement@>
+@<Stmt: parse asm@>
 @<Stmt: parse compound@>
 @<Stmt: parse if@>
 @<Stmt: parse switch@>
@@ -404,6 +405,7 @@ The directives below route code fragments to their physical assembly files under
 @<IR: build param@>
 @<IR: build goto@>
 @<IR: build statement@>
+@<IR: build asm operands@>
 @<IR: build return@>
 @<IR: build expression@>
 @<IR: build int literal@>
@@ -513,6 +515,7 @@ The directives below route code fragments to their physical assembly files under
 @<CodeGen: vreg slot offset@>
 @<CodeGen: marshal args@>
 @<CodeGen: instruction dispatch@>
+@<CodeGen: asm@>
 @<CodeGen: floating point@>
 @<CodeGen: patch branches@>
 @<CodeGen: emit strings@>

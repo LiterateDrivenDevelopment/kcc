@@ -168,11 +168,11 @@ of an expression statement, requiring one-token lookahead.
     b .Lstmt_done
 
 .Lstmt_asm:
-    // Inline assembly: `asm [volatile|inline|goto] ( "template" ) ;`.  Only the
-    // basic form (a single template string, no operand lists) is handled: the
-    // template is captured verbatim and later spliced into the textual `.s`
-    // stream for the platform assembler.  Extended asm (with `:` operand lists)
-    // is not yet supported and stops at the `expected ')'` below.
+    // Inline assembly: `asm [volatile|inline|goto] ( "template" [operands] ) ;`.
+    // The template is captured, then `_kcc_parse_asm_extended` consumes any
+    // GNU operand/clobber lists (the part after the first `:`) and the closing
+    // paren, building the AST_ASM_STMT.  The back end splices the template into
+    // the textual `.s` stream.
     bl _kcc_pp_next               // consume 'asm' / '__asm__'
 .Lstmt_asm_quals:
     // Skip optional volatile/inline/goto qualifiers up to the '('.
@@ -188,15 +188,8 @@ of an expression statement, requiring one-token lookahead.
     mov x0, #TOK_LPAREN
     bl _kcc_parse_expect
     bl _kcc_strlit_gather         // x0 = template ptr, x1 = len
+    bl _kcc_parse_asm_extended    // consumes operands + ')', returns AST_ASM_STMT
     mov x19, x0
-    mov x20, x1
-    mov x0, #AST_ASM_STMT
-    bl _kcc_ast_alloc
-    str x19, [x0, #AST_F0]        // template ptr
-    str x20, [x0, #AST_F1]        // template len
-    mov x19, x0                   // save node
-    mov x0, #TOK_RPAREN
-    bl _kcc_parse_expect
     mov x0, #TOK_SEMI
     bl _kcc_parse_expect
     mov x0, x19
@@ -276,6 +269,200 @@ of an expression statement, requiring one-token lookahead.
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+@}
+
+\paragraph{Extended inline assembly.}
+After the template string, GNU inline assembly may carry up to three
+colon-separated lists: output operands, input operands, and clobbers (a
+fourth, \texttt{goto} labels, is consumed but unsupported).  Each operand is an
+optional \texttt{[name]}, a string-literal \emph{constraint}, and a
+parenthesised C expression.  \texttt{\_kcc\_parse\_asm\_extended} builds the
+\texttt{AST\_ASM\_STMT} with an operand chain hung off \texttt{AST\_F2}; each
+operand is an \texttt{AST\_ASM\_OPERAND} recording its constraint text, its
+expression, and whether it is an output.  Clobbers are consumed but not modelled
+beyond \texttt{"memory"}/\texttt{"cc"}; the back end validates the constraints it
+can honour and rejects the rest, so an unsupported form never miscompiles.
+
+@d Stmt: parse asm @{
+// -- kcc_parse_asm_opsec ----------------------------------------------------
+// void kcc_parse_asm_opsec(node *asm_stmt, uint64_t is_output)
+// Parse one colon-section of operands, appending AST_ASM_OPERAND nodes to the
+// statement's AST_F2 chain.  Stops at the next ':' or ')'.
+.globl _kcc_parse_asm_opsec
+.p2align 2
+_kcc_parse_asm_opsec:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+    mov x19, x0                   // asm node
+    mov x20, x1                   // is_output
+.Los_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COLON
+    b.eq .Los_done
+    cmp x0, #TOK_RPAREN
+    b.eq .Los_done
+    cbz x0, .Los_done             // EOF
+    // Optional [name] — parsed and ignored (positional %N is still supported).
+    cmp x0, #TOK_LBRACKET
+    b.ne .Los_constraint
+    bl _kcc_pp_next
+.Los_skipname:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cbz x0, .Los_done
+    cmp x0, #TOK_RBRACKET
+    b.eq .Los_aftername
+    bl _kcc_pp_next
+    b .Los_skipname
+.Los_aftername:
+    bl _kcc_pp_next               // consume ']'
+.Los_constraint:
+    bl _kcc_strlit_gather         // x0 = constraint ptr, x1 = len
+    mov x21, x0
+    mov x22, x1
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+    bl _kcc_parse_assign_expr
+    mov x23, x0                   // operand expression (callee-saved)
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, #AST_ASM_OPERAND
+    bl _kcc_ast_alloc
+    str x21, [x0, #AST_F0]        // constraint ptr
+    str x22, [x0, #AST_F1]        // constraint len
+    str x23, [x0, #AST_F2]        // expression
+    str x20, [x0, #AST_F3]        // is_output
+    // Append to the statement's operand chain (walk AST_F2 to the tail).
+    mov x1, x0
+    ldr x2, [x19, #AST_F2]
+    cbz x2, .Los_first
+.Los_walk:
+    ldr x3, [x2, #AST_F4]
+    cbz x3, .Los_appendtail
+    mov x2, x3
+    b .Los_walk
+.Los_appendtail:
+    str x1, [x2, #AST_F4]
+    b .Los_more
+.Los_first:
+    str x1, [x19, #AST_F2]
+.Los_more:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COMMA
+    b.ne .Los_done
+    bl _kcc_pp_next
+    b .Los_loop
+.Los_done:
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+// -- kcc_parse_asm_clobbers -------------------------------------------------
+// void kcc_parse_asm_clobbers(void)
+// Consume the comma-separated clobber string literals up to ':' or ')'.
+.globl _kcc_parse_asm_clobbers
+.p2align 2
+_kcc_parse_asm_clobbers:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+.Lac_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COLON
+    b.eq .Lac_done
+    cmp x0, #TOK_RPAREN
+    b.eq .Lac_done
+    cbz x0, .Lac_done
+    bl _kcc_strlit_gather         // consume one clobber string
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COMMA
+    b.ne .Lac_done
+    bl _kcc_pp_next
+    b .Lac_loop
+.Lac_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_parse_asm_extended -------------------------------------------------
+// node *kcc_parse_asm_extended(const char *tmpl, uint64_t len)
+// Build the AST_ASM_STMT and consume any operand/clobber lists plus ')'.
+.globl _kcc_parse_asm_extended
+.p2align 2
+_kcc_parse_asm_extended:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                   // tmpl
+    mov x20, x1                   // len
+    mov x0, #AST_ASM_STMT
+    bl _kcc_ast_alloc
+    mov x21, x0
+    str x19, [x21, #AST_F0]
+    str x20, [x21, #AST_F1]
+    // Extended (has operand lists) iff a ':' follows the template.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COLON
+    b.ne .Lae_close
+    bl _kcc_pp_next               // consume ':' (before outputs)
+    mov x0, x21
+    mov x1, #1                    // is_output
+    bl _kcc_parse_asm_opsec
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COLON
+    b.ne .Lae_close
+    bl _kcc_pp_next               // consume ':' (before inputs)
+    mov x0, x21
+    mov x1, #0
+    bl _kcc_parse_asm_opsec
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COLON
+    b.ne .Lae_close
+    bl _kcc_pp_next               // consume ':' (before clobbers)
+    bl _kcc_parse_asm_clobbers
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COLON
+    b.ne .Lae_close
+    bl _kcc_pp_next               // asm goto labels — consumed, unsupported
+.Lae_goto:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_RPAREN
+    b.eq .Lae_close
+    cbz x0, .Lae_close
+    bl _kcc_pp_next
+    b .Lae_goto
+.Lae_close:
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, x21
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@| _kcc_parse_asm_opsec _kcc_parse_asm_clobbers _kcc_parse_asm_extended
 @}
 
 \paragraph{Expression continuation after label lookahead.}

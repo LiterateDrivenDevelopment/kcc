@@ -87,8 +87,23 @@ _kcc_sema_check_stmt:
     b.eq .Lscs_decl
     cmp x20, #AST_STATIC_ASSERT
     b.eq .Lscs_done
+    cmp x20, #AST_ASM_STMT
+    b.eq .Lscs_asm
 
     b .Lscs_done
+
+.Lscs_asm:
+    // Inline asm: type-check each operand's expression so it carries a resolved
+    // type (the IR builder reads TY_SIZE from it for output store widths).
+    ldr x19, [x19, #AST_F2]        // first operand
+.Lscs_asm_loop:
+    cbz x19, .Lscs_done
+    ldr x0, [x19, #AST_F2]         // operand expression
+    cbz x0, .Lscs_asm_next
+    bl _kcc_sema_expr
+.Lscs_asm_next:
+    ldr x19, [x19, #AST_F4]
+    b .Lscs_asm_loop
 @| _kcc_sema_check_stmt
 @}
 

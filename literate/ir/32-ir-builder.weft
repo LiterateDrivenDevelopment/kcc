@@ -1994,15 +1994,20 @@ _kcc_ir_build_stmt:
     b .Libs_done
 
 .Libs_asm:
-    // Inline assembly: emit an IR_ASM carrying the template pointer (SRC1) and
-    // its length (SRC2).  It yields no value; the back end splices the template
-    // verbatim into the textual `.s` stream.
+    // Inline assembly.  For extended asm, lower each operand's expression first
+    // (inputs → a value vreg, outputs → the lvalue's address vreg), recording
+    // vreg+1 in the operand node (0 = none).  Then emit IR_ASM carrying the
+    // template (SRC1/SRC2) and a pointer to the AST node (IR_TYPE) so the back
+    // end can walk the operands.  Basic asm has an empty operand chain.
+    mov x0, x19
+    bl _kcc_ir_asm_lower_operands
     mov x0, #IR_ASM
     bl _kcc_ir_alloc_instr
     ldr x1, [x19, #AST_F0]      // template ptr
     str x1, [x0, #IR_SRC1]
     ldr x1, [x19, #AST_F1]      // template len
     str x1, [x0, #IR_SRC2]
+    str x19, [x0, #IR_TYPE]     // AST_ASM_STMT (operands live here)
     bl _kcc_ir_emit
     b .Libs_done
 
@@ -2129,6 +2134,108 @@ _kcc_ir_build_stmt:
     ldp x29, x30, [sp], #32
     ret
 @| _kcc_ir_build_stmt
+@}
+
+\paragraph{Lowering extended-asm operands.}
+Each operand's constraint begins with \texttt{=} (output), \texttt{+}
+(read-write), or neither (input).  An input needs a \emph{value} vreg, obtained
+by building its expression; an output needs the lvalue's \emph{address} vreg,
+obtained by building a synthetic \texttt{\&lvalue} (which reuses the ordinary
+address-of lowering).  The two vregs are stored as \texttt{vreg+1} on the
+operand node (\texttt{AST\_F2} = value, \texttt{AST\_F3} = address; 0 means
+absent, so the valid vreg~0 is not mistaken for ``none'').
+
+@d IR: build asm operands @{
+// -- kcc_ir_asm_addr_of -----------------------------------------------------
+// uint64_t kcc_ir_asm_addr_of(node *lvalue)
+// Build the address of an lvalue by lowering a synthetic `&lvalue`.
+.globl _kcc_ir_asm_addr_of
+.p2align 2
+_kcc_ir_asm_addr_of:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                   // lvalue expression
+    mov x0, #AST_UNARY_EXPR
+    bl _kcc_ast_alloc
+    mov x1, #TOK_AMP
+    str x1, [x0, #AST_F0]         // op = &
+    str x19, [x0, #AST_F1]        // operand
+    mov x1, #1
+    str x1, [x0, #AST_F2]         // prefix
+    bl _kcc_ir_build_expr         // → address vreg
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_asm_lower_operands ----------------------------------------------
+// void kcc_ir_asm_lower_operands(node *asm_stmt)
+// Lower every operand's expression.  AST_F2 receives (size<<32)|(value_vreg+1)
+// for an input, AST_F3 receives (size<<32)|(addr_vreg+1) for an output; a zero
+// low half means that half is absent.  The size is the operand type's byte
+// size (from the sema-resolved type), used by the back end to pick the store
+// width and the x/w register form.
+.globl _kcc_ir_asm_lower_operands
+.p2align 2
+_kcc_ir_asm_lower_operands:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    ldr x19, [x0, #AST_F2]        // first operand
+.Lalo_loop:
+    cbz x19, .Lalo_done
+    // size from the operand expression's resolved type (default 8).
+    ldr x0, [x19, #AST_F2]        // expression
+    mov x20, #8
+    ldr x1, [x0, #AST_F3]        // type
+    cbz x1, .Lalo_have_size
+    ldr x1, [x1, #TY_SIZE]
+    cbz x1, .Lalo_have_size
+    mov x20, x1                   // size
+.Lalo_have_size:
+    ldr x0, [x19, #AST_F0]        // constraint ptr
+    ldrb w21, [x0]               // first char
+    cmp w21, #'='
+    b.eq .Lalo_output
+    cmp w21, #'+'
+    b.eq .Lalo_inout
+    // input: value only
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    add x0, x0, #1
+    orr x0, x0, x20, lsl #32
+    str x0, [x19, #AST_F2]
+    str xzr, [x19, #AST_F3]
+    b .Lalo_next
+.Lalo_inout:
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_build_expr
+    add x22, x0, #1
+    orr x22, x22, x20, lsl #32    // value half (stashed)
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_asm_addr_of
+    add x0, x0, #1
+    orr x0, x0, x20, lsl #32
+    str x0, [x19, #AST_F3]        // address half
+    str x22, [x19, #AST_F2]       // value half (overwrite expr)
+    b .Lalo_next
+.Lalo_output:
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_ir_asm_addr_of
+    add x0, x0, #1
+    orr x0, x0, x20, lsl #32
+    str x0, [x19, #AST_F3]
+    str xzr, [x19, #AST_F2]
+.Lalo_next:
+    ldr x19, [x19, #AST_F4]
+    b .Lalo_loop
+.Lalo_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_ir_asm_addr_of _kcc_ir_asm_lower_operands
 @}
 
 \section{Building Return}

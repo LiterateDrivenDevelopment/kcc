@@ -232,9 +232,22 @@ int main(void) {
 }
 \end{verbatim}
 
-Only the \emph{basic} form is supported: a single template with no operand
-lists.  Extended assembly with operand constraints
-(\texttt{asm("..." : outputs : inputs : clobbers)}) is not yet accepted.
+Extended assembly with operand constraints is supported in a common subset:
+register outputs (\texttt{=r}), inputs (\texttt{r}), read-write operands
+(\texttt{+r}), and integer immediates (\texttt{i}), with up to two operands and
+\texttt{\%0}/\texttt{\%1} (or \texttt{\%w0}/\texttt{\%x0}) placeholders.  A
+\texttt{"memory"} or \texttt{"cc"} clobber is accepted; the compiler treats the
+asm as a barrier so cached values are re-read afterwards.
+
+\begin{verbatim}
+int y = 5, x;
+asm("mov %0, %1" : "=r"(x) : "r"(y));   /* x = y  */
+asm("add %0, %0, #1" : "+r"(x));        /* x += 1 */
+\end{verbatim}
+
+Forms outside this subset---three or more operands, memory (\texttt{m}) or
+specific-register constraints, and \texttt{asm goto}---are rejected with a
+diagnostic rather than miscompiled.
 
 \section{Reading Diagnostics}
 \label{sec:um-diagnostics}

@@ -199,12 +199,15 @@ _kcc_opt_cse:
 
     ldr x9, [x26, #IR_OP]
 
-    // 2a. A store or call invalidates every cached load.
+    // 2a. A store, call, or inline-asm invalidates every cached load (the asm
+    // may write memory through its output operands or a "memory" clobber).
     cmp x9, #IR_STORE
     b.eq .Lcse_kill
     cmp x9, #IR_CALL
     b.eq .Lcse_kill
     cmp x9, #IR_CALL_IND
+    b.eq .Lcse_kill
+    cmp x9, #IR_ASM
     b.eq .Lcse_kill
 
     // 2b. Load: reuse an earlier load of the same address.
@@ -395,6 +398,8 @@ _kcc_opt_copyprop:
     cmp x9, #IR_CALL
     b.eq .Lcp_kill
     cmp x9, #IR_CALL_IND
+    b.eq .Lcp_kill
+    cmp x9, #IR_ASM
     b.eq .Lcp_kill
     cmp x9, #IR_VA_START
     b.eq .Lcp_kill

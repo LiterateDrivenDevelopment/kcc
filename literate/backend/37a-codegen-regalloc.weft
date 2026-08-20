@@ -314,6 +314,8 @@ _kcc_cg_regalloc:
 
     // --- SRC1 use? (skip CONST, CALL, BR, GLOBAL_REF) ---
     ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_ASM
+    b.eq .Lp1_asmops
     cmp x9, #IR_CONST
     b.eq .Lp1_src2
     cmp x9, #IR_CALL
@@ -353,6 +355,39 @@ _kcc_cg_regalloc:
     mov x3, x28
     bl _kcc_ra_use
     b .Lp1_next                   // BR_COND defines nothing
+
+.Lp1_asmops:
+    // Inline asm operands are carried on the AST node (IR_TYPE), not in the
+    // SRC fields.  Record each operand's value and address vreg as a use so an
+    // input value stays live up to the asm, and an output lvalue's address is
+    // seen to escape (which keeps the local in memory, since the asm stores its
+    // result through that address rather than promoting the local to a
+    // register).  x9-x28 survive the leaf _kcc_ra_use; the cursor rides x10.
+    ldr x10, [x26, #IR_TYPE]     // asm node
+    cbz x10, .Lp1_next
+    ldr x10, [x10, #AST_F2]      // first operand
+.Lp1_asmop_loop:
+    cbz x10, .Lp1_next
+    ldr x0, [x10, #AST_F2]       // value half
+    and x0, x0, #0xffffffff
+    cbz x0, .Lp1_asmop_addr
+    sub x0, x0, #1
+    ldr x1, [sp, #96]
+    mov x2, x27
+    mov x3, x28
+    bl _kcc_ra_use
+.Lp1_asmop_addr:
+    ldr x0, [x10, #AST_F3]       // address half
+    and x0, x0, #0xffffffff
+    cbz x0, .Lp1_asmop_next
+    sub x0, x0, #1
+    ldr x1, [sp, #96]
+    mov x2, x27
+    mov x3, x28
+    bl _kcc_ra_use
+.Lp1_asmop_next:
+    ldr x10, [x10, #AST_F4]
+    b .Lp1_asmop_loop
 
 .Lp1_callargs:
     ldr x0, [x26, #IR_SRC2]      // args array
@@ -514,6 +549,8 @@ _kcc_cg_regalloc:
 .Lpr_instr:
     cbz x26, .Lpr_next_bb
     ldr x9, [x26, #IR_OP]
+    cmp x9, #IR_ASM
+    b.eq .Lpr_asm
     cmp x9, #IR_ALLOCA
     b.eq .Lpr_alloca
     cmp x9, #IR_STORE
@@ -638,6 +675,26 @@ _kcc_cg_regalloc:
     mov x2, x20
     bl _kcc_ra_disq
     b .Lpr_next_i
+.Lpr_asm:
+    // An extended-asm output takes the address of its lvalue (&x), which is a
+    // disqualifying use: the local must stay in memory so the asm can store its
+    // result through that address.  Disqualify each operand's address vreg.
+    ldr x10, [x26, #IR_TYPE]     // asm node
+    cbz x10, .Lpr_next_i
+    ldr x10, [x10, #AST_F2]      // first operand
+.Lpr_asm_loop:
+    cbz x10, .Lpr_next_i
+    ldr x0, [x10, #AST_F3]       // address half
+    and x0, x0, #0xffffffff
+    cbz x0, .Lpr_asm_next
+    sub x0, x0, #1
+    mov x1, x24
+    mov x2, x20
+    bl _kcc_ra_disq
+.Lpr_asm_next:
+    ldr x10, [x10, #AST_F4]
+    b .Lpr_asm_loop
+
 .Lpr_unary:
     ldr x0, [x26, #IR_SRC1]
     mov x1, x24

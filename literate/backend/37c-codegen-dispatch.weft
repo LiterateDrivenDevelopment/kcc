@@ -212,10 +212,16 @@ _kcc_codegen_instr:
     // Inline assembly.  The direct encoder cannot assemble an arbitrary
     // template, so it records the snippet (template pointer/length keyed by the
     // current code offset) for the textual `.s` renderer and emits a single NOP
-    // placeholder to occupy the slot.  Object files produced by the direct
-    // Mach-O path therefore carry a NOP where the asm should be; a program using
-    // inline asm must be compiled through the `.s`+`as` backend, which splices
-    // the real template at that offset.
+    // placeholder to occupy the slot.  Extended asm (with an operand chain on
+    // the AST node) additionally loads inputs into operand registers, substitutes
+    // %N in the template, and stores outputs back after the placeholder.
+    ldr x0, [x19, #IR_TYPE]       // AST_ASM_STMT node
+    cbz x0, .Lcgi_asm_basic
+    ldr x1, [x0, #AST_F2]         // operand chain
+    cbz x1, .Lcgi_asm_basic
+    bl _kcc_cg_asm_extended
+    b .Lcgi_done
+.Lcgi_asm_basic:
     bl _kcc_code_current_pos      // x0 = offset
     ldr x1, [x19, #IR_SRC1]       // template ptr
     ldr x2, [x19, #IR_SRC2]       // template len
@@ -2383,3 +2389,257 @@ run_test "right shift" \
     "int main(void) { return 32 >> 2; }" 8
 @}
 
+
+\section{Extended Inline Assembly}
+
+Extended asm binds C operands to template placeholders.  \kcc{} supports the
+common register and immediate constraints (\texttt{r}, \texttt{=r}, \texttt{+r},
+\texttt{i}) with up to two operands, which it places in the always-free scratch
+registers \texttt{x9}--\texttt{x10}.  Inputs are loaded into their operand
+registers before the template; \texttt{\%N} in the template is rewritten to the
+operand's register; outputs are stored back afterwards, at the operand's width.
+Anything outside this subset (memory operands, specific registers, three or more
+operands) is rejected with a diagnostic rather than miscompiled.  The two-operand
+ceiling covers the single-input/output and read-modify-write (\texttt{+r}) forms;
+a third live operand currently collides in the register file, so it is refused.
+
+@d CodeGen: asm @{
+.section __TEXT,__cstring,cstring_literals
+_kcc_cg_asm_err:
+    .asciz "kcc: error: unsupported extended asm (only r/=r/+r/i constraints, up to 2 operands)\n"
+.text
+// -- kcc_cg_asm_validate ------------------------------------------------------
+// uint64_t kcc_cg_asm_validate(node *asm_stmt) — 0 if the operands are within
+// the supported subset, else emit a diagnostic and return 1.
+.globl _kcc_cg_asm_validate
+.p2align 2
+_kcc_cg_asm_validate:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    ldr x1, [x0, #AST_F2]         // first operand
+    mov x2, #0                    // count
+.Lcav_loop:
+    cbz x1, .Lcav_count
+    add x2, x2, #1
+    ldr x3, [x1, #AST_F0]        // constraint ptr
+    ldrb w4, [x3]
+    cmp w4, #'='
+    b.eq .Lcav_skip
+    cmp w4, #'+'
+    b.eq .Lcav_skip
+    b .Lcav_check
+.Lcav_skip:
+    ldrb w4, [x3, #1]
+.Lcav_check:
+    cmp w4, #'r'
+    b.eq .Lcav_ok
+    cmp w4, #'i'
+    b.eq .Lcav_ok
+    b .Lcav_reject
+.Lcav_ok:
+    ldr x1, [x1, #AST_F4]
+    b .Lcav_loop
+.Lcav_count:
+    cmp x2, #2
+    b.hi .Lcav_reject
+    mov x0, #0
+    b .Lcav_done
+.Lcav_reject:
+    adrp x0, _kcc_cg_asm_err@@PAGE
+    add  x0, x0, _kcc_cg_asm_err@@PAGEOFF
+    bl _kcc_io_err
+    mov x0, #1
+.Lcav_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_cg_asm_subst ---------------------------------------------------------
+// (char*, uint64_t) kcc_cg_asm_subst(node *asm_stmt)
+// Build a copy of the template with %N / %wN / %xN replaced by the operand's
+// register name (operand N -> x/w (9+N)) and %% -> %.  Returns ptr in x0, len
+// in x1.
+.globl _kcc_cg_asm_subst
+.p2align 2
+_kcc_cg_asm_subst:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    ldr x20, [x0, #AST_F0]        // template ptr
+    ldr x21, [x0, #AST_F1]        // template len
+    // out buffer: len*4 + 64
+    lsl x0, x21, #2
+    add x0, x0, #64
+    bl _kcc_arena_alloc
+    mov x22, x0                   // out buf
+    mov x23, #0                   // out pos
+    mov x24, #0                   // in pos
+.Lcas_loop:
+    cmp x24, x21
+    b.hs .Lcas_done
+    ldrb w0, [x20, x24]
+    add x24, x24, #1
+    cmp w0, #'%'
+    b.ne .Lcas_emit
+    // '%': look at the next char
+    cmp x24, x21
+    b.hs .Lcas_emit_pct          // trailing '%'
+    ldrb w0, [x20, x24]
+    cmp w0, #'%'
+    b.eq .Lcas_dblpct
+    mov w25, #'x'                // default width
+    cmp w0, #'w'
+    b.eq .Lcas_setw
+    cmp w0, #'x'
+    b.eq .Lcas_setx
+    b .Lcas_num
+.Lcas_setw:
+    mov w25, #'w'
+    add x24, x24, #1
+    b .Lcas_num
+.Lcas_setx:
+    mov w25, #'x'
+    add x24, x24, #1
+    b .Lcas_num
+.Lcas_num:
+    // parse operand number into x26
+    mov x26, #0
+.Lcas_numloop:
+    cmp x24, x21
+    b.hs .Lcas_numdone
+    ldrb w0, [x20, x24]
+    cmp w0, #'0'
+    b.lt .Lcas_numdone
+    cmp w0, #'9'
+    b.gt .Lcas_numdone
+    sub w0, w0, #'0'
+    mov w1, #10
+    mul x26, x26, x1
+    add x26, x26, x0
+    add x24, x24, #1
+    b .Lcas_numloop
+.Lcas_numdone:
+    // emit width char, then decimal of (9 + operand number)
+    strb w25, [x22, x23]
+    add x23, x23, #1
+    add x26, x26, #9             // physical register number
+    cmp x26, #10
+    b.lo .Lcas_onedigit
+    mov w0, #'1'
+    strb w0, [x22, x23]
+    add x23, x23, #1
+    sub x26, x26, #10
+.Lcas_onedigit:
+    add w0, w26, #'0'
+    strb w0, [x22, x23]
+    add x23, x23, #1
+    b .Lcas_loop
+.Lcas_dblpct:
+    add x24, x24, #1             // consume the second '%'
+    mov w0, #'%'
+    b .Lcas_emit
+.Lcas_emit_pct:
+    mov w0, #'%'
+.Lcas_emit:
+    strb w0, [x22, x23]
+    add x23, x23, #1
+    b .Lcas_loop
+.Lcas_done:
+    mov x0, x22
+    mov x1, x23
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+
+// -- kcc_cg_asm_extended ------------------------------------------------------
+// void kcc_cg_asm_extended(node *asm_stmt)
+// Load inputs into x9..x11, splice the substituted template, store outputs.
+.globl _kcc_cg_asm_extended
+.p2align 2
+_kcc_cg_asm_extended:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                   // asm node
+    bl _kcc_cg_asm_validate
+    cbnz x0, .Lcae_done          // unsupported -> emit nothing
+    // Load inputs: operand N -> x(9+N).
+    ldr x20, [x19, #AST_F2]
+    mov x21, #0
+.Lcae_inloop:
+    cbz x20, .Lcae_inputs_done
+    ldr x0, [x20, #AST_F2]       // value half
+    and x0, x0, #0xffffffff
+    cbz x0, .Lcae_in_next
+    sub x0, x0, #1               // value vreg
+    add x1, x21, #9
+    bl _kcc_cg_load_vreg
+.Lcae_in_next:
+    add x21, x21, #1
+    ldr x20, [x20, #AST_F4]
+    b .Lcae_inloop
+.Lcae_inputs_done:
+    // Record the substituted template at the placeholder offset, emit the NOP.
+    bl _kcc_code_current_pos
+    mov x22, x0                   // offset
+    mov x0, x19
+    bl _kcc_cg_asm_subst          // x0 = ptr, x1 = len
+    mov x2, x1
+    mov x1, x0
+    mov x0, x22
+    bl _kcc_as_add_snip
+    bl _kcc_enc_nop
+    bl _kcc_code_emit32
+    // Store outputs: operand N register -> its lvalue address (in x8).
+    ldr x20, [x19, #AST_F2]
+    mov x21, #0
+.Lcae_outloop:
+    cbz x20, .Lcae_done
+    ldr x23, [x20, #AST_F3]      // address half (size<<32)|(addr+1)
+    and x0, x23, #0xffffffff
+    cbz x0, .Lcae_out_next
+    sub x0, x0, #1               // address vreg
+    mov x1, #8                   // x8 = address scratch
+    bl _kcc_cg_load_vreg
+    lsr x24, x23, #32            // size
+    add x0, x21, #9             // Rt = operand register
+    mov x1, #8                  // Rn = x8
+    mov x2, #0                  // imm12
+    cmp x24, #1
+    b.eq .Lcae_sz8
+    cmp x24, #2
+    b.eq .Lcae_sz16
+    cmp x24, #4
+    b.eq .Lcae_sz32
+    mov x3, #1                   // 8-byte store (str x)
+    b .Lcae_str
+.Lcae_sz8:
+    mov x3, #2
+    b .Lcae_str
+.Lcae_sz16:
+    mov x3, #3
+    b .Lcae_str
+.Lcae_sz32:
+    mov x3, #0
+.Lcae_str:
+    bl _kcc_enc_str_imm
+    bl _kcc_code_emit32
+.Lcae_out_next:
+    add x21, x21, #1
+    ldr x20, [x20, #AST_F4]
+    b .Lcae_outloop
+.Lcae_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+@| _kcc_cg_asm_validate _kcc_cg_asm_subst _kcc_cg_asm_extended
+@}

@@ -836,6 +836,90 @@ _kcc_eval_const_int:
     ldp x29, x30, [sp], #48
     ret
 
+// -- kcc_expr_is_ice ------------------------------------------------------
+// uint64_t kcc_expr_is_ice(node *n)
+//   1 if n is an integer constant expression (\stdref{6.6}) --- literals,
+//   sizeof/_Alignof, an enum-constant identifier, and const-ops thereof ---
+//   else 0.  Used to tell a real array bound from a variable-length one: an
+//   array declarator whose size is not an ICE is a VLA.  A null bound (`a[]`)
+//   is reported as constant so an incomplete array is not mistaken for a VLA.
+.globl _kcc_expr_is_ice
+.p2align 2
+_kcc_expr_is_ice:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    cbz x0, .Lice_yes
+    mov x19, x0
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_INT_LIT
+    b.eq .Lice_yes
+    cmp x0, #AST_CHAR_LIT
+    b.eq .Lice_yes
+    cmp x0, #AST_SIZEOF_EXPR
+    b.eq .Lice_yes
+    cmp x0, #AST_ALIGNOF_EXPR
+    b.eq .Lice_yes
+    cmp x0, #AST_PAREN_EXPR
+    b.eq .Lice_f0
+    cmp x0, #AST_CAST_EXPR
+    b.eq .Lice_f1
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Lice_f1
+    cmp x0, #AST_BINARY_EXPR
+    b.eq .Lice_bin
+    cmp x0, #AST_COND_EXPR
+    b.eq .Lice_cond
+    cmp x0, #AST_IDENT_EXPR
+    b.eq .Lice_ident
+    b .Lice_no
+.Lice_f0:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_expr_is_ice
+    b .Lice_ret
+.Lice_f1:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_expr_is_ice
+    b .Lice_ret
+.Lice_bin:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_expr_is_ice
+    cbz x0, .Lice_no
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_expr_is_ice
+    b .Lice_ret
+.Lice_cond:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_expr_is_ice
+    cbz x0, .Lice_no
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_expr_is_ice
+    cbz x0, .Lice_no
+    ldr x0, [x19, #AST_F2]
+    bl _kcc_expr_is_ice
+    b .Lice_ret
+.Lice_ident:
+    ldr x20, [x19, #AST_F0]      // name
+    cbz x20, .Lice_no
+    mov x0, x20
+    bl _kcc_strlen
+    mov x1, x0
+    mov x0, x20
+    bl _kcc_symtab_lookup
+    cbz x0, .Lice_no
+    ldr x1, [x0, #SYM_KIND]
+    cmp x1, #SYM_ENUM_CONST
+    b.eq .Lice_yes
+.Lice_no:
+    mov x0, #0
+    b .Lice_ret
+.Lice_yes:
+    mov x0, #1
+.Lice_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
 // -- Switch scan state (shared by the two recursive walkers below) --------
 .data
 .p2align 3

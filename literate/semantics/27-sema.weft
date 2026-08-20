@@ -162,10 +162,26 @@ _kcc_sema_resolve_type:
     // Array length: fold the size as an integer constant expression
     // (\stdref{6.7.6.2}).  A bare literal, but equally `31 + 1` or
     // `sizeof(int) * CHAR_BIT`, must reduce to its value; only a genuinely
-    // absent size (`a[]`) is an incomplete array.
+    // absent size (`a[]`) is an incomplete array.  A size that is NOT a
+    // constant expression is a variable-length array (`int a[n]`), which kcc
+    // does not support: it is rejected with a diagnostic rather than folded to
+    // a bogus fixed length (which would silently under-size the storage).  See
+    // Appendix~\ref{ch:limitations}.
     ldr x1, [x19, #AST_F1]
     cbz x1, .Lsrt_array_incomplete
     mov x0, x1
+    bl _kcc_expr_is_ice
+    cbnz x0, .Lsrt_array_const
+    // VLA: emit a diagnostic and treat the array as incomplete (the error count
+    // fails the compile).
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, _kcc_sema_msg_vla@@PAGE
+    add  x2, x2, _kcc_sema_msg_vla@@PAGEOFF
+    bl _kcc_diag_error
+    b .Lsrt_array_incomplete
+.Lsrt_array_const:
+    ldr x0, [x19, #AST_F1]
     bl _kcc_eval_const_int
     mov x1, x0                     // folded length
     b .Lsrt_array_make
@@ -383,6 +399,11 @@ _kcc_sema_resolve_type:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
+
+.section __TEXT,__cstring,cstring_literals
+_kcc_sema_msg_vla:
+    .asciz "variable-length arrays are not supported"
+.text
 @| _kcc_sema_resolve_type
 @}
 

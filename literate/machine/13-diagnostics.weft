@@ -637,6 +637,13 @@ int main(void){ f(); return 0; }"
 run_diag "int-returns-value-ok" clean "" \
     "int f(void){ return 5; }
 int main(void){ return f(); }"
+run_diag "vla-local"          err "variable-length arrays are not supported" \
+    "int main(void){ int n = 4; int a[n]; a[0]=1; return a[0]; }"
+run_diag "vla-param"          err "variable-length arrays are not supported" \
+    "int f(int n){ char b[n]; b[0]=1; return b[0]; }
+int main(void){ return f(3); }"
+run_diag "fixed-array-ok"     clean "" \
+    "enum { N = 4 }; int g[N]; int main(void){ int a[10]; a[0]=1; return a[0]+g[0]+(int)sizeof(a); }"
 
 echo ""
 echo "=== diagtest: $PASS ok, $FAIL fail ==="

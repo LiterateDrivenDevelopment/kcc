@@ -1,0 +1,598 @@
+% 38b-emit-asm.weft — Textual .s emission (the assemble-with-`as` backend)
+%
+% The primary ARM64 backend (Chapter~\ref{ch:emit-arm64}) encodes each
+% instruction to a 32-bit word and writes a Mach-O object directly.  This
+% chapter provides the SECOND emission strategy from the retargeting playbook:
+% render the generated code as textual assembly (`.s`) and let the platform
+% assembler produce the object file.  It is the strategy a new target uses, and
+% on this target it is what unlocks inline assembly --- an `asm("...")` template
+% is simply spliced into the text stream for `as` to assemble.
+
+\chapter{Textual Assembly Emission}
+\label{ch:emit-asm}
+
+The direct encoder of Chapter~\ref{ch:emit-arm64} is fast and self-contained,
+but it can only emit the fixed instruction set \kcc{} itself selects: it is not
+a general assembler, so it cannot turn an arbitrary \texttt{asm("...")} template
+into machine code.  The retargeting playbook (Chapter~\ref{ch:retargeting})
+describes the alternative---emit textual \texttt{.s} and invoke the platform
+assembler---and this chapter implements it for \arch{}.
+
+The renderer works \emph{from the already-generated code buffer}, so the entire
+front end, optimiser, register allocator, and instruction selector are reused
+unchanged; only the final packaging differs.  For each 32-bit word the code
+generator produced, the renderer emits one of two things.  If a relocation
+covers that word---a call or a data-address reference whose target address the
+linker chooses---it emits the \emph{symbolic} form (\texttt{bl \_f},
+\texttt{adrp x0, \_g@@PAGE}, \ldots) so the assembler re-creates the relocation.
+Otherwise it emits \texttt{.long 0x\emph{word}}: the assembler reproduces the
+exact bytes, and because internal branches are PC-relative and the instruction
+sequence is unchanged, their distances are preserved.  This makes the renderer
+correct by construction even where it has no pretty-printer for an opcode.
+
+\section{The Output Buffer}
+
+Assembly text is accumulated in a growable arena buffer and written out in one
+\texttt{write} at the end.  The helpers below append a byte, a C string, a
+decimal number, and an eight-digit hexadecimal word.
+
+@d Emit-asm: data @{
+.data
+.p2align 3
+_kcc_as_buf:   .quad 0        // growable text buffer
+_kcc_as_pos:   .quad 0        // bytes used
+_kcc_as_cap:   .quad 0        // capacity
+_kcc_as_fd:    .quad 0        // open .s file descriptor
+.section __TEXT,__cstring,cstring_literals
+_kcc_as_s_sect:   .asciz "\t.section __TEXT,__text,regular,pure_instructions\n"
+_kcc_as_s_p2a:    .asciz "\t.p2align 2\n"
+_kcc_as_s_globl:  .asciz "\t.globl "
+_kcc_as_s_long:   .asciz "\t.long 0x"
+_kcc_as_s_bl:     .asciz "\tbl\t"
+_kcc_as_s_adrp:   .asciz "\tadrp\t"
+_kcc_as_s_add:    .asciz "\tadd\t"
+_kcc_as_s_ldr:    .asciz "\tldr\t"
+_kcc_as_s_page:   .asciz "@@PAGE"
+_kcc_as_s_pageoff:.asciz "@@PAGEOFF"
+_kcc_as_s_gotpage:.asciz "@@GOTPAGE"
+_kcc_as_s_gotoff: .asciz "@@GOTPAGEOFF"
+_kcc_as_s_hexdig: .asciz "0123456789abcdef"
+.globl _kcc_as_s_env
+_kcc_as_s_env:    .asciz "KCC_EMIT_ASM"
+.text
+@}
+
+@d Emit-asm: buffer @{
+// -- kcc_as_init --------------------------------------------------------------
+// Allocate the text buffer (64 KiB, grows on demand).
+.globl _kcc_as_init
+.p2align 2
+_kcc_as_init:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    mov x0, #65536
+    bl _kcc_arena_alloc
+    adrp x1, _kcc_as_buf@@PAGE
+    add  x1, x1, _kcc_as_buf@@PAGEOFF
+    str x0, [x1]
+    adrp x1, _kcc_as_pos@@PAGE
+    add  x1, x1, _kcc_as_pos@@PAGEOFF
+    str xzr, [x1]
+    adrp x1, _kcc_as_cap@@PAGE
+    add  x1, x1, _kcc_as_cap@@PAGEOFF
+    mov x2, #65536
+    str x2, [x1]
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_as_ch ----------------------------------------------------------------
+// void kcc_as_ch(uint32_t byte) — append one byte, growing the buffer if full.
+.globl _kcc_as_ch
+.p2align 2
+_kcc_as_ch:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov w19, w0                   // byte
+    adrp x0, _kcc_as_pos@@PAGE
+    add  x0, x0, _kcc_as_pos@@PAGEOFF
+    ldr x1, [x0]                  // pos
+    adrp x2, _kcc_as_cap@@PAGE
+    add  x2, x2, _kcc_as_cap@@PAGEOFF
+    ldr x3, [x2]                  // cap
+    cmp x1, x3
+    b.lo .Lasch_write
+    // Grow: double, copy.
+    lsl x4, x3, #1
+    str x4, [x2]
+    mov x0, x4
+    bl _kcc_arena_alloc           // new buffer
+    mov x5, x0
+    adrp x6, _kcc_as_buf@@PAGE
+    add  x6, x6, _kcc_as_buf@@PAGEOFF
+    ldr x7, [x6]                  // old buffer
+    str x5, [x6]
+    mov x0, x5
+    mov x1, x7
+    adrp x2, _kcc_as_pos@@PAGE
+    add  x2, x2, _kcc_as_pos@@PAGEOFF
+    ldr x2, [x2]
+    bl _kcc_memcpy
+.Lasch_write:
+    adrp x0, _kcc_as_buf@@PAGE
+    add  x0, x0, _kcc_as_buf@@PAGEOFF
+    ldr x0, [x0]                  // buffer
+    adrp x2, _kcc_as_pos@@PAGE
+    add  x2, x2, _kcc_as_pos@@PAGEOFF
+    ldr x3, [x2]                  // pos
+    strb w19, [x0, x3]
+    add x3, x3, #1
+    str x3, [x2]
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_as_str ---------------------------------------------------------------
+// void kcc_as_str(const char *s) — append a NUL-terminated string.
+.globl _kcc_as_str
+.p2align 2
+_kcc_as_str:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    str x19, [sp, #-16]!          // (scratch save below main frame not needed)
+    mov x19, x0
+.Lasstr_loop:
+    ldrb w0, [x19], #1
+    cbz w0, .Lasstr_done
+    bl _kcc_as_ch
+    b .Lasstr_loop
+.Lasstr_done:
+    ldr x19, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_as_dec ---------------------------------------------------------------
+// void kcc_as_dec(uint64_t n) — append decimal digits.
+.globl _kcc_as_dec
+.p2align 2
+_kcc_as_dec:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0
+    add x20, sp, #72              // one past the scratch digit area [sp,#48..71]
+    add x21, sp, #72              // end marker (fixed)
+    cbnz x19, .Lasdec_loop
+    mov w0, #'0'
+    bl _kcc_as_ch
+    b .Lasdec_done
+.Lasdec_loop:
+    cbz x19, .Lasdec_emit
+    mov x2, #10
+    udiv x3, x19, x2
+    msub x4, x3, x2, x19          // x4 = n % 10
+    add w4, w4, #'0'
+    strb w4, [x20, #-1]!
+    mov x19, x3
+    b .Lasdec_loop
+.Lasdec_emit:
+    // digits from x20 (start) up to x21 (end)
+.Lasdec_e2:
+    cmp x20, x21
+    b.hs .Lasdec_done
+    ldrb w0, [x20], #1
+    bl _kcc_as_ch
+    b .Lasdec_e2
+.Lasdec_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+// -- kcc_as_hex8 --------------------------------------------------------------
+// void kcc_as_hex8(uint32_t w) — append exactly 8 hex digits (no 0x prefix).
+.globl _kcc_as_hex8
+.p2align 2
+_kcc_as_hex8:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov w19, w0
+    mov w20, #28                  // shift for the top nibble
+.Lashex_loop:
+    lsr w0, w19, w20
+    and w0, w0, #0xf
+    adrp x1, _kcc_as_s_hexdig@@PAGE
+    add  x1, x1, _kcc_as_s_hexdig@@PAGEOFF
+    ldrb w0, [x1, x0]
+    bl _kcc_as_ch
+    subs w20, w20, #4
+    b.ge .Lashex_loop
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_as_xreg --------------------------------------------------------------
+// void kcc_as_xreg(uint32_t n) — append an x-register name (31 → xzr).
+.globl _kcc_as_xreg
+.p2align 2
+_kcc_as_xreg:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    str x19, [sp, #-16]!
+    mov w19, w0
+    cmp w19, #31
+    b.eq .Lasxr_zr
+    mov w0, #'x'
+    bl _kcc_as_ch
+    mov x0, x19
+    bl _kcc_as_dec
+    b .Lasxr_done
+.Lasxr_zr:
+    mov w0, #'x'
+    bl _kcc_as_ch
+    mov w0, #'z'
+    bl _kcc_as_ch
+    mov w0, #'r'
+    bl _kcc_as_ch
+.Lasxr_done:
+    ldr x19, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
+\section{Rendering the Text Section}
+
+The renderer walks the code buffer one instruction at a time.  Before each
+word it emits any symbol \emph{label} defined at that offset; then, if a
+relocation covers the word, the symbolic form, else the raw \texttt{.long}.
+A small helper appends a symbol's name given its index in the linker's symbol
+vector.
+
+@d Emit-asm: render @{
+// -- kcc_as_symname -----------------------------------------------------------
+// void kcc_as_symname(uint64_t idx) — append symbol[idx].name.
+.globl _kcc_as_symname
+.p2align 2
+_kcc_as_symname:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    adrp x1, _kcc_linker_syms@@PAGE
+    add  x1, x1, _kcc_linker_syms@@PAGEOFF
+    ldr x1, [x1]                  // syms vec
+    ldr x1, [x1, #VEC_DATA]       // entry array
+    mov x2, #SYM_ENTRY_SIZE
+    madd x1, x0, x2, x1           // &syms[idx]
+    ldr x0, [x1, #SYM_NAME]       // name ptr
+    bl _kcc_as_str
+    ldp x29, x30, [sp], #16
+    ret
+
+// -- kcc_as_reloc_at ----------------------------------------------------------
+// uint64_t kcc_as_reloc_at(uint64_t off)
+//   Returns pointer to the reloc entry whose RELOC_OFFSET == off, or 0.
+.globl _kcc_as_reloc_at
+.p2align 2
+_kcc_as_reloc_at:
+    adrp x1, _kcc_linker_relocs@@PAGE
+    add  x1, x1, _kcc_linker_relocs@@PAGEOFF
+    ldr x1, [x1]
+    ldr x2, [x1, #VEC_COUNT]
+    ldr x3, [x1, #VEC_DATA]
+    mov x4, #0
+.Lasra_loop:
+    cmp x4, x2
+    b.hs .Lasra_none
+    mov x5, #RELOC_SIZE
+    madd x6, x4, x5, x3           // &reloc[x4]
+    ldr x7, [x6, #RELOC_OFFSET]
+    cmp x7, x0
+    b.eq .Lasra_hit
+    add x4, x4, #1
+    b .Lasra_loop
+.Lasra_hit:
+    mov x0, x6
+    ret
+.Lasra_none:
+    mov x0, #0
+    ret
+
+// -- kcc_as_labels_at ---------------------------------------------------------
+// void kcc_as_labels_at(uint64_t off) — emit `name:` for every text symbol
+// defined at this offset (and `.globl name` first if it is external).
+.globl _kcc_as_labels_at
+.p2align 2
+_kcc_as_labels_at:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                   // target offset
+    adrp x0, _kcc_linker_syms@@PAGE
+    add  x0, x0, _kcc_linker_syms@@PAGEOFF
+    ldr x0, [x0]
+    ldr x20, [x0, #VEC_COUNT]
+    ldr x21, [x0, #VEC_DATA]
+    mov x22, #0
+.Lasla_loop:
+    cmp x22, x20
+    b.hs .Lasla_done
+    mov x0, #SYM_ENTRY_SIZE
+    madd x0, x22, x0, x21         // &sym[x22]
+    ldr x1, [x0, #SYM_SECTION]
+    cmp x1, #1                    // text section?
+    b.ne .Lasla_next
+    ldr x1, [x0, #SYM_VALUE]
+    cmp x1, x19
+    b.ne .Lasla_next
+    // Emit `.globl name` if external.  Registers x21 (entry array) and x22
+    // (index) are callee-saved and survive the calls, so the symbol pointer is
+    // recomputed by madd rather than stashed on the stack.
+    ldr x2, [x0, #SYM_FLAGS]
+    tst x2, #N_EXT
+    b.eq .Lasla_label
+    adrp x0, _kcc_as_s_globl@@PAGE
+    add  x0, x0, _kcc_as_s_globl@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, #SYM_ENTRY_SIZE
+    madd x0, x22, x0, x21
+    ldr x0, [x0, #SYM_NAME]
+    bl _kcc_as_str
+    mov w0, #'\n'
+    bl _kcc_as_ch
+.Lasla_label:
+    mov x0, #SYM_ENTRY_SIZE
+    madd x0, x22, x0, x21
+    ldr x0, [x0, #SYM_NAME]
+    bl _kcc_as_str
+    mov w0, #':'
+    bl _kcc_as_ch
+    mov w0, #'\n'
+    bl _kcc_as_ch
+.Lasla_next:
+    add x22, x22, #1
+    b .Lasla_loop
+.Lasla_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_as_reloc_line --------------------------------------------------------
+// void kcc_as_reloc_line(uint64_t reloc, uint32_t word)
+//   Emit the symbolic assembly for a relocated instruction.
+.globl _kcc_as_reloc_line
+.p2align 2
+_kcc_as_reloc_line:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                   // reloc entry
+    mov w20, w1                   // word
+    ldr x21, [x19, #RELOC_TYPE]
+    and w0, w20, #0x1f            // Rd/Rt = bits[4:0]
+    lsr w1, w20, #5
+    and w1, w1, #0x1f             // Rn = bits[9:5]
+    // Dispatch on reloc type.
+    cmp x21, #ARM64_RELOC_BRANCH26
+    b.eq .Lasrl_branch
+    cmp x21, #ARM64_RELOC_PAGE21
+    b.eq .Lasrl_adrp
+    cmp x21, #ARM64_RELOC_GOT_LOAD_PAGE21
+    b.eq .Lasrl_gotadrp
+    cmp x21, #ARM64_RELOC_PAGEOFF12
+    b.eq .Lasrl_pageoff
+    cmp x21, #ARM64_RELOC_GOT_LOAD_PAGEOFF12
+    b.eq .Lasrl_gotoff
+    // Unknown reloc type: fall back to a raw word (loses the reloc, but at
+    // least assembles); should not happen for the types kcc emits.
+    b .Lasrl_done
+
+.Lasrl_branch:
+    adrp x0, _kcc_as_s_bl@@PAGE
+    add  x0, x0, _kcc_as_s_bl@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #RELOC_SYM]
+    bl _kcc_as_symname
+    b .Lasrl_nl
+
+.Lasrl_adrp:
+    adrp x0, _kcc_as_s_adrp@@PAGE
+    add  x0, x0, _kcc_as_s_adrp@@PAGEOFF
+    bl _kcc_as_str
+    and w0, w20, #0x1f
+    bl _kcc_as_xreg
+    mov w0, #','
+    bl _kcc_as_ch
+    mov w0, #' '
+    bl _kcc_as_ch
+    ldr x0, [x19, #RELOC_SYM]
+    bl _kcc_as_symname
+    adrp x0, _kcc_as_s_page@@PAGE
+    add  x0, x0, _kcc_as_s_page@@PAGEOFF
+    bl _kcc_as_str
+    b .Lasrl_nl
+
+.Lasrl_gotadrp:
+    adrp x0, _kcc_as_s_adrp@@PAGE
+    add  x0, x0, _kcc_as_s_adrp@@PAGEOFF
+    bl _kcc_as_str
+    and w0, w20, #0x1f
+    bl _kcc_as_xreg
+    mov w0, #','
+    bl _kcc_as_ch
+    mov w0, #' '
+    bl _kcc_as_ch
+    ldr x0, [x19, #RELOC_SYM]
+    bl _kcc_as_symname
+    adrp x0, _kcc_as_s_gotpage@@PAGE
+    add  x0, x0, _kcc_as_s_gotpage@@PAGEOFF
+    bl _kcc_as_str
+    b .Lasrl_nl
+
+.Lasrl_pageoff:
+    // add xD, xN, sym@@PAGEOFF   (kcc materialises an address with add)
+    adrp x0, _kcc_as_s_add@@PAGE
+    add  x0, x0, _kcc_as_s_add@@PAGEOFF
+    bl _kcc_as_str
+    and w0, w20, #0x1f
+    bl _kcc_as_xreg
+    mov w0, #','
+    bl _kcc_as_ch
+    mov w0, #' '
+    bl _kcc_as_ch
+    lsr w0, w20, #5
+    and w0, w0, #0x1f
+    bl _kcc_as_xreg
+    mov w0, #','
+    bl _kcc_as_ch
+    mov w0, #' '
+    bl _kcc_as_ch
+    ldr x0, [x19, #RELOC_SYM]
+    bl _kcc_as_symname
+    adrp x0, _kcc_as_s_pageoff@@PAGE
+    add  x0, x0, _kcc_as_s_pageoff@@PAGEOFF
+    bl _kcc_as_str
+    b .Lasrl_nl
+
+.Lasrl_gotoff:
+    // ldr xD, [xN, sym@@GOTPAGEOFF]
+    adrp x0, _kcc_as_s_ldr@@PAGE
+    add  x0, x0, _kcc_as_s_ldr@@PAGEOFF
+    bl _kcc_as_str
+    and w0, w20, #0x1f
+    bl _kcc_as_xreg
+    mov w0, #','
+    bl _kcc_as_ch
+    mov w0, #' '
+    bl _kcc_as_ch
+    mov w0, #'['
+    bl _kcc_as_ch
+    lsr w0, w20, #5
+    and w0, w0, #0x1f
+    bl _kcc_as_xreg
+    mov w0, #','
+    bl _kcc_as_ch
+    mov w0, #' '
+    bl _kcc_as_ch
+    ldr x0, [x19, #RELOC_SYM]
+    bl _kcc_as_symname
+    adrp x0, _kcc_as_s_gotoff@@PAGE
+    add  x0, x0, _kcc_as_s_gotoff@@PAGEOFF
+    bl _kcc_as_str
+    mov w0, #']'
+    bl _kcc_as_ch
+.Lasrl_nl:
+    mov w0, #'\n'
+    bl _kcc_as_ch
+.Lasrl_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_as_render_text -------------------------------------------------------
+// void kcc_as_render_text(void) — emit the whole __text section as assembly.
+.globl _kcc_as_render_text
+.p2align 2
+_kcc_as_render_text:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    // Section header + alignment.
+    adrp x0, _kcc_as_s_sect@@PAGE
+    add  x0, x0, _kcc_as_s_sect@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_as_s_p2a@@PAGE
+    add  x0, x0, _kcc_as_s_p2a@@PAGEOFF
+    bl _kcc_as_str
+    // Walk the code buffer, four bytes at a time.
+    mov x19, #0                   // offset
+    adrp x0, _kcc_code_pos@@PAGE
+    add  x0, x0, _kcc_code_pos@@PAGEOFF
+    ldr x20, [x0]                 // code size in bytes
+.Lasrt_loop:
+    cmp x19, x20
+    b.hs .Lasrt_done
+    // Emit any labels at this offset.
+    mov x0, x19
+    bl _kcc_as_labels_at
+    // Load the instruction word.
+    adrp x0, _kcc_code_buf@@PAGE
+    add  x0, x0, _kcc_code_buf@@PAGEOFF
+    ldr x0, [x0]
+    ldr w21, [x0, x19]            // word
+    // Relocated?
+    mov x0, x19
+    bl _kcc_as_reloc_at
+    cbz x0, .Lasrt_raw
+    mov x1, x21
+    bl _kcc_as_reloc_line
+    b .Lasrt_advance
+.Lasrt_raw:
+    adrp x0, _kcc_as_s_long@@PAGE
+    add  x0, x0, _kcc_as_s_long@@PAGEOFF
+    bl _kcc_as_str
+    mov w0, w21
+    bl _kcc_as_hex8
+    mov w0, #'\n'
+    bl _kcc_as_ch
+.Lasrt_advance:
+    add x19, x19, #4
+    b .Lasrt_loop
+.Lasrt_done:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Writing the File}
+
+The top-level entry initialises the buffer, renders the text section, and
+writes the accumulated bytes to the given path in a single \texttt{write}.
+
+@d Emit-asm: render @{
+// -- kcc_as_render ------------------------------------------------------------
+// int kcc_as_render(const char *path) — render the current translation unit's
+// generated code as `.s` text and write it to `path`.  Returns 0 on success.
+.globl _kcc_as_render
+.p2align 2
+_kcc_as_render:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                   // path
+    bl _kcc_as_init
+    bl _kcc_as_render_text
+    // Open the output file (O_WRONLY|O_CREAT|O_TRUNC = 0x601, mode 0644).
+    mov x0, x19
+    mov x1, #0x601
+    mov x2, #420
+    bl _kcc_sys_open
+    cmp x0, #0
+    b.lt .Lasrn_err
+    mov x20, x0                   // fd
+    // write(fd, buf, pos)
+    adrp x0, _kcc_as_buf@@PAGE
+    add  x0, x0, _kcc_as_buf@@PAGEOFF
+    ldr x1, [x0]                  // buffer
+    adrp x0, _kcc_as_pos@@PAGE
+    add  x0, x0, _kcc_as_pos@@PAGEOFF
+    ldr x2, [x0]                  // length
+    mov x0, x20                   // fd
+    bl _kcc_sys_write
+    mov x0, x20
+    bl _kcc_sys_close
+    mov x0, #0
+    b .Lasrn_done
+.Lasrn_err:
+    mov x0, #1
+.Lasrn_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}

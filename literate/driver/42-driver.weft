@@ -123,6 +123,18 @@ _kcc_driver_compile:
     // 14b. Append string literal data to code section
     bl _kcc_codegen_emit_strings
 
+    // 14z. Optional textual `.s` emission (the assemble-with-`as` backend).
+    // When KCC_EMIT_ASM=<path> is set, also render the generated code as
+    // assembly to <path>.  This is a side effect for bring-up and testing of
+    // the second emission strategy; the Mach-O path below is unaffected.
+    adrp x0, _kcc_as_s_env@@PAGE
+    add  x0, x0, _kcc_as_s_env@@PAGEOFF
+    mov x1, #12
+    bl _kcc_getenv
+    cbz x0, .Ldc_noasm
+    bl _kcc_as_render
+.Ldc_noasm:
+
     // 14c. Build DWARF debug sections (only under -g); code size and all
     // function addresses are final by now.
     bl _kcc_dwarf_build

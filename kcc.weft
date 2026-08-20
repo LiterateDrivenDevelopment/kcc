@@ -524,6 +524,7 @@ source file to \texttt{.o}.
 
 \begin{multicols}{2}
 @i literate/backend/38-emit-arm64.weft
+@i literate/backend/38b-emit-asm.weft
 \end{multicols}
 \newpage
 

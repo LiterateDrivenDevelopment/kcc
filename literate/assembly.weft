@@ -472,6 +472,11 @@ The directives below route code fragments to their physical assembly files under
 @<Backend: encode system@>
 @<Backend: encode adrp@>
 @<Backend: emit data@>
+@<Vec: constants@>
+@<Linker: constants@>
+@<Emit-asm: data@>
+@<Emit-asm: buffer@>
+@<Emit-asm: render@>
 @}
 
 \noindent\textbf{linker.s} --- relocation and symbol table management:

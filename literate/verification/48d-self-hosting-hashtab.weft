@@ -1,0 +1,253 @@
+% 48d-self-hosting-hashtab.weft — Stage 8e: the FNV-1a hash table, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Hash Table in C}
+\label{ch:self-hosting-hashtab}
+
+The arena, the vector, and the string primitives ported \kcc{}'s foundation;
+this chapter ports the associative structure built on top of it---the
+open-addressing hash table of Chapter~\ref{ch:data-structures}, together with
+its FNV-1a hash.  The table is how \kcc{} answers ``have I seen this name?'':
+the keyword recogniser, the string interner, every lexical scope's symbol map,
+and the per-function local and label tables are all
+\texttt{kcc\_ht}s.  It is the first ported subsystem with real
+\emph{algorithmic} content---a hash, a probe sequence, and a rehashing growth
+step---so getting it byte-compatible exercises the compiler on loops, struct
+arrays, and 64-bit unsigned arithmetic, all at once.
+
+\section{The Byte-Exact Contract}
+
+A hash table is only a drop-in replacement if it places every key in the same
+slot the assembly did; otherwise a later pass that walks the table in slot
+order would see a different sequence and the output would drift.  The port
+therefore reproduces the algorithm exactly: the same FNV-1a constants, the same
+\texttt{hash \& (cap-1)} starting index, the same linear probe with power-of-two
+wrap, and the same growth trigger---double the capacity once inserting would
+push the load factor past three-quarters, tested as
+\texttt{(count+1)*4 > cap*3}.  The two 32-byte and 24-byte layouts match the
+assembly field for field, so the header's \texttt{cap}/\texttt{count} and each
+entry's \texttt{hash}/\texttt{key}/\texttt{keylen}/\texttt{value} sit where the
+rest of the compiler expects them.  The port depends on the arena, \texttt{memset},
+and \texttt{memcmp}, declared as \texttt{extern}.
+
+@l c
+@d Selfhost: hashtab preamble @{
+struct HTEntry {
+    unsigned long hash;
+    const void *key;
+    unsigned long keylen;
+    unsigned long value;
+};
+
+struct HT {
+    struct HTEntry *entries;
+    unsigned long cap;
+    unsigned long count;
+};
+
+void *kcc_arena_alloc(long size);
+void *kcc_memset(void *s, int c, unsigned long n);
+int   kcc_memcmp(const void *s1, const void *s2, unsigned long n);
+@}
+
+\section{FNV-1a}
+
+The 64-bit FNV-1a hash folds each byte into a running accumulator: exclusive-or
+the byte, then multiply by the prime, starting from the offset basis.  The
+constants are the canonical ones, and the multiply wraps modulo $2^{64}$ as
+unsigned arithmetic---exactly what the assembly's \texttt{mul} does.
+
+@l c
+@d Selfhost: hashtab fnv1a @{
+unsigned long kcc_fnv1a(const void *data, unsigned long len) {
+    const unsigned char *p = (const unsigned char *)data;
+    unsigned long h = 0xCBF29CE484222325UL;
+    unsigned long i = 0;
+    while (i < len) {
+        h = h ^ (unsigned long)p[i];
+        h = h * 0x00000100000001B3UL;
+        i = i + 1;
+    }
+    return h;
+}
+@}
+
+\section{Initialization}
+
+\texttt{kcc\_ht\_init} arena-allocates the 24-byte header and a
+\texttt{capacity}-slot entry array, zero-filling the latter so every key
+pointer starts \texttt{NULL} (an empty slot).  The capacity must be a power of
+two, so the mask \texttt{cap-1} selects the low bits of a hash.
+
+@l c
+@d Selfhost: hashtab init @{
+void *kcc_ht_init(unsigned long capacity) {
+    struct HT *h = (struct HT *)kcc_arena_alloc((long)sizeof(struct HT));
+    unsigned long bytes = capacity * (unsigned long)sizeof(struct HTEntry);
+    h->entries = (struct HTEntry *)kcc_arena_alloc((long)bytes);
+    kcc_memset(h->entries, 0, bytes);
+    h->cap = capacity;
+    h->count = 0;
+    return h;
+}
+@}
+
+\section{Lookup}
+
+\texttt{kcc\_ht\_get} hashes the key, starts at \texttt{hash \& mask}, and probes
+forward.  An empty slot means the key is absent, so it returns~0 (a valid
+``not found'' sentinel, since the table's stored values---token types, symbol
+pointers---are never zero where a caller distinguishes them).  A slot matches
+only when the cached hash, the length, and the bytes all agree, the cheap
+checks gating the \texttt{memcmp}.
+
+@l c
+@d Selfhost: hashtab get @{
+unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen) {
+    struct HT *h = (struct HT *)ht;
+    unsigned long hash = kcc_fnv1a(key, keylen);
+    unsigned long mask = h->cap - 1;
+    unsigned long i = hash & mask;
+    while (1) {
+        struct HTEntry *e = &h->entries[i];
+        if (e->key == 0) return 0;
+        if (e->hash == hash && e->keylen == keylen &&
+            kcc_memcmp(e->key, key, keylen) == 0)
+            return e->value;
+        i = (i + 1) & mask;
+    }
+}
+@}
+
+\section{Growth}
+
+\texttt{kcc\_ht\_grow} doubles the capacity and rehashes.  Because the existing
+keys are already unique, each is reinserted by probing the new array for its
+first empty slot from \texttt{hash \& new\_mask}---no equality check is needed.
+The entry is copied field by field, matching the assembly and sidestepping any
+question of struct-assignment lowering.  Growth updates the header's pointer
+and capacity in place, so every outstanding handle stays valid.
+
+@l c
+@d Selfhost: hashtab grow @{
+void kcc_ht_grow(void *ht) {
+    struct HT *h = (struct HT *)ht;
+    struct HTEntry *old = h->entries;
+    unsigned long oldcap = h->cap;
+    unsigned long newcap = oldcap * 2;
+    unsigned long bytes = newcap * (unsigned long)sizeof(struct HTEntry);
+    struct HTEntry *ne = (struct HTEntry *)kcc_arena_alloc((long)bytes);
+    kcc_memset(ne, 0, bytes);
+    unsigned long mask = newcap - 1;
+    unsigned long j = 0;
+    while (j < oldcap) {
+        if (old[j].key != 0) {
+            unsigned long i = old[j].hash & mask;
+            while (ne[i].key != 0) i = (i + 1) & mask;
+            ne[i].hash = old[j].hash;
+            ne[i].key = old[j].key;
+            ne[i].keylen = old[j].keylen;
+            ne[i].value = old[j].value;
+        }
+        j = j + 1;
+    }
+    h->entries = ne;
+    h->cap = newcap;
+}
+@}
+
+\section{Insertion}
+
+\texttt{kcc\_ht\_put} grows first if this insertion would tip the load factor
+past three-quarters, then probes: an empty slot receives the entry (and bumps
+the count), while a slot whose key already matches has its value overwritten.
+The grow-first order keeps the pointer and capacity it reads afterwards
+current.
+
+@l c
+@d Selfhost: hashtab put @{
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen,
+                unsigned long value) {
+    struct HT *h = (struct HT *)ht;
+    if ((h->count + 1) * 4 > h->cap * 3) kcc_ht_grow(h);
+    unsigned long hash = kcc_fnv1a(key, keylen);
+    unsigned long mask = h->cap - 1;
+    unsigned long i = hash & mask;
+    while (1) {
+        struct HTEntry *e = &h->entries[i];
+        if (e->key == 0) {
+            e->hash = hash;
+            e->key = key;
+            e->keylen = keylen;
+            e->value = value;
+            h->count = h->count + 1;
+            return;
+        }
+        if (e->hash == hash && e->keylen == keylen &&
+            kcc_memcmp(e->key, key, keylen) == 0) {
+            e->value = value;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+The fragments compose into \texttt{tmp/selfhost/hashtab.c}, routed by
+\texttt{assembly.weft}.  It supplies the whole \texttt{hashtab.s} object---the
+hash and all four table routines---so the drop-in swap is complete.
+
+@l c
+@d Selfhost: hashtab @{
+@<Selfhost: hashtab preamble@>
+@<Selfhost: hashtab fnv1a@>
+@<Selfhost: hashtab init@>
+@<Selfhost: hashtab get@>
+@<Selfhost: hashtab grow@>
+@<Selfhost: hashtab put@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-hashtab-verify}
+
+\texttt{make selfhost-hashtab} runs the drop-in loop: compile
+\texttt{tmp/selfhost/hashtab.c} with the assembly-built \kcc{}, relink a second
+compiler with the hand-written \texttt{hashtab.o} replaced by the
+kcc-compiled \texttt{hashtab\_c.o}, and re-run the code-generation suite.
+Because every name the compiler resolves---keywords, identifiers, symbols,
+labels---passes through this table, a green run means \kcc{} compiled its own
+associative core correctly, hash and rehash and all.
+
+@d Selfhost: hashtab verify @{
+#!/usr/bin/env bash
+# make selfhost-hashtab — compile kcc's hash table in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/hashtab.c with kcc"
+tmp/kcc -c "$SH/hashtab.c" -o "$SH/hashtab_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_hashtab (hashtab.o -> kcc-compiled hashtab_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "hashtab" ]; then OBJ="$OBJ $SH/hashtab_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_hashtab $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted hash table"
+cp tmp/kcc "$SH/kcc_asm_backup_hashtab"
+cp tmp/kcc_selfhost_hashtab tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_hashtab" tmp/kcc
+exit $status
+@}

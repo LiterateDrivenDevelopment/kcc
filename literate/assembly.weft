@@ -771,6 +771,20 @@ compiler with them, and re-run the code-generation suite:
 @<Selfhost: strings verify@>
 @}
 
+\noindent\textbf{hashtab.c} --- the FNV-1a hash table in C
+(Chapter~\ref{ch:self-hosting-hashtab}), a drop-in replacement:
+
+@o tmp/selfhost/hashtab.c @{
+@<Selfhost: hashtab@>
+@}
+
+\noindent\textbf{hashtab\_verify.sh} --- compile it with \kcc{}, relink the
+compiler with it, and re-run the code-generation suite:
+
+@o tmp/selfhost/hashtab_verify.sh @{
+@<Selfhost: hashtab verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

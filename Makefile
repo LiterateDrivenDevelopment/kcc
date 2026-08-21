@@ -77,6 +77,11 @@ selfhost-strings: build
 	chmod +x tmp/selfhost/strings_verify.sh
 	tmp/selfhost/strings_verify.sh
 
+# Self-hosting (Stage 8e): compile kcc's hash table in C, relink, run suite
+selfhost-hashtab: build
+	chmod +x tmp/selfhost/hashtab_verify.sh
+	tmp/selfhost/hashtab_verify.sh
+
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build
 	chmod +x tmp/tests/difftest.sh

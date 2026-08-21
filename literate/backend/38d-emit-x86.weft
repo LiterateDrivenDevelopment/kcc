@@ -246,6 +246,9 @@ _kcc_x86_s_zerofill: .asciz "\t.zerofill __DATA,__common,_"
 _kcc_x86_s_zf_a3:    .asciz ",3\n"      // ",<size>,3\n" alignment tail (8-byte)
 _kcc_x86_s_comma1:   .asciz ","
 
+// Refusal diagnostic for an opcode the back end does not yet implement.
+_kcc_x86_s_unsup:    .asciz "kcc: --target=x86_64: unsupported operation (floating point, inline asm, or by-value aggregate not yet implemented for the x86-64 back end)\n"
+
 // String literals: a private label per literal, its address via leaq, and the
 // cstring section that holds the bytes.
 _kcc_x86_s_strlbl:   .asciz ".Lx86str"      // label stem; a decimal id follows
@@ -937,6 +940,19 @@ the process exit status reads) and falls into the \texttt{leave}/\texttt{retq}
 epilogue; a \texttt{void} return skips straight to it.  Everything else routes
 to a shape helper.
 
+An opcode the back end has \emph{not} yet learned---a floating-point operation,
+inline assembly, a by-value aggregate---does not fall through silently.  A
+genuine \texttt{IR\_NOP} emits nothing and is skipped, but any other unrecognised
+opcode makes selection print a diagnostic and exit non-zero.  This is a
+deliberate choice: emitting nothing for, say, an \texttt{IR\_FMUL} would leave
+its destination slot holding garbage and \emph{miscompile} the program with no
+warning---the worst possible failure.  Refusing cleanly instead keeps a
+program that uses an unimplemented feature (a \texttt{double}-heavy interpreter
+like Lua) an honest compile-time error rather than a wrong answer at run time,
+matching the front end's treatment of VLAs and \texttt{\_Complex}.  As each
+later rung teaches the back end a new opcode, the set that trips the refusal
+shrinks.
+
 @d X86: render @{
 // -- kcc_x86_sel(ir_instr *i) — select x86-64 for one IR instruction.
 .p2align 2
@@ -1034,7 +1050,22 @@ _kcc_x86_sel:
     cmp x22, #IR_STRING_LIT
     b.eq .Lx86sel_strlit
 
-    b .Lx86sel_done                 // rung 4: ignore FP, inline asm, etc.
+    // A genuine no-op emits nothing and is safe to skip.
+    cmp x22, #IR_NOP
+    b.eq .Lx86sel_done
+
+    // Any other opcode is a feature this back end does not yet implement
+    // (floating point, inline asm, by-value aggregates, ...).  Silently
+    // skipping it would emit a value-less slot and miscompile the program, so
+    // refuse cleanly instead---the same discipline the front end applies to
+    // VLAs and _Complex.  This is what keeps a double-using program (Lua) an
+    // honest compile-time error rather than a wrong answer at run time.
+    adrp x0, _kcc_x86_s_unsup@@PAGE
+    add  x0, x0, _kcc_x86_s_unsup@@PAGEOFF
+    bl _kcc_io_err
+    bl _kcc_io_flush
+    mov x0, #1
+    bl _kcc_sys_exit
 
 .Lx86sel_const:
     adrp x0, _kcc_x86_s_movabsq@@PAGE

@@ -41,11 +41,24 @@ traffic survives to the back end), \texttt{IR\_ADD} to combine them, and an
 \texttt{IR\_SEXT} feeding the return.  Rung~two selects for the whole integer
 ALU (add, subtract, multiply, divide, remainder, the bitwise and shift
 operators, negate and complement), the width-changing conversions
-(\texttt{sext}/\texttt{zext}/\texttt{trunc}/\texttt{bitcast}), and the three
-memory opcodes (\texttt{alloca}/\texttt{load}/\texttt{store}).  What it does
-\emph{not} yet handle is control flow---comparisons, branches, and
-calls---which is rung~three; an unrecognised opcode is still silently skipped,
-so a program that needs those will miscompile until rung~three lands.
+(\texttt{sext}/\texttt{zext}/\texttt{trunc}/\texttt{bitcast}), and the memory
+opcodes (\texttt{alloca}/\texttt{load}/\texttt{store}/\texttt{gep}).
+
+\emph{Rung~three} completes the scalar language: control flow and function
+calls.  It adds the comparisons (\texttt{cmp\_eq} through \texttt{cmp\_ule}),
+the branches (\texttt{br}/\texttt{br\_cond}), and the call machinery
+(\texttt{call}/\texttt{call\_ind}/\texttt{global\_ref}) marshalled to the
+System~V AMD64 ABI, along with the callee-side spill of incoming parameters.
+With this rung a whole program of mutually recursive integer functions,
+conditionals, and loops compiles and runs exit-identically to clang, provided
+its data lives in \emph{functions}: parameters, locals, and calls between
+defined functions all work, and an \texttt{IR\_GLOBAL\_REF} to a defined
+\emph{function} resolves (that is how an indirect call names its target).
+What this rung deliberately leaves out is \emph{data emission}: it emits no
+storage for file-scope variables, so a reference to a global object is an
+unresolved symbol at link time rather than a miscompile.  That, together with
+string-literal data, floating point, and by-value aggregates, is the work of a
+later rung; an unrecognised opcode is still silently skipped.
 
 \section{Strategy: an All-Spill Frame}
 \label{sec:x86-strategy}
@@ -171,6 +184,70 @@ _kcc_x86_s_r10_pr11: .asciz "%r10, (%r11)\n"
 _kcc_x86_s_r10b_pr11:.asciz "%r10b, (%r11)\n"
 _kcc_x86_s_r10w_pr11:.asciz "%r10w, (%r11)\n"
 _kcc_x86_s_r10d_pr11:.asciz "%r10d, (%r11)\n"
+@}
+
+\subsection{Vocabulary for Control Flow and Calls (Rung 3)}
+\label{sec:x86-data-rung3}
+
+Rung~three adds the comparison, branch, and call vocabulary.  Comparisons emit
+a \texttt{cmp} at the operands' common width followed by a \texttt{set}\emph{cc}
+into \verb|%al| and a \texttt{movzbl} that widens the boolean into
+\verb|%r10|.  Branches are the great simplification of assembly emission: a
+basic block becomes a named label \verb|.Lkccbb|$N$ (block ids are globally
+unique), so an \texttt{IR\_BR} is a \texttt{jmp} to that label and the
+assembler resolves forward and backward references itself---no patch vector.
+Calls follow the System~V AMD64 ABI: the integer argument registers, in order,
+are \verb|%rdi|, \verb|%rsi|, \verb|%rdx|, \verb|%rcx|, \verb|%r8|, \verb|%r9|
+(collected in \texttt{\_kcc\_x86\_argregs} for index-based lookup), the return
+value comes back in \verb|%rax|, and a direct call names the callee with the
+Mach-O leading underscore.
+
+@d X86: data @{
+// Comparison: cmp at width, set<cc> into %al, widen with movzbl.
+_kcc_x86_s_cmpl:     .asciz "\tcmpl\t%r11d, %r10d\n"
+_kcc_x86_s_cmpq:     .asciz "\tcmpq\t%r11, %r10\n"
+_kcc_x86_s_movzbl_al:.asciz "\tmovzbl\t%al, %r10d\n"
+_kcc_x86_s_sete:     .asciz "\tsete\t%al\n"
+_kcc_x86_s_setne:    .asciz "\tsetne\t%al\n"
+_kcc_x86_s_setl:     .asciz "\tsetl\t%al\n"
+_kcc_x86_s_setle:    .asciz "\tsetle\t%al\n"
+_kcc_x86_s_setg:     .asciz "\tsetg\t%al\n"
+_kcc_x86_s_setge:    .asciz "\tsetge\t%al\n"
+_kcc_x86_s_setb:     .asciz "\tsetb\t%al\n"
+_kcc_x86_s_setbe:    .asciz "\tsetbe\t%al\n"
+
+// Branches: named basic-block labels resolved by the assembler.
+_kcc_x86_s_bb:       .asciz ".Lkccbb"        // label stem; a decimal id follows
+_kcc_x86_s_label_nl: .asciz ":\n"
+_kcc_x86_s_jmp:      .asciz "\tjmp\t"
+_kcc_x86_s_jne:      .asciz "\tjne\t"
+_kcc_x86_s_test_r10: .asciz "\ttestq\t%r10, %r10\n"
+
+// Calls: System V AMD64 argument registers, call forms, and stack adjust.
+_kcc_x86_s_rdi:      .asciz "%rdi"
+_kcc_x86_s_rsi:      .asciz "%rsi"
+_kcc_x86_s_r8:       .asciz "%r8"
+_kcc_x86_s_r9:       .asciz "%r9"
+_kcc_x86_s_call:     .asciz "\tcall\t"
+_kcc_x86_s_call_r11: .asciz "\tcall\t*%r11\n"
+_kcc_x86_s_zero_al:  .asciz "\tmovb\t$0, %al\n"
+_kcc_x86_s_sub_rsp:  .asciz "\tsubq\t$"
+_kcc_x86_s_add_rsp:  .asciz "\taddq\t$"
+_kcc_x86_s_rsp:      .asciz ", %rsp\n"
+_kcc_x86_s_paren_rsp:.asciz "(%rsp)"
+_kcc_x86_s_rip_r10:  .asciz "(%rip), %r10\n"
+
+// The argument-register lookup table holds pointers, so it lives in a
+// relocatable data section, not the cstring pool (which admits no relocations).
+.data
+.p2align 3
+_kcc_x86_argregs:
+    .quad _kcc_x86_s_rdi
+    .quad _kcc_x86_s_rsi
+    .quad _kcc_x86_s_rdx
+    .quad _kcc_x86_s_rcx
+    .quad _kcc_x86_s_r8
+    .quad _kcc_x86_s_r9
 @}
 
 \section{Text-Buffer Emission Helpers}
@@ -646,6 +723,189 @@ _kcc_x86_memstore:
     ret
 @}
 
+\subsection{Comparison, Label, and Call Helpers (Rung 3)}
+\label{sec:x86-rung3-helpers}
+
+Three more shape helpers cover control flow.  \texttt{\_kcc\_x86\_cmp} emits a
+comparison: it loads both operands, compares them at the width recorded in the
+instruction's type (32-bit \texttt{cmpl} for an \texttt{int}-or-narrower common
+type, else 64-bit \texttt{cmpq}), materialises the boolean with the caller's
+chosen \texttt{set}\emph{cc} into \verb|%al|, widens it into \verb|%r10| with
+\texttt{movzbl}, and stores it.  \texttt{\_kcc\_x86\_bblabel} appends a
+basic-block label reference \verb|.Lkccbb|$N$ (used both to define a block's
+label and to name a branch target).  \texttt{\_kcc\_x86\_marshal} realises the
+System~V argument-passing rules for the integer class: it reads the argument
+array (\texttt{[count\,|\,fsi{<}{<}32, vreg0, class0, \ldots]}), places
+arguments seven and beyond into a freshly subtracted stack region at
+\verb|(k-6)*8(%rsp)|, loads the first six into \verb|%rdi|--\verb|%r9|, and
+returns the \texttt{stack\_adj} the caller adds back after the call.
+Floating-point and by-value aggregate arguments are a later rung; rung~three
+treats every argument as integer/pointer.
+
+@d X86: render @{
+// -- kcc_x86_cmp(ir_instr *i, const char *setcc) — dst = (src1 CMP src2) ? 1:0.
+.p2align 2
+_kcc_x86_cmp:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // instr
+    mov x20, x1                     // set<cc> string
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    ldr x0, [x19, #IR_SRC2]
+    adrp x1, _kcc_x86_s_r11@@PAGE
+    add  x1, x1, _kcc_x86_s_r11@@PAGEOFF
+    bl _kcc_x86_load
+    // Compare width: <=4-byte common type → 32-bit cmpl, else 64-bit cmpq.
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lx86cmp_q
+    ldr x0, [x0, #TY_SIZE]
+    cmp x0, #8
+    b.eq .Lx86cmp_q
+    adrp x0, _kcc_x86_s_cmpl@@PAGE
+    add  x0, x0, _kcc_x86_s_cmpl@@PAGEOFF
+    b .Lx86cmp_emit
+.Lx86cmp_q:
+    adrp x0, _kcc_x86_s_cmpq@@PAGE
+    add  x0, x0, _kcc_x86_s_cmpq@@PAGEOFF
+.Lx86cmp_emit:
+    bl _kcc_as_str
+    mov x0, x20                     // set<cc> %al
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_movzbl_al@@PAGE
+    add  x0, x0, _kcc_x86_s_movzbl_al@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_bblabel(uint64_t bb_id) — append ".Lkccbb<id>".
+.p2align 2
+_kcc_x86_bblabel:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    adrp x0, _kcc_x86_s_bb@@PAGE
+    add  x0, x0, _kcc_x86_s_bb@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_as_dec
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_marshal(uint64_t *args, uint64_t count) → stack_adj.
+//    Loads integer/pointer args into %rdi..%r9 and args 7+ onto the stack.
+.p2align 2
+_kcc_x86_marshal:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                     // args array
+    mov x20, x1                     // count
+    mov x22, #0                     // stack_adj (return value)
+    cbz x20, .Lx86mar_done
+
+    // Stack phase: if count > 6, reserve align16((count-6)*8) and store the
+    // overflow args (index 6..count-1) at (k-6)*8(%rsp).
+    cmp x20, #6
+    b.le .Lx86mar_regs
+    sub x0, x20, #6
+    lsl x0, x0, #3
+    add x0, x0, #15
+    and x22, x0, #~15              // stack_adj
+    adrp x0, _kcc_x86_s_sub_rsp@@PAGE
+    add  x0, x0, _kcc_x86_s_sub_rsp@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x22
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_rsp@@PAGE
+    add  x0, x0, _kcc_x86_s_rsp@@PAGEOFF
+    bl _kcc_as_str
+    mov x21, #6                     // k = 6
+.Lx86mar_stack_loop:
+    cmp x21, x20
+    b.ge .Lx86mar_regs
+    // movq slot(vreg_k), %r10
+    lsl x0, x21, #1
+    add x0, x0, #1                 // 1 + 2k → vreg field
+    ldr x0, [x19, x0, lsl #3]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    // movq %r10, (k-6)*8(%rsp)
+    adrp x0, _kcc_x86_s_movq@@PAGE
+    add  x0, x0, _kcc_x86_s_movq@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_comma@@PAGE
+    add  x0, x0, _kcc_x86_s_comma@@PAGEOFF
+    bl _kcc_as_str
+    sub x0, x21, #6
+    lsl x0, x0, #3                // (k-6)*8
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_paren_rsp@@PAGE
+    add  x0, x0, _kcc_x86_s_paren_rsp@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, #10
+    bl _kcc_as_ch
+    add x21, x21, #1
+    b .Lx86mar_stack_loop
+
+.Lx86mar_regs:
+    // Register phase: args 0..min(count,6)-1 into %rdi..%r9.
+    mov x21, #0
+.Lx86mar_reg_loop:
+    cmp x21, x20
+    b.ge .Lx86mar_done
+    cmp x21, #6
+    b.ge .Lx86mar_done
+    lsl x0, x21, #1
+    add x0, x0, #1                 // 1 + 2k → vreg field
+    ldr x0, [x19, x0, lsl #3]      // vreg
+    adrp x1, _kcc_x86_argregs@@PAGE
+    add  x1, x1, _kcc_x86_argregs@@PAGEOFF
+    ldr x1, [x1, x21, lsl #3]      // argreg[k] string ptr
+    bl _kcc_x86_load
+    add x21, x21, #1
+    b .Lx86mar_reg_loop
+
+.Lx86mar_done:
+    mov x0, x22                     // stack_adj
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_x86_call_args(uint64_t *args) → stack_adj.  Reads the count from the
+//    argument array header and marshals; a null array is a zero-argument call.
+.p2align 2
+_kcc_x86_call_args:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    cbz x0, .Lx86ca_none
+    ldr x1, [x0]                    // word0 = count | (fsi << 32)
+    and x1, x1, #0xffffffff         // count
+    bl _kcc_x86_marshal             // marshal(args=x0, count=x1) → x0 = stack_adj
+    b .Lx86ca_ret
+.Lx86ca_none:
+    mov x0, #0
+.Lx86ca_ret:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
 \subsection{The Dispatch}
 \label{sec:x86-dispatch}
 
@@ -725,7 +985,38 @@ _kcc_x86_sel:
     b.eq .Lx86sel_trunc
     cmp x22, #IR_BITCAST
     b.eq .Lx86sel_bitcast
-    b .Lx86sel_done                 // rung 2: ignore control flow, FP, etc.
+
+    // Comparisons (rung 3): cmp + set<cc> + movzbl.
+    cmp x22, #IR_CMP_EQ
+    b.eq .Lx86sel_cmpeq
+    cmp x22, #IR_CMP_NE
+    b.eq .Lx86sel_cmpne
+    cmp x22, #IR_CMP_SLT
+    b.eq .Lx86sel_cmpslt
+    cmp x22, #IR_CMP_SLE
+    b.eq .Lx86sel_cmpsle
+    cmp x22, #IR_CMP_SGT
+    b.eq .Lx86sel_cmpsgt
+    cmp x22, #IR_CMP_SGE
+    b.eq .Lx86sel_cmpsge
+    cmp x22, #IR_CMP_ULT
+    b.eq .Lx86sel_cmpult
+    cmp x22, #IR_CMP_ULE
+    b.eq .Lx86sel_cmpule
+
+    // Control flow and calls (rung 3).
+    cmp x22, #IR_BR
+    b.eq .Lx86sel_br
+    cmp x22, #IR_BR_COND
+    b.eq .Lx86sel_brcond
+    cmp x22, #IR_CALL
+    b.eq .Lx86sel_call
+    cmp x22, #IR_CALL_IND
+    b.eq .Lx86sel_callind
+    cmp x22, #IR_GLOBAL_REF
+    b.eq .Lx86sel_globalref
+
+    b .Lx86sel_done                 // rung 3: ignore FP, string lits, asm, etc.
 
 .Lx86sel_const:
     adrp x0, _kcc_x86_s_movabsq@@PAGE
@@ -1027,6 +1318,163 @@ _kcc_x86_sel:
     mov x1, #8                      // plain movq copy
     mov x2, #0
     bl _kcc_x86_conv
+    b .Lx86sel_done
+
+// ---- Comparisons: load the set<cc> mnemonic, call the cmp shape. ----
+.Lx86sel_cmpeq:
+    adrp x1, _kcc_x86_s_sete@@PAGE
+    add  x1, x1, _kcc_x86_s_sete@@PAGEOFF
+    b .Lx86sel_cmp_go
+.Lx86sel_cmpne:
+    adrp x1, _kcc_x86_s_setne@@PAGE
+    add  x1, x1, _kcc_x86_s_setne@@PAGEOFF
+    b .Lx86sel_cmp_go
+.Lx86sel_cmpslt:
+    adrp x1, _kcc_x86_s_setl@@PAGE
+    add  x1, x1, _kcc_x86_s_setl@@PAGEOFF
+    b .Lx86sel_cmp_go
+.Lx86sel_cmpsle:
+    adrp x1, _kcc_x86_s_setle@@PAGE
+    add  x1, x1, _kcc_x86_s_setle@@PAGEOFF
+    b .Lx86sel_cmp_go
+.Lx86sel_cmpsgt:
+    adrp x1, _kcc_x86_s_setg@@PAGE
+    add  x1, x1, _kcc_x86_s_setg@@PAGEOFF
+    b .Lx86sel_cmp_go
+.Lx86sel_cmpsge:
+    adrp x1, _kcc_x86_s_setge@@PAGE
+    add  x1, x1, _kcc_x86_s_setge@@PAGEOFF
+    b .Lx86sel_cmp_go
+.Lx86sel_cmpult:
+    adrp x1, _kcc_x86_s_setb@@PAGE
+    add  x1, x1, _kcc_x86_s_setb@@PAGEOFF
+    b .Lx86sel_cmp_go
+.Lx86sel_cmpule:
+    adrp x1, _kcc_x86_s_setbe@@PAGE
+    add  x1, x1, _kcc_x86_s_setbe@@PAGEOFF
+.Lx86sel_cmp_go:
+    mov x0, x19
+    bl _kcc_x86_cmp
+    b .Lx86sel_done
+
+// ---- Unconditional branch: jmp .Lkccbb<target>. ----
+.Lx86sel_br:
+    adrp x0, _kcc_x86_s_jmp@@PAGE
+    add  x0, x0, _kcc_x86_s_jmp@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]         // target BB id
+    bl _kcc_x86_bblabel
+    mov x0, #10
+    bl _kcc_as_ch
+    b .Lx86sel_done
+
+// ---- Conditional branch: test cond, jne true, jmp false. ----
+.Lx86sel_brcond:
+    ldr x0, [x19, #IR_DEST]         // condition vreg
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    adrp x0, _kcc_x86_s_test_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_test_r10@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_jne@@PAGE
+    add  x0, x0, _kcc_x86_s_jne@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]         // true BB id
+    bl _kcc_x86_bblabel
+    mov x0, #10
+    bl _kcc_as_ch
+    adrp x0, _kcc_x86_s_jmp@@PAGE
+    add  x0, x0, _kcc_x86_s_jmp@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC2]         // false BB id
+    bl _kcc_x86_bblabel
+    mov x0, #10
+    bl _kcc_as_ch
+    b .Lx86sel_done
+
+// ---- Global reference: leaq _<name>(%rip), %r10 ; store to dest. ----
+.Lx86sel_globalref:
+    adrp x0, _kcc_x86_s_leaq@@PAGE
+    add  x0, x0, _kcc_x86_s_leaq@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_us@@PAGE
+    add  x0, x0, _kcc_x86_s_us@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]         // symbol name
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_rip_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_rip_r10@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    b .Lx86sel_done
+
+// ---- Direct call: marshal args, call _<name>, store %rax. ----
+.Lx86sel_call:
+    ldr x0, [x19, #IR_SRC2]         // args array (0 if none)
+    bl _kcc_x86_call_args           // loads args into ABI regs/stack
+    mov x20, x0                     // x20 = stack_adj (survives the call sequence)
+    // movb $0, %al   (variadic safety: no FP args in rung 3)
+    adrp x0, _kcc_x86_s_zero_al@@PAGE
+    add  x0, x0, _kcc_x86_s_zero_al@@PAGEOFF
+    bl _kcc_as_str
+    // call _<name>
+    adrp x0, _kcc_x86_s_call@@PAGE
+    add  x0, x0, _kcc_x86_s_call@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_us@@PAGE
+    add  x0, x0, _kcc_x86_s_us@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]         // callee name
+    bl _kcc_as_str
+    mov x0, #10
+    bl _kcc_as_ch
+    b .Lx86sel_call_tail
+
+// ---- Indirect call: marshal args, call *%r11, store %rax. ----
+.Lx86sel_callind:
+    ldr x0, [x19, #IR_SRC2]         // args array
+    bl _kcc_x86_call_args           // loads args into ABI regs/stack
+    mov x20, x0                     // x20 = stack_adj
+    // Load the function pointer into %r11 (arg regs already set; r11 is free).
+    ldr x0, [x19, #IR_SRC1]         // fn-ptr vreg
+    adrp x1, _kcc_x86_s_r11@@PAGE
+    add  x1, x1, _kcc_x86_s_r11@@PAGEOFF
+    bl _kcc_x86_load
+    adrp x0, _kcc_x86_s_zero_al@@PAGE
+    add  x0, x0, _kcc_x86_s_zero_al@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_call_r11@@PAGE
+    add  x0, x0, _kcc_x86_s_call_r11@@PAGEOFF
+    bl _kcc_as_str
+    // fall through to the shared return/stack-restore tail
+
+.Lx86sel_call_tail:
+    // Restore the stack if arguments overflowed onto it (x20 = stack_adj).
+    cbz x20, .Lx86sel_call_ret
+    adrp x0, _kcc_x86_s_add_rsp@@PAGE
+    add  x0, x0, _kcc_x86_s_add_rsp@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_rsp@@PAGE
+    add  x0, x0, _kcc_x86_s_rsp@@PAGEOFF
+    bl _kcc_as_str
+.Lx86sel_call_ret:
+    // Store %rax into the result vreg unless the call is void.
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lx86sel_done           // no type → nothing to home
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_VOID
+    b.eq .Lx86sel_done
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_rax@@PAGE
+    add  x1, x1, _kcc_x86_s_rax@@PAGEOFF
+    bl _kcc_x86_store
+    b .Lx86sel_done
 
 .Lx86sel_done:
     ldp x21, x22, [sp, #32]
@@ -1095,6 +1543,75 @@ _kcc_x86_prescan:
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
+    ret
+@}
+
+\section{Spilling Incoming Parameters}
+\label{sec:x86-params}
+
+On the callee side, the System~V ABI delivers the first six integer parameters
+in \verb|%rdi|--\verb|%r9| and the rest on the caller's stack.  Because the IR
+numbers a function's parameters as its first vregs (\texttt{\%0}, \texttt{\%1},
+\ldots), the prologue copies each incoming register into its parameter's vreg
+slot, after which a parameter is indistinguishable from any other value in the
+all-spill model.  A parameter past the sixth is read from the caller's stack
+image at \verb|16 + (k-6)*8(%rbp)| (the saved \verb|%rbp| and return address
+occupy the first sixteen bytes above \verb|%rbp|).  As with the argument
+marshalling, rung~three assumes every parameter is of the integer class;
+floating-point and by-value aggregate parameters are a later rung.
+
+@d X86: render @{
+// -- kcc_x86_spill_params(ir_func *f) — copy incoming args into vreg slots.
+.p2align 2
+_kcc_x86_spill_params:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    ldr x19, [x0, #IRF_PARAMS]      // param count
+    mov x20, #0                     // k
+.Lx86sp_loop:
+    cmp x20, x19
+    b.ge .Lx86sp_done
+    cmp x20, #6
+    b.ge .Lx86sp_stack
+    // movq %argreg[k], slot(k)
+    mov x0, x20                     // vreg = k
+    adrp x1, _kcc_x86_argregs@@PAGE
+    add  x1, x1, _kcc_x86_argregs@@PAGEOFF
+    ldr x1, [x1, x20, lsl #3]       // argreg[k] string ptr
+    bl _kcc_x86_store
+    b .Lx86sp_next
+.Lx86sp_stack:
+    // movq 16+(k-6)*8(%rbp), %r10   (positive displacement: caller stack image)
+    adrp x0, _kcc_x86_s_movq@@PAGE
+    add  x0, x0, _kcc_x86_s_movq@@PAGEOFF
+    bl _kcc_as_str
+    sub x0, x20, #6
+    lsl x0, x0, #3
+    add x0, x0, #16                 // 16 + (k-6)*8
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_rbp@@PAGE
+    add  x0, x0, _kcc_x86_s_rbp@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_comma@@PAGE
+    add  x0, x0, _kcc_x86_s_comma@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, #10
+    bl _kcc_as_ch
+    // store %r10 → slot(k)
+    mov x0, x20
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+.Lx86sp_next:
+    add x20, x20, #1
+    b .Lx86sp_loop
+.Lx86sp_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
     ret
 @}
 
@@ -1195,6 +1712,10 @@ _kcc_x86_render_text:
     bl _kcc_as_str
 
 .Lx86rt_body:
+    // Spill incoming parameters into their vreg slots (SysV integer class).
+    mov x0, x22
+    bl _kcc_x86_spill_params
+
     // Walk basic blocks.
     ldr x23, [x22, #IRF_BLOCKS]
     cbz x23, .Lx86rt_next_func
@@ -1208,6 +1729,12 @@ _kcc_x86_render_text:
     mov x1, x25
     bl _kcc_vec_get
     ldr x27, [x0]                   // BB ptr
+    // Emit the block's label ".Lkccbb<id>:" so branches can target it.
+    ldr x0, [x27, #BB_ID]
+    bl _kcc_x86_bblabel
+    adrp x0, _kcc_x86_s_label_nl@@PAGE
+    add  x0, x0, _kcc_x86_s_label_nl@@PAGEOFF
+    bl _kcc_as_str
     ldr x27, [x27, #BB_FIRST]       // first instruction
 
 .Lx86rt_instr:

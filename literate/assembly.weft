@@ -757,6 +757,20 @@ compiler with it, and re-run the code-generation suite:
 @<Selfhost: vec verify@>
 @}
 
+\noindent\textbf{strings.c} --- the string/memory primitives in C
+(Chapter~\ref{ch:self-hosting-strings}), a drop-in replacement:
+
+@o tmp/selfhost/strings.c @{
+@<Selfhost: strings@>
+@}
+
+\noindent\textbf{strings\_verify.sh} --- compile them with \kcc{}, relink the
+compiler with them, and re-run the code-generation suite:
+
+@o tmp/selfhost/strings_verify.sh @{
+@<Selfhost: strings verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

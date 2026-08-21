@@ -72,6 +72,11 @@ selfhost-vec: build
 	chmod +x tmp/selfhost/vec_verify.sh
 	tmp/selfhost/vec_verify.sh
 
+# Self-hosting (Stage 8d): compile kcc's string primitives in C, relink, run suite
+selfhost-strings: build
+	chmod +x tmp/selfhost/strings_verify.sh
+	tmp/selfhost/strings_verify.sh
+
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build
 	chmod +x tmp/tests/difftest.sh

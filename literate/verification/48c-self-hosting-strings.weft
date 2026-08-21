@@ -1,0 +1,167 @@
+% 48c-self-hosting-strings.weft — Stage 8d: the string/memory primitives,
+% written in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The String Primitives in C}
+\label{ch:self-hosting-strings}
+
+The arena and the vector proved \kcc{} can compile its own storage and its own
+workhorse container; this chapter ports the layer beneath both---the five
+string and memory primitives of Chapter~\ref{ch:string-operations}:
+\texttt{kcc\_strlen}, \texttt{kcc\_memcpy}, \texttt{kcc\_memcmp},
+\texttt{kcc\_memset}, and \texttt{kcc\_strcmp}.  These are the most
+\emph{pervasive} functions in the compiler.  \texttt{memcpy} moves every
+struct copy and every vector reallocation; \texttt{memset} clears every zeroed
+buffer; \texttt{strcmp} and \texttt{strlen} drive keyword recognition, symbol
+lookup, and option parsing; \texttt{memcmp} compares interned strings.  Swapping
+the hand-written assembly for a C re-implementation compiled by \kcc{}
+therefore routes essentially every byte the compiler touches through code
+\kcc{} produced.  Because they are leaf routines with no dependencies, the port
+is self-contained---no \texttt{extern} declarations at all.
+
+\section{The Byte-Exact Contract}
+
+A drop-in replacement must be behaviourally identical to the last bit, and the
+one place that bites is the comparison result.  The assembly loads each byte
+with \textsc{ldrb}, which zero-extends, and returns the difference of the two
+\emph{unsigned} byte values (\texttt{s1[i]\,-\,s2[i]}, each in $0$--$255$).  A
+naive C port using plain \texttt{char}---which is \emph{signed} on this
+target---would compare a high-bit byte as negative and return the wrong sign.
+The port therefore reads bytes through \texttt{unsigned char} throughout, so
+\texttt{kcc\_strcmp} and \texttt{kcc\_memcmp} reproduce the assembly's exact
+signed-\texttt{int} result, high bytes and all.
+
+\section{Length}
+
+\texttt{kcc\_strlen} scans to the terminating NUL and returns the count of
+bytes before it.
+
+@l c
+@d Selfhost: strings strlen @{
+unsigned long kcc_strlen(const char *s) {
+    const char *p = s;
+    while (*p) p = p + 1;
+    return (unsigned long)(p - s);
+}
+@}
+
+\section{Copy and Fill}
+
+\texttt{kcc\_memcpy} copies \texttt{n} bytes front to back (no overlap
+handling, matching \texttt{memcpy} rather than \texttt{memmove}) and returns
+the destination; \texttt{kcc\_memset} writes the low eight bits of \texttt{c}
+into \texttt{n} bytes and returns its buffer.
+
+@l c
+@d Selfhost: strings memcpy @{
+void *kcc_memcpy(void *dst, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned long i = 0;
+    while (i < n) { d[i] = s[i]; i = i + 1; }
+    return dst;
+}
+@}
+
+@l c
+@d Selfhost: strings memset @{
+void *kcc_memset(void *s, int c, unsigned long n) {
+    unsigned char *p = (unsigned char *)s;
+    unsigned char b = (unsigned char)c;
+    unsigned long i = 0;
+    while (i < n) { p[i] = b; i = i + 1; }
+    return s;
+}
+@}
+
+\section{Comparison}
+
+Both comparisons read bytes as \texttt{unsigned char} and return the signed
+difference of the first differing pair, zero when the ranges (or strings)
+match.  \texttt{kcc\_memcmp} runs to a fixed length; \texttt{kcc\_strcmp}
+stops at the first NUL common to both.
+
+@l c
+@d Selfhost: strings memcmp @{
+int kcc_memcmp(const void *s1, const void *s2, unsigned long n) {
+    const unsigned char *a = (const unsigned char *)s1;
+    const unsigned char *b = (const unsigned char *)s2;
+    unsigned long i = 0;
+    while (i < n) {
+        if (a[i] != b[i]) return (int)a[i] - (int)b[i];
+        i = i + 1;
+    }
+    return 0;
+}
+@}
+
+@l c
+@d Selfhost: strings strcmp @{
+int kcc_strcmp(const char *s1, const char *s2) {
+    const unsigned char *a = (const unsigned char *)s1;
+    const unsigned char *b = (const unsigned char *)s2;
+    while (*a == *b) {
+        if (*a == 0) return 0;
+        a = a + 1;
+        b = b + 1;
+    }
+    return (int)*a - (int)*b;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+The five fragments compose into \texttt{tmp/selfhost/strings.c}, routed by
+\texttt{assembly.weft}.
+
+@l c
+@d Selfhost: strings @{
+@<Selfhost: strings strlen@>
+@<Selfhost: strings memcpy@>
+@<Selfhost: strings memset@>
+@<Selfhost: strings memcmp@>
+@<Selfhost: strings strcmp@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-strings-verify}
+
+\texttt{make selfhost-strings} runs the drop-in loop: compile
+\texttt{tmp/selfhost/strings.c} with the assembly-built \kcc{}, relink a second
+compiler with the hand-written \texttt{strings.o} replaced by the freshly
+compiled \texttt{strings\_c.o}, and re-run the code-generation suite through it.
+Because these primitives underlie every allocation, copy, and name comparison
+in the compiler, a green run is the strongest of the self-hosting checks: it
+means \kcc{} compiled the very memory operations it then used to compile the
+whole suite, byte for byte.
+
+@d Selfhost: strings verify @{
+#!/usr/bin/env bash
+# make selfhost-strings — compile kcc's string primitives in C with kcc,
+# relink, run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/strings.c with kcc"
+tmp/kcc -c "$SH/strings.c" -o "$SH/strings_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_strings (strings.o -> kcc-compiled strings_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "strings" ]; then OBJ="$OBJ $SH/strings_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_strings $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted string primitives"
+cp tmp/kcc "$SH/kcc_asm_backup_strings"
+cp tmp/kcc_selfhost_strings tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_strings" tmp/kcc
+exit $status
+@}

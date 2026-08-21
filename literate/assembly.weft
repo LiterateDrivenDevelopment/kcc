@@ -829,6 +829,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: diag verify@>
 @}
 
+\noindent\textbf{symtab.c} --- the symbol table in C
+(Chapter~\ref{ch:self-hosting-symtab}), a drop-in replacement:
+
+@o tmp/selfhost/symtab.c @{
+@<Selfhost: symtab@>
+@}
+
+@o tmp/selfhost/symtab_verify.sh @{
+@<Selfhost: symtab verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

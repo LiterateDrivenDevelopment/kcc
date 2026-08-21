@@ -102,6 +102,11 @@ selfhost-diag: build
 	chmod +x tmp/selfhost/diag_verify.sh
 	tmp/selfhost/diag_verify.sh
 
+# Self-hosting (Stage 8j): compile kcc's symbol table in C, relink, run suite
+selfhost-symtab: build
+	chmod +x tmp/selfhost/symtab_verify.sh
+	tmp/selfhost/symtab_verify.sh
+
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build
 	chmod +x tmp/tests/difftest.sh

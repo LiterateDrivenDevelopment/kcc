@@ -1,0 +1,272 @@
+% 48i-self-hosting-symtab.weft — Stage 8j: the symbol table, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Symbol Table in C}
+\label{ch:self-hosting-symtab}
+
+The symbol table of Chapter~\ref{ch:symtab} is the first \emph{semantic}
+subsystem to port, and the first built entirely on containers that are now
+themselves C: it is a stack of scopes, each a hash table, layered over the
+vector.  It answers ``is this name declared, and as what?''---the question
+underneath every use of an identifier, tag, or label.  Because both the vector
+and the hash table it stands on are already kcc-compiled C, porting the symbol
+table means name resolution runs top to bottom through code kcc produced.
+
+\section{Layout and State}
+
+Three scope stacks---ordinary identifiers, tags
+(\texttt{struct}/\texttt{union}/\texttt{enum}), and labels---are vectors of hash
+table pointers, kept in the exported globals \texttt{kcc\_sym\_ordinary},
+\texttt{kcc\_sym\_tags}, \texttt{kcc\_sym\_labels}, alongside the current
+\texttt{kcc\_sym\_depth}.  A symbol record is the 72-byte layout the assembly
+used, its fields---kind, type, name, linkage, value, depth, line, flags,
+column---at the same offsets semantic analysis reads.  The port declares the
+vector's own header so it can pop a scope by decrementing the count directly, as
+the assembly does, and reads the lexer's \texttt{kcc\_tok\_line} for a
+declaration's provisional line.
+
+@l c
+@d Selfhost: symtab preamble @{
+struct Vec {
+    void *data;
+    unsigned long count;
+    unsigned long cap;
+    unsigned long elem_size;
+};
+
+struct Sym {
+    unsigned long kind;
+    void *type;
+    const char *name;
+    unsigned long linkage;
+    unsigned long value;
+    unsigned long depth;
+    unsigned long line;
+    unsigned long flags;
+    unsigned long col;
+};
+
+void *kcc_vec_init(unsigned long elem_size);
+void kcc_vec_push(void *vec, const void *elem);
+void *kcc_vec_get(void *vec, unsigned long index);
+void *kcc_ht_init(unsigned long capacity);
+unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen,
+                unsigned long value);
+void *kcc_arena_alloc(long size);
+
+extern unsigned long kcc_tok_line;
+
+void *kcc_sym_ordinary = 0;
+void *kcc_sym_tags = 0;
+void *kcc_sym_labels = 0;
+unsigned long kcc_sym_depth = 0;
+
+static void *sym_top_ht(void *stack) {
+    struct Vec *v = (struct Vec *)stack;
+    void **slot = (void **)kcc_vec_get(stack, v->count - 1);
+    return *slot;
+}
+@}
+
+\section{Scopes}
+
+Pushing a scope allocates a fresh 256-slot ordinary table and a 16-slot tag
+table, appends each to its stack, and deepens the counter; popping decrements
+both counts and the depth (the arena reclaims the tables at exit).  Because
+\texttt{kcc\_symtab\_init} pushes file scope, it is defined after the push it
+calls.
+
+@l c
+@d Selfhost: symtab scopes @{
+void kcc_symtab_push_scope(void) {
+    void *ord = kcc_ht_init(256);
+    kcc_vec_push(kcc_sym_ordinary, &ord);
+    void *tag = kcc_ht_init(16);
+    kcc_vec_push(kcc_sym_tags, &tag);
+    kcc_sym_depth = kcc_sym_depth + 1;
+}
+
+void kcc_symtab_pop_scope(void) {
+    ((struct Vec *)kcc_sym_ordinary)->count =
+        ((struct Vec *)kcc_sym_ordinary)->count - 1;
+    ((struct Vec *)kcc_sym_tags)->count =
+        ((struct Vec *)kcc_sym_tags)->count - 1;
+    kcc_sym_depth = kcc_sym_depth - 1;
+}
+
+void kcc_symtab_init(void) {
+    kcc_sym_ordinary = kcc_vec_init(8);
+    kcc_sym_tags = kcc_vec_init(8);
+    kcc_sym_labels = kcc_vec_init(8);
+    kcc_sym_depth = 0;
+    kcc_symtab_push_scope();
+}
+@}
+
+\section{Ordinary Names}
+
+\texttt{kcc\_symtab\_declare} builds a symbol record---kind, type, name, depth,
+provisional line, defined flag---and inserts it in the innermost ordinary
+scope.  \texttt{kcc\_symtab\_lookup} walks the stack top-down so an inner
+declaration shadows an outer one; \texttt{lookup\_current} consults only the
+innermost scope (to tell a same-scope redefinition from a legal shadow); and
+\texttt{current\_ht} hands back that scope's table so a caller can iterate the
+block's symbols at exit.
+
+@l c
+@d Selfhost: symtab ordinary @{
+void *kcc_symtab_declare(const char *name, unsigned long len,
+                         unsigned long kind, void *type) {
+    struct Sym *s = (struct Sym *)kcc_arena_alloc(72);
+    s->kind = kind;
+    s->type = type;
+    s->name = name;
+    s->linkage = 0;
+    s->value = 0;
+    s->depth = kcc_sym_depth;
+    s->line = kcc_tok_line;
+    s->flags = 1;
+    s->col = 0;
+    kcc_ht_put(sym_top_ht(kcc_sym_ordinary), name, len, (unsigned long)s);
+    return s;
+}
+
+void *kcc_symtab_lookup(const char *name, unsigned long len) {
+    struct Vec *v = (struct Vec *)kcc_sym_ordinary;
+    unsigned long i = v->count;
+    while (i > 0) {
+        i = i - 1;
+        void **slot = (void **)kcc_vec_get(kcc_sym_ordinary, i);
+        unsigned long r = kcc_ht_get(*slot, name, len);
+        if (r) return (void *)r;
+    }
+    return 0;
+}
+
+void *kcc_symtab_lookup_current(const char *name, unsigned long len) {
+    return (void *)kcc_ht_get(sym_top_ht(kcc_sym_ordinary), name, len);
+}
+
+void *kcc_symtab_current_ht(void) {
+    return sym_top_ht(kcc_sym_ordinary);
+}
+@}
+
+\section{Tags}
+
+Tags live in their own name space, so the same identifier can be a tag and an
+ordinary name at once.  Declaration and lookup mirror the ordinary case on the
+tag stack.
+
+@l c
+@d Selfhost: symtab tags @{
+void *kcc_symtab_declare_tag(const char *name, unsigned long len, void *type) {
+    struct Sym *s = (struct Sym *)kcc_arena_alloc(72);
+    s->kind = 1;
+    s->type = type;
+    s->name = name;
+    s->linkage = 0;
+    s->value = 0;
+    s->depth = kcc_sym_depth;
+    s->line = 0;
+    s->flags = 1;
+    s->col = 0;
+    kcc_ht_put(sym_top_ht(kcc_sym_tags), name, len, (unsigned long)s);
+    return s;
+}
+
+void *kcc_symtab_lookup_tag(const char *name, unsigned long len) {
+    struct Vec *v = (struct Vec *)kcc_sym_tags;
+    unsigned long i = v->count;
+    while (i > 0) {
+        i = i - 1;
+        void **slot = (void **)kcc_vec_get(kcc_sym_tags, i);
+        unsigned long r = kcc_ht_get(*slot, name, len);
+        if (r) return (void *)r;
+    }
+    return 0;
+}
+@}
+
+\section{Labels}
+
+Labels are function-scoped: one table per body.  \texttt{label\_begin} and
+\texttt{label\_end} bracket the function, \texttt{label\_add} records a label
+with a sentinel value, and \texttt{label\_lookup} reports whether a
+\texttt{goto} target exists---guarding against an empty label stack.
+
+@l c
+@d Selfhost: symtab labels @{
+void kcc_symtab_label_begin(void) {
+    void *h = kcc_ht_init(16);
+    kcc_vec_push(kcc_sym_labels, &h);
+}
+
+void kcc_symtab_label_end(void) {
+    ((struct Vec *)kcc_sym_labels)->count =
+        ((struct Vec *)kcc_sym_labels)->count - 1;
+}
+
+void kcc_symtab_label_add(const char *name, unsigned long len) {
+    kcc_ht_put(sym_top_ht(kcc_sym_labels), name, len, 1);
+}
+
+int kcc_symtab_label_lookup(const char *name, unsigned long len) {
+    struct Vec *v = (struct Vec *)kcc_sym_labels;
+    if (v->count == 0) return 0;
+    unsigned long r = kcc_ht_get(sym_top_ht(kcc_sym_labels), name, len);
+    return r ? 1 : 0;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: symtab @{
+@<Selfhost: symtab preamble@>
+@<Selfhost: symtab scopes@>
+@<Selfhost: symtab ordinary@>
+@<Selfhost: symtab tags@>
+@<Selfhost: symtab labels@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-symtab-verify}
+
+\texttt{make selfhost-symtab} runs the drop-in loop.  Because every declared
+name---variable, function, typedef, tag, or label---is entered and resolved
+through this table, a green code-generation suite means \kcc{} compiled its own
+scoping and name resolution correctly, shadowing rules and all.
+
+@d Selfhost: symtab verify @{
+#!/usr/bin/env bash
+# make selfhost-symtab — compile kcc's symbol table in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/symtab.c with kcc"
+tmp/kcc -c "$SH/symtab.c" -o "$SH/symtab_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_symtab (symtab.o -> kcc-compiled symtab_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "symtab" ]; then OBJ="$OBJ $SH/symtab_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_symtab $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted symbol table"
+cp tmp/kcc "$SH/kcc_asm_backup_symtab"
+cp tmp/kcc_selfhost_symtab tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_symtab" tmp/kcc
+exit $status
+@}

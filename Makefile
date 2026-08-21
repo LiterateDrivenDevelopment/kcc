@@ -97,6 +97,11 @@ selfhost-source: build
 	chmod +x tmp/selfhost/source_verify.sh
 	tmp/selfhost/source_verify.sh
 
+# Self-hosting (Stage 8i): compile kcc's diagnostic engine in C, relink, run suites
+selfhost-diag: build
+	chmod +x tmp/selfhost/diag_verify.sh
+	tmp/selfhost/diag_verify.sh
+
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build
 	chmod +x tmp/tests/difftest.sh

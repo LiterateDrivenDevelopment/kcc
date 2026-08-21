@@ -602,6 +602,7 @@ the binaries, and verify that the exit code matches the expected value.
 @i literate/verification/48e-self-hosting-strtab.weft
 @i literate/verification/48f-self-hosting-io.weft
 @i literate/verification/48g-self-hosting-source.weft
+@i literate/verification/48h-self-hosting-diag.weft
 \end{multicols}
 \newpage
 

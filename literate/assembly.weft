@@ -818,6 +818,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: source verify@>
 @}
 
+\noindent\textbf{diag.c} --- the diagnostic engine in C
+(Chapter~\ref{ch:self-hosting-diag}), a drop-in replacement:
+
+@o tmp/selfhost/diag.c @{
+@<Selfhost: diag@>
+@}
+
+@o tmp/selfhost/diag_verify.sh @{
+@<Selfhost: diag verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

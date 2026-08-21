@@ -1,0 +1,199 @@
+% 48g-self-hosting-source.weft — Stage 8h: the source manager and translation
+% phases 1--2, written in C, compiled by kcc itself, and linked back in.
+
+\chapter{Self-Hosting: The Source Manager in C}
+\label{ch:self-hosting-source}
+
+With the foundation ported, the next subsystem up is the one that produces the
+bytes everything else consumes: the source manager of
+Chapter~\ref{ch:source-manager}, together with translation phases~1 and~2
+(Chapters~\ref{ch:source-encoding} and~\ref{ch:line-splicing}).  Its three
+routines map a file into memory, replace trigraphs, and splice
+backslash--newline line continuations---the first bytes of every compilation.
+It is the first port to touch the operating system directly (through the
+\texttt{kcc\_sys\_*} wrappers, which stay in assembly because they are raw
+\texttt{svc}s) and the first whose global state---the mapped buffer and its
+size---is read by \emph{other} modules, so it keeps those symbols exactly.
+
+\section{Opening the File}
+
+\texttt{kcc\_source\_open} records the path, opens it read-only, measures it
+with \texttt{lseek(SEEK\_END)}, rejects the empty file, and maps it
+\texttt{PROT\_READ}/\texttt{MAP\_PRIVATE}; a \texttt{-1} from any syscall prints
+the corresponding message to stderr and exits.  The mapped base and byte size
+land in the exported globals the lexer and the diagnostic engine read.  The
+syscall flag values are the numeric constants the assembly used (O\_RDONLY~0,
+SEEK\_END~2, PROT\_READ~1, MAP\_PRIVATE~2).
+
+@l c
+@d Selfhost: source preamble @{
+long kcc_sys_open(const char *path, int flags, int mode);
+long kcc_sys_close(int fd);
+void *kcc_sys_mmap(void *addr, unsigned long len, int prot, int flags,
+                   int fd, long off);
+long kcc_sys_lseek(int fd, long offset, int whence);
+void kcc_sys_exit(int status);
+void kcc_io_err(const char *s);
+void *kcc_arena_alloc(long size);
+
+void *kcc_src_base = 0;
+unsigned long kcc_src_size = 0;
+const char *kcc_src_path = 0;
+@}
+
+@l c
+@d Selfhost: source open @{
+void kcc_source_open(const char *path) {
+    kcc_src_path = path;
+    long fd = kcc_sys_open(path, 0, 0);
+    if (fd == -1) {
+        kcc_io_err("kcc: error: cannot open file: ");
+        kcc_io_err(path);
+        kcc_io_err("\n");
+        kcc_sys_exit(1);
+    }
+    long size = kcc_sys_lseek((int)fd, 0, 2);
+    if (size == -1) {
+        kcc_sys_close((int)fd);
+        kcc_io_err("kcc: error: cannot read file\n");
+        kcc_sys_exit(1);
+    }
+    if (size == 0) {
+        kcc_sys_close((int)fd);
+        kcc_io_err("kcc: error: source file is empty\n");
+        kcc_sys_exit(1);
+    }
+    void *base = kcc_sys_mmap(0, (unsigned long)size, 1, 2, (int)fd, 0);
+    if ((long)base == -1) {
+        kcc_sys_close((int)fd);
+        kcc_io_err("kcc: error: cannot map file\n");
+        kcc_sys_exit(1);
+    }
+    kcc_src_base = base;
+    kcc_src_size = (unsigned long)size;
+    kcc_sys_close((int)fd);
+}
+@}
+
+\section{Phase 1: Trigraphs}
+
+Because the mapping is read-only, \texttt{kcc\_source\_encode} copies the source
+into a writable arena buffer, replacing each of the nine \texttt{??X} trigraphs
+with its single character as it goes (advancing the reader by three) and
+copying any other byte verbatim (advancing by one).  A lone or unmatched
+\texttt{?} is just copied---the same fall-through the assembly takes.  The new
+base and its shorter length replace the globals, readying the buffer for
+in-place splicing.
+
+@l c
+@d Selfhost: source encode @{
+void kcc_source_encode(void) {
+    const unsigned char *r = (const unsigned char *)kcc_src_base;
+    const unsigned char *end = r + kcc_src_size;
+    unsigned char *w0 = (unsigned char *)kcc_arena_alloc((long)kcc_src_size);
+    unsigned char *w = w0;
+    while (r < end) {
+        if (r[0] == '?' && (r + 2) < end && r[1] == '?') {
+            unsigned char c = r[2];
+            unsigned char rep = 0;
+            if (c == '=') rep = '#';
+            else if (c == '(') rep = '[';
+            else if (c == '/') rep = '\\';
+            else if (c == ')') rep = ']';
+            else if (c == '\'') rep = '^';
+            else if (c == '<') rep = '{';
+            else if (c == '!') rep = '|';
+            else if (c == '>') rep = '}';
+            else if (c == '-') rep = '~';
+            if (rep) {
+                *w = rep;
+                w = w + 1;
+                r = r + 3;
+                continue;
+            }
+        }
+        *w = *r;
+        w = w + 1;
+        r = r + 1;
+    }
+    kcc_src_base = w0;
+    kcc_src_size = (unsigned long)(w - w0);
+}
+@}
+
+\section{Phase 2: Line Splicing}
+
+\texttt{kcc\_source\_splice} rewrites the (now writable) buffer in place,
+dropping every backslash immediately followed by a newline and copying
+everything else; a backslash at the very end is kept.  The surviving length
+updates \texttt{kcc\_src\_size}.
+
+@l c
+@d Selfhost: source splice @{
+void kcc_source_splice(void) {
+    unsigned char *base = (unsigned char *)kcc_src_base;
+    unsigned char *end = base + kcc_src_size;
+    unsigned char *w = base;
+    unsigned char *r = base;
+    while (r < end) {
+        if (*r == '\\' && (r + 1) < end && r[1] == 0x0A) {
+            r = r + 2;
+            continue;
+        }
+        *w = *r;
+        w = w + 1;
+        r = r + 1;
+    }
+    kcc_src_size = (unsigned long)(w - base);
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: source @{
+@<Selfhost: source preamble@>
+@<Selfhost: source open@>
+@<Selfhost: source encode@>
+@<Selfhost: source splice@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-source-verify}
+
+\texttt{make selfhost-source} runs the drop-in loop.  Because every byte the
+compiler parses first passes through this buffer---mapped, trigraph-translated,
+and spliced---a green code-generation suite means \kcc{} compiled its own front
+door correctly.
+
+@d Selfhost: source verify @{
+#!/usr/bin/env bash
+# make selfhost-source — compile kcc's source manager in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/source.c with kcc"
+tmp/kcc -c "$SH/source.c" -o "$SH/source_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_source (source.o -> kcc-compiled source_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "source" ]; then OBJ="$OBJ $SH/source_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_source $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted source manager"
+cp tmp/kcc "$SH/kcc_asm_backup_source"
+cp tmp/kcc_selfhost_source tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_source" tmp/kcc
+exit $status
+@}

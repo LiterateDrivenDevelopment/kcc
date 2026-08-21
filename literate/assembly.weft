@@ -807,6 +807,17 @@ compiler with it, and re-run the code-generation suite:
 @<Selfhost: io verify@>
 @}
 
+\noindent\textbf{source.c} --- the source manager and translation phases 1--2 in
+C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
+
+@o tmp/selfhost/source.c @{
+@<Selfhost: source@>
+@}
+
+@o tmp/selfhost/source_verify.sh @{
+@<Selfhost: source verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

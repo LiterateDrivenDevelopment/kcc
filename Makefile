@@ -92,6 +92,11 @@ selfhost-io: build
 	chmod +x tmp/selfhost/io_verify.sh
 	tmp/selfhost/io_verify.sh
 
+# Self-hosting (Stage 8h): compile kcc's source manager in C, relink, run suite
+selfhost-source: build
+	chmod +x tmp/selfhost/source_verify.sh
+	tmp/selfhost/source_verify.sh
+
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build
 	chmod +x tmp/tests/difftest.sh

@@ -2253,17 +2253,110 @@ negation, or a folded arithmetic initialiser all reduce to a number here.  An
 array longer than its initialiser has its tail zero-filled with a single
 \texttt{.zero} directive.
 
-The aggregate shapes---a \texttt{const} struct, an array of structs, a
-\texttt{const} pointer array---are laid out field by field with their own
-relocations, which this rung does not yet emit; for those
-\texttt{\_kcc\_x86\_emit\_rodata\_global} declines (returns~0) and the global
-stays undefined, an honest link error rather than a wrong image.  The routine
-returns~1 when it emitted the data.
+A \texttt{const} struct of scalar fields, and a one-dimensional array of such
+structs, are laid out field by field.  A struct's initialiser matches its
+fields positionally, but a field does not always begin where the previous one
+ended---the ABI inserts padding so each member sits at its natural alignment---%
+so \texttt{\_kcc\_x86\_emit\_struct\_bytes} tracks a write cursor and, before
+each field, emits a \texttt{.zero} run to bridge any gap from the cursor to that
+field's recorded byte offset.  Each field is then a scalar value directive at
+its own width, and any bytes past the last initialised field (trailing padding
+or unmentioned fields) are zero-filled to the struct's total size.  An array of
+structs repeats this per element and zero-fills any element the initialiser
+omits.  The only \texttt{const} aggregate still declined is a pointer
+array---its elements are relocations to other symbols, not plain bytes---which
+stays undefined, an honest link error.  The routine returns~1 when it emitted
+the data.
 
 @d X86: render @{
+// -- kcc_x86_emit_struct_bytes(type *sty, node *init, uint64_t total) — lay out
+//    one struct's scalar fields as value directives, bridging alignment padding
+//    with .zero and zero-filling the tail to `total` bytes.
+.p2align 2
+_kcc_x86_emit_struct_bytes:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
+    mov x22, x2                     // total struct size
+    ldr x0, [x0, #TY_F0]            // AST_STRUCT_DECL
+    ldr x19, [x0, #AST_F1]          // field cursor
+    mov x20, #0                     // init element cursor
+    cbz x1, .Lx86sb_fields
+    ldr x20, [x1, #AST_F0]          // first init element
+.Lx86sb_fields:
+    mov x23, #0                     // write cursor (byte position)
+.Lx86sb_loop:
+    cbz x19, .Lx86sb_tail
+    // Field type → size + kind; field byte offset.
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lx86sb_tail
+    ldr x24, [x0, #TY_SIZE]         // field size
+    ldr x25, [x0, #TY_KIND]        // field kind
+    ldr x0, [x19, #AST_F3]         // field byte offset
+    // Bridge any alignment padding [cursor, offset) with .zero.
+    cmp x0, x23
+    b.ls .Lx86sb_atfield
+    sub x1, x0, x23                // gap bytes
+    mov x23, x0                    // cursor = offset
+    mov x0, x1
+    bl _kcc_x86_emit_zero
+.Lx86sb_atfield:
+    // Value bits: from the init element if present, else zero.
+    cbz x20, .Lx86sb_zeroval
+    mov x0, x20
+    mov x1, x25
+    bl _kcc_rodata_leaf_bits
+    ldr x20, [x20, #AST_F4]        // advance init element
+    b .Lx86sb_emit
+.Lx86sb_zeroval:
+    mov x0, #0
+.Lx86sb_emit:
+    mov x1, x24                    // field size
+    bl _kcc_x86_emit_value
+    add x23, x23, x24             // cursor += field size
+    ldr x19, [x19, #AST_F4]        // next field
+    b .Lx86sb_loop
+.Lx86sb_tail:
+    // Zero-fill from the cursor to the struct's total size.
+    cmp x23, x22
+    b.ge .Lx86sb_done
+    sub x0, x22, x23
+    bl _kcc_x86_emit_zero
+.Lx86sb_done:
+    ldr x25, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+// -- kcc_x86_emit_zero(uint64_t n) — emit "\t.zero n\n" (nothing if n == 0).
+.p2align 2
+_kcc_x86_emit_zero:
+    cbz x0, .Lx86ez_ret
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    adrp x0, _kcc_x86_s_zerodir@@PAGE
+    add  x0, x0, _kcc_x86_s_zerodir@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_as_dec
+    mov x0, #10
+    bl _kcc_as_ch
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+.Lx86ez_ret:
+    ret
+
 // -- kcc_x86_emit_rodata_global(node *decl, const char *name) → 1 emitted, 0 declined.
-//    Emits a scalar or array-of-scalar const global as value directives in the
-//    read-only section.  Declines struct / array-of-struct / pointer-array.
+//    Emits a const global's read-only byte image: scalar, array-of-scalar,
+//    struct-of-scalars, or array of such structs.  Declines a pointer array.
 //    `name` is the linker symbol: the source name for a file-scope global, the
 //    mangled sl_<node> for a static local.
 .p2align 2
@@ -2279,36 +2372,48 @@ _kcc_x86_emit_rodata_global:
     mov x20, x1                     // symbol name (source name, or mangled sl_ for a static local)
     cbz x20, .Lx86rg_decline
 
-    // Resolve type; find element type + size + declared element count.
+    // Resolve type and classify the shape into x22:
+    //   0 = scalar, 1 = array of scalar, 2 = struct, 3 = array of struct.
+    // x23 = the element/struct type; x25 = element size; x26 = element kind;
+    // x24 = declared element count (for the array shapes).
     ldr x0, [x19, #AST_F0]
     bl _kcc_sema_resolve_type
     cbz x0, .Lx86rg_decline
     mov x21, x0                     // full type
     ldr x0, [x21, #TY_KIND]
-    cmp x0, #TY_ARRAY
-    b.eq .Lx86rg_array
-    // Scalar: element is the type itself; decline if it is a struct.
     cmp x0, #TY_STRUCT
-    b.eq .Lx86rg_decline
-    mov x23, x21                    // element type = type
-    mov x24, #1                     // declared count = 1
-    b .Lx86rg_have_elem
-.Lx86rg_array:
+    b.eq .Lx86rg_shape_struct
+    cmp x0, #TY_ARRAY
+    b.eq .Lx86rg_shape_array
+    // Scalar.
+    mov x22, #0
+    mov x23, x21
+    mov x24, #1
+    b .Lx86rg_classified
+.Lx86rg_shape_struct:
+    mov x22, #2
+    mov x23, x21                    // struct type
+    b .Lx86rg_classified
+.Lx86rg_shape_array:
     ldr x23, [x21, #TY_F0]          // element type
     ldr x0, [x23, #TY_KIND]
-    cmp x0, #TY_STRUCT              // array of structs: declined (needs field layout)
-    b.eq .Lx86rg_decline
-    mov x0, x21
-    bl _kcc_type_layout             // total bytes
-    mov x24, x0                     // total (→ count below)
+    cmp x0, #TY_STRUCT
+    b.eq .Lx86rg_shape_aos
+    mov x22, #1                     // array of scalar
+    b .Lx86rg_arr_count
+.Lx86rg_shape_aos:
+    mov x22, #3                     // array of struct
+.Lx86rg_arr_count:
     ldr x25, [x23, #TY_SIZE]        // element size
     cbz x25, .Lx86rg_decline
-    udiv x24, x24, x25              // declared element count = total / elem_size
-.Lx86rg_have_elem:
+    mov x0, x21
+    bl _kcc_type_layout             // total bytes
+    udiv x24, x0, x25               // declared element count = total / elem_size
+.Lx86rg_classified:
     ldr x25, [x23, #TY_SIZE]        // element size (bytes)
     ldr x26, [x23, #TY_KIND]        // element kind (for leaf_bits)
 
-    // Read-only section header + alignment, then .globl / label.
+    // Read-only section header + alignment, then .globl / label (once).
     adrp x0, _kcc_x86_os@@PAGE
     add  x0, x0, _kcc_x86_os@@PAGEOFF
     ldr x0, [x0]
@@ -2342,8 +2447,13 @@ _kcc_x86_emit_rodata_global:
     add  x0, x0, _kcc_x86_s_colon_nl@@PAGEOFF
     bl _kcc_as_str
 
-    // Walk the initialiser, emitting one value directive per element.
-    // x22 = emitted element count.
+    // Dispatch by shape.
+    cmp x22, #2
+    b.eq .Lx86rg_struct
+    cmp x22, #3
+    b.eq .Lx86rg_aos
+
+    // Scalar / array-of-scalar: one value directive per element.  x22 = emitted.
     mov x22, #0
     ldr x0, [x19, #AST_F2]          // initialiser
     cbz x0, .Lx86rg_tail            // no init → all zero (tail fill covers it)
@@ -2368,7 +2478,6 @@ _kcc_x86_emit_rodata_global:
     mov x1, x25
     bl _kcc_x86_emit_value
     mov x22, #1
-
 .Lx86rg_tail:
     // Zero-fill any declared elements the initialiser did not cover.
     cmp x22, x24
@@ -2377,6 +2486,51 @@ _kcc_x86_emit_rodata_global:
     mul x0, x0, x25                 // (count - emitted) * elem_size bytes
     cbz x0, .Lx86rg_ok
     mov x27, x0                     // byte count
+    adrp x0, _kcc_x86_s_zerodir@@PAGE
+    add  x0, x0, _kcc_x86_s_zerodir@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x27
+    bl _kcc_as_dec
+    mov x0, #10
+    bl _kcc_as_ch
+    b .Lx86rg_ok
+
+.Lx86rg_struct:
+    // One struct: lay out its fields with padding.  total size = layout.
+    mov x0, x21
+    bl _kcc_type_layout
+    mov x24, x0                     // total struct size
+    mov x0, x23                     // struct type
+    ldr x1, [x19, #AST_F2]          // init list
+    mov x2, x24                     // total size
+    bl _kcc_x86_emit_struct_bytes
+    b .Lx86rg_ok
+.Lx86rg_aos:
+    // Array of structs: each initialiser element is a struct brace list.
+    // x23 = struct element type, x25 = struct size, x24 = declared count.
+    mov x22, #0                     // emitted struct count
+    ldr x27, [x19, #AST_F2]         // array init list
+    cbz x27, .Lx86rg_aos_tail
+    ldr x27, [x27, #AST_F0]         // first struct element
+.Lx86rg_aos_loop:
+    cbz x27, .Lx86rg_aos_tail
+    cmp x22, x24
+    b.ge .Lx86rg_aos_tail
+    mov x0, x23                     // struct type
+    mov x1, x27                     // this struct's brace list
+    mov x2, x25                     // struct size
+    bl _kcc_x86_emit_struct_bytes
+    add x22, x22, #1
+    ldr x27, [x27, #AST_F4]         // next struct element
+    b .Lx86rg_aos_loop
+.Lx86rg_aos_tail:
+    // Zero-fill missing array elements.
+    cmp x22, x24
+    b.ge .Lx86rg_ok
+    sub x0, x24, x22
+    mul x0, x0, x25
+    cbz x0, .Lx86rg_ok
+    mov x27, x0
     adrp x0, _kcc_x86_s_zerodir@@PAGE
     add  x0, x0, _kcc_x86_s_zerodir@@PAGEOFF
     bl _kcc_as_str

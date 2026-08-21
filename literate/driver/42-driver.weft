@@ -117,6 +117,12 @@ _kcc_driver_compile:
     add  x0, x0, _kcc_target@@PAGEOFF
     ldr x0, [x0]
     cbz x0, .Ldc_arm64
+    // Publish the AST translation unit so the x86 back end can emit storage for
+    // file-scope globals (its data pass walks the same tree the ARM64
+    // pre-registration does).
+    adrp x1, _kcc_x86_tu@@PAGE
+    add  x1, x1, _kcc_x86_tu@@PAGEOFF
+    str x21, [x1]                  // x21 = trans_unit
     mov x0, x20                    // out_path
     bl _kcc_driver_x86_object
     b .Ldc_return
@@ -765,9 +771,14 @@ supplies \texttt{fork}/\texttt{execve}/\texttt{wait4}).  Because \kcc{}-compiled
 programs are freestanding---their entry point is \texttt{\_main}, with no C
 runtime start-up---the link line is
 \texttt{ld \\meta{objects} -o \\meta{out} -lSystem -syslibroot \\meta{sdk}
--arch arm64 -e \_main}.  The SDK root needed by \texttt{-syslibroot} is found
-from \texttt{\$SDKROOT} or, failing that, the two standard SDK locations.  After
-a successful link the intermediate object files are removed.
+-arch \\meta{arch} -e \_main}.  The architecture follows the selected target:
+\texttt{arm64} by default, or \texttt{x86\_64} under \texttt{-{}-target=x86\_64}
+(link mode's pre-scan sets \texttt{\_kcc\_target} exactly as the compile-mode
+scan does, and each source is then compiled through the same target dispatch, so
+\texttt{kcc -{}-target=x86\_64 hello.c -o hello} both compiles and links for
+x86-64 in one step).  The SDK root needed by \texttt{-syslibroot} is found from
+\texttt{\$SDKROOT} or, failing that, the two standard SDK locations.  After a
+successful link the intermediate object files are removed.
 
 Not every non-option argument is a source.  As the driver scans the command
 line it classifies each one: a name ending in \texttt{.c} is compiled to a
@@ -976,6 +987,11 @@ _kcc_driver_link_all:
     bl _kcc_strcmp
     cbz x0, .Lla_pre_emitasm
     ldr x0, [x20, x21, lsl #3]
+    adrp x1, _kcc_opt_target_x86@@PAGE
+    add  x1, x1, _kcc_opt_target_x86@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_pre_target
+    ldr x0, [x20, x21, lsl #3]
     adrp x1, _kcc_opt_g@@PAGE
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
@@ -1035,6 +1051,15 @@ _kcc_driver_link_all:
     str  x1, [x0]
     add x21, x21, #1
     b .Lla_pre
+.Lla_pre_target:
+    // "--target=x86_64": select the x86-64 back end for both compilation and
+    // the final link (which then passes `-arch x86_64` to ld).
+    adrp x0, _kcc_target@@PAGE
+    add  x0, x0, _kcc_target@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x21, x21, #1
+    b .Lla_pre
 .Lla_pre_done:
 
     // Linker argv: at most argc + 12 pointers.
@@ -1084,6 +1109,11 @@ _kcc_driver_link_all:
     add  x1, x1, _kcc_opt_emitasm@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lla_skipopt           // --emit-asm: handled in pass 1
+    mov x0, x27
+    adrp x1, _kcc_opt_target_x86@@PAGE
+    add  x1, x1, _kcc_opt_target_x86@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lla_skipopt           // --target=x86_64: handled in pass 1
     // -Idir / -I dir: skip (registered in pass 1)
     mov x0, x27
     mov x1, #0
@@ -1191,8 +1221,18 @@ _kcc_driver_link_all:
     add  x0, x0, _kcc_str_arch@@PAGEOFF
     str x0, [x21, x22, lsl #3]
     add x22, x22, #1
+    // Architecture: "x86_64" under --target=x86_64, else the native "arm64".
+    adrp x0, _kcc_target@@PAGE
+    add  x0, x0, _kcc_target@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lla_arch_arm64
+    adrp x0, _kcc_str_x86_64@@PAGE
+    add  x0, x0, _kcc_str_x86_64@@PAGEOFF
+    b .Lla_arch_set
+.Lla_arch_arm64:
     adrp x0, _kcc_str_arm64@@PAGE
     add  x0, x0, _kcc_str_arm64@@PAGEOFF
+.Lla_arch_set:
     str x0, [x21, x22, lsl #3]
     add x22, x22, #1
     adrp x0, _kcc_str_dash_e@@PAGE

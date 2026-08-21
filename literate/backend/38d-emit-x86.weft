@@ -115,8 +115,11 @@ operand as \verb|disp(base)|.
 @d X86: data @{
 .data
 .globl _kcc_target
+.globl _kcc_x86_tu
 _kcc_target:     .quad 0        // 0 = arm64/Mach-O (default), 1 = x86-64
 _kcc_x86_vreg_n: .quad 0        // current function's vreg count (frame sizing)
+_kcc_x86_tu:     .quad 0        // the AST translation unit (for data emission)
+_kcc_x86_strs:   .quad 0        // vec of {data_ptr, len} string-literal entries
 
 .section __TEXT,__cstring,cstring_literals
 // Directives and symbol scaffolding.
@@ -236,6 +239,19 @@ _kcc_x86_s_add_rsp:  .asciz "\taddq\t$"
 _kcc_x86_s_rsp:      .asciz ", %rsp\n"
 _kcc_x86_s_paren_rsp:.asciz "(%rsp)"
 _kcc_x86_s_rip_r10:  .asciz "(%rip), %r10\n"
+_kcc_x86_s_got_r10:  .asciz "@@GOTPCREL(%rip), %r10\n"
+
+// Data emission: zeroed common storage for a file-scope global.
+_kcc_x86_s_zerofill: .asciz "\t.zerofill __DATA,__common,_"
+_kcc_x86_s_zf_a3:    .asciz ",3\n"      // ",<size>,3\n" alignment tail (8-byte)
+_kcc_x86_s_comma1:   .asciz ","
+
+// String literals: a private label per literal, its address via leaq, and the
+// cstring section that holds the bytes.
+_kcc_x86_s_strlbl:   .asciz ".Lx86str"      // label stem; a decimal id follows
+_kcc_x86_s_cstrsect: .asciz ".section __TEXT,__cstring,cstring_literals\n"
+_kcc_x86_s_byte:     .asciz "\t.byte "
+_kcc_x86_s_zero_nl:  .asciz "0\n"
 
 // The argument-register lookup table holds pointers, so it lives in a
 // relocatable data section, not the cstring pool (which admits no relocations).
@@ -1015,8 +1031,10 @@ _kcc_x86_sel:
     b.eq .Lx86sel_callind
     cmp x22, #IR_GLOBAL_REF
     b.eq .Lx86sel_globalref
+    cmp x22, #IR_STRING_LIT
+    b.eq .Lx86sel_strlit
 
-    b .Lx86sel_done                 // rung 3: ignore FP, string lits, asm, etc.
+    b .Lx86sel_done                 // rung 4: ignore FP, inline asm, etc.
 
 .Lx86sel_const:
     adrp x0, _kcc_x86_s_movabsq@@PAGE
@@ -1395,14 +1413,50 @@ _kcc_x86_sel:
 
 // ---- Global reference: leaq _<name>(%rip), %r10 ; store to dest. ----
 .Lx86sel_globalref:
-    adrp x0, _kcc_x86_s_leaq@@PAGE
-    add  x0, x0, _kcc_x86_s_leaq@@PAGEOFF
+    // Load the symbol's address from the GOT: movq _<name>@@GOTPCREL(%rip), %r10.
+    // The GOT form resolves uniformly for a symbol defined in this unit (the
+    // linker points the slot at the local definition) and for an external one
+    // imported from another object or a dylib (like puts), which has no fixed
+    // image address---exactly the ARM64 back end's GOTPAGE discipline.
+    adrp x0, _kcc_x86_s_movq@@PAGE
+    add  x0, x0, _kcc_x86_s_movq@@PAGEOFF
     bl _kcc_as_str
     adrp x0, _kcc_x86_s_us@@PAGE
     add  x0, x0, _kcc_x86_s_us@@PAGEOFF
     bl _kcc_as_str
     ldr x0, [x19, #IR_SRC1]         // symbol name
     bl _kcc_as_str
+    adrp x0, _kcc_x86_s_got_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_got_r10@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    b .Lx86sel_done
+
+// ---- String literal: record (bytes,len), leaq .Lx86str<id>(%rip), %r10. ----
+.Lx86sel_strlit:
+    // id = current count of the string table; record {SRC1, SRC2}.
+    adrp x0, _kcc_x86_strs@@PAGE
+    add  x0, x0, _kcc_x86_strs@@PAGEOFF
+    ldr x0, [x0]
+    ldr x20, [x0, #VEC_COUNT]       // id = current entry count
+    ldr x1, [x19, #IR_SRC1]         // data ptr
+    ldr x2, [x19, #IR_SRC2]         // length
+    stp x1, x2, [sp, #-16]!         // build the {ptr, len} entry
+    mov x1, sp
+    bl _kcc_vec_push                // push(strs, &entry)
+    add sp, sp, #16
+    // leaq .Lx86str<id>(%rip), %r10
+    adrp x0, _kcc_x86_s_leaq@@PAGE
+    add  x0, x0, _kcc_x86_s_leaq@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_strlbl@@PAGE
+    add  x0, x0, _kcc_x86_s_strlbl@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20                     // id
+    bl _kcc_as_dec
     adrp x0, _kcc_x86_s_rip_r10@@PAGE
     add  x0, x0, _kcc_x86_s_rip_r10@@PAGEOFF
     bl _kcc_as_str
@@ -1762,6 +1816,206 @@ _kcc_x86_render_text:
     ret
 @}
 
+\section{Emitting Global Variable Storage}
+\label{sec:x86-data-emit}
+
+Functions are only half of a translation unit; the other half is its
+file-scope data.  \kcc{} emits a \emph{mutable} global's initialiser as
+runtime stores (they were streamed into \texttt{main} above, exactly like any
+other assignment), so the storage itself only has to be reserved and
+zeroed---an initialised store then overwrites the zero with the real value.
+\texttt{\_kcc\_x86\_emit\_data} walks the AST translation unit
+(\texttt{\_kcc\_x86\_tu}, published by the driver) and, for each defining
+variable declaration, emits a \verb|.zerofill __DATA,__common| reservation at
+the declared type's size (floored at eight bytes and rounded to a whole
+eight-byte slot, matching the ARM64 pre-registration).  An external global
+(\texttt{extern}) is a declaration, not a definition, and is skipped; a
+\texttt{static} file-scope global gets no \texttt{.globl} (internal linkage);
+everything else is exported so other units can link against it.
+
+One class is deliberately \emph{not} emitted here: a \texttt{const} global
+whose initialiser is a fixed byte image
+(\texttt{\_kcc\_global\_const\_rodata}/\texttt{\_ptrarr})---\kcc{} realises
+those as read-only data with their actual bytes and emits \emph{no} runtime
+store, so zeroed storage would read as zero rather than the initialiser.  Until
+the read-only-data rung lands, such a global is left undefined (a link error,
+not a silent wrong value).  This pass also walks only \emph{top-level}
+declarations, so a block-scoped \texttt{static} local---which \kcc{} hoists to a
+mangled \texttt{sl\_}\meta{node} global reached by \texttt{IR\_GLOBAL\_REF}---is
+likewise still undefined; reserving its storage means recursing into function
+bodies, as the ARM64 pre-registration's second pass does, and is deferred to
+the same later rung.
+
+@d X86: render @{
+// -- kcc_x86_emit_data() — emit .zerofill storage for file-scope globals.
+.p2align 2
+_kcc_x86_emit_data:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    adrp x0, _kcc_x86_tu@@PAGE
+    add  x0, x0, _kcc_x86_tu@@PAGEOFF
+    ldr x19, [x0]
+    cbz x19, .Lx86ed_done
+    ldr x19, [x19, #AST_F0]         // first top-level declaration
+.Lx86ed_loop:
+    cbz x19, .Lx86ed_done
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_VAR_DECL
+    b.ne .Lx86ed_next
+    ldr x20, [x19, #AST_F1]         // name
+    cbz x20, .Lx86ed_next
+    ldr x0, [x19, #AST_F3]          // storage class
+    cmp x0, #2                      // extern → declaration, no storage
+    b.eq .Lx86ed_next
+    cmp x0, #1                      // typedef → no storage
+    b.eq .Lx86ed_next
+    mov x21, x0                     // x21 = storage class (3 = static)
+    // Skip const globals that become read-only byte images (deferred rung).
+    mov x0, x19
+    bl _kcc_global_const_rodata
+    cbnz x0, .Lx86ed_next
+    mov x0, x19
+    bl _kcc_global_const_ptrarr
+    cbnz x0, .Lx86ed_next
+    // Size = round_up_8(max(8, type_layout(resolve(AST_F0)))).
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    cbz x0, .Lx86ed_next
+    bl _kcc_type_layout
+    mov x22, x0
+    cmp x22, #8
+    b.ge .Lx86ed_round
+    mov x22, #8
+.Lx86ed_round:
+    add x22, x22, #7
+    and x22, x22, #~7               // round up to a whole 8-byte slot
+
+    // .globl _<name>   (unless static: internal linkage)
+    cmp x21, #3
+    b.eq .Lx86ed_zf
+    adrp x0, _kcc_x86_s_globl@@PAGE
+    add  x0, x0, _kcc_x86_s_globl@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20
+    bl _kcc_as_str
+    mov x0, #10
+    bl _kcc_as_ch
+.Lx86ed_zf:
+    // .zerofill __DATA,__common,_<name>,<size>,3
+    adrp x0, _kcc_x86_s_zerofill@@PAGE
+    add  x0, x0, _kcc_x86_s_zerofill@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_comma1@@PAGE
+    add  x0, x0, _kcc_x86_s_comma1@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x22
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_zf_a3@@PAGE
+    add  x0, x0, _kcc_x86_s_zf_a3@@PAGEOFF
+    bl _kcc_as_str
+.Lx86ed_next:
+    ldr x19, [x19, #AST_F4]         // next sibling
+    b .Lx86ed_loop
+.Lx86ed_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{Emitting String-Literal Data}
+\label{sec:x86-strings}
+
+A string literal reaches the back end as an \texttt{IR\_STRING\_LIT} whose
+\texttt{SRC1} points at the raw bytes and \texttt{SRC2} is their length.
+Selection cannot emit the bytes inline---they belong in the read-only
+\texttt{\_\_TEXT,\_\_cstring} section, not in the instruction stream---so it
+does the same two-phase trick the ARM64 back end does: at the use site it
+assigns the literal the next private label \verb|.Lx86str|$N$, records the
+\texttt{(bytes,\,length)} pair in a table, and loads the label's address with a
+\texttt{leaq}.  After all functions and globals are emitted,
+\texttt{\_kcc\_x86\_emit\_strings} walks the table once and emits the cstring
+section: each entry's label followed by a \texttt{.byte} line carrying its
+bytes and a terminating NUL.  Emitting raw \texttt{.byte} values (rather than a
+quoted \texttt{.asciz}) sidesteps any escaping question---an embedded quote,
+backslash, or NUL is just another number.  The table is per-render state,
+initialised in \texttt{\_kcc\_x86\_render}; the label is private
+(\verb|.L|-prefixed), so two translation units never collide.
+
+@d X86: render @{
+// -- kcc_x86_emit_strings() — emit the cstring section for recorded literals.
+.p2align 2
+_kcc_x86_emit_strings:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    adrp x0, _kcc_x86_strs@@PAGE
+    add  x0, x0, _kcc_x86_strs@@PAGEOFF
+    ldr x19, [x0]
+    cbz x19, .Lx86es_done
+    ldr x20, [x19, #VEC_COUNT]      // number of literals
+    cbz x20, .Lx86es_done
+
+    // .section __TEXT,__cstring,cstring_literals
+    adrp x0, _kcc_x86_s_cstrsect@@PAGE
+    add  x0, x0, _kcc_x86_s_cstrsect@@PAGEOFF
+    bl _kcc_as_str
+
+    mov x21, #0                     // literal index
+.Lx86es_lit:
+    cmp x21, x20
+    b.ge .Lx86es_done
+    // .Lx86str<id>:
+    adrp x0, _kcc_x86_s_strlbl@@PAGE
+    add  x0, x0, _kcc_x86_s_strlbl@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x21
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_label_nl@@PAGE
+    add  x0, x0, _kcc_x86_s_label_nl@@PAGEOFF
+    bl _kcc_as_str
+    // Fetch entry {ptr, len}.
+    mov x0, x19
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x23, [x0]                   // data ptr
+    ldr x24, [x0, #8]               // length
+    // \t.byte
+    adrp x0, _kcc_x86_s_byte@@PAGE
+    add  x0, x0, _kcc_x86_s_byte@@PAGEOFF
+    bl _kcc_as_str
+    mov x22, #0                     // byte index
+.Lx86es_byte:
+    cmp x22, x24
+    b.ge .Lx86es_nul
+    ldrb w0, [x23, x22]
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_comma1@@PAGE
+    add  x0, x0, _kcc_x86_s_comma1@@PAGEOFF
+    bl _kcc_as_str
+    add x22, x22, #1
+    b .Lx86es_byte
+.Lx86es_nul:
+    // trailing NUL terminator, then newline
+    adrp x0, _kcc_x86_s_zero_nl@@PAGE
+    add  x0, x0, _kcc_x86_s_zero_nl@@PAGEOFF
+    bl _kcc_as_str
+    add x21, x21, #1
+    b .Lx86es_lit
+.Lx86es_done:
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@}
+
 \section{Rendering to a File}
 \label{sec:x86-render}
 
@@ -1769,10 +2023,10 @@ _kcc_x86_render_text:
 reuses the growable text buffer of the \texttt{.s} back end
 (\S\ref{sec:emit-asm-buffer})---\texttt{\_kcc\_as\_init} to allocate it and
 \texttt{\_kcc\_as\_str}/\texttt{\_kcc\_as\_ch}/\texttt{\_kcc\_as\_dec} to fill
-it---then writes the buffer to the output path through the shared
-\texttt{\_kcc\_as\_write\_file} helper, exactly as the ARM64 assembly path
-does.  The buffer machinery is target-neutral; only the text poured into it
-is x86-64.
+it---renders the functions and then the global data, then writes the buffer to
+the output path through the shared \texttt{\_kcc\_as\_write\_file} helper,
+exactly as the ARM64 assembly path does.  The buffer machinery is
+target-neutral; only the text poured into it is x86-64.
 
 @d X86: render @{
 // -- kcc_x86_render(const char *path) — render x86-64 asm to <path>. 0 on ok.
@@ -1783,12 +2037,20 @@ _kcc_x86_render:
     mov x29, sp
     str x0, [sp, #16]              // save path across the render calls
     bl _kcc_as_init
-    bl _kcc_x86_render_text
+    // Fresh string-literal table for this render (16-byte {ptr,len} entries).
+    mov x0, #16
+    bl _kcc_vec_init
+    adrp x1, _kcc_x86_strs@@PAGE
+    add  x1, x1, _kcc_x86_strs@@PAGEOFF
+    str x0, [x1]
+    bl _kcc_x86_render_text        // emits functions (records string literals)
+    bl _kcc_x86_emit_data          // file-scope global storage
+    bl _kcc_x86_emit_strings       // cstring section for recorded literals
     ldr x0, [sp, #16]             // path
     bl _kcc_as_write_file
     ldp x29, x30, [sp], #32
     ret
-@| _kcc_x86_render _kcc_target
+@| _kcc_x86_render _kcc_target _kcc_x86_tu
 @}
 
 \section{Rung One in Retrospect}

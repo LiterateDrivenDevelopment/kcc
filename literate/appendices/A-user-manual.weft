@@ -269,17 +269,32 @@ The x86-64 back end is being built up one capability at a time and today
 covers the \emph{scalar} language: integer and pointer arithmetic, the full
 set of operators and comparisons, control flow (\texttt{if}, \texttt{while},
 \texttt{for}, \texttt{?:}, \texttt{\&\&}/\texttt{||}), local variables and
-arrays, structs addressed by member, and function calls following the
-System~V AMD64 calling convention---including recursion and calls that pass
-arguments on the stack.  A program built from these features runs identically
-to one compiled by a mainstream x86-64 compiler.
+arrays, structs addressed by member, mutable file-scope global variables,
+string literals, and function calls following the System~V AMD64 calling
+convention---including recursion, calls that pass arguments on the stack, and
+calls to library functions such as \texttt{printf}.  A whole program such as
 
-What the x86-64 back end does \emph{not} yet handle is a program that defines
-\emph{file-scope variables} (a reference to one becomes an unresolved symbol at
-link time), string literals, floating-point arithmetic, or passing a struct by
-value.  These are planned; until then, keep such a program on the default ARM64
-path, which supports the whole language.  The native path is entirely
-unaffected by this option---omitting \texttt{-{}-target} (or writing
+\begin{verbatim}
+int printf(const char *, ...);
+int count = 0;
+int main(void) {
+    for (int i = 1; i <= 5; i++)
+        if (i % 2 == 0) { printf("%d even\n", i); count++; }
+    printf("evens=%d\n", count);
+    return count;
+}
+\end{verbatim}
+
+\noindent compiles, links, and runs in one step with output identical to a
+mainstream x86-64 compiler.
+
+What the x86-64 back end does \emph{not} yet handle is a \texttt{const} global
+whose value lives in read-only data (a reference to one becomes an unresolved
+symbol at link time---a clean link error, never a wrong value), a
+block-scoped \texttt{static} local, floating-point arithmetic, or passing a
+struct by value.  These are planned; until then, keep such a program on the
+default ARM64 path, which supports the whole language.  The native path is
+entirely unaffected by this option---omitting \texttt{-{}-target} (or writing
 \texttt{-{}-target=arm64}) compiles for ARM64 exactly as before.
 
 \section{Reading Diagnostics}

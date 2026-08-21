@@ -491,6 +491,7 @@ only supplies the IR walk and x86-64 instruction selection:
 @<IR: constants@>
 @<Vec: constants@>
 @<Types: constants@>
+@<Parser: AST constants@>
 @<X86: data@>
 @<X86: render@>
 @}

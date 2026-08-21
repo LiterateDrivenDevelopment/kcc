@@ -18,145 +18,1083 @@ that runs on Apple silicon under the Rosetta translator.  Nothing above the
 emission step---the front end, the IR, the optimizer---knows or cares that a
 different machine is now the destination; that is the whole point of the seam.
 
-This chapter is built one rung of the playbook ladder at a time.  The first
-rung is deliberately the smallest program that exercises the entire pipeline
-end to end: \verb|int main(void) { return N; }|.  Its optimized IR is two
-instructions---an \texttt{IR\_CONST} that materializes \texttt{N} and an
-\texttt{IR\_RET} that returns it---so selecting for it requires exactly two
-cases.  When this builds, assembles, links, and exits with \texttt{N} under
-Rosetta, the target is proven live: the driver dispatch, the text buffer, the
-IR walk, and the assembler/linker invocation are all working, and every
-later rung is \emph{more selection}, not more scaffolding.
+This chapter is built one rung of the playbook ladder at a time.  Rung~one
+(\S\ref{sec:x86-rung1-history}) was the smallest program that exercises the
+entire pipeline end to end, \verb|int main(void) { return N; }|, whose
+optimized IR is a single \texttt{IR\_CONST} feeding an \texttt{IR\_RET}.  With
+the scaffolding proven live, this chapter is \emph{rung~two}: the integer
+arithmetic--logic unit plus the memory operations that give locals an address.
+That is exactly the set of opcodes a function like
+
+\begin{verbatim}
+  int f(void) {
+      volatile int x = 40;
+      volatile int y = 2;
+      return x + y;
+  }
+\end{verbatim}
+
+\noindent lowers to---\texttt{IR\_ALLOCA} for each local, \texttt{IR\_STORE}
+to initialise it, \texttt{IR\_LOAD} to read it back (\texttt{volatile} stops
+\texttt{mem2reg} from promoting the locals into registers, so the memory
+traffic survives to the back end), \texttt{IR\_ADD} to combine them, and an
+\texttt{IR\_SEXT} feeding the return.  Rung~two selects for the whole integer
+ALU (add, subtract, multiply, divide, remainder, the bitwise and shift
+operators, negate and complement), the width-changing conversions
+(\texttt{sext}/\texttt{zext}/\texttt{trunc}/\texttt{bitcast}), and the three
+memory opcodes (\texttt{alloca}/\texttt{load}/\texttt{store}).  What it does
+\emph{not} yet handle is control flow---comparisons, branches, and
+calls---which is rung~three; an unrecognised opcode is still silently skipped,
+so a program that needs those will miscompile until rung~three lands.
+
+\section{Strategy: an All-Spill Frame}
+\label{sec:x86-strategy}
+
+The x86-64 back end borrows the ARM64 code generator's ``all-spill'' strategy
+(\S\ref{sec:codegen-strategy}) wholesale, because it is the simplest thing that
+is correct and it sidesteps register allocation entirely.  \emph{Every virtual
+register owns one eight-byte slot in the stack frame.}  An instruction loads
+its operands from their slots into scratch registers, computes, and stores the
+result back to the destination's slot.  No value is assumed to survive in a
+register from one IR instruction to the next, so there is no allocation, no
+liveness, and no spilling logic---just a fixed, mechanical lowering.
+
+The frame is the conventional \texttt{\%rbp}-anchored one and has two regions
+below the saved base pointer:
+
+\begin{verbatim}
+  0(%rbp)                 saved %rbp (pushq'd on entry)
+  -8(%rbp) .. -vc*8(%rbp)  vreg value slots   (vreg_count * 8)
+  below that              alloca storage      (alloca_slots * 8)
+\end{verbatim}
+
+Virtual register~$V$ lives at \verb|-(V+1)*8(%rbp)|.  Alloca storage begins
+past the value slots so an \texttt{alloca}'s object can never overlap a vreg
+slot (the same anti-aliasing discipline the ARM64 frame uses).  A pre-scan
+assigns each \texttt{IR\_ALLOCA} a running slot offset and sums the total; the
+frame is \verb|align16((vreg_count + alloca_slots) * 8)| bytes, carved out with
+one \texttt{subq} in the prologue and released by \texttt{leave} at each return.
+
+Arithmetic runs at full 64-bit width, exactly as the ARM64 path does: operands
+arrive in their slots already sign- or zero-extended (the loads and the
+explicit conversion opcodes see to that), so a 64-bit \texttt{addq} computes
+the correct low bits and the IR's own \texttt{sext}/\texttt{trunc} nodes
+re-normalise a narrower result where the language requires it.  The scratch
+registers are \verb|%r10| (first source and result), \verb|%r11| (second
+source), and---only for the shift and divide instructions, which pin specific
+registers---\verb|%rcx|, \verb|%rax|, and \verb|%rdx|.
 
 \section{Target State and Assembly Vocabulary}
 \label{sec:x86-data}
 
 A single global, \texttt{\_kcc\_target}, records which back end the driver
 selected: \texttt{0} (the default) is ARM64/Mach-O and leaves the flagship
-path completely untouched; \texttt{1} is x86-64.  The remaining data are the
-fixed fragments of assembly this rung emits---the section directive, the
-pieces of a \texttt{.globl} declaration and a label, and the two instructions
-of a constant return.  Registers are spelled in AT\&T syntax
-(\verb|%eax|, an immediate is \verb|$N|), which is what \texttt{as} on macOS
-expects.
+path completely untouched; \texttt{1} is x86-64.  A second file-local global,
+\texttt{\_kcc\_x86\_vreg\_n}, holds the current function's virtual-register
+count so instruction selection can size the frame and compute alloca
+addresses.  The remaining data are the fixed fragments of AT\&T assembly this
+back end pours into the text buffer---section and symbol directives, the frame
+prologue/epilogue, every instruction mnemonic, and the register operands.
+AT\&T syntax names registers with a \texttt{\%} sigil, immediates with
+\texttt{\$}, orders operands source-then-destination, and writes a memory
+operand as \verb|disp(base)|.
 
 @d X86: data @{
 .data
 .globl _kcc_target
-_kcc_target:   .quad 0        // 0 = arm64/Mach-O (default), 1 = x86-64
+_kcc_target:     .quad 0        // 0 = arm64/Mach-O (default), 1 = x86-64
+_kcc_x86_vreg_n: .quad 0        // current function's vreg count (frame sizing)
 
 .section __TEXT,__cstring,cstring_literals
+// Directives and symbol scaffolding.
 _kcc_x86_s_text:     .asciz ".text\n"
 _kcc_x86_s_globl:    .asciz ".globl _"
 _kcc_x86_s_us:       .asciz "_"
 _kcc_x86_s_colon_nl: .asciz ":\n"
-_kcc_x86_s_movl:     .asciz "\tmovl\t$"
-_kcc_x86_s_eax:      .asciz ", %eax\n"
-_kcc_x86_s_retq:     .asciz "\tretq\n"
 _kcc_x86_s_minus:    .asciz "-"
+_kcc_x86_s_rbp:      .asciz "(%rbp)"
+_kcc_x86_s_comma:    .asciz ", "
+
+// Frame prologue/epilogue.
+_kcc_x86_s_push_rbp: .asciz "\tpushq\t%rbp\n"
+_kcc_x86_s_mov_sp:   .asciz "\tmovq\t%rsp, %rbp\n"
+_kcc_x86_s_sub_sp:   .asciz "\tsubq\t$"
+_kcc_x86_s_sp_nl:    .asciz ", %rsp\n"
+_kcc_x86_s_leave:    .asciz "\tleave\n"
+_kcc_x86_s_retq:     .asciz "\tretq\n"
+
+// Move family (with a trailing tab where an operand follows).
+_kcc_x86_s_movq:     .asciz "\tmovq\t"
+_kcc_x86_s_movabsq:  .asciz "\tmovabsq\t$"
+_kcc_x86_s_movl:     .asciz "\tmovl\t"
+_kcc_x86_s_movb:     .asciz "\tmovb\t"
+_kcc_x86_s_movw:     .asciz "\tmovw\t"
+_kcc_x86_s_movslq:   .asciz "\tmovslq\t"
+_kcc_x86_s_movsbq:   .asciz "\tmovsbq\t"
+_kcc_x86_s_movswq:   .asciz "\tmovswq\t"
+_kcc_x86_s_movzbq:   .asciz "\tmovzbq\t"
+_kcc_x86_s_movzwq:   .asciz "\tmovzwq\t"
+_kcc_x86_s_leaq:     .asciz "\tleaq\t"
+
+// Integer ALU mnemonics.
+_kcc_x86_s_addq:     .asciz "\taddq\t"
+_kcc_x86_s_subq:     .asciz "\tsubq\t"
+_kcc_x86_s_imulq:    .asciz "\timulq\t"
+_kcc_x86_s_andq:     .asciz "\tandq\t"
+_kcc_x86_s_orq:      .asciz "\torq\t"
+_kcc_x86_s_xorq:     .asciz "\txorq\t"
+_kcc_x86_s_negq:     .asciz "\tnegq\t"
+_kcc_x86_s_notq:     .asciz "\tnotq\t"
+_kcc_x86_s_shlq:     .asciz "\tshlq\t"
+_kcc_x86_s_sarq:     .asciz "\tsarq\t"
+_kcc_x86_s_shrq:     .asciz "\tshrq\t"
+_kcc_x86_s_cqto:     .asciz "\tcqto\n"
+_kcc_x86_s_xor_rdx:  .asciz "\txorq\t%rdx, %rdx\n"
+_kcc_x86_s_idiv_rcx: .asciz "\tidivq\t%rcx\n"
+_kcc_x86_s_div_rcx:  .asciz "\tdivq\t%rcx\n"
+
+// Register operands and common instruction tails.
+_kcc_x86_s_r10:      .asciz "%r10"
+_kcc_x86_s_r11:      .asciz "%r11"
+_kcc_x86_s_rax:      .asciz "%rax"
+_kcc_x86_s_rcx:      .asciz "%rcx"
+_kcc_x86_s_rdx:      .asciz "%rdx"
+_kcc_x86_s_r11_r10:  .asciz "%r11, %r10\n"   // binary op tail: dst = dst OP r11
+_kcc_x86_s_r10_nl:   .asciz "%r10\n"          // unary op tail
+_kcc_x86_s_cl_r10:   .asciz "%cl, %r10\n"     // shift-by-%cl tail
+_kcc_x86_s_c_r10:    .asciz ", %r10\n"        // ", %r10\n"
+_kcc_x86_s_c_r10d:   .asciz ", %r10d\n"       // ", %r10d\n"
+// Memory operand tails for load (source (%r11)) and store (dest (%r11)).
+_kcc_x86_s_pr11_r10: .asciz "(%r11), %r10\n"
+_kcc_x86_s_pr11_r10d:.asciz "(%r11), %r10d\n"
+_kcc_x86_s_r10_pr11: .asciz "%r10, (%r11)\n"
+_kcc_x86_s_r10b_pr11:.asciz "%r10b, (%r11)\n"
+_kcc_x86_s_r10w_pr11:.asciz "%r10w, (%r11)\n"
+_kcc_x86_s_r10d_pr11:.asciz "%r10d, (%r11)\n"
 @}
 
-\section{Emitting a Signed 32-bit Immediate}
-\label{sec:x86-imm}
+\section{Text-Buffer Emission Helpers}
+\label{sec:x86-helpers}
 
-An \texttt{IR\_CONST} feeding an \texttt{int} return holds its value in
-\texttt{IR\_SRC1}.  A negative constant (\verb|return -5;|, which the folder
-has already reduced to a single constant) arrives as a two's-complement bit
-pattern in the low 32 bits, so the immediate is emitted signed: if bit~31 is
-set, print a minus sign and the magnitude \texttt{2\textsuperscript{32}-w};
-otherwise print \texttt{w} directly.  The decimal digits themselves are
-produced by the shared text-buffer helper \texttt{\_kcc\_as\_dec}.
+Selection is written in terms of a handful of primitives over the growable
+text buffer (\S\ref{sec:emit-asm-buffer}): \texttt{\_kcc\_as\_str} appends a
+NUL-terminated string, \texttt{\_kcc\_as\_ch} one byte, and
+\texttt{\_kcc\_as\_dec} an unsigned decimal.  On top of those,
+\texttt{\_kcc\_x86\_disp} prints a frame displacement \verb|-D(%rbp)|, and
+\texttt{\_kcc\_x86\_slot} prints the operand for virtual register~$V$, whose
+displacement is $(V+1)\times 8$.  \texttt{\_kcc\_x86\_load} emits
+\verb|movq slot(V), reg| (a slot always holds a canonical 64-bit value, so a
+plain \texttt{movq} reads any vreg), and \texttt{\_kcc\_x86\_store} the inverse
+\verb|movq reg, slot(V)|.  A register operand is passed by pointer to its name
+string.
 
 @d X86: render @{
 .text
-// -- kcc_x86_signed32(uint64_t val) — append val's low 32 bits as signed dec.
+// -- kcc_x86_disp(uint64_t d) — append "-d(%rbp)" (a frame displacement).
 .p2align 2
-_kcc_x86_signed32:
+_kcc_x86_disp:
     stp x29, x30, [sp, #-32]!
     mov x29, sp
     str x19, [sp, #16]
-    and x19, x0, #0xffffffff        // w = low 32 bits
-    tst x19, #0x80000000            // bit 31 set → negative
-    b.eq .Lx86s_pos
+    mov x19, x0                     // d
     adrp x0, _kcc_x86_s_minus@@PAGE
     add  x0, x0, _kcc_x86_s_minus@@PAGEOFF
     bl _kcc_as_str
-    mov x0, #1
-    lsl x0, x0, #32                 // 2^32
-    sub x0, x0, x19                 // magnitude
-    bl _kcc_as_dec
-    b .Lx86s_done
-.Lx86s_pos:
     mov x0, x19
     bl _kcc_as_dec
-.Lx86s_done:
+    adrp x0, _kcc_x86_s_rbp@@PAGE
+    add  x0, x0, _kcc_x86_s_rbp@@PAGEOFF
+    bl _kcc_as_str
     ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_slot(uint64_t v) — append the operand for vreg v: "-(v+1)*8(%rbp)".
+.p2align 2
+_kcc_x86_slot:
+    add x0, x0, #1
+    lsl x0, x0, #3
+    b _kcc_x86_disp
+
+// -- kcc_x86_load(uint64_t v, const char *reg) — emit "movq slot(v), reg".
+.p2align 2
+_kcc_x86_load:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // v
+    mov x20, x1                     // reg name
+    adrp x0, _kcc_x86_s_movq@@PAGE
+    add  x0, x0, _kcc_x86_s_movq@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_x86_slot
+    adrp x0, _kcc_x86_s_comma@@PAGE
+    add  x0, x0, _kcc_x86_s_comma@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20
+    bl _kcc_as_str
+    mov x0, #10                     // '\n'
+    bl _kcc_as_ch
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_store(uint64_t v, const char *reg) — emit "movq reg, slot(v)".
+.p2align 2
+_kcc_x86_store:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // v
+    mov x20, x1                     // reg name
+    adrp x0, _kcc_x86_s_movq@@PAGE
+    add  x0, x0, _kcc_x86_s_movq@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_comma@@PAGE
+    add  x0, x0, _kcc_x86_s_comma@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_x86_slot
+    mov x0, #10                     // '\n'
+    bl _kcc_as_ch
+    ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
 @}
 
-\section{Instruction Selection (Rung 1)}
+\section{Instruction Selection}
 \label{sec:x86-sel}
 
-Selection is a per-instruction dispatch: given one IR instruction and the
-function's virtual-register value map, emit the equivalent x86-64.  This rung
-handles the two opcodes the first program produces.  \texttt{IR\_CONST}
-records its immediate in the map (it emits nothing on its own---the value is
-consumed where it is used).  \texttt{IR\_RET} loads the returned virtual
-register's constant into \verb|%eax| with a \texttt{movl} and issues
-\texttt{retq}; a \texttt{void} return (null type or \texttt{TY\_VOID}) emits
-only the \texttt{retq}.  Every other opcode is silently skipped for now---each
-later rung adds a case here, which is exactly why the dispatch is isolated
-from the walk.  Because macOS wraps the entry point with \texttt{LC\_MAIN},
-a \texttt{main} whose \verb|%eax| holds \texttt{N} at \texttt{retq} exits the
-process with status \texttt{N}, so no explicit exit sequence is needed.
+Selection is a per-instruction dispatch: given one IR instruction, emit the
+equivalent x86-64 and leave the result in the destination's slot.  The
+opcode routes to a handler; anything rung~two does not yet implement (control
+flow, floating point) falls through and emits nothing.  We build the handlers
+bottom-up as a set of small helpers---one per instruction \emph{shape}---then
+the dispatch that calls them.
+
+\subsection{Binary, Unary, and Shift Shapes}
+\label{sec:x86-alu}
+
+The commutative and two-operand ALU instructions all share one shape: load
+\texttt{SRC1} into \verb|%r10|, load \texttt{SRC2} into \verb|%r11|, emit the
+mnemonic followed by \verb|%r11, %r10| (so \verb|%r10| becomes
+\verb|%r10 OP %r11|), and store \verb|%r10| to \texttt{DEST}.  Subtraction is
+non-commutative but the operand order is already correct
+(\verb|subq %r11, %r10| is $\mathtt{src1}-\mathtt{src2}$).  The unary shape
+(negate, complement) omits the second load.  The shift shape loads the count
+into \verb|%rcx| because x86 variable shifts take their amount only in
+\verb|%cl|.
 
 @d X86: render @{
-// -- kcc_x86_sel(instr, map) — select x86-64 for one IR instruction.
+// -- kcc_x86_binop(ir_instr *i, const char *mnem) — dst = src1 OP src2.
 .p2align 2
-_kcc_x86_sel:
+_kcc_x86_binop:
     stp x29, x30, [sp, #-32]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     mov x19, x0                     // instr
-    mov x20, x1                     // vreg value map
-    ldr x0, [x19, #IR_OP]
-    cmp x0, #IR_CONST
+    mov x20, x1                     // mnemonic
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    ldr x0, [x19, #IR_SRC2]
+    adrp x1, _kcc_x86_s_r11@@PAGE
+    add  x1, x1, _kcc_x86_s_r11@@PAGEOFF
+    bl _kcc_x86_load
+    mov x0, x20
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_r11_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_r11_r10@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_unop(ir_instr *i, const char *mnem) — dst = OP src1.
+.p2align 2
+_kcc_x86_unop:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    mov x20, x1
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    mov x0, x20
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_r10_nl@@PAGE
+    add  x0, x0, _kcc_x86_s_r10_nl@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_shift(ir_instr *i, const char *mnem) — dst = src1 SHIFT src2 (%cl).
+.p2align 2
+_kcc_x86_shift:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0
+    mov x20, x1
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    ldr x0, [x19, #IR_SRC2]
+    adrp x1, _kcc_x86_s_rcx@@PAGE
+    add  x1, x1, _kcc_x86_s_rcx@@PAGEOFF
+    bl _kcc_x86_load
+    mov x0, x20
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_cl_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_cl_r10@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Division and Remainder}
+\label{sec:x86-div}
+
+x86 division is the one integer operation with fixed register operands.  The
+dividend goes in \verb|%rdx:%rax|; \texttt{idivq}/\texttt{divq} leaves the
+quotient in \verb|%rax| and the remainder in \verb|%rdx|.  The helper loads
+\texttt{SRC1} into \verb|%rax|, widens it into \verb|%rdx| (\texttt{cqto}
+sign-extends for the signed forms, \verb|xorq %rdx, %rdx| zeroes it for the
+unsigned ones), loads the divisor into \verb|%rcx|, divides, and stores either
+\verb|%rax| (quotient, for \texttt{sdiv}/\texttt{udiv}) or \verb|%rdx|
+(remainder, for \texttt{smod}/\texttt{umod}) to \texttt{DEST}.  Because the
+operands were sign- or zero-extended when they were loaded from memory, the
+full-width division agrees with C's trunc-toward-zero semantics on the narrow
+type.
+
+@d X86: render @{
+// -- kcc_x86_divop(ir_instr *i, uint64_t is_signed, uint64_t want_rem)
+.p2align 2
+_kcc_x86_divop:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                     // instr
+    mov x20, x1                     // is_signed
+    mov x21, x2                     // want_rem
+    // %rax = src1
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_rax@@PAGE
+    add  x1, x1, _kcc_x86_s_rax@@PAGEOFF
+    bl _kcc_x86_load
+    // Widen the dividend into %rdx.
+    cbz x20, .Lx86div_unsigned
+    adrp x0, _kcc_x86_s_cqto@@PAGE
+    add  x0, x0, _kcc_x86_s_cqto@@PAGEOFF
+    bl _kcc_as_str
+    b .Lx86div_divisor
+.Lx86div_unsigned:
+    adrp x0, _kcc_x86_s_xor_rdx@@PAGE
+    add  x0, x0, _kcc_x86_s_xor_rdx@@PAGEOFF
+    bl _kcc_as_str
+.Lx86div_divisor:
+    // %rcx = src2
+    ldr x0, [x19, #IR_SRC2]
+    adrp x1, _kcc_x86_s_rcx@@PAGE
+    add  x1, x1, _kcc_x86_s_rcx@@PAGEOFF
+    bl _kcc_x86_load
+    // idivq / divq %rcx
+    cbz x20, .Lx86div_unsigned_op
+    adrp x0, _kcc_x86_s_idiv_rcx@@PAGE
+    add  x0, x0, _kcc_x86_s_idiv_rcx@@PAGEOFF
+    bl _kcc_as_str
+    b .Lx86div_result
+.Lx86div_unsigned_op:
+    adrp x0, _kcc_x86_s_div_rcx@@PAGE
+    add  x0, x0, _kcc_x86_s_div_rcx@@PAGEOFF
+    bl _kcc_as_str
+.Lx86div_result:
+    // Store %rax (quotient) or %rdx (remainder) to DEST.
+    ldr x0, [x19, #IR_DEST]
+    cbnz x21, .Lx86div_rem
+    adrp x1, _kcc_x86_s_rax@@PAGE
+    add  x1, x1, _kcc_x86_s_rax@@PAGEOFF
+    b .Lx86div_store
+.Lx86div_rem:
+    adrp x1, _kcc_x86_s_rdx@@PAGE
+    add  x1, x1, _kcc_x86_s_rdx@@PAGEOFF
+.Lx86div_store:
+    bl _kcc_x86_store
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{Width-Changing Conversions}
+\label{sec:x86-conv}
+
+The four conversions all read \texttt{SRC1} straight from its slot with a
+single extending move---the low bytes of the canonical slot value are exactly
+the narrow source---and store the widened result.
+\texttt{\_kcc\_x86\_extend} takes the mnemonic and the destination-register
+tail (\verb|, %r10| for the 64-bit forms, \verb|, %r10d| for \texttt{movl},
+which zero-extends into \verb|%r10|) and emits \verb|mnem slot(SRC1), reg|.
+\texttt{IR\_SEXT} and \texttt{IR\_ZEXT} choose the mnemonic from their source
+width in \texttt{SRC2} (\texttt{movsbq}/\texttt{movswq}/\texttt{movslq} signed,
+\texttt{movzbq}/\texttt{movzwq}/\texttt{movl} unsigned); \texttt{IR\_TRUNC}
+chooses from its \emph{target} width in \texttt{IR\_TYPE} and zero-extends the
+surviving low bytes, matching the ARM64 mask-and-copy; \texttt{IR\_BITCAST} is
+a plain \texttt{movq} copy.
+
+@d X86: render @{
+// -- kcc_x86_extend(ir_instr *i, const char *mnem, const char *tail)
+//    Emit "mnem slot(SRC1)tail" then store %r10 to DEST.  `tail` supplies the
+//    ", %r10\n" (or ", %r10d\n") destination-register text.
+.p2align 2
+_kcc_x86_extend:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                     // instr
+    mov x20, x1                     // mnemonic
+    mov x21, x2                     // tail
+    mov x0, x20
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_x86_slot
+    mov x0, x21
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_x86_conv(ir_instr *i, uint64_t width, uint64_t is_signed)
+//    Pick the extending mnemonic/tail for a `width`-byte source and emit it.
+//    is_signed selects movs* vs movz*/movl; width 8 or 0 is a plain movq copy.
+.p2align 2
+_kcc_x86_conv:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x1                     // width
+    mov x20, x2                     // is_signed
+    // x0 already holds instr; stash it so the dispatch below can reload.
+    str x0, [sp, #-16]!            // save instr (16-byte aligned push)
+    cmp x19, #1
+    b.eq .Lx86conv_b
+    cmp x19, #2
+    b.eq .Lx86conv_w
+    cmp x19, #4
+    b.eq .Lx86conv_l
+    // Default (8 or unknown): movq copy, no extension.
+    ldr x0, [sp], #16
+    adrp x1, _kcc_x86_s_movq@@PAGE
+    add  x1, x1, _kcc_x86_s_movq@@PAGEOFF
+    adrp x2, _kcc_x86_s_c_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_c_r10@@PAGEOFF
+    bl _kcc_x86_extend
+    b .Lx86conv_done
+.Lx86conv_b:
+    ldr x0, [sp], #16
+    cbz x20, .Lx86conv_bz
+    adrp x1, _kcc_x86_s_movsbq@@PAGE
+    add  x1, x1, _kcc_x86_s_movsbq@@PAGEOFF
+    b .Lx86conv_b_go
+.Lx86conv_bz:
+    adrp x1, _kcc_x86_s_movzbq@@PAGE
+    add  x1, x1, _kcc_x86_s_movzbq@@PAGEOFF
+.Lx86conv_b_go:
+    adrp x2, _kcc_x86_s_c_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_c_r10@@PAGEOFF
+    bl _kcc_x86_extend
+    b .Lx86conv_done
+.Lx86conv_w:
+    ldr x0, [sp], #16
+    cbz x20, .Lx86conv_wz
+    adrp x1, _kcc_x86_s_movswq@@PAGE
+    add  x1, x1, _kcc_x86_s_movswq@@PAGEOFF
+    b .Lx86conv_w_go
+.Lx86conv_wz:
+    adrp x1, _kcc_x86_s_movzwq@@PAGE
+    add  x1, x1, _kcc_x86_s_movzwq@@PAGEOFF
+.Lx86conv_w_go:
+    adrp x2, _kcc_x86_s_c_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_c_r10@@PAGEOFF
+    bl _kcc_x86_extend
+    b .Lx86conv_done
+.Lx86conv_l:
+    ldr x0, [sp], #16
+    cbz x20, .Lx86conv_lz
+    // Signed 32→64: movslq slot, %r10.
+    adrp x1, _kcc_x86_s_movslq@@PAGE
+    add  x1, x1, _kcc_x86_s_movslq@@PAGEOFF
+    adrp x2, _kcc_x86_s_c_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_c_r10@@PAGEOFF
+    bl _kcc_x86_extend
+    b .Lx86conv_done
+.Lx86conv_lz:
+    // Unsigned 32→64: movl slot, %r10d (implicitly zero-extends into %r10).
+    adrp x1, _kcc_x86_s_movl@@PAGE
+    add  x1, x1, _kcc_x86_s_movl@@PAGEOFF
+    adrp x2, _kcc_x86_s_c_r10d@@PAGE
+    add  x2, x2, _kcc_x86_s_c_r10d@@PAGEOFF
+    bl _kcc_x86_extend
+.Lx86conv_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\subsection{Memory Operations}
+\label{sec:x86-mem}
+
+\texttt{IR\_LOAD} dereferences a pointer with an access-size override in
+\texttt{SRC2} (the code $1/2/4$ unsigned, $5/6/7$ signed, $0$ eight-byte;
+$8$ is a single-precision float, deferred to a later rung).  The helper loads
+the pointer into \verb|%r11|, emits the width-appropriate move from
+\verb|(%r11)| into \verb|%r10| (or \verb|%r10d| for the zero-extending
+32-bit \texttt{movl}), and stores \verb|%r10| to \texttt{DEST}.
+\texttt{IR\_STORE} is the inverse with its size override in \texttt{IR\_DEST}
+($0/1/2/4$): load the value into \verb|%r10| and the pointer into \verb|%r11|,
+then \verb|mov %r10x, (%r11)| at the right width.  \texttt{IR\_GEP} (get
+element pointer) is the address arithmetic that array subscripts and struct
+member accesses lower to: its second operand is already a \emph{byte} offset
+(the IR builder pre-scales a subscript by the element size), so the address is
+just \texttt{SRC1}${}+{}$\texttt{SRC2}---the very shape of a two-operand ALU
+add, and so it reuses \texttt{\_kcc\_x86\_binop} with \texttt{addq}.
+
+@d X86: render @{
+// -- kcc_x86_memload(ir_instr *i, const char *mnem, const char *tail)
+//    Emit "mov* (%r11), reg" for a pointer already implied by SRC1, storing to
+//    DEST.  Loads the pointer into %r11 first.
+.p2align 2
+_kcc_x86_memload:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0                     // instr
+    mov x20, x1                     // mnemonic
+    mov x21, x2                     // tail  "(%r11), %r10\n" etc.
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_r11@@PAGE
+    add  x1, x1, _kcc_x86_s_r11@@PAGEOFF
+    bl _kcc_x86_load
+    mov x0, x20
+    bl _kcc_as_str
+    mov x0, x21
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_x86_memstore(ir_instr *i, const char *mnem, const char *valtail)
+//    Emit "mov* reg, (%r11)".  Loads value into %r10, pointer into %r11.
+.p2align 2
+_kcc_x86_memstore:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x0
+    mov x20, x1                     // mnemonic
+    mov x21, x2                     // valtail  "%r10, (%r11)\n" etc.
+    ldr x0, [x19, #IR_SRC1]         // value
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    ldr x0, [x19, #IR_SRC2]         // pointer
+    adrp x1, _kcc_x86_s_r11@@PAGE
+    add  x1, x1, _kcc_x86_s_r11@@PAGEOFF
+    bl _kcc_x86_load
+    mov x0, x20
+    bl _kcc_as_str
+    mov x0, x21
+    bl _kcc_as_str
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\subsection{The Dispatch}
+\label{sec:x86-dispatch}
+
+With the shape helpers in hand, \texttt{\_kcc\_x86\_sel} is a flat opcode
+switch.  \texttt{IR\_CONST} materialises its immediate with \texttt{movabsq}
+(the one x86 move that takes a full 64-bit immediate) into \verb|%r10| and
+stores it.  \texttt{IR\_ALLOCA} computes the \emph{address} of its storage---%
+\verb|-(vreg_n + offset + size)*8(%rbp)|, where the pre-scan left the running
+slot offset in \texttt{SRC2} and \texttt{SRC1} is the object's slot count---%
+with a \texttt{leaq} and stores that pointer.  \texttt{IR\_RET} loads the
+returned vreg into \verb|%rax| (the low 32 bits are the \texttt{int} result
+the process exit status reads) and falls into the \texttt{leave}/\texttt{retq}
+epilogue; a \texttt{void} return skips straight to it.  Everything else routes
+to a shape helper.
+
+@d X86: render @{
+// -- kcc_x86_sel(ir_instr *i) — select x86-64 for one IR instruction.
+.p2align 2
+_kcc_x86_sel:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                     // instr
+    ldr x22, [x19, #IR_OP]
+
+    cmp x22, #IR_CONST
     b.eq .Lx86sel_const
-    cmp x0, #IR_RET
+    cmp x22, #IR_RET
     b.eq .Lx86sel_ret
-    b .Lx86sel_done                 // rung 1: ignore all other opcodes
+    cmp x22, #IR_ALLOCA
+    b.eq .Lx86sel_alloca
+    cmp x22, #IR_LOAD
+    b.eq .Lx86sel_load
+    cmp x22, #IR_STORE
+    b.eq .Lx86sel_store
+
+    // Two-operand ALU: route by opcode to a mnemonic, then kcc_x86_binop.
+    // IR_GEP is address arithmetic (base + byte offset), i.e. a plain addq.
+    cmp x22, #IR_ADD
+    b.eq .Lx86sel_add
+    cmp x22, #IR_GEP
+    b.eq .Lx86sel_add
+    cmp x22, #IR_SUB
+    b.eq .Lx86sel_sub
+    cmp x22, #IR_MUL
+    b.eq .Lx86sel_mul
+    cmp x22, #IR_AND
+    b.eq .Lx86sel_and
+    cmp x22, #IR_OR
+    b.eq .Lx86sel_or
+    cmp x22, #IR_XOR
+    b.eq .Lx86sel_xor
+    cmp x22, #IR_NEG
+    b.eq .Lx86sel_neg
+    cmp x22, #IR_NOT
+    b.eq .Lx86sel_not
+    cmp x22, #IR_SHL
+    b.eq .Lx86sel_shl
+    cmp x22, #IR_LSHR
+    b.eq .Lx86sel_lshr
+    cmp x22, #IR_ASHR
+    b.eq .Lx86sel_ashr
+    cmp x22, #IR_SDIV
+    b.eq .Lx86sel_sdiv
+    cmp x22, #IR_UDIV
+    b.eq .Lx86sel_udiv
+    cmp x22, #IR_SMOD
+    b.eq .Lx86sel_smod
+    cmp x22, #IR_UMOD
+    b.eq .Lx86sel_umod
+    cmp x22, #IR_SEXT
+    b.eq .Lx86sel_sext
+    cmp x22, #IR_ZEXT
+    b.eq .Lx86sel_zext
+    cmp x22, #IR_TRUNC
+    b.eq .Lx86sel_trunc
+    cmp x22, #IR_BITCAST
+    b.eq .Lx86sel_bitcast
+    b .Lx86sel_done                 // rung 2: ignore control flow, FP, etc.
 
 .Lx86sel_const:
-    ldr x0, [x19, #IR_DEST]         // dest vreg
-    ldr x1, [x19, #IR_SRC1]         // immediate
-    str x1, [x20, x0, lsl #3]       // map[dest] = imm
+    adrp x0, _kcc_x86_s_movabsq@@PAGE
+    add  x0, x0, _kcc_x86_s_movabsq@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_c_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_c_r10@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    b .Lx86sel_done
+
+.Lx86sel_alloca:
+    // D = (vreg_n + offset + size) * 8.
+    ldr x20, [x19, #IR_SRC2]        // offset (slots, from pre-scan)
+    ldr x21, [x19, #IR_SRC1]        // size (slots)
+    cbnz x21, .Lx86sel_alloca_sz
+    mov x21, #1
+.Lx86sel_alloca_sz:
+    adrp x0, _kcc_x86_vreg_n@@PAGE
+    add  x0, x0, _kcc_x86_vreg_n@@PAGEOFF
+    ldr x0, [x0]
+    add x0, x0, x20
+    add x0, x0, x21
+    lsl x20, x0, #3                 // D (bytes)
+    adrp x0, _kcc_x86_s_leaq@@PAGE
+    add  x0, x0, _kcc_x86_s_leaq@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20
+    bl _kcc_x86_disp
+    adrp x0, _kcc_x86_s_c_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_c_r10@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
     b .Lx86sel_done
 
 .Lx86sel_ret:
     ldr x0, [x19, #IR_TYPE]
-    cbz x0, .Lx86sel_ret_void       // null type → void
-    ldr x0, [x0, #TY_KIND]
-    cmp x0, #TY_VOID
-    b.eq .Lx86sel_ret_void
-    // movl $<imm>, %eax
-    adrp x0, _kcc_x86_s_movl@@PAGE
-    add  x0, x0, _kcc_x86_s_movl@@PAGEOFF
+    cbz x0, .Lx86sel_ret_epi        // null type → void
+    ldr x1, [x0, #TY_KIND]
+    cmp x1, #TY_VOID
+    b.eq .Lx86sel_ret_epi
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_rax@@PAGE
+    add  x1, x1, _kcc_x86_s_rax@@PAGEOFF
+    bl _kcc_x86_load
+.Lx86sel_ret_epi:
+    adrp x0, _kcc_x86_s_leave@@PAGE
+    add  x0, x0, _kcc_x86_s_leave@@PAGEOFF
     bl _kcc_as_str
-    ldr x0, [x19, #IR_SRC1]         // returned vreg
-    ldr x0, [x20, x0, lsl #3]       // its constant value
-    bl _kcc_x86_signed32
-    adrp x0, _kcc_x86_s_eax@@PAGE
-    add  x0, x0, _kcc_x86_s_eax@@PAGEOFF
-    bl _kcc_as_str
-.Lx86sel_ret_void:
     adrp x0, _kcc_x86_s_retq@@PAGE
     add  x0, x0, _kcc_x86_s_retq@@PAGEOFF
     bl _kcc_as_str
+    b .Lx86sel_done
+
+.Lx86sel_load:
+    // Access-size override in SRC2 selects the extending move.
+    ldr x20, [x19, #IR_SRC2]
+    cmp x20, #1
+    b.eq .Lx86sel_load_u8
+    cmp x20, #2
+    b.eq .Lx86sel_load_u16
+    cmp x20, #4
+    b.eq .Lx86sel_load_u32
+    cmp x20, #5
+    b.eq .Lx86sel_load_s8
+    cmp x20, #6
+    b.eq .Lx86sel_load_s16
+    cmp x20, #7
+    b.eq .Lx86sel_load_s32
+    cmp x20, #8
+    b.eq .Lx86sel_done              // single-precision float: deferred
+    // Default: 64-bit movq.
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movq@@PAGE
+    add  x1, x1, _kcc_x86_s_movq@@PAGEOFF
+    adrp x2, _kcc_x86_s_pr11_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_pr11_r10@@PAGEOFF
+    bl _kcc_x86_memload
+    b .Lx86sel_done
+.Lx86sel_load_u8:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movzbq@@PAGE
+    add  x1, x1, _kcc_x86_s_movzbq@@PAGEOFF
+    adrp x2, _kcc_x86_s_pr11_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_pr11_r10@@PAGEOFF
+    bl _kcc_x86_memload
+    b .Lx86sel_done
+.Lx86sel_load_u16:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movzwq@@PAGE
+    add  x1, x1, _kcc_x86_s_movzwq@@PAGEOFF
+    adrp x2, _kcc_x86_s_pr11_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_pr11_r10@@PAGEOFF
+    bl _kcc_x86_memload
+    b .Lx86sel_done
+.Lx86sel_load_u32:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movl@@PAGE
+    add  x1, x1, _kcc_x86_s_movl@@PAGEOFF
+    adrp x2, _kcc_x86_s_pr11_r10d@@PAGE
+    add  x2, x2, _kcc_x86_s_pr11_r10d@@PAGEOFF
+    bl _kcc_x86_memload
+    b .Lx86sel_done
+.Lx86sel_load_s8:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movsbq@@PAGE
+    add  x1, x1, _kcc_x86_s_movsbq@@PAGEOFF
+    adrp x2, _kcc_x86_s_pr11_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_pr11_r10@@PAGEOFF
+    bl _kcc_x86_memload
+    b .Lx86sel_done
+.Lx86sel_load_s16:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movswq@@PAGE
+    add  x1, x1, _kcc_x86_s_movswq@@PAGEOFF
+    adrp x2, _kcc_x86_s_pr11_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_pr11_r10@@PAGEOFF
+    bl _kcc_x86_memload
+    b .Lx86sel_done
+.Lx86sel_load_s32:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movslq@@PAGE
+    add  x1, x1, _kcc_x86_s_movslq@@PAGEOFF
+    adrp x2, _kcc_x86_s_pr11_r10@@PAGE
+    add  x2, x2, _kcc_x86_s_pr11_r10@@PAGEOFF
+    bl _kcc_x86_memload
+    b .Lx86sel_done
+
+.Lx86sel_store:
+    // Access-size override in DEST selects the store width.
+    ldr x20, [x19, #IR_DEST]
+    cmp x20, #1
+    b.eq .Lx86sel_store_8
+    cmp x20, #2
+    b.eq .Lx86sel_store_16
+    cmp x20, #4
+    b.eq .Lx86sel_store_32
+    cmp x20, #8
+    b.eq .Lx86sel_done              // single-precision float: deferred
+    // Default: 64-bit movq.
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movq@@PAGE
+    add  x1, x1, _kcc_x86_s_movq@@PAGEOFF
+    adrp x2, _kcc_x86_s_r10_pr11@@PAGE
+    add  x2, x2, _kcc_x86_s_r10_pr11@@PAGEOFF
+    bl _kcc_x86_memstore
+    b .Lx86sel_done
+.Lx86sel_store_8:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movb@@PAGE
+    add  x1, x1, _kcc_x86_s_movb@@PAGEOFF
+    adrp x2, _kcc_x86_s_r10b_pr11@@PAGE
+    add  x2, x2, _kcc_x86_s_r10b_pr11@@PAGEOFF
+    bl _kcc_x86_memstore
+    b .Lx86sel_done
+.Lx86sel_store_16:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movw@@PAGE
+    add  x1, x1, _kcc_x86_s_movw@@PAGEOFF
+    adrp x2, _kcc_x86_s_r10w_pr11@@PAGE
+    add  x2, x2, _kcc_x86_s_r10w_pr11@@PAGEOFF
+    bl _kcc_x86_memstore
+    b .Lx86sel_done
+.Lx86sel_store_32:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_movl@@PAGE
+    add  x1, x1, _kcc_x86_s_movl@@PAGEOFF
+    adrp x2, _kcc_x86_s_r10d_pr11@@PAGE
+    add  x2, x2, _kcc_x86_s_r10d_pr11@@PAGEOFF
+    bl _kcc_x86_memstore
+    b .Lx86sel_done
+
+// ---- Two-operand ALU tails: load mnemonic, call the binop shape. ----
+.Lx86sel_add:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_addq@@PAGE
+    add  x1, x1, _kcc_x86_s_addq@@PAGEOFF
+    bl _kcc_x86_binop
+    b .Lx86sel_done
+.Lx86sel_sub:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_subq@@PAGE
+    add  x1, x1, _kcc_x86_s_subq@@PAGEOFF
+    bl _kcc_x86_binop
+    b .Lx86sel_done
+.Lx86sel_mul:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_imulq@@PAGE
+    add  x1, x1, _kcc_x86_s_imulq@@PAGEOFF
+    bl _kcc_x86_binop
+    b .Lx86sel_done
+.Lx86sel_and:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_andq@@PAGE
+    add  x1, x1, _kcc_x86_s_andq@@PAGEOFF
+    bl _kcc_x86_binop
+    b .Lx86sel_done
+.Lx86sel_or:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_orq@@PAGE
+    add  x1, x1, _kcc_x86_s_orq@@PAGEOFF
+    bl _kcc_x86_binop
+    b .Lx86sel_done
+.Lx86sel_xor:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_xorq@@PAGE
+    add  x1, x1, _kcc_x86_s_xorq@@PAGEOFF
+    bl _kcc_x86_binop
+    b .Lx86sel_done
+.Lx86sel_neg:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_negq@@PAGE
+    add  x1, x1, _kcc_x86_s_negq@@PAGEOFF
+    bl _kcc_x86_unop
+    b .Lx86sel_done
+.Lx86sel_not:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_notq@@PAGE
+    add  x1, x1, _kcc_x86_s_notq@@PAGEOFF
+    bl _kcc_x86_unop
+    b .Lx86sel_done
+.Lx86sel_shl:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_shlq@@PAGE
+    add  x1, x1, _kcc_x86_s_shlq@@PAGEOFF
+    bl _kcc_x86_shift
+    b .Lx86sel_done
+.Lx86sel_lshr:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_shrq@@PAGE
+    add  x1, x1, _kcc_x86_s_shrq@@PAGEOFF
+    bl _kcc_x86_shift
+    b .Lx86sel_done
+.Lx86sel_ashr:
+    mov x0, x19
+    adrp x1, _kcc_x86_s_sarq@@PAGE
+    add  x1, x1, _kcc_x86_s_sarq@@PAGEOFF
+    bl _kcc_x86_shift
+    b .Lx86sel_done
+.Lx86sel_sdiv:
+    mov x0, x19
+    mov x1, #1                      // signed
+    mov x2, #0                      // quotient
+    bl _kcc_x86_divop
+    b .Lx86sel_done
+.Lx86sel_udiv:
+    mov x0, x19
+    mov x1, #0
+    mov x2, #0
+    bl _kcc_x86_divop
+    b .Lx86sel_done
+.Lx86sel_smod:
+    mov x0, x19
+    mov x1, #1
+    mov x2, #1                      // remainder
+    bl _kcc_x86_divop
+    b .Lx86sel_done
+.Lx86sel_umod:
+    mov x0, x19
+    mov x1, #0
+    mov x2, #1
+    bl _kcc_x86_divop
+    b .Lx86sel_done
+.Lx86sel_sext:
+    mov x0, x19
+    ldr x1, [x19, #IR_SRC2]         // source width
+    mov x2, #1                      // signed
+    bl _kcc_x86_conv
+    b .Lx86sel_done
+.Lx86sel_zext:
+    mov x0, x19
+    ldr x1, [x19, #IR_SRC2]         // source width
+    mov x2, #0                      // unsigned
+    bl _kcc_x86_conv
+    b .Lx86sel_done
+.Lx86sel_trunc:
+    mov x0, x19
+    ldr x1, [x19, #IR_TYPE]         // target type → width
+    cbz x1, .Lx86sel_trunc_copy
+    ldr x1, [x1, #TY_SIZE]
+    mov x2, #0                      // truncation keeps low bytes, zero-extended
+    bl _kcc_x86_conv
+    b .Lx86sel_done
+.Lx86sel_trunc_copy:
+    mov x1, #8                      // unknown width → plain copy
+    mov x2, #0
+    bl _kcc_x86_conv
+    b .Lx86sel_done
+.Lx86sel_bitcast:
+    mov x0, x19
+    mov x1, #8                      // plain movq copy
+    mov x2, #0
+    bl _kcc_x86_conv
 
 .Lx86sel_done:
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
+    ret
+@}
+
+\section{The Frame: Pre-scan, Prologue, Epilogue}
+\label{sec:x86-frame}
+
+Before a function's instructions can be selected, its frame must be sized.
+\texttt{\_kcc\_x86\_prescan} walks every basic block and, for each
+\texttt{IR\_ALLOCA}, records the running slot offset in \texttt{SRC2} and
+advances by the alloca's slot count (\texttt{SRC1}, defaulting to one).  It
+returns the total number of alloca slots.  The vreg value slots and the alloca
+storage together fix the frame size; the prologue emits the standard
+\verb|pushq %rbp| / \verb|movq %rsp, %rbp| and, when the frame is non-empty,
+one \verb|subq $frame, %rsp| (rounded up to a 16-byte multiple so the stack
+stays aligned).  The \texttt{leave} in every \texttt{IR\_RET} epilogue undoes
+all of it in one instruction, so no per-function epilogue state is needed.
+
+@d X86: render @{
+// -- kcc_x86_prescan(ir_func *f) → total alloca slots; sets each alloca's SRC2.
+.p2align 2
+_kcc_x86_prescan:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x0                     // func
+    mov x20, #0                     // running offset (slots)
+    ldr x21, [x19, #IRF_BLOCKS]
+    cbz x21, .Lx86ps_done
+    ldr x22, [x21, #VEC_COUNT]
+    mov x23, #0                     // bb index
+.Lx86ps_bb:
+    cmp x23, x22
+    b.ge .Lx86ps_done
+    mov x0, x21
+    mov x1, x23
+    bl _kcc_vec_get
+    ldr x24, [x0]                   // BB ptr
+    ldr x24, [x24, #BB_FIRST]
+.Lx86ps_instr:
+    cbz x24, .Lx86ps_next_bb
+    ldr x0, [x24, #IR_OP]
+    cmp x0, #IR_ALLOCA
+    b.ne .Lx86ps_skip
+    str x20, [x24, #IR_SRC2]        // record this alloca's offset
+    ldr x0, [x24, #IR_SRC1]         // slot count
+    cbnz x0, .Lx86ps_add
+    mov x0, #1
+.Lx86ps_add:
+    add x20, x20, x0
+.Lx86ps_skip:
+    ldr x24, [x24, #IR_NEXT]
+    b .Lx86ps_instr
+.Lx86ps_next_bb:
+    add x23, x23, #1
+    b .Lx86ps_bb
+.Lx86ps_done:
+    mov x0, x20
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
     ret
 @}
 
@@ -165,12 +1103,10 @@ _kcc_x86_sel:
 
 The top-level walk mirrors the IR dumper (\S\ref{sec:ir-dump}): iterate the
 function list \texttt{\_kcc\_ir\_funcs}, and for each function emit its symbol
-declaration and label, then stream its instructions through selection.  A
+declaration and label, publish its vreg count, run the pre-scan, emit the
+prologue, then stream its instructions through selection.  A
 non-\texttt{static} function gets a \texttt{.globl}; the label is always the
-name with the Mach-O leading underscore.  Each function allocates a small
-array indexed by virtual-register number (\texttt{IRF\_VREG\_N} entries) in
-which selection records constants; because a constant is always defined
-before the return that uses it, a plain arena allocation suffices.
+name with the Mach-O leading underscore.
 
 @d X86: render @{
 // -- kcc_x86_render_text() — walk the IR, emit x86-64 assembly to the buffer.
@@ -212,7 +1148,7 @@ _kcc_x86_render_text:
     bl _kcc_as_str
     ldr x0, [x22, #IRF_NAME]
     bl _kcc_as_str
-    mov x0, #'\n'
+    mov x0, #10                     // '\n'
     bl _kcc_as_ch
 
 .Lx86rt_label:
@@ -226,13 +1162,39 @@ _kcc_x86_render_text:
     add  x0, x0, _kcc_x86_s_colon_nl@@PAGEOFF
     bl _kcc_as_str
 
-    // Allocate the per-function vreg value map (IRF_VREG_N quadwords).
-    ldr x0, [x22, #IRF_VREG_N]
-    add x0, x0, #1                  // one extra for safety
-    lsl x0, x0, #3
-    bl _kcc_arena_alloc
-    mov x26, x0                     // vreg map
+    // Publish the vreg count (alloca addressing reads it) and pre-scan allocas.
+    ldr x26, [x22, #IRF_VREG_N]     // vreg count
+    adrp x0, _kcc_x86_vreg_n@@PAGE
+    add  x0, x0, _kcc_x86_vreg_n@@PAGEOFF
+    str x26, [x0]
+    mov x0, x22
+    bl _kcc_x86_prescan             // x0 = total alloca slots
 
+    // frame_bytes = align16((vreg_count + alloca_slots) * 8).
+    add x0, x0, x26
+    lsl x0, x0, #3                  // bytes
+    add x0, x0, #15
+    and x0, x0, #~15
+    mov x27, x0                     // frame_bytes
+
+    // Prologue: pushq %rbp ; movq %rsp, %rbp ; subq $frame, %rsp.
+    adrp x0, _kcc_x86_s_push_rbp@@PAGE
+    add  x0, x0, _kcc_x86_s_push_rbp@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_mov_sp@@PAGE
+    add  x0, x0, _kcc_x86_s_mov_sp@@PAGEOFF
+    bl _kcc_as_str
+    cbz x27, .Lx86rt_body
+    adrp x0, _kcc_x86_s_sub_sp@@PAGE
+    add  x0, x0, _kcc_x86_s_sub_sp@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x27
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_sp_nl@@PAGE
+    add  x0, x0, _kcc_x86_s_sp_nl@@PAGEOFF
+    bl _kcc_as_str
+
+.Lx86rt_body:
     // Walk basic blocks.
     ldr x23, [x22, #IRF_BLOCKS]
     cbz x23, .Lx86rt_next_func
@@ -251,7 +1213,6 @@ _kcc_x86_render_text:
 .Lx86rt_instr:
     cbz x27, .Lx86rt_next_bb
     mov x0, x27
-    mov x1, x26
     bl _kcc_x86_sel
     ldr x27, [x27, #IR_NEXT]
     b .Lx86rt_instr
@@ -302,3 +1263,16 @@ _kcc_x86_render:
     ret
 @| _kcc_x86_render _kcc_target
 @}
+
+\section{Rung One in Retrospect}
+\label{sec:x86-rung1-history}
+
+Rung~one selected only \texttt{IR\_CONST} and \texttt{IR\_RET} and carried the
+returned constant in a small per-function value map, emitting the whole
+function as \verb|movl $N, %eax| / \verb|retq| with no stack frame at all.
+Rung~two subsumes that path: a constant now materialises into its vreg slot
+and the return loads from it, so \verb|int main(void){return N;}| still exits
+with \texttt{N}---now through the general all-spill frame rather than a
+special case.  The map is gone; every value lives in memory between
+instructions, which is exactly what let the arithmetic and memory opcodes join
+the target without disturbing the ones already working.

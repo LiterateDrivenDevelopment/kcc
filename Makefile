@@ -103,7 +103,7 @@ doc:
 
 # Weave + compile to PDF (lualatex for native Unicode)
 weave: doc
-	latexmk -lualatex -interaction=nonstopmode -halt-on-error kcc.tex
+	latexmk -lualatex -interaction=nonstopmode -f kcc.tex
 
 # Clean generated files
 clean:

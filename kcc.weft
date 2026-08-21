@@ -96,26 +96,6 @@
   morestring=[b]",
 }
 
-%\lstset{
-%  language=aarch64,
-%  basicstyle=\ttfamily\small,
-%  keywordstyle=\color{blue!70!black}\bfseries,
-%  keywordstyle=[2]\color{red!60!black},
-%  keywordstyle=[3]\color{green!40!black}\bfseries,
-%  commentstyle=\color{gray}\itshape,
-%  stringstyle=\color{orange!80!black},
-%  numbers=left,
-%  numberstyle=\tiny\color{gray},
-%  numbersep=8pt,
-%  tabsize=4,
-%  showstringspaces=false,
-%  breaklines=true,
-%  frame=single,
-%  rulecolor=\color{gray!30},
-%  xleftmargin=1.5em,
-%  framexleftmargin=1.5em,
-%}
-
 \lstset{
   language=aarch64,
   basicstyle=\ttfamily\footnotesize\linespread{0.85}\selectfont,
@@ -154,6 +134,8 @@
 \newcommand{\kcc}{\textsf{kcc}}
 \newcommand{\reg}[1]{\texttt{#1}}
 \newcommand{\meta}[1]{\textsf{#1}}
+\newcommand{\arch}[1]{\textsf{#1}}
+
 
 % Title
 \title{\kcc\\[0.5em]
@@ -193,17 +175,21 @@
 % ═══════════════════════════════════════════════════════════════════
 \part{Orientation}
 
-Before the book builds the compiler from the language standard down to the
-running binary, three chapters orient the reader who wants to arrive quickly:
-how to \emph{use} \kcc{}, how to \emph{extend} it to a new architecture, and
-how its many fragments are \emph{assembled} into the physical files the
-machine requires.
+\noindent Before the book builds the compiler from the language standard down 
+to the running binary, three chapters orient the reader who wants to arrive 
+quickly: how to \emph{use} \kcc{}, how to \emph{extend} it to a new
+architecture, and how its many fragments are \emph{assembled} into the physical 
+files the machine requires.
 
 @i literate/appendices/A-user-manual.weft
 \newpage
 
 @i literate/backend/36e-retargeting.weft
 \newpage
+
+@i literate/appendices/E-limitations.weft
+\newpage
+
 
 \begin{multicols}{2}
 @i literate/assembly.weft
@@ -215,7 +201,7 @@ machine requires.
 % ═══════════════════════════════════════════════════════════════════
 \part{Foundations}
 
-Every compiler is an implementation of a language standard, and the
+\noindent Every compiler is an implementation of a language standard, and the
 standard is a legal document: ambiguous, self-referential, and full of
 subtle constraints that only become visible when you try to encode them
 as executable rules.  This part pins down the normative corpus that
@@ -641,10 +627,6 @@ the binaries, and verify that the exit code matches the expected value.
 \end{multicols}
 \newpage
 
-\begin{multicols}{2}
-@i literate/appendices/E-limitations.weft
-\end{multicols}
-\newpage
 
 \begin{multicols}{2}
 % ═══════════════════════════════════════════════════════════════════

@@ -261,7 +261,21 @@ _kcc_driver_x86_object:
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     mov x19, x0                    // out_path
-    // Build "<out_path>.s".
+
+    // Linux/ELF target: this compiler runs on Darwin, whose `as` emits Mach-O,
+    // not ELF.  So under --target=x86_64-linux kcc renders the ELF-flavour
+    // assembly straight to the output path and stops---the object is produced
+    // by assembling that `.s` on a Linux host (or with a cross-assembler).
+    adrp x0, _kcc_x86_os@@PAGE
+    add  x0, x0, _kcc_x86_os@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lxo_darwin
+    mov x0, x19                    // out_path receives the assembly text
+    bl _kcc_x86_render
+    b .Lxo_done
+.Lxo_darwin:
+    // Build "<out_path>.s".  (Restore x0 = out_path; the os check above clobbered it.)
+    mov x0, x19
     bl _kcc_strlen
     mov x20, x0                    // out_len
     add x0, x20, #3
@@ -584,6 +598,11 @@ _kcc_driver_compile_all:
     bl _kcc_strcmp
     cbz x0, .Lca_scan_target
     ldr x0, [x20, x23, lsl #3]     // argv[i]
+    adrp x1, _kcc_opt_target_linux@@PAGE
+    add  x1, x1, _kcc_opt_target_linux@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_scan_target_linux
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
     adrp x1, _kcc_opt_g@@PAGE
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
@@ -660,6 +679,18 @@ _kcc_driver_compile_all:
     str  x1, [x0]
     add x23, x23, #1
     b .Lca_scan
+.Lca_scan_target_linux:
+    // "--target=x86_64-linux": x86-64 back end in its Linux/ELF flavour.
+    adrp x0, _kcc_target@@PAGE
+    add  x0, x0, _kcc_target@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    adrp x0, _kcc_x86_os@@PAGE
+    add  x0, x0, _kcc_x86_os@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x23, x23, #1
+    b .Lca_scan
 .Lca_scan_o:
     add x23, x23, #1               // step to the -o value
     cmp x23, x19
@@ -697,6 +728,11 @@ _kcc_driver_compile_all:
     add  x1, x1, _kcc_opt_target_x86@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lca_skip_wall         // --target=x86_64: handled in pass 1
+    mov x0, x25
+    adrp x1, _kcc_opt_target_linux@@PAGE
+    add  x1, x1, _kcc_opt_target_linux@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_skip_wall         // --target=x86_64-linux: handled in pass 1
     mov x0, x25
     adrp x1, _kcc_opt_o@@PAGE
     add  x1, x1, _kcc_opt_o@@PAGEOFF
@@ -1301,6 +1337,8 @@ _kcc_opt_emitasm:
     .asciz "--emit-asm"
 _kcc_opt_target_x86:
     .asciz "--target=x86_64"
+_kcc_opt_target_linux:
+    .asciz "--target=x86_64-linux"
 _kcc_str_x86_64:
     .asciz "x86_64"
 _kcc_str_as_argv0:

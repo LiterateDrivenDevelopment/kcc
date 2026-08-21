@@ -288,6 +288,21 @@ int main(void) {
 \noindent compiles, links, and runs in one step with output identical to a
 mainstream x86-64 compiler.
 
+\paragraph{Targeting Linux (ELF).}  The same instruction selection can emit
+x86-64 assembly in the Linux/ELF dialect with \texttt{-{}-target=x86\_64-linux}:
+symbols are un-prefixed, read-only data goes in \texttt{.rodata}, zeroed globals
+use \texttt{.comm}, and an external reference resolves directly (for a static
+link) rather than through the Mach-O GOT.  Because \kcc{} runs on macOS---whose
+system assembler emits only Mach-O---this mode \emph{writes the assembly to the
+output path and stops} rather than assembling it; you finish the build on a
+Linux host (or in a container):
+
+\begin{verbatim}
+kcc --target=x86_64-linux -c prog.c -o prog.s   # emits ELF-dialect asm
+# then, on a Linux/x86-64 host:
+as -o prog.o prog.s  &&  ld -o prog prog.o ...   # assemble + link + run
+\end{verbatim}
+
 What the x86-64 back end does \emph{not} yet handle is a \texttt{const} global
 whose value lives in read-only data (a reference to one becomes an unresolved
 symbol at link time---a clean link error, never a wrong value), a

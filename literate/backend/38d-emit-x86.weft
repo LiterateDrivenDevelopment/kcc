@@ -116,16 +116,23 @@ operand as \verb|disp(base)|.
 .data
 .globl _kcc_target
 .globl _kcc_x86_tu
+.globl _kcc_x86_os
 _kcc_target:     .quad 0        // 0 = arm64/Mach-O (default), 1 = x86-64
 _kcc_x86_vreg_n: .quad 0        // current function's vreg count (frame sizing)
 _kcc_x86_tu:     .quad 0        // the AST translation unit (for data emission)
 _kcc_x86_strs:   .quad 0        // vec of {data_ptr, len} string-literal entries
+_kcc_x86_os:     .quad 0        // 0 = Darwin/Mach-O (default), 1 = Linux/ELF
 
 .section __TEXT,__cstring,cstring_literals
 // Directives and symbol scaffolding.
 _kcc_x86_s_text:     .asciz ".text\n"
-_kcc_x86_s_globl:    .asciz ".globl _"
+_kcc_x86_s_globl:    .asciz ".globl "
 _kcc_x86_s_us:       .asciz "_"
+
+// Linux/ELF-flavour directives (selected when _kcc_x86_os = 1).
+_kcc_x86_s_rodata:   .asciz ".section .rodata\n"
+_kcc_x86_s_comm:     .asciz "\t.comm "
+_kcc_x86_s_comm_a8:  .asciz ",8\n"          // ",<size>,8\n" .comm alignment tail
 _kcc_x86_s_colon_nl: .asciz ":\n"
 _kcc_x86_s_minus:    .asciz "-"
 _kcc_x86_s_rbp:      .asciz "(%rbp)"
@@ -267,6 +274,51 @@ _kcc_x86_argregs:
     .quad _kcc_x86_s_rcx
     .quad _kcc_x86_s_r8
     .quad _kcc_x86_s_r9
+@}
+
+\section{Two Object-Format Flavours: Darwin and Linux}
+\label{sec:x86-flavour}
+
+The instruction \emph{selection} above is pure x86-64 and does not care which
+operating system will host the program---but the surrounding assembly
+\emph{directives} do.  Mach-O (Darwin) and ELF (Linux) disagree on three
+things this back end emits: Mach-O prefixes every C symbol with an underscore
+while ELF does not; their section directives are spelled differently
+(\verb|.section __TEXT,__cstring| versus \verb|.section .rodata|,
+\verb|.zerofill __DATA,__common| versus \verb|.comm|); and a reference to an
+external symbol goes through the GOT on Darwin (a dylib import has no image
+address) but resolves directly in a statically linked ELF executable.  A single
+global, \texttt{\_kcc\_x86\_os}, selects the flavour: \texttt{0} is Darwin (the
+default, so the existing Mach-O path is untouched) and \texttt{1} is Linux.
+
+The one pervasive difference---the underscore---is funnelled through a helper.
+\texttt{\_kcc\_x86\_sym} emits a symbol name preceded by an underscore only
+under Darwin, so every label, \texttt{.globl}, and call target is written the
+same way and the flavour is decided in one place.
+
+@d X86: render @{
+.text
+// -- kcc_x86_sym(const char *name) — append a symbol: "_"+name on Darwin,
+//    bare name on Linux/ELF.
+.p2align 2
+_kcc_x86_sym:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                     // name
+    adrp x0, _kcc_x86_os@@PAGE
+    add  x0, x0, _kcc_x86_os@@PAGEOFF
+    ldr x0, [x0]
+    cbnz x0, .Lx86sym_bare          // Linux: no underscore
+    adrp x0, _kcc_x86_s_us@@PAGE
+    add  x0, x0, _kcc_x86_s_us@@PAGEOFF
+    bl _kcc_as_str
+.Lx86sym_bare:
+    mov x0, x19
+    bl _kcc_as_str
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
 @}
 
 \section{Text-Buffer Emission Helpers}
@@ -1442,24 +1494,39 @@ _kcc_x86_sel:
     bl _kcc_as_ch
     b .Lx86sel_done
 
-// ---- Global reference: leaq _<name>(%rip), %r10 ; store to dest. ----
+// ---- Global reference: the symbol's address into %r10, stored to dest. ----
 .Lx86sel_globalref:
-    // Load the symbol's address from the GOT: movq _<name>@@GOTPCREL(%rip), %r10.
-    // The GOT form resolves uniformly for a symbol defined in this unit (the
-    // linker points the slot at the local definition) and for an external one
-    // imported from another object or a dylib (like puts), which has no fixed
-    // image address---exactly the ARM64 back end's GOTPAGE discipline.
+    // Darwin: movq _<name>@@GOTPCREL(%rip), %r10 --- the GOT form resolves
+    // uniformly for a locally defined symbol and for a dylib import (like puts),
+    // which has no fixed image address, exactly the ARM64 GOTPAGE discipline.
+    // Linux/ELF (static): leaq <name>(%rip), %r10 --- a statically linked
+    // executable resolves every symbol to a real address at link time, so the
+    // direct RIP form suffices and no GOT slot is needed.
+    adrp x0, _kcc_x86_os@@PAGE
+    add  x0, x0, _kcc_x86_os@@PAGEOFF
+    ldr x0, [x0]
+    cbnz x0, .Lx86gref_elf
+    // Darwin GOT form.
     adrp x0, _kcc_x86_s_movq@@PAGE
     add  x0, x0, _kcc_x86_s_movq@@PAGEOFF
     bl _kcc_as_str
-    adrp x0, _kcc_x86_s_us@@PAGE
-    add  x0, x0, _kcc_x86_s_us@@PAGEOFF
-    bl _kcc_as_str
     ldr x0, [x19, #IR_SRC1]         // symbol name
-    bl _kcc_as_str
+    bl _kcc_x86_sym                 // "_"+name on Darwin
     adrp x0, _kcc_x86_s_got_r10@@PAGE
     add  x0, x0, _kcc_x86_s_got_r10@@PAGEOFF
     bl _kcc_as_str
+    b .Lx86gref_store
+.Lx86gref_elf:
+    // Linux direct form: leaq <name>(%rip), %r10.
+    adrp x0, _kcc_x86_s_leaq@@PAGE
+    add  x0, x0, _kcc_x86_s_leaq@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]
+    bl _kcc_x86_sym                 // bare name on Linux
+    adrp x0, _kcc_x86_s_rip_r10@@PAGE
+    add  x0, x0, _kcc_x86_s_rip_r10@@PAGEOFF
+    bl _kcc_as_str
+.Lx86gref_store:
     ldr x0, [x19, #IR_DEST]
     adrp x1, _kcc_x86_s_r10@@PAGE
     add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
@@ -1506,15 +1573,12 @@ _kcc_x86_sel:
     adrp x0, _kcc_x86_s_zero_al@@PAGE
     add  x0, x0, _kcc_x86_s_zero_al@@PAGEOFF
     bl _kcc_as_str
-    // call _<name>
+    // call <name>  (underscore-prefixed on Darwin via kcc_x86_sym)
     adrp x0, _kcc_x86_s_call@@PAGE
     add  x0, x0, _kcc_x86_s_call@@PAGEOFF
     bl _kcc_as_str
-    adrp x0, _kcc_x86_s_us@@PAGE
-    add  x0, x0, _kcc_x86_s_us@@PAGEOFF
-    bl _kcc_as_str
     ldr x0, [x19, #IR_SRC1]         // callee name
-    bl _kcc_as_str
+    bl _kcc_x86_sym
     mov x0, #10
     bl _kcc_as_ch
     b .Lx86sel_call_tail
@@ -1707,8 +1771,9 @@ The top-level walk mirrors the IR dumper (\S\ref{sec:ir-dump}): iterate the
 function list \texttt{\_kcc\_ir\_funcs}, and for each function emit its symbol
 declaration and label, publish its vreg count, run the pre-scan, emit the
 prologue, then stream its instructions through selection.  A
-non-\texttt{static} function gets a \texttt{.globl}; the label is always the
-name with the Mach-O leading underscore.
+non-\texttt{static} function gets a \texttt{.globl}; the label and declaration
+route the name through \texttt{\_kcc\_x86\_sym}, so it carries the Mach-O
+leading underscore under Darwin and none under Linux/ELF.
 
 @d X86: render @{
 // -- kcc_x86_render_text() — walk the IR, emit x86-64 assembly to the buffer.
@@ -1742,24 +1807,21 @@ _kcc_x86_render_text:
     bl _kcc_vec_get
     ldr x22, [x0]                   // func ptr
 
-    // .globl _<name>   (unless static)
+    // .globl <name>   (unless static)
     ldr x0, [x22, #IRF_STATIC]
     cbnz x0, .Lx86rt_label
     adrp x0, _kcc_x86_s_globl@@PAGE
     add  x0, x0, _kcc_x86_s_globl@@PAGEOFF
     bl _kcc_as_str
     ldr x0, [x22, #IRF_NAME]
-    bl _kcc_as_str
+    bl _kcc_x86_sym
     mov x0, #10                     // '\n'
     bl _kcc_as_ch
 
 .Lx86rt_label:
-    // _<name>:
-    adrp x0, _kcc_x86_s_us@@PAGE
-    add  x0, x0, _kcc_x86_s_us@@PAGEOFF
-    bl _kcc_as_str
+    // <name>:  (underscore-prefixed on Darwin)
     ldr x0, [x22, #IRF_NAME]
-    bl _kcc_as_str
+    bl _kcc_x86_sym
     adrp x0, _kcc_x86_s_colon_nl@@PAGE
     add  x0, x0, _kcc_x86_s_colon_nl@@PAGEOFF
     bl _kcc_as_str
@@ -1923,18 +1985,24 @@ _kcc_x86_emit_data:
     add x22, x22, #7
     and x22, x22, #~7               // round up to a whole 8-byte slot
 
-    // .globl _<name>   (unless static: internal linkage)
+    // .globl <name>   (unless static: internal linkage)
     cmp x21, #3
-    b.eq .Lx86ed_zf
+    b.eq .Lx86ed_storage
     adrp x0, _kcc_x86_s_globl@@PAGE
     add  x0, x0, _kcc_x86_s_globl@@PAGEOFF
     bl _kcc_as_str
     mov x0, x20
-    bl _kcc_as_str
+    bl _kcc_x86_sym
     mov x0, #10
     bl _kcc_as_ch
-.Lx86ed_zf:
-    // .zerofill __DATA,__common,_<name>,<size>,3
+.Lx86ed_storage:
+    // Zeroed common storage.  Darwin: .zerofill __DATA,__common,_<name>,<size>,3.
+    // Linux/ELF: .comm <name>,<size>,8.
+    adrp x0, _kcc_x86_os@@PAGE
+    add  x0, x0, _kcc_x86_os@@PAGEOFF
+    ldr x0, [x0]
+    cbnz x0, .Lx86ed_comm
+    // Darwin .zerofill: the directive string already carries the "_" prefix.
     adrp x0, _kcc_x86_s_zerofill@@PAGE
     add  x0, x0, _kcc_x86_s_zerofill@@PAGEOFF
     bl _kcc_as_str
@@ -1947,6 +2015,22 @@ _kcc_x86_emit_data:
     bl _kcc_as_dec
     adrp x0, _kcc_x86_s_zf_a3@@PAGE
     add  x0, x0, _kcc_x86_s_zf_a3@@PAGEOFF
+    bl _kcc_as_str
+    b .Lx86ed_next
+.Lx86ed_comm:
+    // Linux .comm <name>,<size>,8
+    adrp x0, _kcc_x86_s_comm@@PAGE
+    add  x0, x0, _kcc_x86_s_comm@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x20
+    bl _kcc_as_str                  // bare name (ELF: no underscore)
+    adrp x0, _kcc_x86_s_comma1@@PAGE
+    add  x0, x0, _kcc_x86_s_comma1@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x22
+    bl _kcc_as_dec
+    adrp x0, _kcc_x86_s_comm_a8@@PAGE
+    add  x0, x0, _kcc_x86_s_comm_a8@@PAGEOFF
     bl _kcc_as_str
 .Lx86ed_next:
     ldr x19, [x19, #AST_F4]         // next sibling
@@ -1993,9 +2077,18 @@ _kcc_x86_emit_strings:
     ldr x20, [x19, #VEC_COUNT]      // number of literals
     cbz x20, .Lx86es_done
 
-    // .section __TEXT,__cstring,cstring_literals
+    // Read-only section header: Darwin __TEXT,__cstring vs Linux .rodata.
+    adrp x0, _kcc_x86_os@@PAGE
+    add  x0, x0, _kcc_x86_os@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lx86es_darwin_sect
+    adrp x0, _kcc_x86_s_rodata@@PAGE
+    add  x0, x0, _kcc_x86_s_rodata@@PAGEOFF
+    b .Lx86es_sect_emit
+.Lx86es_darwin_sect:
     adrp x0, _kcc_x86_s_cstrsect@@PAGE
     add  x0, x0, _kcc_x86_s_cstrsect@@PAGEOFF
+.Lx86es_sect_emit:
     bl _kcc_as_str
 
     mov x21, #0                     // literal index

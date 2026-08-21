@@ -743,6 +743,20 @@ self-test, and diff against clang:
 @<Selfhost: lexer verify@>
 @}
 
+\noindent\textbf{vec.c} --- the growable vector in C
+(Chapter~\ref{ch:self-hosting-vec}), a drop-in replacement:
+
+@o tmp/selfhost/vec.c @{
+@<Selfhost: vec@>
+@}
+
+\noindent\textbf{vec\_verify.sh} --- compile it with \kcc{}, relink the
+compiler with it, and re-run the code-generation suite:
+
+@o tmp/selfhost/vec_verify.sh @{
+@<Selfhost: vec verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

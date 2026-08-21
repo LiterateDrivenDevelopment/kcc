@@ -67,6 +67,11 @@ selfhost-lexer: build
 	chmod +x tmp/selfhost/lexer_verify.sh
 	tmp/selfhost/lexer_verify.sh
 
+# Self-hosting (Stage 8c): compile kcc's vector in C with kcc, relink, run suite
+selfhost-vec: build
+	chmod +x tmp/selfhost/vec_verify.sh
+	tmp/selfhost/vec_verify.sh
+
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build
 	chmod +x tmp/tests/difftest.sh

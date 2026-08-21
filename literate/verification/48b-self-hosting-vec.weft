@@ -1,0 +1,161 @@
+% 49-self-hosting-vec.weft — Stage 8c: the growable vector, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Vector in C}
+\label{ch:self-hosting-vec}
+
+The arena (Chapter~\ref{ch:self-hosting-arena}) proved \kcc{} can compile a
+piece of its own \emph{storage} layer; this chapter climbs one level up and
+ports a \emph{data structure}---the growable vector of
+Chapter~\ref{ch:data-structures}.  The vector is the workhorse container of the
+whole compiler: the list of IR functions, each function's basic blocks, the
+symbol-table scopes, the relocation and symbol vectors of the linker, and the
+back end's patch lists are all \texttt{kcc\_vec}s.  Re-implementing it in C,
+compiling that C with \kcc{}, and linking the result back in place of the
+hand-written assembly is therefore a second, independent self-hosting step:
+where the arena stressed one allocation path, the vector stresses element
+copying, the geometric-growth reallocation, and pointer arithmetic on a
+caller-supplied element size---exercised millions of times across the suite.
+
+\section{Interface and Layout}
+
+The C port must be a drop-in replacement, so it exports exactly the three
+symbols the assembly vector did---\texttt{kcc\_vec\_init},
+\texttt{kcc\_vec\_push}, and \texttt{kcc\_vec\_get}---and it reads and writes a
+header whose fields sit at the very offsets the rest of the compiler already
+hard-codes: \texttt{data} at~0, \texttt{count} at~8, \texttt{cap} at~16,
+\texttt{elem\_size} at~24.  Because \kcc{}'s all-spill layout gives every scalar
+struct field its own eight-byte slot, the natural C declaration---a pointer
+followed by three \texttt{unsigned long}s---occupies exactly those offsets, so
+the C header and the assembly header are the same 32 bytes byte for byte.  The
+port depends only on the two primitives the assembly version used, the arena
+allocator and \texttt{memcpy}, declared here as ordinary \texttt{extern}
+functions the linker resolves across objects.
+
+@l c
+@d Selfhost: vec preamble @{
+struct Vec {
+    void *data;
+    unsigned long count;
+    unsigned long cap;
+    unsigned long elem_size;
+};
+
+void *kcc_arena_alloc(long size);
+void  kcc_memcpy(void *dst, const void *src, unsigned long n);
+@}
+
+\section{Initialization}
+
+\texttt{kcc\_vec\_init} arena-allocates the 32-byte header and an initial
+backing array for sixteen elements, mirroring the assembly routine exactly: the
+count starts at zero and the caller never specifies a capacity.
+
+@l c
+@d Selfhost: vec init @{
+void *kcc_vec_init(unsigned long elem_size) {
+    struct Vec *v = (struct Vec *)kcc_arena_alloc(sizeof(struct Vec));
+    v->data = kcc_arena_alloc((long)(16 * elem_size));
+    v->count = 0;
+    v->cap = 16;
+    v->elem_size = elem_size;
+    return v;
+}
+@}
+
+\section{Push}
+
+\texttt{kcc\_vec\_push} appends a copy of the caller's element.  When the vector
+is full it doubles the capacity, allocates a fresh array, and copies the live
+elements across before storing the new one---the geometric growth that keeps a
+sequence of $n$ pushes amortised linear.  Both copies go through the same
+\texttt{memcpy} the assembly used, and all sizes are computed from the header's
+\texttt{elem\_size}, so a vector of any element width behaves identically.
+
+@l c
+@d Selfhost: vec push @{
+void kcc_vec_push(void *vec, const void *elem) {
+    struct Vec *v = (struct Vec *)vec;
+    if (v->count >= v->cap) {
+        unsigned long newcap = v->cap * 2;
+        void *nd = kcc_arena_alloc((long)(newcap * v->elem_size));
+        kcc_memcpy(nd, v->data, v->count * v->elem_size);
+        v->data = nd;
+        v->cap = newcap;
+    }
+    kcc_memcpy((char *)v->data + v->count * v->elem_size, elem, v->elem_size);
+    v->count = v->count + 1;
+}
+@}
+
+\section{Element Access}
+
+\texttt{kcc\_vec\_get} returns a pointer to the element at an index, computed as
+\texttt{data + index * elem\_size}, with no bounds checking---the caller
+guarantees the index is in range, exactly as the assembly contract required.
+
+@l c
+@d Selfhost: vec get @{
+void *kcc_vec_get(void *vec, unsigned long index) {
+    struct Vec *v = (struct Vec *)vec;
+    return (char *)v->data + index * v->elem_size;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+The three fragments compose into one C file, \texttt{tmp/selfhost/vec.c}, routed
+by \texttt{assembly.weft}.
+
+@l c
+@d Selfhost: vec @{
+@<Selfhost: vec preamble@>
+@<Selfhost: vec init@>
+@<Selfhost: vec push@>
+@<Selfhost: vec get@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-vec-verify}
+
+\texttt{make selfhost-vec} runs the same drop-in loop the arena uses.  It
+compiles \texttt{tmp/selfhost/vec.c} with the assembly-built \kcc{}, relinks a
+second compiler binary with the hand-written \texttt{vec.o} swapped for the
+freshly compiled \texttt{vec\_c.o}, and points the code-generation suite at it.
+
+The passing criterion is again complete: the self-hosted compiler must
+reproduce every result of the assembly-built one.  Because vectors carry the IR
+function list, every function's basic blocks, and the symbol-table scopes, a
+green run means the C vector---compiled by \kcc{}---is behaviourally
+byte-for-byte equivalent to the assembly original, growth path and all.
+
+@d Selfhost: vec verify @{
+#!/usr/bin/env bash
+# make selfhost-vec — compile kcc's vector in C with kcc, relink, run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/vec.c with kcc"
+tmp/kcc -c "$SH/vec.c" -o "$SH/vec_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_vec (vec.o -> kcc-compiled vec_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "vec" ]; then OBJ="$OBJ $SH/vec_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_vec $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted vector"
+cp tmp/kcc "$SH/kcc_asm_backup_vec"
+cp tmp/kcc_selfhost_vec tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_vec" tmp/kcc
+exit $status
+@}

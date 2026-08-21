@@ -24,8 +24,12 @@
 (ARM64 / Mach-O) that compiles and runs real software---Lua~5.4.7's
 entire official suite, zlib~1.3.1 end to end, cJSON byte-identical to
 \texttt{clang}.  The natural next ambition is a \emph{second} target.
-This appendix argues that a second target should not be started yet, and
-lays out precisely what to finish first.
+This appendix argues that a second target should not be started until the
+shared core is finished and proven, and lays out precisely what that means.
+(The argument held: by the time the x86-64 target was actually begun, the
+target-neutral milestones M1--M5 were complete---see the revised M7 status in
+\S\ref{sec:mt-m7} for how the second target was then grown, skeleton-first,
+ahead of the interface-carving step M6.)
 
 % ================================================================
 \section{The Guiding Principle}
@@ -84,7 +88,7 @@ M4 & Broaden the IR optimizer (strength reduction + copy propagation) & neutral 
 M5 & Write-protect read-only data (stray writes fault, not corrupt) & oracle & \meterB & \stDone\\
 M6 & Carve the target interface (route ARM64 through it) & seam & \meterA & \stOpen\\
 \hline
-M7 & Second target (x86-64 / ELF)              & backend & \meterA & \stOpen\\
+M7 & Second target (x86-64 / Mach-O)           & backend & \meterA & \stPart\\
 \hline
 \end{tabular}
 \end{center}
@@ -523,11 +527,30 @@ With M1--M6 complete, adding x86-64 / Mach-O (then ELF / Linux) is the
 thirty-percent problem the playbook describes: an instruction-selection
 table, a register-bank descriptor, an ABI table, and an object emitter,
 validated differentially against the ARM64 oracle and run under
-Rosetta~/ qemu.  It is deliberately \emph{out of scope} for this
-appendix, whose entire purpose is to guarantee that when M7 begins, every
-failure it uncovers belongs to the new backend and nowhere else.  The
-mechanics of M7 live in the retargeting playbook
+Rosetta~/ qemu.  The mechanics of M7 live in the retargeting playbook
 (Chapter~\ref{ch:retargeting}).
+
+\textbf{Status (in progress, \emph{skeleton-first}).}  The second target has
+in fact been \emph{started} ahead of M6, by a deliberate change of plan.
+Rather than carve the full target interface first and then populate it, the
+x86-64 back end was grown as a separate, self-contained emitter
+(Chapter~\ref{ch:emit-x86}) that walks the same optimized, target-neutral IR
+and prints x86-64 assembly for the system assembler---the playbook's
+\emph{assembly-emission} strategy.  This proves the seam end to end at every
+step while leaving ARM64 byte-identical (it stays the default; the driver
+branches only under \texttt{-{}-target=x86\_64}).  Three rungs have landed: rung
+one (\texttt{const}\,+\,\texttt{ret}, the whole pipeline proven with
+\texttt{int main(void)\{return N;\}}), rung two (the integer ALU and the memory
+operations---\texttt{alloca}/\texttt{load}/\texttt{store}/\texttt{gep}---via an
+all-spill \texttt{\%rbp} frame), and rung three (comparisons, branches, and
+System~V calls, including recursion and stack-passed arguments).  Together they
+compile the scalar subset of the language.  What remains for the target is data
+emission (file-scope globals and string literals), floating point, and by-value
+aggregates; and M6 proper---refactoring ARM64 to \emph{share} this target's
+interface rather than run beside it---is still the eventual consolidation.  The
+divergence from the ``M6 before M7'' order was a judgement that a running,
+differentially-tested skeleton is a better foundation for the interface than a
+carved-but-empty one.
 
 % ================================================================
 \section{Summary}

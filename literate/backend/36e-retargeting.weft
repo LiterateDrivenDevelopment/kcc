@@ -285,6 +285,19 @@ At the end of this ladder the new target passes the same difference corpus
 the flagship does.  Each rung was small, and each was verified before the
 next was begun.
 
+\paragraph{As realized for x86-64.}  This ladder is not hypothetical: it is
+exactly the path the x86-64 back end of Chapter~\ref{ch:emit-x86} follows.
+Rung one stood up emission and the minimal instruction set together
+(\texttt{const}\,+\,\texttt{ret}, proving the pipeline with
+\texttt{int main(void)\{return N;\}}); rung two grew selection across the whole
+integer ALU and the memory operations over an all-spill frame; rung three added
+comparisons, branches, and the System~V calling convention, including
+stack-passed arguments.  Each was committed only once its programs ran
+exit-identically to \texttt{clang -arch x86\_64} under Rosetta and the ARM64
+oracle stayed byte-identical.  The remaining rungs---data emission, floating
+point, and the by-value aggregate ABI---are what stand between the current
+scalar subset and the full difference corpus.
+
 \section{Testing a Cross Target}
 \label{sec:testing-cross}
 

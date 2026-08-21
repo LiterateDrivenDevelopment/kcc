@@ -155,6 +155,8 @@ Option & Effect \\
 \texttt{-g}             & emit DWARF debug information for a debugger \\
 \texttt{-{}-emit-asm}   & build the object through textual assembly: emit a \\
                         & \texttt{.s} file and run the platform \texttt{as} on it \\
+\texttt{-{}-target=x86\_64} & generate x86-64 code instead of the native ARM64 \\
+                        & (currently a scalar-only subset; see \S\ref{sec:um-x86}) \\
 \hline
 \end{tabular}
 \end{center}
@@ -249,6 +251,37 @@ Forms outside this subset---three or more operands, memory (\texttt{m}) or
 specific-register constraints, and \texttt{asm goto}---are rejected with a
 diagnostic rather than miscompiled.
 
+\section{Generating x86-64 Code}
+\label{sec:um-x86}
+
+\kcc{}'s native output is ARM64 for Apple silicon, but it can also generate
+x86-64 code with the \texttt{-{}-target=x86\_64} option.  This selects a second
+back end that renders the program as x86-64 assembly, assembles it with the
+system \texttt{as -arch x86\_64}, and links a Mach-O executable that runs on
+Apple silicon under the Rosetta translator:
+
+\begin{verbatim}
+kcc --target=x86_64 add.c -o add
+./add                 # runs under Rosetta; echo $? shows the exit status
+\end{verbatim}
+
+The x86-64 back end is being built up one capability at a time and today
+covers the \emph{scalar} language: integer and pointer arithmetic, the full
+set of operators and comparisons, control flow (\texttt{if}, \texttt{while},
+\texttt{for}, \texttt{?:}, \texttt{\&\&}/\texttt{||}), local variables and
+arrays, structs addressed by member, and function calls following the
+System~V AMD64 calling convention---including recursion and calls that pass
+arguments on the stack.  A program built from these features runs identically
+to one compiled by a mainstream x86-64 compiler.
+
+What the x86-64 back end does \emph{not} yet handle is a program that defines
+\emph{file-scope variables} (a reference to one becomes an unresolved symbol at
+link time), string literals, floating-point arithmetic, or passing a struct by
+value.  These are planned; until then, keep such a program on the default ARM64
+path, which supports the whole language.  The native path is entirely
+unaffected by this option---omitting \texttt{-{}-target} (or writing
+\texttt{-{}-target=arm64}) compiles for ARM64 exactly as before.
+
 \section{Reading Diagnostics}
 \label{sec:um-diagnostics}
 
@@ -290,10 +323,11 @@ external installation.  It optimizes---constant folding, dead-code
 elimination, common-subexpression elimination, and keeping locals in
 registers---and allocates both integer and floating values to registers.
 
-Its current limits are worth stating plainly so you are not surprised.  It
-targets Apple silicon only; there is no cross-compilation to other
-processors or operating systems yet (the framework for adding one is
-described in Chapter~\ref{ch:retargeting}).  One tail corner of C17 remains:
+Its current limits are worth stating plainly so you are not surprised.  Its
+native, full-language target is Apple silicon (ARM64); a second, x86-64 target
+is under construction and today compiles the scalar subset described in
+\S\ref{sec:um-x86} (the framework behind it is Chapter~\ref{ch:retargeting}).
+One tail corner of C17 remains:
 propagating \texttt{volatile} from a qualified \emph{object} through member
 access (a member or bit-field declared \texttt{volatile} is already
 honoured).  Nested designator chains, brace elision, and per-operation

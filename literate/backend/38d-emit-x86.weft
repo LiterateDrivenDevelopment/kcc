@@ -134,6 +134,13 @@ _kcc_x86_s_rodata:   .asciz ".section .rodata\n"
 _kcc_x86_s_comm:     .asciz "\t.comm "
 _kcc_x86_s_comm_a8:  .asciz ",8\n"          // ",<size>,8\n" .comm alignment tail
 
+// Module-init pointer: the section header, then ".quad <name>\n" registers the
+// synthesised kcc.module_init so it runs before main.  Darwin: __mod_init_func;
+// Linux/ELF: .init_array.
+_kcc_x86_s_modinit_d:.asciz ".section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad "
+_kcc_x86_s_modinit_l:.asciz ".section .init_array,\"aw\"\n\t.p2align 3\n\t.quad "
+_kcc_x86_s_modinitnm:.asciz "kcc.module_init"
+
 // Read-only initialised data (const globals): section, alignment, and the
 // value directives keyed by element width.  Darwin uses __TEXT,__const.
 _kcc_x86_s_constsect:.asciz ".section __TEXT,__const\n"
@@ -1817,9 +1824,17 @@ _kcc_x86_render_text:
     bl _kcc_vec_get
     ldr x22, [x0]                   // func ptr
 
-    // .globl <name>   (unless static)
+    // .globl <name>   (unless static, or the synthesised module-init function).
+    // "kcc.module_init" must have internal linkage: every translation unit with
+    // a file-scope initialiser emits one, and exporting them would collide at
+    // link time.  The ARM64 code generator special-cases the same name.
     ldr x0, [x22, #IRF_STATIC]
     cbnz x0, .Lx86rt_label
+    ldr x0, [x22, #IRF_NAME]
+    adrp x1, _kcc_str_modinit@@PAGE
+    add  x1, x1, _kcc_str_modinit@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lx86rt_label          // name == "kcc.module_init" → no .globl
     adrp x0, _kcc_x86_s_globl@@PAGE
     add  x0, x0, _kcc_x86_s_globl@@PAGEOFF
     bl _kcc_as_str
@@ -2600,6 +2615,59 @@ _kcc_x86_emit_value:
     ret
 @}
 
+\section{Registering the Module Initialiser}
+\label{sec:x86-modinit}
+
+A file-scope initialiser that is not a compile-time constant---and, as it
+happens, a \texttt{static} array initialised from a string literal, which
+\kcc{} fills with runtime stores rather than read-only bytes---is emitted as
+code inside a synthesised \texttt{kcc.module\_init} function.  That function
+only runs if something \emph{calls} it, and in a \texttt{main}-bearing unit its
+work is inlined into \texttt{main}; but in every other translation unit it must
+be registered so the loader runs it before \texttt{main}.  When the IR builder
+recorded a module initialiser (\texttt{\_kcc\_modinit\_present}),
+\texttt{\_kcc\_x86\_emit\_modinit} emits a pointer to it in the platform's
+init-array section---\texttt{\_\_DATA,\_\_mod\_init\_func} on Darwin,
+\texttt{.init\_array} on Linux---so a global or static's initialiser in a
+non-\texttt{main} unit actually executes.  Without this the storage stays
+zero, which is exactly why a freshly linked zlib reported a bogus version:
+\texttt{deflateInit}'s \texttt{static const char my\_version[] = ZLIB\_VERSION}
+was never filled.
+
+@d X86: render @{
+// -- kcc_x86_emit_modinit() — register kcc.module_init in the init-array.
+.p2align 2
+_kcc_x86_emit_modinit:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    adrp x0, _kcc_modinit_present@@PAGE
+    add  x0, x0, _kcc_modinit_present@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lx86mi_done
+    // Section header (Darwin __mod_init_func vs Linux .init_array), then
+    // ".quad <kcc.module_init>".
+    adrp x0, _kcc_x86_os@@PAGE
+    add  x0, x0, _kcc_x86_os@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Lx86mi_darwin
+    adrp x0, _kcc_x86_s_modinit_l@@PAGE
+    add  x0, x0, _kcc_x86_s_modinit_l@@PAGEOFF
+    b .Lx86mi_emit
+.Lx86mi_darwin:
+    adrp x0, _kcc_x86_s_modinit_d@@PAGE
+    add  x0, x0, _kcc_x86_s_modinit_d@@PAGEOFF
+.Lx86mi_emit:
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_modinitnm@@PAGE
+    add  x0, x0, _kcc_x86_s_modinitnm@@PAGEOFF
+    bl _kcc_x86_sym                 // "_kcc.module_init" (Darwin) / bare (Linux)
+    mov x0, #10
+    bl _kcc_as_ch
+.Lx86mi_done:
+    ldp x29, x30, [sp], #16
+    ret
+@}
+
 \section{Emitting String-Literal Data}
 \label{sec:x86-strings}
 
@@ -2729,6 +2797,7 @@ _kcc_x86_render:
     bl _kcc_x86_emit_data          // file-scope global storage
     bl _kcc_x86_emit_statics       // static-local storage (mangled sl_ names)
     bl _kcc_x86_emit_strings       // cstring section for recorded literals
+    bl _kcc_x86_emit_modinit       // register kcc.module_init (non-const inits)
     ldr x0, [sp, #16]             // path
     bl _kcc_as_write_file
     ldp x29, x30, [sp], #32

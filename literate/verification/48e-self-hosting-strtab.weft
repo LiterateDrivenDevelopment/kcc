@@ -1,0 +1,98 @@
+% 48e-self-hosting-strtab.weft — Stage 8f: the string interner, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The String Interner in C}
+\label{ch:self-hosting-strtab}
+
+With the arena, the vector, the string primitives, and the hash table all
+ported, the natural next piece is the one that sits directly on top of the last
+two: the string interner of Chapter~\ref{ch:data-structures}.  Interning is how
+\kcc{} guarantees that each distinct identifier or keyword text is stored
+exactly once, so two names can be compared by pointer instead of byte by
+byte---the property the symbol table relies on.  The interner is a thin layer,
+just two routines and a global handle, but it is a satisfying rung because
+\emph{every} function it calls is now itself C \kcc{} compiled: the hash table
+(\texttt{kcc\_ht\_init}/\texttt{get}/\texttt{put}), the arena
+(\texttt{kcc\_arena\_alloc}), and \texttt{kcc\_memcpy}.  Porting it means a name
+lookup runs entirely through code the compiler produced.
+
+\section{State and Contract}
+
+The interner keeps one global, \texttt{kcc\_strtab}, a pointer to its backing
+hash table, zero until \texttt{kcc\_strtab\_init} creates a 256-slot table.  As
+a drop-in that global keeps the exact name and zero-initialised layout the
+assembly used.  \texttt{kcc\_strtab\_intern} takes a string and length (the text
+need not be NUL-terminated): if the hash table already holds it, the stored
+pointer---which is the canonical copy---comes straight back; otherwise the
+routine allocates \texttt{len+1} bytes from the arena, copies the text,
+NUL-terminates it, records it in the table keyed by its own bytes with itself as
+the value, and returns it.  Storing the copy as both key and value is what lets
+a later lookup return the canonical pointer.
+
+@l c
+@d Selfhost: strtab @{
+void *kcc_ht_init(unsigned long capacity);
+unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen,
+                unsigned long value);
+void *kcc_arena_alloc(long size);
+void *kcc_memcpy(void *dst, const void *src, unsigned long n);
+
+void *kcc_strtab;
+
+void kcc_strtab_init(void) {
+    kcc_strtab = kcc_ht_init(256);
+}
+
+const char *kcc_strtab_intern(const char *s, unsigned long len) {
+    unsigned long found = kcc_ht_get(kcc_strtab, s, len);
+    if (found) return (const char *)found;
+    char *copy = (char *)kcc_arena_alloc((long)(len + 1));
+    kcc_memcpy(copy, s, len);
+    copy[len] = 0;
+    kcc_ht_put(kcc_strtab, copy, len, (unsigned long)copy);
+    return copy;
+}
+@}
+
+\section{Verification}
+\label{sec:selfhost-strtab-verify}
+
+\texttt{make selfhost-strtab} runs the drop-in loop: compile
+\texttt{tmp/selfhost/strtab.c} with the assembly-built \kcc{}, relink a second
+compiler with the hand-written \texttt{strtab.o} replaced by the kcc-compiled
+\texttt{strtab\_c.o}, and re-run the code-generation suite.  Because every
+identifier and keyword the lexer sees is interned through this layer, a green
+run means \kcc{} compiled its own name-canonicalisation correctly.
+
+@d Selfhost: strtab verify @{
+#!/usr/bin/env bash
+# make selfhost-strtab — compile kcc's string interner in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/strtab.c with kcc"
+tmp/kcc -c "$SH/strtab.c" -o "$SH/strtab_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_strtab (strtab.o -> kcc-compiled strtab_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "strtab" ]; then OBJ="$OBJ $SH/strtab_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_strtab $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted interner"
+cp tmp/kcc "$SH/kcc_asm_backup_strtab"
+cp tmp/kcc_selfhost_strtab tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_strtab" tmp/kcc
+exit $status
+@}

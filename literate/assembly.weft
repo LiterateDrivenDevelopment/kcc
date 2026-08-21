@@ -785,6 +785,28 @@ compiler with it, and re-run the code-generation suite:
 @<Selfhost: hashtab verify@>
 @}
 
+\noindent\textbf{strtab.c} --- the string interner in C
+(Chapter~\ref{ch:self-hosting-strtab}), a drop-in replacement:
+
+@o tmp/selfhost/strtab.c @{
+@<Selfhost: strtab@>
+@}
+
+@o tmp/selfhost/strtab_verify.sh @{
+@<Selfhost: strtab verify@>
+@}
+
+\noindent\textbf{io.c} --- the buffered output layer in C
+(Chapter~\ref{ch:self-hosting-io}), a drop-in replacement:
+
+@o tmp/selfhost/io.c @{
+@<Selfhost: io@>
+@}
+
+@o tmp/selfhost/io_verify.sh @{
+@<Selfhost: io verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

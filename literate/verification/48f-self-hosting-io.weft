@@ -1,0 +1,182 @@
+% 48f-self-hosting-io.weft — Stage 8g: the buffered output layer, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: Buffered Output in C}
+\label{ch:self-hosting-io}
+
+The last of the foundational subsystems to port is the one every other layer
+ultimately writes through: the buffered output of Chapter~\ref{ch:io}.  Every
+diagnostic, every \texttt{-{}-dump} listing, and the assembly the \texttt{.s}
+back end emits pass through \texttt{kcc\_io\_puts}, \texttt{kcc\_io\_write}, and
+their siblings.  Unlike the earlier ports this one owns real \emph{mutable
+global state}---a 4\,KiB buffer, a write cursor, and a file descriptor---so it
+is also a test that \kcc{} initialises a non-\texttt{main} unit's file-scope
+globals correctly: \texttt{kcc\_io\_fd} starts at~1 (stdout) and
+\texttt{kcc\_io\_cap} at~4096, values a module initialiser must set before the
+first byte is written.
+
+\section{State and the Flush Contract}
+
+The module keeps four globals under the exact names and initial values the
+assembly used: the destination \texttt{kcc\_io\_fd} (1, stdout), the current
+\texttt{kcc\_io\_pos} (0), the capacity \texttt{kcc\_io\_cap} (4096), and the
+4\,KiB \texttt{kcc\_io\_buf} itself.  \texttt{kcc\_io\_flush} writes the buffered
+prefix through the \texttt{kcc\_sys\_write} syscall wrapper and resets the
+cursor; the two syscall-facing routines (\texttt{flush} and the unbuffered
+\texttt{kcc\_io\_err}) are the module's only dependencies, declared
+\texttt{extern} along with \texttt{kcc\_strlen}.
+
+The one behavioural subtlety a faithful port must preserve is \emph{when} the
+flush happens: \texttt{kcc\_io\_putc} flushes \emph{before} storing when the
+buffer is already full, whereas \texttt{kcc\_io\_puts} and \texttt{kcc\_io\_write}
+store first and flush once the cursor reaches the end.  Both avoid overrun, but
+the resulting flush boundaries differ, so the C reproduces each shape exactly.
+
+@l c
+@d Selfhost: io preamble @{
+long kcc_sys_write(long fd, const void *buf, unsigned long n);
+unsigned long kcc_strlen(const char *s);
+
+long kcc_io_fd = 1;
+unsigned long kcc_io_pos = 0;
+unsigned long kcc_io_cap = 4096;
+char kcc_io_buf[4096];
+@}
+
+\section{Flush and Put}
+
+@l c
+@d Selfhost: io flush @{
+void kcc_io_flush(void) {
+    if (kcc_io_pos == 0) return;
+    kcc_sys_write(kcc_io_fd, kcc_io_buf, kcc_io_pos);
+    kcc_io_pos = 0;
+}
+@}
+
+@l c
+@d Selfhost: io putc @{
+void kcc_io_putc(int c) {
+    if (kcc_io_pos >= kcc_io_cap) kcc_io_flush();
+    kcc_io_buf[kcc_io_pos] = (char)c;
+    kcc_io_pos = kcc_io_pos + 1;
+}
+@}
+
+@l c
+@d Selfhost: io puts @{
+void kcc_io_puts(const char *s) {
+    while (*s) {
+        kcc_io_buf[kcc_io_pos] = *s;
+        kcc_io_pos = kcc_io_pos + 1;
+        if (kcc_io_pos >= 4096) kcc_io_flush();
+        s = s + 1;
+    }
+}
+@}
+
+\section{Write, Format, and Error}
+
+\texttt{kcc\_io\_write} emits an explicit byte count (for token text, which is a
+pointer/length pair rather than a NUL-terminated string).  \texttt{kcc\_io\_putu}
+renders an unsigned integer by taking decimal digits least-significant first
+into a small stack buffer and writing them in order.  \texttt{kcc\_io\_err}
+sends a string straight to stderr through the syscall, unbuffered, so a
+diagnostic survives an immediate crash.
+
+@l c
+@d Selfhost: io write @{
+void kcc_io_write(const void *ptr, unsigned long len) {
+    const char *p = (const char *)ptr;
+    unsigned long i = 0;
+    while (i < len) {
+        kcc_io_buf[kcc_io_pos] = p[i];
+        kcc_io_pos = kcc_io_pos + 1;
+        if (kcc_io_pos >= 4096) kcc_io_flush();
+        i = i + 1;
+    }
+}
+@}
+
+@l c
+@d Selfhost: io putu @{
+void kcc_io_putu(unsigned long n) {
+    char buf[24];
+    int i = 24;
+    if (n == 0) {
+        i = i - 1;
+        buf[i] = '0';
+    } else {
+        while (n) {
+            i = i - 1;
+            buf[i] = (char)('0' + (n % 10));
+            n = n / 10;
+        }
+    }
+    kcc_io_write(&buf[i], (unsigned long)(24 - i));
+}
+@}
+
+@l c
+@d Selfhost: io err @{
+void kcc_io_err(const char *s) {
+    unsigned long len = kcc_strlen(s);
+    kcc_sys_write(2, s, len);
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: io @{
+@<Selfhost: io preamble@>
+@<Selfhost: io flush@>
+@<Selfhost: io putc@>
+@<Selfhost: io puts@>
+@<Selfhost: io write@>
+@<Selfhost: io putu@>
+@<Selfhost: io err@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-io-verify}
+
+\texttt{make selfhost-io} runs the drop-in loop: compile
+\texttt{tmp/selfhost/io.c} with the assembly-built \kcc{}, relink a second
+compiler with the hand-written \texttt{io.o} replaced by the kcc-compiled
+\texttt{io\_c.o}, and re-run the code-generation suite.  Because the suite's
+harness reads the exit status rather than the text, and because the compiler
+itself writes nothing on a clean run, this port is also implicitly checked by
+every other verification that now flows through the C buffer.
+
+@d Selfhost: io verify @{
+#!/usr/bin/env bash
+# make selfhost-io — compile kcc's buffered output in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/io.c with kcc"
+tmp/kcc -c "$SH/io.c" -o "$SH/io_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_io (io.o -> kcc-compiled io_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "io" ]; then OBJ="$OBJ $SH/io_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_io $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted output layer"
+cp tmp/kcc "$SH/kcc_asm_backup_io"
+cp tmp/kcc_selfhost_io tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_io" tmp/kcc
+exit $status
+@}

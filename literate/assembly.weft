@@ -481,6 +481,20 @@ The directives below route code fragments to their physical assembly files under
 @<Emit-asm: render@>
 @}
 
+\noindent\textbf{emit\_x86.s} --- the second target: an x86-64 back end that
+emits textual assembly for the system assembler.  It reuses the growable text
+buffer of \textbf{emit\_arm64.s} (the \texttt{\_kcc\_as\_*} helpers), so it
+only supplies the IR walk and x86-64 instruction selection:
+
+@o tmp/src/emit_x86.s @{
+@<ARM64: common macros@>
+@<IR: constants@>
+@<Vec: constants@>
+@<Types: constants@>
+@<X86: data@>
+@<X86: render@>
+@}
+
 \noindent\textbf{linker.s} --- relocation and symbol table management:
 
 @o tmp/src/linker.s @{

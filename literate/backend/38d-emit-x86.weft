@@ -1,0 +1,304 @@
+% 38d-emit-x86.weft — The second target: an x86-64 / Mach-O back end that
+% emits textual assembly and delegates encoding to the system assembler.
+
+\chapter{A Second Target: x86-64 by Assembly Emission}
+\label{ch:emit-x86}
+
+The flagship ARM64 back end (Chapters~\ref{ch:emit-arm64}--\ref{ch:emit-macho})
+proves \kcc{} can go all the way to the metal: it encodes every instruction
+into its own bytes and lays out the Mach-O container by hand.  The second
+target takes the other road the porting playbook
+(Chapter~\ref{ch:retargeting}) sanctions---\emph{assembly emission}.  Instead
+of encoding instructions and writing an object file, this back end walks the
+same target-neutral IR the ARM64 path consumes and \emph{prints x86-64
+assembly text}, then hands that text to the platform assembler
+(\texttt{as -arch x86\_64}).  The assembler does the encoding and produces the
+Mach-O object; the linker (\texttt{ld -arch x86\_64}) produces an executable
+that runs on Apple silicon under the Rosetta translator.  Nothing above the
+emission step---the front end, the IR, the optimizer---knows or cares that a
+different machine is now the destination; that is the whole point of the seam.
+
+This chapter is built one rung of the playbook ladder at a time.  The first
+rung is deliberately the smallest program that exercises the entire pipeline
+end to end: \verb|int main(void) { return N; }|.  Its optimized IR is two
+instructions---an \texttt{IR\_CONST} that materializes \texttt{N} and an
+\texttt{IR\_RET} that returns it---so selecting for it requires exactly two
+cases.  When this builds, assembles, links, and exits with \texttt{N} under
+Rosetta, the target is proven live: the driver dispatch, the text buffer, the
+IR walk, and the assembler/linker invocation are all working, and every
+later rung is \emph{more selection}, not more scaffolding.
+
+\section{Target State and Assembly Vocabulary}
+\label{sec:x86-data}
+
+A single global, \texttt{\_kcc\_target}, records which back end the driver
+selected: \texttt{0} (the default) is ARM64/Mach-O and leaves the flagship
+path completely untouched; \texttt{1} is x86-64.  The remaining data are the
+fixed fragments of assembly this rung emits---the section directive, the
+pieces of a \texttt{.globl} declaration and a label, and the two instructions
+of a constant return.  Registers are spelled in AT\&T syntax
+(\verb|%eax|, an immediate is \verb|$N|), which is what \texttt{as} on macOS
+expects.
+
+@d X86: data @{
+.data
+.globl _kcc_target
+_kcc_target:   .quad 0        // 0 = arm64/Mach-O (default), 1 = x86-64
+
+.section __TEXT,__cstring,cstring_literals
+_kcc_x86_s_text:     .asciz ".text\n"
+_kcc_x86_s_globl:    .asciz ".globl _"
+_kcc_x86_s_us:       .asciz "_"
+_kcc_x86_s_colon_nl: .asciz ":\n"
+_kcc_x86_s_movl:     .asciz "\tmovl\t$"
+_kcc_x86_s_eax:      .asciz ", %eax\n"
+_kcc_x86_s_retq:     .asciz "\tretq\n"
+_kcc_x86_s_minus:    .asciz "-"
+@}
+
+\section{Emitting a Signed 32-bit Immediate}
+\label{sec:x86-imm}
+
+An \texttt{IR\_CONST} feeding an \texttt{int} return holds its value in
+\texttt{IR\_SRC1}.  A negative constant (\verb|return -5;|, which the folder
+has already reduced to a single constant) arrives as a two's-complement bit
+pattern in the low 32 bits, so the immediate is emitted signed: if bit~31 is
+set, print a minus sign and the magnitude \texttt{2\textsuperscript{32}-w};
+otherwise print \texttt{w} directly.  The decimal digits themselves are
+produced by the shared text-buffer helper \texttt{\_kcc\_as\_dec}.
+
+@d X86: render @{
+.text
+// -- kcc_x86_signed32(uint64_t val) — append val's low 32 bits as signed dec.
+.p2align 2
+_kcc_x86_signed32:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    and x19, x0, #0xffffffff        // w = low 32 bits
+    tst x19, #0x80000000            // bit 31 set → negative
+    b.eq .Lx86s_pos
+    adrp x0, _kcc_x86_s_minus@@PAGE
+    add  x0, x0, _kcc_x86_s_minus@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, #1
+    lsl x0, x0, #32                 // 2^32
+    sub x0, x0, x19                 // magnitude
+    bl _kcc_as_dec
+    b .Lx86s_done
+.Lx86s_pos:
+    mov x0, x19
+    bl _kcc_as_dec
+.Lx86s_done:
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Instruction Selection (Rung 1)}
+\label{sec:x86-sel}
+
+Selection is a per-instruction dispatch: given one IR instruction and the
+function's virtual-register value map, emit the equivalent x86-64.  This rung
+handles the two opcodes the first program produces.  \texttt{IR\_CONST}
+records its immediate in the map (it emits nothing on its own---the value is
+consumed where it is used).  \texttt{IR\_RET} loads the returned virtual
+register's constant into \verb|%eax| with a \texttt{movl} and issues
+\texttt{retq}; a \texttt{void} return (null type or \texttt{TY\_VOID}) emits
+only the \texttt{retq}.  Every other opcode is silently skipped for now---each
+later rung adds a case here, which is exactly why the dispatch is isolated
+from the walk.  Because macOS wraps the entry point with \texttt{LC\_MAIN},
+a \texttt{main} whose \verb|%eax| holds \texttt{N} at \texttt{retq} exits the
+process with status \texttt{N}, so no explicit exit sequence is needed.
+
+@d X86: render @{
+// -- kcc_x86_sel(instr, map) — select x86-64 for one IR instruction.
+.p2align 2
+_kcc_x86_sel:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // instr
+    mov x20, x1                     // vreg value map
+    ldr x0, [x19, #IR_OP]
+    cmp x0, #IR_CONST
+    b.eq .Lx86sel_const
+    cmp x0, #IR_RET
+    b.eq .Lx86sel_ret
+    b .Lx86sel_done                 // rung 1: ignore all other opcodes
+
+.Lx86sel_const:
+    ldr x0, [x19, #IR_DEST]         // dest vreg
+    ldr x1, [x19, #IR_SRC1]         // immediate
+    str x1, [x20, x0, lsl #3]       // map[dest] = imm
+    b .Lx86sel_done
+
+.Lx86sel_ret:
+    ldr x0, [x19, #IR_TYPE]
+    cbz x0, .Lx86sel_ret_void       // null type → void
+    ldr x0, [x0, #TY_KIND]
+    cmp x0, #TY_VOID
+    b.eq .Lx86sel_ret_void
+    // movl $<imm>, %eax
+    adrp x0, _kcc_x86_s_movl@@PAGE
+    add  x0, x0, _kcc_x86_s_movl@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC1]         // returned vreg
+    ldr x0, [x20, x0, lsl #3]       // its constant value
+    bl _kcc_x86_signed32
+    adrp x0, _kcc_x86_s_eax@@PAGE
+    add  x0, x0, _kcc_x86_s_eax@@PAGEOFF
+    bl _kcc_as_str
+.Lx86sel_ret_void:
+    adrp x0, _kcc_x86_s_retq@@PAGE
+    add  x0, x0, _kcc_x86_s_retq@@PAGEOFF
+    bl _kcc_as_str
+
+.Lx86sel_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@}
+
+\section{Walking the Module}
+\label{sec:x86-walk}
+
+The top-level walk mirrors the IR dumper (\S\ref{sec:ir-dump}): iterate the
+function list \texttt{\_kcc\_ir\_funcs}, and for each function emit its symbol
+declaration and label, then stream its instructions through selection.  A
+non-\texttt{static} function gets a \texttt{.globl}; the label is always the
+name with the Mach-O leading underscore.  Each function allocates a small
+array indexed by virtual-register number (\texttt{IRF\_VREG\_N} entries) in
+which selection records constants; because a constant is always defined
+before the return that uses it, a plain arena allocation suffices.
+
+@d X86: render @{
+// -- kcc_x86_render_text() — walk the IR, emit x86-64 assembly to the buffer.
+.p2align 2
+_kcc_x86_render_text:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+
+    // Section directive.
+    adrp x0, _kcc_x86_s_text@@PAGE
+    add  x0, x0, _kcc_x86_s_text@@PAGEOFF
+    bl _kcc_as_str
+
+    adrp x0, _kcc_ir_funcs@@PAGE
+    add  x0, x0, _kcc_ir_funcs@@PAGEOFF
+    ldr x19, [x0]
+    cbz x19, .Lx86rt_done
+    ldr x20, [x19, #VEC_COUNT]      // func count
+    mov x21, #0                     // func index
+
+.Lx86rt_func:
+    cmp x21, x20
+    b.ge .Lx86rt_done
+    mov x0, x19
+    mov x1, x21
+    bl _kcc_vec_get
+    ldr x22, [x0]                   // func ptr
+
+    // .globl _<name>   (unless static)
+    ldr x0, [x22, #IRF_STATIC]
+    cbnz x0, .Lx86rt_label
+    adrp x0, _kcc_x86_s_globl@@PAGE
+    add  x0, x0, _kcc_x86_s_globl@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x22, #IRF_NAME]
+    bl _kcc_as_str
+    mov x0, #'\n'
+    bl _kcc_as_ch
+
+.Lx86rt_label:
+    // _<name>:
+    adrp x0, _kcc_x86_s_us@@PAGE
+    add  x0, x0, _kcc_x86_s_us@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x22, #IRF_NAME]
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_colon_nl@@PAGE
+    add  x0, x0, _kcc_x86_s_colon_nl@@PAGEOFF
+    bl _kcc_as_str
+
+    // Allocate the per-function vreg value map (IRF_VREG_N quadwords).
+    ldr x0, [x22, #IRF_VREG_N]
+    add x0, x0, #1                  // one extra for safety
+    lsl x0, x0, #3
+    bl _kcc_arena_alloc
+    mov x26, x0                     // vreg map
+
+    // Walk basic blocks.
+    ldr x23, [x22, #IRF_BLOCKS]
+    cbz x23, .Lx86rt_next_func
+    ldr x24, [x23, #VEC_COUNT]      // block count
+    mov x25, #0                     // block index
+
+.Lx86rt_bb:
+    cmp x25, x24
+    b.ge .Lx86rt_next_func
+    mov x0, x23
+    mov x1, x25
+    bl _kcc_vec_get
+    ldr x27, [x0]                   // BB ptr
+    ldr x27, [x27, #BB_FIRST]       // first instruction
+
+.Lx86rt_instr:
+    cbz x27, .Lx86rt_next_bb
+    mov x0, x27
+    mov x1, x26
+    bl _kcc_x86_sel
+    ldr x27, [x27, #IR_NEXT]
+    b .Lx86rt_instr
+
+.Lx86rt_next_bb:
+    add x25, x25, #1
+    b .Lx86rt_bb
+
+.Lx86rt_next_func:
+    add x21, x21, #1
+    b .Lx86rt_func
+
+.Lx86rt_done:
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+@}
+
+\section{Rendering to a File}
+\label{sec:x86-render}
+
+\texttt{\_kcc\_x86\_render(path)} is the entry point the driver calls.  It
+reuses the growable text buffer of the \texttt{.s} back end
+(\S\ref{sec:emit-asm-buffer})---\texttt{\_kcc\_as\_init} to allocate it and
+\texttt{\_kcc\_as\_str}/\texttt{\_kcc\_as\_ch}/\texttt{\_kcc\_as\_dec} to fill
+it---then writes the buffer to the output path through the shared
+\texttt{\_kcc\_as\_write\_file} helper, exactly as the ARM64 assembly path
+does.  The buffer machinery is target-neutral; only the text poured into it
+is x86-64.
+
+@d X86: render @{
+// -- kcc_x86_render(const char *path) — render x86-64 asm to <path>. 0 on ok.
+.globl _kcc_x86_render
+.p2align 2
+_kcc_x86_render:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x0, [sp, #16]              // save path across the render calls
+    bl _kcc_as_init
+    bl _kcc_x86_render_text
+    ldr x0, [sp, #16]             // path
+    bl _kcc_as_write_file
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_x86_render _kcc_target
+@}

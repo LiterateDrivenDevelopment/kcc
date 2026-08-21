@@ -1252,13 +1252,29 @@ _kcc_as_render:
     bl _kcc_as_render_text
     bl _kcc_as_render_common      // __common zero-storage globals
     bl _kcc_as_render_modinit     // __mod_init_func (global initialisers)
-    // Open the output file (O_WRONLY|O_CREAT|O_TRUNC = 0x601, mode 0644).
     mov x0, x19
+    bl _kcc_as_write_file
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_as_write_file --------------------------------------------------------
+// int kcc_as_write_file(const char *path) — write the rendered text buffer
+// (_kcc_as_buf, _kcc_as_pos) to `path` and close it.  Shared by every
+// assembly-emission back end (ARM64 `.s` and x86-64), so the buffer globals
+// stay file-local to this module.  Returns 0 on success, 1 on error.
+.globl _kcc_as_write_file
+.p2align 2
+_kcc_as_write_file:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x20, [sp, #16]
+    // Open the output file (O_WRONLY|O_CREAT|O_TRUNC = 0x601, mode 0644).
     mov x1, #0x601
     mov x2, #420
     bl _kcc_sys_open
     cmp x0, #0
-    b.lt .Lasrn_err
+    b.lt .Lawf_err
     mov x20, x0                   // fd
     // write(fd, buf, pos)
     adrp x0, _kcc_as_buf@@PAGE
@@ -1272,11 +1288,11 @@ _kcc_as_render:
     mov x0, x20
     bl _kcc_sys_close
     mov x0, #0
-    b .Lasrn_done
-.Lasrn_err:
+    b .Lawf_done
+.Lawf_err:
     mov x0, #1
-.Lasrn_done:
-    ldp x19, x20, [sp, #16]
+.Lawf_done:
+    ldr x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
 @}

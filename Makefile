@@ -10,10 +10,10 @@ SHELL := /bin/bash
 .SILENT:
 
 # All assembly source basenames (order doesn't matter for linking)
-sources := main syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 linker codegen emit_macho dwarf driver
+sources := main syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver
 
 # Library sources (everything except main — shared with the test binary)
-lib_sources := syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 linker codegen emit_macho dwarf driver
+lib_sources := syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver
 
 # Test source basenames (in tmp/tests/)
 test_sources := test_runner test_lexer

@@ -108,6 +108,20 @@ _kcc_driver_compile:
     bl _kcc_ir_validate
     cbnz x0, .Ldc_error
 
+    // 12c. Target dispatch.  Under --target=x86_64 the IR is handed to the
+    // x86-64 assembly-emission back end (Chapter~\ref{ch:emit-x86}), which
+    // walks the same optimized IR and assembles with `as -arch x86_64`,
+    // bypassing the ARM64 code generator and Mach-O writer entirely.  The
+    // default (0) leaves the flagship ARM64 path below completely untouched.
+    adrp x0, _kcc_target@@PAGE
+    add  x0, x0, _kcc_target@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Ldc_arm64
+    mov x0, x20                    // out_path
+    bl _kcc_driver_x86_object
+    b .Ldc_return
+.Ldc_arm64:
+
     // 13. Initialize backend
     bl _kcc_code_init
     bl _kcc_linker_init
@@ -226,7 +240,74 @@ _kcc_driver_emit_asm_object:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #64
     ret
-@| _kcc_driver_compile _kcc_driver_emit_asm_object
+
+// -- kcc_driver_x86_object ----------------------------------------------------
+// int kcc_driver_x86_object(const char *out_path)
+// Renders the x86-64 assembly to "<out_path>.s", then runs the platform
+// assembler for x86-64 (`as -arch x86_64 -o <out_path> <out_path>.s`) to
+// produce the Mach-O object.  Returns 0 on success, 1 on error.  Mirrors
+// kcc_driver_emit_asm_object, but renders x86-64 and passes `-arch x86_64`.
+.globl _kcc_driver_x86_object
+.p2align 2
+_kcc_driver_x86_object:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov x19, x0                    // out_path
+    // Build "<out_path>.s".
+    bl _kcc_strlen
+    mov x20, x0                    // out_len
+    add x0, x20, #3
+    bl _kcc_arena_alloc
+    mov x21, x0                    // out_s buffer
+    mov x0, x21
+    mov x1, x19
+    mov x2, x20
+    bl _kcc_memcpy                 // copy out_path
+    add x0, x21, x20              // &out_s[out_len]
+    adrp x1, _kcc_str_dot_s@@PAGE
+    add  x1, x1, _kcc_str_dot_s@@PAGEOFF
+    mov x2, #3                     // ".s\0"
+    bl _kcc_memcpy
+    // Render the x86-64 assembly to out_s.
+    mov x0, x21
+    bl _kcc_x86_render
+    cbnz x0, .Lxo_err
+    // Build argv = { "as", "-arch", "x86_64", "-o", out_path, out_s, 0 }.
+    mov x0, #56                    // 7 pointers
+    bl _kcc_arena_alloc
+    mov x22, x0
+    adrp x0, _kcc_str_as_argv0@@PAGE
+    add  x0, x0, _kcc_str_as_argv0@@PAGEOFF
+    str x0, [x22, #0]
+    adrp x0, _kcc_str_arch@@PAGE
+    add  x0, x0, _kcc_str_arch@@PAGEOFF
+    str x0, [x22, #8]
+    adrp x0, _kcc_str_x86_64@@PAGE
+    add  x0, x0, _kcc_str_x86_64@@PAGEOFF
+    str x0, [x22, #16]
+    adrp x0, _kcc_opt_o@@PAGE
+    add  x0, x0, _kcc_opt_o@@PAGEOFF
+    str x0, [x22, #24]
+    str x19, [x22, #32]           // out_path
+    str x21, [x22, #40]           // out_s
+    str xzr, [x22, #48]           // NULL terminator
+    adrp x0, _kcc_str_as_path@@PAGE
+    add  x0, x0, _kcc_str_as_path@@PAGEOFF
+    mov x1, x22
+    bl _kcc_driver_spawn
+    cbnz x0, .Lxo_err
+    mov x0, #0
+    b .Lxo_done
+.Lxo_err:
+    mov x0, #1
+.Lxo_done:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+@| _kcc_driver_compile _kcc_driver_emit_asm_object _kcc_driver_x86_object
 @}
 
 \section{Compiling Several Translation Units}
@@ -492,6 +573,11 @@ _kcc_driver_compile_all:
     bl _kcc_strcmp
     cbz x0, .Lca_scan_emitasm
     ldr x0, [x20, x23, lsl #3]     // argv[i]
+    adrp x1, _kcc_opt_target_x86@@PAGE
+    add  x1, x1, _kcc_opt_target_x86@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_scan_target
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
     adrp x1, _kcc_opt_g@@PAGE
     add  x1, x1, _kcc_opt_g@@PAGEOFF
     bl _kcc_strcmp
@@ -560,6 +646,14 @@ _kcc_driver_compile_all:
     str  x1, [x0]
     add x23, x23, #1
     b .Lca_scan
+.Lca_scan_target:
+    // "--target=x86_64": select the x86-64 back end; not a source
+    adrp x0, _kcc_target@@PAGE
+    add  x0, x0, _kcc_target@@PAGEOFF
+    mov  x1, #1
+    str  x1, [x0]
+    add x23, x23, #1
+    b .Lca_scan
 .Lca_scan_o:
     add x23, x23, #1               // step to the -o value
     cmp x23, x19
@@ -592,6 +686,11 @@ _kcc_driver_compile_all:
     add  x1, x1, _kcc_opt_emitasm@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lca_skip_wall         // --emit-asm: handled in pass 1
+    mov x0, x25
+    adrp x1, _kcc_opt_target_x86@@PAGE
+    add  x1, x1, _kcc_opt_target_x86@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_skip_wall         // --target=x86_64: handled in pass 1
     mov x0, x25
     adrp x1, _kcc_opt_o@@PAGE
     add  x1, x1, _kcc_opt_o@@PAGEOFF
@@ -1160,6 +1259,10 @@ _kcc_opt_defmac:
     .asciz "-D"
 _kcc_opt_emitasm:
     .asciz "--emit-asm"
+_kcc_opt_target_x86:
+    .asciz "--target=x86_64"
+_kcc_str_x86_64:
+    .asciz "x86_64"
 _kcc_str_as_argv0:
     .asciz "as"
 _kcc_str_as_path:

@@ -1,0 +1,695 @@
+% 48v-self-hosting-emit-arm64.weft — Stage 8w: the ARM64 encoder + textual-`.s`
+% renderer, written in C, compiled by kcc itself, and linked back in.
+
+\chapter{Self-Hosting: The ARM64 Encoder in C}
+\label{ch:self-hosting-emit-arm64}
+
+The \texttt{emit\_arm64} object carries two cooperating back ends: the direct
+binary encoder of Chapter~\ref{ch:emit-arm64}---a growable code buffer plus one
+pure bit-packing function per instruction format---and the textual assembler of
+Chapter~\ref{ch:emit-asm}, which walks that same code buffer and renders it as
+\texttt{.s} for the platform assembler.  Both are mechanical: the encoders are
+arithmetic on register and immediate fields, and the renderer is linear scans
+that append bytes to a text buffer.  Porting the pair to C is therefore
+low-risk, and the verification is unusually strong---\texttt{difftest}
+byte-compares the direct-encoder object against clang on every case, and an
+\texttt{--emit-asm} byte-compare covers the renderer.
+
+The second target's x86-64 back end reuses this module's text-buffer helpers
+(\texttt{kcc\_as\_init}, \texttt{kcc\_as\_ch}, \texttt{kcc\_as\_str},
+\texttt{kcc\_as\_dec}, \texttt{kcc\_as\_write\_file}), so the C port exports them
+under the same names; the encoders and code-buffer entry points stay exported
+for the code generator, and this module remains the definition site of the code
+buffer's three state words.
+
+\section{Externs, Constants, and Module State}
+
+@l c
+@d Selfhost: emit_arm64 preamble @{
+void *kcc_arena_alloc(unsigned long n);
+void *kcc_memcpy(void *dst, const void *src, unsigned long n);
+long kcc_sys_open(const char *path, unsigned long flags, unsigned long mode);
+long kcc_sys_write(long fd, const void *buf, unsigned long n);
+long kcc_sys_close(long fd);
+
+/* Linker tables (vec pointers) and codegen state read by the renderer. */
+extern void *kcc_linker_syms;
+extern void *kcc_linker_relocs;
+extern unsigned long kcc_cstr_pos;
+extern unsigned long kcc_globals_size;
+extern unsigned long kcc_modinit_sym;
+
+/* Vec / linker-symbol / relocation layout. */
+#define VEC_DATA        0
+#define VEC_COUNT       8
+#define SYM_NAME        0
+#define SYM_SECTION     8
+#define SYM_VALUE       16
+#define SYM_FLAGS       24
+#define SYM_ENTRY_SIZE  32
+#define N_EXT           0x01
+#define RELOC_OFFSET    0
+#define RELOC_TYPE      8
+#define RELOC_SYM       16
+#define RELOC_SIZE      24
+#define ARM64_RELOC_BRANCH26            2
+#define ARM64_RELOC_PAGE21              3
+#define ARM64_RELOC_PAGEOFF12           4
+#define ARM64_RELOC_GOT_LOAD_PAGE21     5
+#define ARM64_RELOC_GOT_LOAD_PAGEOFF12  6
+
+#define CODEBUF_INIT_CAP 4096
+
+/* Code-buffer state — this module is its definition site (read by codegen and
+ * by the DWARF emitter). */
+void *kcc_code_buf = 0;
+unsigned long kcc_code_pos = 0;
+unsigned long kcc_code_cap = 0;
+
+/* Textual-.s buffer + inline-asm snippet table + branch-target flag array. */
+static void *as_buf = 0;
+static unsigned long as_pos = 0;
+static unsigned long as_cap = 0;
+void *kcc_asm_snips = 0;
+unsigned long kcc_asm_snip_count = 0;
+unsigned long kcc_asm_snip_cap = 0;
+void *kcc_as_targets = 0;
+char kcc_as_s_env[] = "KCC_EMIT_ASM";
+
+static const char s_sect[]    = "\t.section __TEXT,__text,regular\n";
+static const char s_p2a[]     = "\t.p2align 2\n";
+static const char s_globl[]   = "\t.globl ";
+static const char s_long[]    = "\t.long 0x";
+static const char s_byte[]    = "\t.byte 0x";
+static const char s_bl[]      = "\tbl\t";
+static const char s_adrp[]    = "\tadrp\t";
+static const char s_add[]     = "\tadd\t";
+static const char s_ldr[]     = "\tldr\t";
+static const char s_page[]    = "@@PAGE";
+static const char s_pageoff[] = "@@PAGEOFF";
+static const char s_gotpage[] = "@@GOTPAGE";
+static const char s_gotoff[]  = "@@GOTPAGEOFF";
+static const char s_hexdig[]  = "0123456789abcdef";
+static const char s_bdot[]    = "\tb.";
+static const char s_b[]       = "\tb\t";
+static const char s_cbz[]     = "\tcbz\t";
+static const char s_cbnz[]    = "\tcbnz\t";
+static const char s_lc[]      = "Lc";
+static const char s_zerofill[]= "\t.zerofill __DATA,__common,";
+static const char s_a3nl[]    = ",3\n";
+static const char s_modsect[] =
+    "\t.section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad ";
+static const char s_conds[] =
+    "eq\0ne\0hs\0lo\0mi\0pl\0vs\0vc\0hi\0ls\0ge\0lt\0gt\0le\0al\0nv";
+
+static unsigned long u64at(void *p, unsigned long off) {
+    return *(unsigned long *)((char *)p + off);
+}
+@}
+
+\section{Instruction Encoders}
+
+Each encoder packs its operand fields into the fixed base word for its format;
+the \texttt{sf} bit selects 64- vs.\ 32-bit, and register/immediate fields land
+at their documented positions.  These are the exact bit patterns of
+Chapter~\ref{ch:emit-arm64}.
+
+@l c
+@d Selfhost: emit_arm64 encoders @{
+unsigned kcc_enc_add_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x0B000000u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_sub_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x4B000000u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_mul(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x1B000000u | (sf << 31) | (rm << 16) | (31u << 10) | (rn << 5) | rd;
+}
+unsigned kcc_enc_sdiv(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x1AC00C00u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_udiv(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x1AC00800u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_msub(unsigned rd, unsigned rn, unsigned rm, unsigned ra, unsigned sf) {
+    return 0x1B008000u | (sf << 31) | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+}
+unsigned kcc_enc_add_imm(unsigned rd, unsigned rn, unsigned imm12, unsigned sf) {
+    return 0x11000000u | (sf << 31) | (imm12 << 10) | (rn << 5) | rd;
+}
+unsigned kcc_enc_sub_imm(unsigned rd, unsigned rn, unsigned imm12, unsigned sf) {
+    return 0x51000000u | (sf << 31) | (imm12 << 10) | (rn << 5) | rd;
+}
+unsigned kcc_enc_movz(unsigned rd, unsigned imm16, unsigned hw, unsigned sf) {
+    return 0x52800000u | (sf << 31) | (hw << 21) | (imm16 << 5) | rd;
+}
+unsigned kcc_enc_movk(unsigned rd, unsigned imm16, unsigned hw, unsigned sf) {
+    return 0x72800000u | (sf << 31) | (hw << 21) | (imm16 << 5) | rd;
+}
+unsigned kcc_enc_and_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x0A000000u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_orr_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x2A000000u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_eor_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x4A000000u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_mvn(unsigned rd, unsigned rm, unsigned sf) {
+    return 0x2A200000u | (sf << 31) | (rm << 16) | (31u << 5) | rd;
+}
+unsigned kcc_enc_lsl_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x1AC02000u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_lsr_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x1AC02400u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_asr_reg(unsigned rd, unsigned rn, unsigned rm, unsigned sf) {
+    return 0x1AC02800u | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_cmp_reg(unsigned rn, unsigned rm, unsigned sf) {
+    return 0x6B000000u | (sf << 31) | (rm << 16) | (rn << 5) | 31u;
+}
+unsigned kcc_enc_cset(unsigned rd, unsigned cond, unsigned sf) {
+    return 0x1A800000u | 0x400u | (sf << 31) | (31u << 16) | (cond << 12) | (31u << 5) | rd;
+}
+unsigned kcc_enc_str_imm(unsigned rt, unsigned rn, unsigned imm12, unsigned size) {
+    unsigned base;
+    if (size == 2) base = 0x39000000u;         /* STRB */
+    else if (size == 3) base = 0x79000000u;     /* STRH */
+    else if (size == 0) base = 0xB9000000u;     /* 32-bit */
+    else base = 0xF9000000u;                    /* 64-bit */
+    return base | (imm12 << 10) | (rn << 5) | rt;
+}
+unsigned kcc_enc_ldr_imm(unsigned rt, unsigned rn, unsigned imm12, unsigned size) {
+    unsigned base;
+    if (size == 2) base = 0x39400000u;          /* LDRB */
+    else if (size == 3) base = 0x79400000u;     /* LDRH */
+    else if (size == 4) base = 0xB9800000u;     /* LDRSW */
+    else if (size == 5) base = 0x39800000u;     /* LDRSB */
+    else if (size == 6) base = 0x79800000u;     /* LDRSH */
+    else if (size == 0) base = 0xB9400000u;     /* 32-bit */
+    else base = 0xF9400000u;                    /* 64-bit */
+    return base | (imm12 << 10) | (rn << 5) | rt;
+}
+unsigned kcc_enc_stp_pre(unsigned rt1, unsigned rt2, unsigned rn, unsigned imm7) {
+    return 0xA9800000u | ((imm7 & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+unsigned kcc_enc_ldp_post(unsigned rt1, unsigned rt2, unsigned rn, unsigned imm7) {
+    return 0xA8C00000u | ((imm7 & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1;
+}
+unsigned kcc_enc_mov_reg(unsigned rd, unsigned rm, unsigned sf) {
+    return 0x2A000000u | (sf << 31) | (rm << 16) | (31u << 5) | rd;
+}
+unsigned kcc_enc_fp_dp2(unsigned rd, unsigned rn, unsigned rm, unsigned opcode) {
+    return 0x1E600800u | (opcode << 12) | (rm << 16) | (rn << 5) | rd;
+}
+unsigned kcc_enc_scvtf(unsigned rd, unsigned rn)   { return 0x9E620000u | (rn << 5) | rd; }
+unsigned kcc_enc_ucvtf(unsigned rd, unsigned rn)   { return 0x9E630000u | (rn << 5) | rd; }
+unsigned kcc_enc_fcvtzs(unsigned rd, unsigned rn)  { return 0x9E780000u | (rn << 5) | rd; }
+unsigned kcc_enc_fcvt_s_d(unsigned rd, unsigned rn){ return 0x1E624000u | (rn << 5) | rd; }
+unsigned kcc_enc_fcvt_d_s(unsigned rd, unsigned rn){ return 0x1E22C000u | (rn << 5) | rd; }
+unsigned kcc_enc_fmov_d_x(unsigned rd, unsigned rn){ return 0x9E670000u | (rn << 5) | rd; }
+unsigned kcc_enc_fmov_x_d(unsigned rd, unsigned rn){ return 0x9E660000u | (rn << 5) | rd; }
+unsigned kcc_enc_fmov_d_d(unsigned rd, unsigned rn){ return 0x1E604000u | (rn << 5) | rd; }
+unsigned kcc_enc_fneg_d(unsigned rd, unsigned rn)  { return 0x1E614000u | (rn << 5) | rd; }
+unsigned kcc_enc_fcmp(unsigned rn, unsigned rm)    { return 0x1E602000u | (rm << 16) | (rn << 5); }
+unsigned kcc_enc_ldr_fp(unsigned rt, unsigned rn, unsigned imm12) {
+    return 0xFD400000u | (imm12 << 10) | (rn << 5) | rt;
+}
+unsigned kcc_enc_str_fp(unsigned rt, unsigned rn, unsigned imm12) {
+    return 0xFD000000u | (imm12 << 10) | (rn << 5) | rt;
+}
+unsigned kcc_enc_ldr_fp_s(unsigned rt, unsigned rn, unsigned imm12) {
+    return 0xBD400000u | (imm12 << 10) | (rn << 5) | rt;
+}
+unsigned kcc_enc_str_fp_s(unsigned rt, unsigned rn, unsigned imm12) {
+    return 0xBD000000u | (imm12 << 10) | (rn << 5) | rt;
+}
+unsigned kcc_enc_b(long off) {
+    return (unsigned)(((unsigned long)(off >> 2)) & 0x03FFFFFF) | 0x14000000u;
+}
+unsigned kcc_enc_bl(long off) {
+    return (unsigned)(((unsigned long)(off >> 2)) & 0x03FFFFFF) | 0x94000000u;
+}
+unsigned kcc_enc_b_cond(long off, unsigned cond) {
+    unsigned imm19 = (unsigned)(((unsigned long)(off >> 2)) & 0x7FFFF);
+    return 0x54000000u | (imm19 << 5) | cond;
+}
+unsigned kcc_enc_cbz(unsigned rt, long off, unsigned sf) {
+    unsigned imm19 = (unsigned)(((unsigned long)(off >> 2)) & 0x7FFFF);
+    return 0x34000000u | (sf << 31) | (imm19 << 5) | rt;
+}
+unsigned kcc_enc_cbnz(unsigned rt, long off, unsigned sf) {
+    unsigned imm19 = (unsigned)(((unsigned long)(off >> 2)) & 0x7FFFF);
+    return 0x35000000u | (sf << 31) | (imm19 << 5) | rt;
+}
+unsigned kcc_enc_ret(void) { return 0xD65F03C0u; }
+unsigned kcc_enc_blr(unsigned rn) { return 0xD63F0000u | (rn << 5); }
+unsigned kcc_enc_nop(void) { return 0xD503201Fu; }
+unsigned kcc_enc_brk(unsigned imm16) { return 0xD4200000u | (imm16 << 5); }
+unsigned kcc_enc_adrp(unsigned rd, unsigned imm21) {
+    unsigned immlo = imm21 & 0x3;
+    unsigned immhi = (imm21 >> 2) & 0x7FFFF;
+    return 0x90000000u | (immlo << 29) | (immhi << 5) | rd;
+}
+@}
+
+\section{The Code Buffer}
+
+The direct encoder appends four bytes per instruction, doubling the arena buffer
+when full; \texttt{patch32} back-patches a resolved forward branch.
+
+@l c
+@d Selfhost: emit_arm64 codebuf @{
+void kcc_code_init(void) {
+    kcc_code_buf = kcc_arena_alloc(CODEBUF_INIT_CAP);
+    kcc_code_pos = 0;
+    kcc_code_cap = CODEBUF_INIT_CAP;
+}
+void kcc_code_emit32(unsigned word) {
+    if (kcc_code_pos + 4 > kcc_code_cap) {
+        unsigned long ncap = kcc_code_cap << 1;
+        kcc_code_cap = ncap;
+        void *nb = kcc_arena_alloc(ncap);
+        kcc_memcpy(nb, kcc_code_buf, kcc_code_pos);
+        kcc_code_buf = nb;
+    }
+    *(unsigned *)((char *)kcc_code_buf + kcc_code_pos) = word;
+    kcc_code_pos += 4;
+}
+unsigned long kcc_code_current_pos(void) { return kcc_code_pos; }
+void kcc_code_patch32(unsigned long offset, unsigned word) {
+    *(unsigned *)((char *)kcc_code_buf + offset) = word;
+}
+@}
+
+\section{The Text Buffer}
+
+Assembly text accumulates in a growable arena buffer, appended a byte, string,
+decimal, or hex digit at a time; the register-name helpers spell \texttt{xzr} and
+\texttt{wzr} for register~31.
+
+@l c
+@d Selfhost: emit_arm64 as-buffer @{
+void kcc_as_init(void) {
+    as_buf = kcc_arena_alloc(65536);
+    as_pos = 0;
+    as_cap = 65536;
+}
+void kcc_as_ch(unsigned byte) {
+    if (as_pos >= as_cap) {
+        unsigned long ncap = as_cap << 1;
+        as_cap = ncap;
+        void *nb = kcc_arena_alloc(ncap);
+        kcc_memcpy(nb, as_buf, as_pos);
+        as_buf = nb;
+    }
+    ((unsigned char *)as_buf)[as_pos] = (unsigned char)byte;
+    as_pos += 1;
+}
+void kcc_as_str(const char *s) {
+    while (*s) { kcc_as_ch((unsigned char)*s); s++; }
+}
+void kcc_as_putn(const char *p, unsigned long n) {
+    while (n) { kcc_as_ch((unsigned char)*p); p++; n--; }
+}
+void kcc_as_dec(unsigned long n) {
+    if (n == 0) { kcc_as_ch('0'); return; }
+    char tmp[24];
+    int i = 0;
+    while (n) { tmp[i++] = '0' + (n % 10); n /= 10; }
+    while (i) kcc_as_ch((unsigned char)tmp[--i]);
+}
+void kcc_as_hex8(unsigned w) {
+    int sh = 28;
+    while (sh >= 0) { kcc_as_ch((unsigned char)s_hexdig[(w >> sh) & 0xf]); sh -= 4; }
+}
+void kcc_as_hex2(unsigned b) {
+    b &= 0xff;
+    kcc_as_ch((unsigned char)s_hexdig[(b >> 4) & 0xf]);
+    kcc_as_ch((unsigned char)s_hexdig[b & 0xf]);
+}
+void kcc_as_xreg(unsigned n) {
+    if (n == 31) { kcc_as_ch('x'); kcc_as_ch('z'); kcc_as_ch('r'); return; }
+    kcc_as_ch('x'); kcc_as_dec(n);
+}
+void kcc_as_wreg(unsigned n) {
+    kcc_as_ch('w');
+    if (n == 31) { kcc_as_ch('z'); kcc_as_ch('r'); return; }
+    kcc_as_dec(n);
+}
+@}
+
+\section{Rendering the Text Section}
+
+The renderer walks the code buffer word by word.  It emits any symbol labels at
+each offset, splices inline-asm templates, renders relocated words symbolically
+(so the assembler re-creates the relocation) and internal branches by name (so
+distances are recomputed), and otherwise drops a raw \texttt{.long}.  The trailing
+string-literal region is rendered one \texttt{.byte} at a time.
+
+@l c
+@d Selfhost: emit_arm64 as-render @{
+void kcc_as_symname(unsigned long idx) {
+    char *data = *(char **)((char *)kcc_linker_syms + VEC_DATA);
+    char *sym = data + idx * SYM_ENTRY_SIZE;
+    kcc_as_str(*(char **)(sym + SYM_NAME));
+}
+void *kcc_as_reloc_at(unsigned long off) {
+    void *vec = kcc_linker_relocs;
+    unsigned long count = u64at(vec, VEC_COUNT);
+    char *data = *(char **)((char *)vec + VEC_DATA);
+    for (unsigned long i = 0; i < count; i++) {
+        char *r = data + i * RELOC_SIZE;
+        if (u64at(r, RELOC_OFFSET) == off) return r;
+    }
+    return 0;
+}
+void kcc_as_add_snip(unsigned long off, const char *tmpl, unsigned long len) {
+    if (kcc_asm_snip_count >= kcc_asm_snip_cap) {
+        unsigned long nc = (kcc_asm_snip_cap == 0) ? 16 : kcc_asm_snip_cap;
+        nc <<= 1;
+        char *na = kcc_arena_alloc(nc * 24);
+        if (kcc_asm_snips) kcc_memcpy(na, kcc_asm_snips, kcc_asm_snip_count * 24);
+        kcc_asm_snips = na;
+        kcc_asm_snip_cap = nc;
+    }
+    char *e = (char *)kcc_asm_snips + kcc_asm_snip_count * 24;
+    *(unsigned long *)(e + 0) = off;
+    *(unsigned long *)(e + 8) = (unsigned long)tmpl;
+    *(unsigned long *)(e + 16) = len;
+    kcc_asm_snip_count += 1;
+}
+void *kcc_as_snip_at(unsigned long off) {
+    if (!kcc_asm_snips) return 0;
+    for (unsigned long i = 0; i < kcc_asm_snip_count; i++) {
+        char *e = (char *)kcc_asm_snips + i * 24;
+        if (u64at(e, 0) == off) return e;
+    }
+    return 0;
+}
+void kcc_as_labels_at(unsigned long off) {
+    void *vec = kcc_linker_syms;
+    unsigned long count = u64at(vec, VEC_COUNT);
+    char *data = *(char **)((char *)vec + VEC_DATA);
+    for (unsigned long i = 0; i < count; i++) {
+        char *sym = data + i * SYM_ENTRY_SIZE;
+        if (u64at(sym, SYM_SECTION) != 1) continue;
+        if (u64at(sym, SYM_VALUE) != off) continue;
+        if (u64at(sym, SYM_FLAGS) & N_EXT) {
+            kcc_as_str(s_globl);
+            kcc_as_str(*(char **)(sym + SYM_NAME));
+            kcc_as_ch('\n');
+        }
+        kcc_as_str(*(char **)(sym + SYM_NAME));
+        kcc_as_ch(':');
+        kcc_as_ch('\n');
+    }
+}
+void kcc_as_reloc_line(void *reloc, unsigned word) {
+    unsigned long type = u64at(reloc, RELOC_TYPE);
+    unsigned rd = word & 0x1f;
+    unsigned rn = (word >> 5) & 0x1f;
+    if (type == ARM64_RELOC_BRANCH26) {
+        kcc_as_str(s_bl);
+        kcc_as_symname(u64at(reloc, RELOC_SYM));
+        kcc_as_ch('\n');
+    } else if (type == ARM64_RELOC_PAGE21) {
+        kcc_as_str(s_adrp); kcc_as_xreg(rd); kcc_as_ch(','); kcc_as_ch(' ');
+        kcc_as_symname(u64at(reloc, RELOC_SYM)); kcc_as_str(s_page); kcc_as_ch('\n');
+    } else if (type == ARM64_RELOC_GOT_LOAD_PAGE21) {
+        kcc_as_str(s_adrp); kcc_as_xreg(rd); kcc_as_ch(','); kcc_as_ch(' ');
+        kcc_as_symname(u64at(reloc, RELOC_SYM)); kcc_as_str(s_gotpage); kcc_as_ch('\n');
+    } else if (type == ARM64_RELOC_PAGEOFF12) {
+        kcc_as_str(s_add); kcc_as_xreg(rd); kcc_as_ch(','); kcc_as_ch(' ');
+        kcc_as_xreg(rn); kcc_as_ch(','); kcc_as_ch(' ');
+        kcc_as_symname(u64at(reloc, RELOC_SYM)); kcc_as_str(s_pageoff); kcc_as_ch('\n');
+    } else if (type == ARM64_RELOC_GOT_LOAD_PAGEOFF12) {
+        kcc_as_str(s_ldr); kcc_as_xreg(rd); kcc_as_ch(','); kcc_as_ch(' ');
+        kcc_as_ch('['); kcc_as_xreg(rn); kcc_as_ch(','); kcc_as_ch(' ');
+        kcc_as_symname(u64at(reloc, RELOC_SYM)); kcc_as_str(s_gotoff); kcc_as_ch(']');
+        kcc_as_ch('\n');
+    }
+}
+void *kcc_as_sym_at(unsigned long off) {
+    void *vec = kcc_linker_syms;
+    unsigned long count = u64at(vec, VEC_COUNT);
+    char *data = *(char **)((char *)vec + VEC_DATA);
+    for (unsigned long i = 0; i < count; i++) {
+        char *sym = data + i * SYM_ENTRY_SIZE;
+        if (u64at(sym, SYM_SECTION) != 1) continue;
+        if (u64at(sym, SYM_VALUE) != off) continue;
+        return *(void **)(sym + SYM_NAME);
+    }
+    return 0;
+}
+unsigned long kcc_as_branch_kind(unsigned word) {
+    unsigned top6 = word >> 26;
+    if (top6 == 0x05) return 1;                 /* b */
+    if (top6 == 0x25) return 2;                 /* bl */
+    unsigned top8 = (word >> 24) & 0xff;
+    if (top8 == 0x54) { return (word & 0x10) ? 0 : 3; }  /* b.cond */
+    unsigned top7 = (word >> 24) & 0x7f;
+    if (top7 == 0x34) return 4;                 /* cbz */
+    if (top7 == 0x35) return 5;                 /* cbnz */
+    return 0;
+}
+long kcc_as_branch_target(unsigned word, unsigned long off) {
+    unsigned long kind = kcc_as_branch_kind(word);
+    if (kind == 0) return -1;
+    int imm;
+    if (kind <= 2) { imm = (int)((word & 0x03FFFFFFu) << 6); imm >>= 6; }
+    else { imm = (int)((((word >> 5) & 0x7FFFFu)) << 13); imm >>= 13; }
+    return (long)off + ((long)imm << 2);
+}
+void kcc_as_label_ref(unsigned long target) {
+    void *name = kcc_as_sym_at(target);
+    if (name) { kcc_as_str((char *)name); return; }
+    kcc_as_str(s_lc);
+    kcc_as_dec(target);
+}
+void kcc_as_render_branch(unsigned word, unsigned long off) {
+    unsigned long kind = kcc_as_branch_kind(word);
+    long target = kcc_as_branch_target(word, off);
+    if (kind == 1) {
+        kcc_as_str(s_b); kcc_as_label_ref(target);
+    } else if (kind == 2) {
+        kcc_as_str(s_bl); kcc_as_label_ref(target);
+    } else if (kind == 3) {
+        kcc_as_str(s_bdot);
+        kcc_as_str(s_conds + (word & 0xf) * 3);
+        kcc_as_ch('\t');
+        kcc_as_label_ref(target);
+    } else {                                    /* cbz (4) / cbnz (5) */
+        kcc_as_str(kind == 4 ? s_cbz : s_cbnz);
+        unsigned r = word & 0x1f;
+        if (word & 0x80000000u) kcc_as_xreg(r); else kcc_as_wreg(r);
+        kcc_as_ch(','); kcc_as_ch(' ');
+        kcc_as_label_ref(target);
+    }
+    kcc_as_ch('\n');
+}
+void kcc_as_mark_targets(unsigned long code_size) {
+    unsigned long words = code_size >> 2;
+    unsigned char *flags = kcc_arena_alloc(words + 1);
+    kcc_as_targets = flags;
+    for (unsigned long i = 0; i < words; i++) flags[i] = 0;
+    for (unsigned long off = 0; off < code_size; off += 4) {
+        if (kcc_as_reloc_at(off)) continue;
+        unsigned word = *(unsigned *)((char *)kcc_code_buf + off);
+        if (kcc_as_branch_kind(word) == 0) continue;
+        long target = kcc_as_branch_target(word, off);
+        if (target == -1) continue;
+        if (kcc_as_sym_at((unsigned long)target)) continue;
+        ((unsigned char *)kcc_as_targets)[(unsigned long)target >> 2] = 1;
+    }
+}
+void kcc_as_render_text(void) {
+    kcc_as_str(s_sect);
+    kcc_as_str(s_p2a);
+    unsigned long total = kcc_code_pos;
+    unsigned long code_size = total - kcc_cstr_pos;
+    kcc_as_mark_targets(code_size);
+    unsigned long off = 0;
+    for (; off < code_size; off += 4) {
+        kcc_as_labels_at(off);
+        if (kcc_as_targets && ((unsigned char *)kcc_as_targets)[off >> 2]) {
+            kcc_as_str(s_lc); kcc_as_dec(off); kcc_as_ch(':'); kcc_as_ch('\n');
+        }
+        void *snip = kcc_as_snip_at(off);
+        if (snip) {
+            kcc_as_ch('\t');
+            kcc_as_putn(*(char **)((char *)snip + 8), u64at(snip, 16));
+            kcc_as_ch('\n');
+            continue;
+        }
+        unsigned word = *(unsigned *)((char *)kcc_code_buf + off);
+        void *reloc = kcc_as_reloc_at(off);
+        if (reloc) { kcc_as_reloc_line(reloc, word); continue; }
+        if (kcc_as_branch_kind(word) != 0) { kcc_as_render_branch(word, off); continue; }
+        kcc_as_str(s_long); kcc_as_hex8(word); kcc_as_ch('\n');
+    }
+    for (; off < total; off += 1) {
+        kcc_as_labels_at(off);
+        kcc_as_str(s_byte);
+        kcc_as_hex2(*(unsigned char *)((char *)kcc_code_buf + off));
+        kcc_as_ch('\n');
+    }
+}
+@}
+
+\section{Globals, Module Init, and File Output}
+
+Zero-storage globals become \texttt{.zerofill} entries; a synthesised module-init
+function is registered in \texttt{\_\_mod\_init\_func}; and the accumulated text is
+written to the output path in a single \texttt{write}.
+
+@l c
+@d Selfhost: emit_arm64 as-render @{
+unsigned long kcc_as_common_size(unsigned long off) {
+    unsigned long best = kcc_globals_size;
+    void *vec = kcc_linker_syms;
+    unsigned long count = u64at(vec, VEC_COUNT);
+    char *data = *(char **)((char *)vec + VEC_DATA);
+    for (unsigned long i = 0; i < count; i++) {
+        char *sym = data + i * SYM_ENTRY_SIZE;
+        if (u64at(sym, SYM_SECTION) != 2) continue;
+        unsigned long v = u64at(sym, SYM_VALUE);
+        if (v <= off) continue;                 /* not a successor */
+        if (v >= best) continue;                /* not smaller than best */
+        best = v;
+    }
+    return best - off;
+}
+void kcc_as_render_common(void) {
+    void *vec = kcc_linker_syms;
+    unsigned long count = u64at(vec, VEC_COUNT);
+    char *data = *(char **)((char *)vec + VEC_DATA);
+    for (unsigned long i = 0; i < count; i++) {
+        char *sym = data + i * SYM_ENTRY_SIZE;
+        if (u64at(sym, SYM_SECTION) != 2) continue;
+        if (u64at(sym, SYM_FLAGS) & N_EXT) {
+            kcc_as_str(s_globl);
+            kcc_as_str(*(char **)(sym + SYM_NAME));
+            kcc_as_ch('\n');
+        }
+        kcc_as_str(s_zerofill);
+        kcc_as_str(*(char **)(sym + SYM_NAME));
+        kcc_as_ch(',');
+        kcc_as_dec(kcc_as_common_size(u64at(sym, SYM_VALUE)));
+        kcc_as_str(s_a3nl);
+    }
+}
+void kcc_as_render_modinit(void) {
+    unsigned long m = kcc_modinit_sym;          /* symbol index + 1 (0 = none) */
+    if (m == 0) return;
+    kcc_as_str(s_modsect);
+    kcc_as_symname(m - 1);
+    kcc_as_ch('\n');
+}
+int kcc_as_write_file(const char *path) {
+    long fd = kcc_sys_open(path, 0x601, 420);   /* O_WRONLY|O_CREAT|O_TRUNC, 0644 */
+    if (fd < 0) return 1;
+    kcc_sys_write(fd, as_buf, as_pos);
+    kcc_sys_close(fd);
+    return 0;
+}
+int kcc_as_render(const char *path) {
+    kcc_as_init();
+    kcc_as_render_text();
+    kcc_as_render_common();
+    kcc_as_render_modinit();
+    return kcc_as_write_file(path);
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: emit_arm64 @{
+@<Selfhost: emit_arm64 preamble@>
+@<Selfhost: emit_arm64 encoders@>
+@<Selfhost: emit_arm64 codebuf@>
+@<Selfhost: emit_arm64 as-buffer@>
+@<Selfhost: emit_arm64 as-render@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-emit-arm64-verify}
+
+\texttt{make selfhost-emit-arm64} exercises both halves.  \texttt{difftest}
+byte-compares the direct-encoder object against clang across the whole corpus,
+covering every instruction encoder and the code buffer.  For the textual
+renderer, a probe rich in branches, calls, and global references is built
+\emph{through} \texttt{--emit-asm} (so the C renderer emits \texttt{.s} that the
+platform assembler turns into an object) and run: its exit status must match the
+direct-encoder reference---the assembled program behaves identically, which is
+exactly what the renderer must guarantee.  (A byte-compare of the object is not
+usable: the platform assembler embeds nondeterministic bytes, so even two runs
+of the same compiler differ.)  The code-generation suite runs last as a smoke
+test.
+
+@d Selfhost: emit_arm64 verify @{
+#!/usr/bin/env bash
+# make selfhost-emit-arm64 — compile kcc's ARM64 encoder + .s renderer in C with
+# kcc, relink, and verify both halves (difftest + --emit-asm byte-compare).
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/5] compiling tmp/selfhost/emit_arm64.c with kcc"
+tmp/kcc -c "$SH/emit_arm64.c" -o "$SH/emit_arm64_c.o" >/dev/null
+
+echo "[2/5] linking tmp/kcc_selfhost_emit_arm64 (emit_arm64.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "emit_arm64" ]; then OBJ="$OBJ $SH/emit_arm64_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_emit_arm64 $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+cp tmp/kcc "$SH/kcc_asm_backup_emit_arm64"
+
+echo "[3/5] --emit-asm functional check: C renderer -> as -> runnable program"
+cat > "$SH/emit_probe.c" <<'PROBE'
+int g;
+static int add(int a, int b) { return a + b; }
+int fib(int n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
+int main(void) {
+    g = 7; int s = 0;
+    for (int i = 0; i < 5; i++) s += add(i, g);
+    return (s + fib(6)) % 100;
+}
+PROBE
+# Ground truth: the direct-encoder object, built by the assembly compiler.
+tmp/kcc "$SH/emit_probe.c" -o "$SH/emit_probe_ref" >/dev/null
+set +e; "$SH/emit_probe_ref"; ref=$?; set -e
+# The C renderer, driving --emit-asm through the platform assembler.
+cp tmp/kcc_selfhost_emit_arm64 tmp/kcc
+tmp/kcc --emit-asm "$SH/emit_probe.c" -o "$SH/emit_probe_c" >/dev/null
+set +e; "$SH/emit_probe_c"; got=$?; set -e
+if [ "$ref" != "$got" ]; then
+    cp "$SH/kcc_asm_backup_emit_arm64" tmp/kcc
+    echo "FAIL: --emit-asm program (C renderer) exit $got != direct-encoder $ref"; exit 1
+fi
+echo "  --emit-asm program runs identically (exit $got)"
+
+echo "[4/5] difftest (byte-compares every encoder against clang)"
+set +e
+bash tmp/tests/difftest.sh >/tmp/emit_arm64_difftest.log 2>&1
+dstatus=$?
+tail -1 /tmp/emit_arm64_difftest.log
+set -e
+if [ $dstatus -ne 0 ]; then cp "$SH/kcc_asm_backup_emit_arm64" tmp/kcc; exit $dstatus; fi
+
+echo "[5/5] running the codegen suite with the self-hosted encoder"
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_emit_arm64" tmp/kcc
+exit $status
+@}

@@ -972,6 +972,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: dwarf verify@>
 @}
 
+\noindent The ARM64 encoder and textual-\texttt{.s} renderer, ported to C
+(Chapter~\ref{ch:self-hosting-emit-arm64}), a drop-in replacement:
+
+@o tmp/selfhost/emit_arm64.c @{
+@<Selfhost: emit_arm64@>
+@}
+
+@o tmp/selfhost/emit_arm64_verify.sh @{
+@<Selfhost: emit_arm64 verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

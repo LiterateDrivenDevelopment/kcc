@@ -939,6 +939,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: parser verify@>
 @}
 
+\noindent The compilation driver, ported to C
+(Chapter~\ref{ch:self-hosting-driver}), a drop-in replacement:
+
+@o tmp/selfhost/driver.c @{
+@<Selfhost: driver@>
+@}
+
+@o tmp/selfhost/driver_verify.sh @{
+@<Selfhost: driver verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

@@ -1,0 +1,496 @@
+% 48s-self-hosting-driver.weft — Stage 8t: the compilation driver, written in
+% C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Compilation Driver in C}
+\label{ch:self-hosting-driver}
+
+The driver of Chapter~\ref{ch:compile-driver} is the compiler's outer shell: it
+runs every phase in order for one file, loops that over many under \texttt{-c},
+and---invoked without \texttt{-c}---compiles and then links an executable by
+running the system assembler and linker as child processes.  Porting it puts the
+orchestration itself through kcc-compiled C: the argument parsing, the
+straight-line pipeline, the fork/exec spawning, and the linker command line.
+Every compilation the code-generation suite runs and every executable the
+end-to-end suite links passes through this file, so a green sweep of both is the
+witness.
+
+\section{State, Strings, and the Pipeline}
+
+The port owns the two driver globals (the captured environment and the
+\texttt{--emit-asm} flag) and declares as externs the target/debug flags other
+modules own, the whole phase pipeline, and the syscalls used to spawn processes.
+The command-line option spellings and the assembler/linker paths are string
+constants---compared against arguments and passed as \texttt{argv} elements.
+\texttt{kcc\_driver\_compile} is the sequential pipeline: read the source, run
+the phases to optimized IR, then either dispatch to the x86 back end or generate
+ARM64 code and write the Mach-O object.
+
+@l c
+@d Selfhost: driver preamble @{
+void *kcc_arena_alloc(long size);
+void *kcc_memcpy(void *dst, const void *src, unsigned long n);
+int kcc_memcmp(const void *a, const void *b, unsigned long n);
+unsigned long kcc_strlen(const char *s);
+int kcc_strcmp(const char *a, const char *b);
+void kcc_io_flush(void);
+void kcc_io_err(const char *s);
+
+void kcc_source_open(const char *path);
+void kcc_source_encode(void);
+void kcc_source_splice(void);
+void kcc_lex_init(void *base, unsigned long size);
+void kcc_pp_init(void);
+void kcc_strtab_init(void);
+void kcc_typedef_init(void);
+void *kcc_parse(void);
+void kcc_types_init(void);
+void kcc_symtab_init(void);
+void kcc_sema_check(void *tu);
+unsigned long kcc_diag_had_errors(void);
+void kcc_ir_init(void);
+void kcc_ir_build(void *tu);
+void kcc_opt_run(void);
+unsigned long kcc_ir_validate(void);
+void kcc_code_init(void);
+void kcc_linker_init(void);
+void kcc_codegen_init(void);
+void kcc_preregister_globals(void *tu);
+void kcc_codegen_all(void);
+void kcc_codegen_emit_strings(void);
+int kcc_as_render(const char *path);
+int kcc_x86_render(const char *path);
+void kcc_dwarf_build(void);
+void kcc_macho_init(const char *out);
+void kcc_macho_finalize(void);
+void kcc_pp_add_include_dir(const char *dir);
+void kcc_pp_add_cmdline_define(const char *def);
+
+long kcc_sys_fork(void);
+long kcc_sys_execve(const char *path, char *const argv[], char *const envp[]);
+long kcc_sys_wait4(long pid, int *status, long options, void *rusage);
+long kcc_sys_open(const char *path, long flags, long mode);
+long kcc_sys_close(long fd);
+long kcc_sys_unlink(const char *path);
+void kcc_sys_exit(int status);
+
+extern void *kcc_src_base;
+extern unsigned long kcc_src_size;
+extern unsigned long kcc_target;
+extern unsigned long kcc_x86_os;
+extern void *kcc_x86_tu;
+extern unsigned long kcc_warn_all;
+extern unsigned long kcc_dwarf_enabled;
+
+void *kcc_envp = 0;
+unsigned long kcc_emit_asm = 0;
+
+static const char OPT_O[] = "-o";
+static const char OPT_WALL[] = "-Wall";
+static const char OPT_G[] = "-g";
+static const char OPT_EMITASM[] = "--emit-asm";
+static const char OPT_TARGET_X86[] = "--target=x86_64";
+static const char OPT_TARGET_LINUX[] = "--target=x86_64-linux";
+static const char STR_X86_64[] = "x86_64";
+static const char STR_AS_ARGV0[] = "as";
+static const char STR_AS_PATH[] = "/usr/bin/as";
+static const char STR_DOT_S[] = ".s";
+static const char STR_ARCH[] = "-arch";
+static const char STR_LD_ARGV0[] = "ld";
+static const char STR_LD_PATH[] = "/usr/bin/ld";
+static const char STR_LSYSTEM[] = "-lSystem";
+static const char STR_SYSLIBROOT[] = "-syslibroot";
+static const char STR_ARM64[] = "arm64";
+static const char STR_DASH_E[] = "-e";
+static const char STR_UMAIN[] = "_main";
+static const char STR_AOUT[] = "a.out";
+static const char STR_SDKROOT_ENV[] = "SDKROOT";
+static const char STR_SDK_CLT[] =
+    "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
+static const char STR_SDK_XCODE[] =
+    "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
+static const char ERR_NOINPUT[] = "kcc: error: no input files\n";
+
+char *kcc_getenv(const char *name, unsigned long namelen);
+int kcc_driver_x86_object(const char *out);
+int kcc_driver_emit_asm_object(const char *out);
+int kcc_driver_spawn(const char *path, char *const argv[]);
+char *kcc_driver_obj_name(const char *src);
+unsigned long kcc_driver_I(const char *arg, const char *next, unsigned long reg);
+unsigned long kcc_driver_D(const char *arg, const char *next, unsigned long reg);
+@}
+
+@l c
+@d Selfhost: driver compile @{
+int kcc_driver_compile(const char *src, const char *out) {
+    kcc_source_open(src);
+    kcc_source_encode();
+    kcc_source_splice();
+    kcc_lex_init(kcc_src_base, kcc_src_size);
+    kcc_pp_init();
+    kcc_strtab_init();
+    kcc_typedef_init();
+    void *tu = kcc_parse();
+    kcc_types_init();
+    kcc_symtab_init();
+    kcc_sema_check(tu);
+    if (kcc_diag_had_errors()) { kcc_io_flush(); return 1; }
+    kcc_ir_init();
+    kcc_ir_build(tu);
+    kcc_opt_run();
+    if (kcc_ir_validate()) { kcc_io_flush(); return 1; }
+    if (kcc_target) {
+        kcc_x86_tu = tu;
+        return kcc_driver_x86_object(out);
+    }
+    kcc_code_init();
+    kcc_linker_init();
+    kcc_codegen_init();
+    kcc_preregister_globals(tu);
+    kcc_codegen_all();
+    kcc_codegen_emit_strings();
+    if (kcc_emit_asm) return kcc_driver_emit_asm_object(out);
+    char *side = kcc_getenv("KCC_EMIT_ASM", 12);
+    if (side) kcc_as_render(side);
+    kcc_dwarf_build();
+    kcc_macho_init(out);
+    kcc_macho_finalize();
+    return 0;
+}
+
+/* Build "<out>.s", render to it, then assemble to <out>. */
+int kcc_driver_emit_asm_object(const char *out) {
+    unsigned long len = kcc_strlen(out);
+    char *outs = (char *)kcc_arena_alloc((long)(len + 3));
+    kcc_memcpy(outs, out, len);
+    kcc_memcpy(outs + len, STR_DOT_S, 3);
+    if (kcc_as_render(outs)) return 1;
+    char *av[5];
+    av[0] = (char *)STR_AS_ARGV0;
+    av[1] = (char *)OPT_O;
+    av[2] = (char *)out;
+    av[3] = outs;
+    av[4] = 0;
+    if (kcc_driver_spawn(STR_AS_PATH, av)) return 1;
+    return 0;
+}
+
+int kcc_driver_x86_object(const char *out) {
+    if (kcc_x86_os) {                     /* Linux/ELF: render .s to out, stop. */
+        kcc_x86_render(out);
+        return 0;
+    }
+    unsigned long len = kcc_strlen(out);
+    char *outs = (char *)kcc_arena_alloc((long)(len + 3));
+    kcc_memcpy(outs, out, len);
+    kcc_memcpy(outs + len, STR_DOT_S, 3);
+    if (kcc_x86_render(outs)) return 1;
+    char *av[7];
+    av[0] = (char *)STR_AS_ARGV0;
+    av[1] = (char *)STR_ARCH;
+    av[2] = (char *)STR_X86_64;
+    av[3] = (char *)OPT_O;
+    av[4] = (char *)out;
+    av[5] = outs;
+    av[6] = 0;
+    if (kcc_driver_spawn(STR_AS_PATH, av)) return 1;
+    return 0;
+}
+@}
+
+\section{Argument Helpers and Object Naming}
+
+\texttt{driver\_I} and \texttt{driver\_D} each recognise their option in the
+attached (\texttt{-Idir}) or separated (\texttt{-I dir}) shape and return how
+many argument slots it occupies, optionally registering the directory or macro;
+this lets every argument loop step over them uniformly.  \texttt{obj\_name}
+rewrites a \texttt{.c} suffix to \texttt{.o}, or appends \texttt{.o}.
+
+@l c
+@d Selfhost: driver args @{
+unsigned long kcc_driver_I(const char *arg, const char *next, unsigned long reg) {
+    if (kcc_memcmp(arg, "-I", 2) != 0) return 0;
+    if (arg[2] == 0) {                    /* separated "-I dir" */
+        if (reg && next) kcc_pp_add_include_dir(next);
+        return 2;
+    }
+    if (reg) kcc_pp_add_include_dir(arg + 2);  /* attached "-Idir" */
+    return 1;
+}
+
+unsigned long kcc_driver_D(const char *arg, const char *next, unsigned long reg) {
+    if (kcc_memcmp(arg, "-D", 2) != 0) return 0;
+    if (arg[2] == 0) {                    /* separated "-D NAME" */
+        if (reg && next) kcc_pp_add_cmdline_define(next);
+        return 2;
+    }
+    if (reg) kcc_pp_add_cmdline_define(arg + 2);
+    return 1;
+}
+
+char *kcc_driver_obj_name(const char *src) {
+    unsigned long len = kcc_strlen(src);
+    char *dst = (char *)kcc_arena_alloc((long)(len + 3));
+    kcc_memcpy(dst, src, len);
+    if (len >= 2 && src[len - 2] == '.' && src[len - 1] == 'c') {
+        dst[len - 1] = 'o';
+        dst[len] = 0;
+    } else {
+        dst[len] = '.';
+        dst[len + 1] = 'o';
+        dst[len + 2] = 0;
+    }
+    return dst;
+}
+@}
+
+\section{Compiling Several Files}
+
+\texttt{compile\_all} handles \texttt{-c}: a first pass sets the flags
+(\texttt{-Wall}, \texttt{-g}, \texttt{--emit-asm}, \texttt{--target}), registers
+include dirs and macros, and finds an explicit \texttt{-o} and the source count;
+a second pass compiles each source, honouring \texttt{-o} only for a single
+input.  It exits with the combined status.
+
+@l c
+@d Selfhost: driver compile-all @{
+void kcc_driver_compile_all(long argc, char **argv) {
+    const char *explicit_out = 0;
+    long src_count = 0;
+    for (long i = 2; i < argc; ) {
+        char *a = argv[i];
+        if (kcc_strcmp(a, OPT_WALL) == 0) { kcc_warn_all = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_EMITASM) == 0) { kcc_emit_asm = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_TARGET_X86) == 0) { kcc_target = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_TARGET_LINUX) == 0) {
+            kcc_target = 1; kcc_x86_os = 1; i++; continue;
+        }
+        if (kcc_strcmp(a, OPT_G) == 0) { kcc_dwarf_enabled = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_O) == 0) {
+            i++;
+            if (i >= argc) break;
+            explicit_out = argv[i]; i++; continue;
+        }
+        const char *next = (i + 1 < argc) ? argv[i + 1] : 0;
+        unsigned long n = kcc_driver_I(a, next, 1);
+        if (n) { i += (long)n; continue; }
+        n = kcc_driver_D(a, next, 1);
+        if (n) { i += (long)n; continue; }
+        src_count++; i++;
+    }
+    if (src_count == 0) { kcc_io_err(ERR_NOINPUT); kcc_sys_exit(1); }
+
+    long err = 0;
+    for (long i = 2; i < argc; ) {
+        char *a = argv[i];
+        if (kcc_strcmp(a, OPT_WALL) == 0 || kcc_strcmp(a, OPT_G) == 0 ||
+            kcc_strcmp(a, OPT_EMITASM) == 0 || kcc_strcmp(a, OPT_TARGET_X86) == 0 ||
+            kcc_strcmp(a, OPT_TARGET_LINUX) == 0) { i++; continue; }
+        if (kcc_strcmp(a, OPT_O) == 0) { i += 2; continue; }
+        unsigned long n = kcc_driver_I(a, 0, 0);
+        if (n) { i += (long)n; continue; }
+        n = kcc_driver_D(a, 0, 0);
+        if (n) { i += (long)n; continue; }
+        const char *out;
+        if (src_count == 1 && explicit_out) out = explicit_out;
+        else out = kcc_driver_obj_name(a);
+        err |= kcc_driver_compile(a, out);
+        i++;
+    }
+    kcc_io_flush();
+    kcc_sys_exit((int)err);
+}
+@}
+
+\section{Environment, SDK, and Spawning}
+
+\texttt{getenv} scans the captured environment; \texttt{dir\_exists} probes a
+path by opening it; \texttt{sdkroot} finds the macOS SDK (from \texttt{\$SDKROOT}
+or the two standard locations) for \texttt{ld -syslibroot}; and \texttt{spawn}
+forks, execs the child, and returns its exit status.
+
+@l c
+@d Selfhost: driver spawn @{
+char *kcc_getenv(const char *name, unsigned long namelen) {
+    char **envp = (char **)kcc_envp;
+    if (envp == 0) return 0;
+    for (; *envp; envp++) {
+        char *e = *envp;
+        if (kcc_memcmp(e, name, namelen) == 0 && e[namelen] == '=')
+            return e + namelen + 1;
+    }
+    return 0;
+}
+
+int kcc_dir_exists(const char *path) {
+    long fd = kcc_sys_open(path, 0, 0);
+    if (fd < 0) return 0;
+    kcc_sys_close(fd);
+    return 1;
+}
+
+char *kcc_driver_sdkroot(void) {
+    char *p = kcc_getenv(STR_SDKROOT_ENV, 7);
+    if (p && kcc_dir_exists(p)) return p;
+    if (kcc_dir_exists(STR_SDK_CLT)) return (char *)STR_SDK_CLT;
+    if (kcc_dir_exists(STR_SDK_XCODE)) return (char *)STR_SDK_XCODE;
+    return (char *)STR_SDK_CLT;
+}
+
+int kcc_driver_spawn(const char *path, char *const argv[]) {
+    long pid = kcc_sys_fork();
+    if (pid == 0) {
+        kcc_sys_execve(path, argv, (char *const *)kcc_envp);
+        kcc_sys_exit(127);
+    }
+    if (pid < 0) return -1;
+    int status = 0;
+    kcc_sys_wait4(pid, &status, 0, 0);
+    return (status >> 8) & 0xff;
+}
+@}
+
+\section{Automatic Linking}
+
+\texttt{link\_all} is the no-\texttt{-c} path: a first pass sets the flags, then
+it scans the arguments building the linker command line---compiling each
+\texttt{.c} to a temporary object (tracked for removal), forwarding an unknown
+\texttt{-flag} verbatim, and handing any other file (a \texttt{.o}, an archive)
+straight to \texttt{ld}.  It appends the freestanding link line
+(\texttt{-o out -lSystem -syslibroot <sdk> -arch <arch> -e \_main}), runs
+\texttt{ld}, removes the temporary objects, and exits with the linker's status.
+
+@l c
+@d Selfhost: driver link @{
+void kcc_driver_link_all(long argc, char **argv) {
+    /* Pass 1: honour flags wherever they appear. */
+    for (long i = 1; i < argc; ) {
+        char *a = argv[i];
+        if (kcc_strcmp(a, OPT_WALL) == 0) { kcc_warn_all = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_EMITASM) == 0) { kcc_emit_asm = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_TARGET_X86) == 0) { kcc_target = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_G) == 0) { kcc_dwarf_enabled = 1; i++; continue; }
+        const char *next = (i + 1 < argc) ? argv[i + 1] : 0;
+        unsigned long n = kcc_driver_I(a, next, 1);
+        if (n) { i += (long)n; continue; }
+        n = kcc_driver_D(a, next, 1);
+        if (n) { i += (long)n; continue; }
+        i++;
+    }
+
+    char **larg = (char **)kcc_arena_alloc((long)((argc + 12) * 8));
+    char **tmpobj = (char **)kcc_arena_alloc((long)((argc + 1) * 8));
+    long tmpcount = 0;
+
+    larg[0] = (char *)STR_LD_ARGV0;
+    long k = 1;                            /* next larg slot */
+    const char *out = 0;
+    long err = 0;
+    long inputs = 0;
+
+    for (long i = 1; i < argc; ) {
+        char *a = argv[i];
+        if (kcc_strcmp(a, OPT_O) == 0) {
+            i++;
+            if (i >= argc) break;
+            out = argv[i]; i++; continue;
+        }
+        if (kcc_strcmp(a, OPT_WALL) == 0 || kcc_strcmp(a, OPT_G) == 0 ||
+            kcc_strcmp(a, OPT_EMITASM) == 0 ||
+            kcc_strcmp(a, OPT_TARGET_X86) == 0) { i++; continue; }
+        unsigned long n = kcc_driver_I(a, 0, 0);
+        if (n) { i += (long)n; continue; }
+        n = kcc_driver_D(a, 0, 0);
+        if (n) { i += (long)n; continue; }
+        /* Classify a non-option argument. */
+        if (a[0] == '-') {                 /* unknown linker flag: forward */
+            larg[k++] = a; i++; continue;
+        }
+        unsigned long al = kcc_strlen(a);
+        if (al >= 2 && a[al - 2] == '.' && a[al - 1] == 'c') {
+            char *obj = kcc_driver_obj_name(a);
+            larg[k++] = obj;
+            tmpobj[tmpcount++] = obj;
+            err |= kcc_driver_compile(a, obj);
+            inputs++; i++;
+        } else {                           /* .o / .a / other: linker input */
+            larg[k++] = a;
+            inputs++; i++;
+        }
+    }
+
+    if (err) { kcc_io_flush(); kcc_sys_exit(1); }
+    if (inputs == 0) { kcc_io_err(ERR_NOINPUT); kcc_sys_exit(1); }
+
+    if (out == 0) out = STR_AOUT;
+    larg[k++] = (char *)OPT_O;
+    larg[k++] = (char *)out;
+    larg[k++] = (char *)STR_LSYSTEM;
+    larg[k++] = (char *)STR_SYSLIBROOT;
+    larg[k++] = kcc_driver_sdkroot();
+    larg[k++] = (char *)STR_ARCH;
+    larg[k++] = kcc_target ? (char *)STR_X86_64 : (char *)STR_ARM64;
+    larg[k++] = (char *)STR_DASH_E;
+    larg[k++] = (char *)STR_UMAIN;
+    larg[k] = 0;
+
+    kcc_io_flush();
+    int status = kcc_driver_spawn(STR_LD_PATH, larg);
+
+    for (long i = 0; i < tmpcount; i++) kcc_sys_unlink(tmpobj[i]);
+
+    kcc_io_flush();
+    kcc_sys_exit(status);
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: driver @{
+@<Selfhost: driver preamble@>
+@<Selfhost: driver compile@>
+@<Selfhost: driver args@>
+@<Selfhost: driver compile-all@>
+@<Selfhost: driver spawn@>
+@<Selfhost: driver link@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-driver-verify}
+
+\texttt{make selfhost-driver} runs the drop-in loop through the code-generation
+suite (whose harness drives \texttt{kcc\_driver\_compile\_all}) and the
+end-to-end suite (which drives \texttt{kcc\_driver\_link\_all} to build and run
+real executables), so both the compile and the link orchestration are verified.
+
+@d Selfhost: driver verify @{
+#!/usr/bin/env bash
+# make selfhost-driver — compile kcc's driver in C with kcc, relink, run the
+# codegen and end-to-end suites.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/driver.c with kcc"
+tmp/kcc -c "$SH/driver.c" -o "$SH/driver_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_driver (driver.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "driver" ]; then OBJ="$OBJ $SH/driver_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_driver $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running codegen + e2e with the self-hosted driver"
+cp tmp/kcc "$SH/kcc_asm_backup_driver"
+cp tmp/kcc_selfhost_driver tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh; s1=$?
+bash tmp/tests/e2e.sh;          s2=$?
+cp "$SH/kcc_asm_backup_driver" tmp/kcc
+[ $s1 -eq 0 ] && [ $s2 -eq 0 ]
+@}

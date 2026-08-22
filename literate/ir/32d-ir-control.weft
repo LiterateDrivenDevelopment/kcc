@@ -1185,10 +1185,26 @@ _kcc_ir_build_switch:
     bl _kcc_ir_branch_to
 
     // 6. Pass 3: build the whole body as one statement; case/default labels
-    //    place themselves (see kcc_ir_build_stmt).  Exit is the break target;
-    //    a switch has no continue.
-    ldr x0, [x21, #BB_ID]
-    mov x1, #0
+    //    place themselves (see kcc_ir_build_stmt).  Exit is the break target.
+    //    A switch is transparent to `continue` (\stdref{6.8.6.2}): a continue
+    //    in a switch body belongs to the enclosing loop, not the switch, so we
+    //    inherit the current top-of-stack continue target rather than clearing
+    //    it (0 only when the switch is not inside any loop).
+    ldr x0, [x21, #BB_ID]        // break = exit_bb
+    adrp x1, _kcc_loop_depth@@PAGE
+    add  x1, x1, _kcc_loop_depth@@PAGEOFF
+    ldr  x2, [x1]
+    cbz  x2, .Lsw_cont_none      // no enclosing loop → continue target 0
+    sub  x2, x2, #1              // enclosing entry index
+    lsl  x2, x2, #4              // * 16
+    add  x2, x2, #8              // + 8 = continue_bb_id field
+    adrp x3, _kcc_loop_stack@@PAGE
+    add  x3, x3, _kcc_loop_stack@@PAGEOFF
+    ldr  x1, [x3, x2]            // x1 = inherited continue target
+    b    .Lsw_cont_have
+.Lsw_cont_none:
+    mov  x1, #0
+.Lsw_cont_have:
     bl _kcc_loop_push
     ldr x0, [x19, #AST_F1]
     bl _kcc_ir_build_stmt
@@ -1253,6 +1269,9 @@ run_test "switch-nested-case-loop" \
 
 run_test "switch-case-in-block" \
     "int main(void) { int x = 1, r = 0; switch (x) { case 0: { r = 5; case 1: r = r + 8; } break; } return r; }" 8
+
+run_test "switch-continue-in-loop" \
+    "int main(void) { int s = 0, i = 0; while (i < 5) { switch (i) { case 2: i = i + 1; continue; default: break; } s = s + i; i = i + 1; } return s; }" 8
 @}
 
 \subsection{Break and Continue}
@@ -1264,7 +1283,13 @@ pushes its targets onto the stack before building the body, and pops
 after.  \texttt{\_kcc\_ir\_build\_break} reads the break target from
 the stack top, emits \texttt{IR\_BR} to that block, and marks the
 current block terminated.  \texttt{\_kcc\_ir\_build\_continue} does
-the same with the continue target.
+the same with the continue target.  A \texttt{switch} also pushes an
+entry---so that a \texttt{break} inside it exits the switch---but a
+\texttt{switch} is transparent to \texttt{continue} (\stdref{6.8.6.2}):
+its entry therefore carries the \emph{enclosing loop's} continue target,
+inherited from the entry beneath it, so a \texttt{continue} in a switch
+body correctly restarts the surrounding loop rather than branching to a
+non-existent target.
 
 @d IR: build break @{
 // -- Loop Stack -----------------------------------------------------------

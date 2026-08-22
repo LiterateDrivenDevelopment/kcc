@@ -1016,6 +1016,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: preprocessor verify@>
 @}
 
+\noindent The ARM64 code generator, ported to C
+(Chapter~\ref{ch:self-hosting-codegen}), a drop-in replacement:
+
+@o tmp/selfhost/codegen.c @{
+@<Selfhost: codegen@>
+@}
+
+@o tmp/selfhost/codegen_verify.sh @{
+@<Selfhost: codegen verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

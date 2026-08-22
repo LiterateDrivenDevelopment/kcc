@@ -621,6 +621,7 @@ the binaries, and verify that the exit code matches the expected value.
 @i literate/verification/48w-self-hosting-sema.weft
 @i literate/verification/48x-self-hosting-emit-x86.weft
 @i literate/verification/48y-self-hosting-preprocessor.weft
+@i literate/verification/48z-self-hosting-codegen.weft
 \end{multicols}
 \newpage
 

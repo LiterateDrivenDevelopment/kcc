@@ -1,0 +1,1826 @@
+% 48z-self-hosting-codegen.weft — Stage 8-final: the ARM64 code generator,
+% written in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The ARM64 Code Generator in C}
+\label{ch:self-hosting-codegen}
+
+The code generator of Chapters~\ref{ch:codegen}--\ref{ch:codegen} is the compiler's
+back-end spine: it walks the neutral IR and emits ARM64 machine code, byte for
+byte the object clang would produce.  Porting it---with the linear-scan register
+allocator, spill-slot colouring, the AAPCS64 argument marshaller, the FP
+d-register bank, and the per-opcode instruction dispatch---leaves only the IR
+builder in assembly.  Because every generated instruction is checked against
+clang by \texttt{difftest}, this is the most byte-sensitive port in the whole
+self-hosting effort: a single different register assignment or slot colour would
+change the machine code and fail the comparison.
+
+The C form is far more compact than the assembly it replaces, because each
+mov/bl/bl triple that computed an instruction word and appended it collapses to
+one nested call: \texttt{kcc\_code\_emit32(kcc\_enc\_add\_reg(...))}.
+
+\section{State, Constants, Externs}
+
+@l c
+@d Selfhost: cg preamble @{
+/* IR instruction / block / function field offsets */
+#define IR_OP 0
+#define IR_DEST 8
+#define IR_SRC1 16
+#define IR_SRC2 24
+#define IR_TYPE 32
+#define IR_NEXT 40
+#define BB_ID 0
+#define BB_FIRST 8
+#define BB_LAST 16
+#define IRF_NAME 0
+#define IRF_BLOCKS 16
+#define IRF_VREG_N 24
+#define IRF_PARAMS 40
+#define IRF_PARAM_CLS 48
+#define IRF_LOWPC 64
+#define IRF_STATIC 72
+#define IRF_SYMIDX 80
+#define IRF_VARIADIC 88
+/* type / AST / vec / sym offsets */
+#define TY_KIND 0
+#define TY_SIZE 8
+#define TY_ALIGN 16
+#define TY_QUALS 24
+#define TY_F0 32
+#define TY_F1 40
+#define AST_TAG 0
+#define AST_F0 24
+#define AST_F1 32
+#define AST_F2 40
+#define AST_F3 48
+#define AST_F4 56
+#define VEC_DATA 0
+#define VEC_COUNT 8
+#define VEC_CAP 16
+#define VEC_ELEMSIZE 24
+#define VEC_SIZE 32
+#define SYM_ENTRY_SIZE 32
+#define SYM_VALUE 16
+#define N_SECT 0x0E
+#define N_EXT 0x01
+#define PATCH_SIZE 16
+/* scratch registers */
+#define CG_REG_SRC1 9
+#define CG_REG_SRC2 10
+#define CG_REG_DST 11
+/* type kinds */
+enum { TY_VOID=1, TY_BOOL=2, TY_LLONG=7, TY_FLOAT=8, TY_DOUBLE=9, TY_LDOUBLE=10,
+       TY_PTR=11, TY_ARRAY=12, TY_STRUCT=14, TY_UNION=15, TY_ENUM=16 };
+/* IR opcodes */
+enum {
+    IR_ADD=1, IR_SUB=2, IR_MUL=3, IR_SDIV=4, IR_UDIV=5, IR_SMOD=6, IR_UMOD=7,
+    IR_NEG=8, IR_AND=10, IR_OR=11, IR_XOR=12, IR_SHL=13, IR_LSHR=14, IR_ASHR=15,
+    IR_NOT=16, IR_CMP_EQ=20, IR_CMP_NE=21, IR_CMP_SLT=22, IR_CMP_SLE=23,
+    IR_CMP_SGT=24, IR_CMP_SGE=25, IR_CMP_ULT=26, IR_CMP_ULE=27,
+    IR_LOAD=30, IR_STORE=31, IR_ALLOCA=32, IR_GEP=33, IR_BR=40, IR_BR_COND=41,
+    IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
+    IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_VA_START=56, IR_FPROUND=57,
+    IR_UITOFP=58, IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64,
+    IR_ASM=65
+};
+/* AST tags used by the prereg walk and rodata layout */
+enum {
+    AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_STR_LIT=52, AST_UNARY_EXPR=55,
+    AST_COMPOUND=30, AST_IF_STMT=32, AST_SWITCH_STMT=33, AST_WHILE_STMT=34,
+    AST_DO_STMT=35, AST_FOR_STMT=36, AST_CASE_STMT=42, AST_LABEL_STMT=41,
+    AST_DEFAULT_STMT=43, AST_INIT_LIST=65
+};
+/* ARM64 reloc types */
+enum { ARM64_RELOC_BRANCH26=2, ARM64_RELOC_PAGE21=3, ARM64_RELOC_PAGEOFF12=4,
+       ARM64_RELOC_GOT_LOAD_PAGE21=5, ARM64_RELOC_GOT_LOAD_PAGEOFF12=6 };
+
+/* ARM64 instruction encoders (from emit_arm64) */
+unsigned kcc_enc_add_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_sub_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_mul(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_sdiv(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_udiv(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_msub(unsigned,unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_add_imm(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_sub_imm(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_movz(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_movk(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_and_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_orr_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_eor_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_mvn(unsigned,unsigned,unsigned);
+unsigned kcc_enc_lsl_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_lsr_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_asr_reg(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_cmp_reg(unsigned,unsigned,unsigned);
+unsigned kcc_enc_cset(unsigned,unsigned,unsigned);
+unsigned kcc_enc_str_imm(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_ldr_imm(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_stp_pre(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_ldp_post(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_mov_reg(unsigned,unsigned,unsigned);
+unsigned kcc_enc_fp_dp2(unsigned,unsigned,unsigned,unsigned);
+unsigned kcc_enc_scvtf(unsigned,unsigned);
+unsigned kcc_enc_ucvtf(unsigned,unsigned);
+unsigned kcc_enc_fcvtzs(unsigned,unsigned);
+unsigned kcc_enc_fcvt_s_d(unsigned,unsigned);
+unsigned kcc_enc_fcvt_d_s(unsigned,unsigned);
+unsigned kcc_enc_fmov_d_x(unsigned,unsigned);
+unsigned kcc_enc_fmov_x_d(unsigned,unsigned);
+unsigned kcc_enc_fmov_d_d(unsigned,unsigned);
+unsigned kcc_enc_fneg_d(unsigned,unsigned);
+unsigned kcc_enc_fcmp(unsigned,unsigned);
+unsigned kcc_enc_ldr_fp(unsigned,unsigned,unsigned);
+unsigned kcc_enc_str_fp(unsigned,unsigned,unsigned);
+unsigned kcc_enc_ldr_fp_s(unsigned,unsigned,unsigned);
+unsigned kcc_enc_str_fp_s(unsigned,unsigned,unsigned);
+unsigned kcc_enc_b(long);
+unsigned kcc_enc_bl(long);
+unsigned kcc_enc_cbnz(unsigned,long,unsigned);
+unsigned kcc_enc_ret(void);
+unsigned kcc_enc_blr(unsigned);
+unsigned kcc_enc_nop(void);
+unsigned kcc_enc_adrp(unsigned,unsigned);
+/* code buffer (emit_arm64) */
+void kcc_code_init(void);
+void kcc_code_emit32(unsigned word);
+unsigned long kcc_code_current_pos(void);
+void kcc_code_patch32(unsigned long off, unsigned word);
+extern void *kcc_code_buf; extern unsigned long kcc_code_pos, kcc_code_cap;
+/* linker / vec / ht / arena / string / sema */
+void *kcc_arena_alloc(unsigned long);
+void *kcc_memcpy(void*,const void*,unsigned long);
+unsigned long kcc_strlen(const char*);
+int kcc_strcmp(const char*,const char*);
+void *kcc_ht_init(unsigned long);
+void kcc_ht_put(void*,const void*,unsigned long,void*);
+void *kcc_ht_get(void*,const void*,unsigned long);
+void *kcc_vec_get(void*,unsigned long);
+void kcc_vec_push(void*,const void*);
+void *kcc_sema_resolve_type(void*);
+unsigned long kcc_type_layout(void*);
+unsigned long kcc_eval_const_int(void*);
+const char *kcc_ir_static_name(void*);
+unsigned long kcc_ir_load_width(void*);
+int kcc_global_const_rodata(void*);
+int kcc_global_const_ptrarr(void*);
+void kcc_as_add_snip(unsigned long,const char*,unsigned long);
+void kcc_io_err(const char*);
+unsigned long kcc_linker_add_sym(const char*,unsigned long,unsigned long,unsigned long);
+void kcc_linker_add_reloc(unsigned long,unsigned long,unsigned long);
+unsigned long kcc_linker_extern(const char*);
+unsigned long kcc_linker_global_sym(const char*,unsigned long);
+extern void *kcc_ir_funcs, *kcc_linker_syms, *kcc_linker_extern_ht;
+extern char kcc_str_modinit[];
+extern unsigned long kcc_modinit_sym;
+
+/* codegen state — this module is its definition site */
+unsigned long kcc_cg_frame_size = 0;
+unsigned long kcc_cg_vreg_count = 0;
+void *kcc_cg_slotmap = 0;
+unsigned long kcc_cg_max_slot = 0;
+void *kcc_cstr_buf = 0;
+unsigned long kcc_cstr_cap = 0;
+unsigned long kcc_cstr_pos = 0;
+unsigned long kcc_cstr_count = 0;
+void *kcc_cstr_fixups = 0;
+unsigned long kcc_rodata_const_present = 0;
+unsigned long kcc_rodata_const_size = 0;
+void *kcc_rodata_const_relocs = 0;
+unsigned long kcc_rodata_const_fileoff = 0;
+void *kcc_cg_defined_globals = 0;
+void *kcc_cg_regmap = 0;
+void *kcc_cg_promoted = 0;
+unsigned long kcc_cg_callee_mask = 0;
+unsigned long kcc_cg_save_count = 0;
+unsigned long kcc_cg_save_base = 0;
+void *kcc_cg_fpregmap = 0;
+unsigned long kcc_cg_fp_callee_mask = 0;
+unsigned long kcc_cg_fp_save_count = 0;
+unsigned long kcc_cg_fp_save_base = 0;
+
+#define IL(i,off) (*(unsigned long *)((char *)(i) + (off)))
+#define EMIT(w) kcc_code_emit32((w))
+
+/* forward decls */
+void kcc_codegen_func(void *func);
+void kcc_cg_regalloc(void *func);
+void kcc_cg_color_slots(void *func, unsigned long vreg_n, unsigned long *lastuse, unsigned long *flags);
+unsigned long kcc_cg_slot_offset(unsigned long vreg);
+void kcc_cg_load_vreg(unsigned long vreg, unsigned long reg);
+void kcc_cg_store_vreg(unsigned long vreg, unsigned long reg);
+void kcc_cg_load_vreg_fp(unsigned long vreg, unsigned long reg);
+void kcc_cg_store_vreg_fp(unsigned long vreg, unsigned long reg);
+unsigned long kcc_cg_promoted_reg(unsigned long vreg);
+void kcc_cg_callee_transfer(unsigned long restore);
+unsigned long kcc_cg_marshal_args(unsigned long *args, unsigned long count, unsigned long fsi);
+void kcc_codegen_instr(void *instr, void *bb_labels, void *patches);
+void kcc_codegen_patch_branches(void *bb_labels, void *patches);
+void kcc_codegen_string_lit(void *instr);
+void kcc_cg_emit_add_imm(unsigned long rd, unsigned long rn, unsigned long imm);
+void kcc_cg_emit_sub_imm(unsigned long rd, unsigned long rn, unsigned long imm);
+void kcc_cg_emit_frame_ldst(unsigned long rt, unsigned long byte_off, unsigned long kind);
+unsigned long kcc_emit_cstring(const char *data, unsigned long len);
+void kcc_cstr_reserve(unsigned long need);
+unsigned long kcc_rodata_leaf_bits(void *n, unsigned long kind);
+void kcc_emit_rodata_global(void *decl, const char *uname);
+void kcc_emit_rodata_ptrarr(void *decl, const char *uname);
+void kcc_emit_struct_fields(void *sty, void *init, char *buf, unsigned long base);
+void kcc_cg_prereg_static(void *decl);
+void kcc_cg_prereg_stmt(void *stmt);
+void kcc_cg_asm_extended(void *node);
+static void cg_normalize_ret(void *ret_type);
+
+/* Build the Mach-O "_"+name in the arena. */
+static char *underscore(const char *name) {
+    unsigned long l = kcc_strlen(name);
+    char *b = (char *)kcc_arena_alloc(l + 2);
+    b[0] = '_';
+    kcc_memcpy(b + 1, name, l + 1);
+    return b;
+}
+@}
+
+\section{Initialization and the Frame Constants}
+
+@l c
+@d Selfhost: cg init @{
+void kcc_codegen_init(void) {
+    kcc_cg_frame_size = 0;
+    kcc_cstr_buf = kcc_arena_alloc(4096);
+    kcc_cstr_cap = 4096;
+    kcc_cstr_pos = 0;
+    kcc_cstr_count = 0;
+    void *fx = kcc_arena_alloc(VEC_SIZE);
+    kcc_cstr_fixups = fx;
+    IL(fx, VEC_ELEMSIZE) = 16;
+    IL(fx, VEC_CAP) = 32;
+    IL(fx, VEC_COUNT) = 0;
+    IL(fx, VEC_DATA) = (unsigned long)kcc_arena_alloc(512);
+    kcc_rodata_const_present = 0;
+    kcc_rodata_const_size = 0;
+    void *rc = kcc_arena_alloc(VEC_SIZE);
+    kcc_rodata_const_relocs = rc;
+    IL(rc, VEC_ELEMSIZE) = 16;
+    IL(rc, VEC_CAP) = 32;
+    IL(rc, VEC_COUNT) = 0;
+    IL(rc, VEC_DATA) = (unsigned long)kcc_arena_alloc(512);
+    kcc_cg_defined_globals = kcc_ht_init(32);
+}
+@}
+
+\section{Read-Only Constant Globals}
+
+\texttt{rodata\_leaf\_bits} folds a leaf initialiser to its raw bits; the rodata
+emitters lay a \texttt{const} scalar, array, struct, or array-of-struct into the
+read-only cstring buffer with a section-1 symbol and a fixup, and a const
+pointer array into \texttt{\_\_DATA\_CONST,\_\_const} with per-slot relocations.
+
+@l c
+@d Selfhost: cg rodata @{
+unsigned long kcc_rodata_leaf_bits(void *n, unsigned long kind) {
+    if (kind < TY_FLOAT) return kcc_eval_const_int(n);   /* integer */
+    if (IL(n, AST_TAG) == AST_UNARY_EXPR) {              /* -literal: flip sign bit */
+        void *lit = (void *)IL(n, AST_F1);
+        return IL(lit, AST_F0) ^ (1UL << 63);
+    }
+    return IL(n, AST_F0);                                /* float literal bits */
+}
+
+/* Write `size` little-endian bytes of `bits` at buf[off], narrowing to single
+ * precision when the element kind is float. */
+static void write_le(char *buf, unsigned long off, unsigned long bits,
+                     unsigned long size, unsigned long kind) {
+    if (kind == TY_FLOAT) {
+        /* narrow the double bit pattern to a single via the FP unit */
+        double d;
+        kcc_memcpy(&d, &bits, 8);
+        float f = (float)d;
+        unsigned w;
+        kcc_memcpy(&w, &f, 4);
+        bits = w;
+    }
+    for (unsigned long j = 0; j < size; j++) {
+        buf[off + j] = (char)(bits & 0xff);
+        bits >>= 8;
+    }
+}
+
+void kcc_emit_struct_fields(void *sty, void *init, char *buf, unsigned long base) {
+    void *decl = (void *)IL(sty, TY_F0);
+    void *field = (void *)IL(decl, AST_F1);
+    void *elem = (void *)IL(init, AST_F0);
+    while (field && elem) {
+        void *ft = kcc_sema_resolve_type((void *)IL(field, AST_F0));
+        unsigned long fsize = IL(ft, TY_SIZE);
+        unsigned long fkind = IL(ft, TY_KIND);
+        unsigned long bits = kcc_rodata_leaf_bits(elem, fkind);
+        unsigned long foff = IL(field, AST_F3);
+        write_le(buf, base + foff, bits, fsize, fkind);
+        field = (void *)IL(field, AST_F4);
+        elem = (void *)IL(elem, AST_F4);
+    }
+}
+
+void kcc_emit_rodata_global(void *decl, const char *uname) {
+    void *full = kcc_sema_resolve_type((void *)IL(decl, AST_F0));
+    unsigned long total = kcc_type_layout(full);
+    unsigned long span = total;
+    unsigned long kind = IL(full, TY_KIND);
+    void *elemtype;
+    if (kind == TY_STRUCT) {
+        /* scalar struct */
+        unsigned long pos = kcc_cstr_pos;
+        unsigned long al = IL(full, TY_ALIGN);
+        unsigned long o = (pos + al - 1) & ~(al - 1);
+        kcc_cstr_reserve(o + total);
+        char *buf = (char *)kcc_cstr_buf;
+        for (unsigned long i = pos; i < o + total; i++) buf[i] = 0;
+        kcc_emit_struct_fields(full, (void *)IL(decl, AST_F2), buf, o);
+        kcc_cstr_pos = o + total;
+        unsigned long flags = N_SECT;
+        if (IL(decl, AST_F3) != 3) flags |= N_EXT;
+        unsigned long sym = kcc_linker_add_sym(uname, 1, 0, flags);
+        unsigned long fix[2] = { sym, o };
+        kcc_vec_push(kcc_cstr_fixups, fix);
+        kcc_ht_put(kcc_linker_extern_ht, uname, kcc_strlen(uname), (void *)(sym + 1));
+        return;
+    }
+    if (kind == TY_ARRAY && IL((void *)IL(full, TY_F0), TY_KIND) == TY_STRUCT) {
+        /* array of structs */
+        elemtype = (void *)IL(full, TY_F0);
+        unsigned long stride = IL(elemtype, TY_SIZE);
+        unsigned long cnt = 0;
+        for (void *e = (void *)IL((void *)IL(decl, AST_F2), AST_F0); e; e = (void *)IL(e, AST_F4)) cnt++;
+        if (cnt * stride > span) span = cnt * stride;
+        unsigned long pos = kcc_cstr_pos;
+        unsigned long al = IL(elemtype, TY_ALIGN);
+        unsigned long o = (pos + al - 1) & ~(al - 1);
+        kcc_cstr_reserve(o + span);
+        char *buf = (char *)kcc_cstr_buf;
+        for (unsigned long i = pos; i < o + span; i++) buf[i] = 0;
+        unsigned long b = o;
+        for (void *e = (void *)IL((void *)IL(decl, AST_F2), AST_F0); e; e = (void *)IL(e, AST_F4)) {
+            kcc_emit_struct_fields(elemtype, e, buf, b);
+            b += stride;
+        }
+        kcc_cstr_pos = o + span;
+        {
+            unsigned long flags = N_SECT;
+            if (IL(decl, AST_F3) != 3) flags |= N_EXT;
+            unsigned long sym = kcc_linker_add_sym(uname, 1, 0, flags);
+            unsigned long fix[2] = { sym, o };
+            kcc_vec_push(kcc_cstr_fixups, fix);
+            kcc_ht_put(kcc_linker_extern_ht, uname, kcc_strlen(uname), (void *)(sym + 1));
+        }
+        return;
+    }
+    /* scalar / array-of-scalar */
+    if (kind == TY_ARRAY) elemtype = (void *)IL(full, TY_F0);
+    else elemtype = full;
+    unsigned long esize = IL(elemtype, TY_SIZE);
+    unsigned long ekind = IL(elemtype, TY_KIND);
+    unsigned long cnt = 1;
+    void *init = (void *)IL(decl, AST_F2);
+    if (IL(init, AST_TAG) == AST_INIT_LIST) {
+        cnt = 0;
+        for (void *e = (void *)IL(init, AST_F0); e; e = (void *)IL(e, AST_F4)) cnt++;
+    }
+    if (cnt * esize > span) span = cnt * esize;
+    unsigned long pos = kcc_cstr_pos;
+    unsigned long al = IL(elemtype, TY_ALIGN);
+    unsigned long o = (pos + al - 1) & ~(al - 1);
+    kcc_cstr_reserve(o + span);
+    char *buf = (char *)kcc_cstr_buf;
+    for (unsigned long i = pos; i < o; i++) buf[i] = 0;
+    unsigned long w = o;
+    if (IL(init, AST_TAG) == AST_INIT_LIST) {
+        for (void *e = (void *)IL(init, AST_F0); e; e = (void *)IL(e, AST_F4)) {
+            write_le(buf, w, kcc_rodata_leaf_bits(e, ekind), esize, ekind);
+            w += esize;
+        }
+    } else {
+        write_le(buf, w, kcc_rodata_leaf_bits(init, ekind), esize, ekind);
+        w += esize;
+    }
+    for (; w < o + span; w++) buf[w] = 0;
+    kcc_cstr_pos = o + span;
+    {
+        unsigned long flags = N_SECT;
+        if (IL(decl, AST_F3) != 3) flags |= N_EXT;
+        unsigned long sym = kcc_linker_add_sym(uname, 1, 0, flags);
+        unsigned long fix[2] = { sym, o };
+        kcc_vec_push(kcc_cstr_fixups, fix);
+        kcc_ht_put(kcc_linker_extern_ht, uname, kcc_strlen(uname), (void *)(sym + 1));
+    }
+}
+
+void kcc_emit_rodata_ptrarr(void *decl, const char *uname) {
+    kcc_rodata_const_present = 1;
+    unsigned long total = kcc_type_layout(kcc_sema_resolve_type((void *)IL(decl, AST_F0)));
+    unsigned long o = (kcc_rodata_const_size + 7) & ~7UL;
+    void *e = (void *)IL((void *)IL(decl, AST_F2), AST_F0);
+    unsigned long i = 0;
+    for (; e; e = (void *)IL(e, AST_F4), i++) {
+        if (IL(e, AST_TAG) != AST_STR_LIT) continue;
+        unsigned long sym = kcc_emit_cstring((const char *)IL(e, AST_F0), IL(e, AST_F1));
+        unsigned long rel[2] = { o + i * 8, sym };
+        kcc_vec_push(kcc_rodata_const_relocs, rel);
+    }
+    unsigned long span = i * 8;
+    if (span < total) span = total;
+    kcc_rodata_const_size = o + span;
+    unsigned long flags = N_SECT;
+    if (IL(decl, AST_F3) != 3) flags |= N_EXT;
+    unsigned long sym = kcc_linker_add_sym(uname, 3, o, flags);
+    kcc_ht_put(kcc_linker_extern_ht, uname, kcc_strlen(uname), (void *)(sym + 1));
+}
+@}
+
+\section{Pre-registering Globals and Functions}
+
+@l c
+@d Selfhost: cg prereg @{
+static unsigned long fam_extra(void *decl, void *ty) {
+    if (IL(ty, TY_KIND) != TY_STRUCT) return 0;
+    void *init = (void *)IL(decl, AST_F2);
+    if (!init || IL(init, AST_TAG) != AST_INIT_LIST) return 0;
+    void *sdecl = (void *)IL(ty, TY_F0);
+    if (!sdecl) return 0;
+    void *field = (void *)IL(sdecl, AST_F1);
+    if (!field) return 0;
+    unsigned long nf = 1;
+    while (IL(field, AST_F4)) { field = (void *)IL(field, AST_F4); nf++; }
+    void *ft = kcc_sema_resolve_type((void *)IL(field, AST_F0));
+    if (!ft || IL(ft, TY_KIND) != TY_ARRAY) return 0;
+    if (IL(ft, TY_F1)) return 0;                         /* sized: not flexible */
+    unsigned long esz = kcc_type_layout((void *)IL(ft, TY_F0));
+    void *e = (void *)IL(init, AST_F0);
+    unsigned long skip = nf - 1;
+    while (e && skip) { e = (void *)IL(e, AST_F4); skip--; }
+    if (!e) return 0;
+    if (IL(e, AST_TAG) == AST_STR_LIT) return IL(e, AST_F1) + 1;
+    if (IL(e, AST_TAG) != AST_INIT_LIST) return 0;
+    unsigned long c = 0;
+    for (void *s = (void *)IL(e, AST_F0); s; s = (void *)IL(s, AST_F4)) c++;
+    return c * esz;
+}
+
+void kcc_preregister_globals(void *tu) {
+    void *first = (void *)IL(tu, AST_F0);
+    for (void *d = first; d; d = (void *)IL(d, AST_F4)) {
+        if (IL(d, AST_TAG) != AST_VAR_DECL) continue;
+        void *name = (void *)IL(d, AST_F1);
+        if (!name) continue;
+        if (IL(d, AST_F3) == 2) continue;                /* extern */
+        void *ty = kcc_sema_resolve_type((void *)IL(d, AST_F0));
+        if (!ty) continue;
+        unsigned long size = kcc_type_layout(ty) + fam_extra(d, ty);
+        if (size < 8) size = 8;
+        size = (size + 7) & ~7UL;
+        char *uname = underscore(name);
+        if (kcc_global_const_rodata(d)) kcc_emit_rodata_global(d, uname);
+        else if (kcc_global_const_ptrarr(d)) kcc_emit_rodata_ptrarr(d, uname);
+        else kcc_linker_global_sym(uname, size);
+        kcc_ht_put(kcc_cg_defined_globals, name, kcc_strlen(name), (void *)1);
+    }
+    for (void *d = first; d; d = (void *)IL(d, AST_F4)) {
+        if (IL(d, AST_TAG) != AST_FUNC_DECL) continue;
+        void *body = (void *)IL(d, AST_F3);
+        if (body) kcc_cg_prereg_stmt(body);
+    }
+}
+
+void kcc_cg_prereg_static(void *decl) {
+    const char *mangled = kcc_ir_static_name(decl);
+    void *ty0 = (void *)IL(decl, AST_F0);
+    unsigned long size = 8;
+    if (ty0) {
+        void *ty = kcc_sema_resolve_type(ty0);
+        if (ty) {
+            unsigned long s = kcc_type_layout(ty);
+            if (s >= 8) size = (s + 7) & ~7UL;
+        }
+    }
+    char *uname = underscore(mangled);
+    if (kcc_global_const_rodata(decl)) kcc_emit_rodata_global(decl, uname);
+    else if (kcc_global_const_ptrarr(decl)) kcc_emit_rodata_ptrarr(decl, uname);
+    else kcc_linker_global_sym(uname, size);
+    kcc_ht_put(kcc_cg_defined_globals, mangled, kcc_strlen(mangled), (void *)1);
+}
+
+void kcc_cg_prereg_stmt(void *stmt) {
+    for (void *s = stmt; s; s = (void *)IL(s, AST_F4)) {
+        unsigned long tag = IL(s, AST_TAG);
+        if (tag == AST_VAR_DECL) { if (IL(s, AST_F3) == 3) kcc_cg_prereg_static(s); continue; }
+        switch (tag) {
+        case AST_COMPOUND: case AST_DO_STMT: case AST_DEFAULT_STMT:
+            kcc_cg_prereg_stmt((void *)IL(s, AST_F0)); break;
+        case AST_SWITCH_STMT: case AST_WHILE_STMT: case AST_CASE_STMT: case AST_LABEL_STMT:
+            kcc_cg_prereg_stmt((void *)IL(s, AST_F1)); break;
+        case AST_IF_STMT:
+            kcc_cg_prereg_stmt((void *)IL(s, AST_F1));
+            kcc_cg_prereg_stmt((void *)IL(s, AST_F2));
+            break;
+        case AST_FOR_STMT:
+            kcc_cg_prereg_stmt((void *)IL(s, AST_F0));
+            kcc_cg_prereg_stmt((void *)IL(s, AST_F3));
+            break;
+        default: break;
+        }
+    }
+}
+
+void kcc_cg_preregister_funcs(void) {
+    void *funcs = kcc_ir_funcs;
+    if (!funcs) return;
+    unsigned long n = IL(funcs, VEC_COUNT);
+    for (unsigned long i = 0; i < n; i++) {
+        void *f = *(void **)kcc_vec_get(funcs, i);
+        const char *name = (const char *)IL(f, IRF_NAME);
+        int is_modinit = (kcc_strcmp(name, kcc_str_modinit) == 0);
+        char *uname = underscore(name);
+        unsigned long flags = N_SECT | N_EXT;
+        if (is_modinit || IL(f, IRF_STATIC)) flags = N_SECT;
+        unsigned long sym = kcc_linker_add_sym(uname, 1, 0, flags);
+        IL(f, IRF_SYMIDX) = sym;
+        if (is_modinit) { kcc_modinit_sym = sym + 1; continue; }
+        kcc_ht_put(kcc_linker_extern_ht, uname, kcc_strlen(uname), (void *)(sym + 1));
+    }
+}
+
+void kcc_codegen_all(void) {
+    kcc_cg_preregister_funcs();
+    void *funcs = kcc_ir_funcs;
+    if (!funcs) return;
+    unsigned long n = IL(funcs, VEC_COUNT);
+    for (unsigned long i = 0; i < n; i++)
+        kcc_codegen_func(*(void **)kcc_vec_get(funcs, i));
+}
+@}
+
+\section{Register Allocation}
+
+The linear-scan allocator: pass~1 records per-vreg liveness (last use, defining
+block, escape, call-crossing) and candidate flags; a promotability scan marks
+scalar locals whose address never escapes; loop detection sets \texttt{has\_loop};
+then the integer and FP scans hand out registers; finally the promotion map is
+built and the spill slots are coloured.
+
+@l c
+@d Selfhost: cg regalloc @{
+static void ra_use(unsigned long u, unsigned long cur_bb, unsigned long pos, unsigned long calls,
+                   unsigned long vreg_n, unsigned long *lastuse, unsigned long *defbb,
+                   unsigned long *calldef, unsigned long *flags) {
+    if (u >= vreg_n) return;
+    lastuse[u] = pos;
+    if (defbb[u] != cur_bb) flags[u] |= 2;               /* escapes */
+    if (calls > calldef[u]) flags[u] |= 4;               /* crosses a call */
+}
+static void ra_disq(unsigned long u, unsigned long *flags, unsigned long vreg_n) {
+    if (u >= vreg_n) return;
+    if (flags[u] & 0x100) flags[u] &= ~(unsigned long)0x100;
+}
+
+void kcc_cg_regalloc(void *func) {
+    unsigned long vreg_n = IL(func, IRF_VREG_N);
+    kcc_cg_regmap = 0; kcc_cg_promoted = 0; kcc_cg_callee_mask = 0; kcc_cg_save_count = 0;
+    kcc_cg_fpregmap = 0; kcc_cg_fp_callee_mask = 0; kcc_cg_fp_save_count = 0;
+    kcc_cg_slotmap = 0; kcc_cg_max_slot = vreg_n;
+    if (!vreg_n) return;
+    unsigned long *block = (unsigned long *)kcc_arena_alloc(vreg_n * 8 * 7);
+    for (unsigned long i = 0; i < vreg_n * 7; i++) block[i] = 0;
+    unsigned long *lastuse = block, *defbb = block + vreg_n, *calldef = block + 2 * vreg_n;
+    unsigned long *flags = block + 3 * vreg_n, *map = block + 4 * vreg_n;
+    unsigned long *promoted = block + 5 * vreg_n, *fpmap = block + 6 * vreg_n;
+    void *blocks = (void *)IL(func, IRF_BLOCKS);
+    unsigned long nbb = IL(blocks, VEC_COUNT);
+
+    /* ---- pass 1: liveness / candidates ---- */
+    unsigned long pos = 0, calls = 0;
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT)) {
+            unsigned long op = IL(i, IR_OP);
+            if (op == IR_ASM) {
+                void *node = (void *)IL(i, IR_TYPE);
+                if (node) for (void *o = (void *)IL(node, AST_F2); o; o = (void *)IL(o, AST_F4)) {
+                    unsigned long v = IL(o, AST_F2) & 0xffffffff;
+                    if (v) ra_use(v - 1, b, pos, calls, vreg_n, lastuse, defbb, calldef, flags);
+                    unsigned long a = IL(o, AST_F3) & 0xffffffff;
+                    if (a) ra_use(a - 1, b, pos, calls, vreg_n, lastuse, defbb, calldef, flags);
+                }
+                pos++;
+                continue;
+            }
+            /* SRC1 use (skip const/call/br/global_ref) */
+            if (op != IR_CONST && op != IR_CALL && op != IR_BR && op != IR_GLOBAL_REF)
+                ra_use(IL(i, IR_SRC1), b, pos, calls, vreg_n, lastuse, defbb, calldef, flags);
+            /* SRC2 use / call args / brcond */
+            if (op == IR_CALL || op == IR_CALL_IND) {
+                unsigned long *args = (unsigned long *)IL(i, IR_SRC2);
+                if (args) {
+                    unsigned long ac = args[0] & 0xffffffff;
+                    for (unsigned long k = 0; k < ac; k++)
+                        ra_use(args[1 + 2 * k], b, pos, calls, vreg_n, lastuse, defbb, calldef, flags);
+                }
+                calls++;
+                /* struct/union-returning call: DEST is a use, escapes */
+                void *ty = (void *)IL(i, IR_TYPE);
+                if (ty && (IL(ty, 0) == 14 || IL(ty, 0) == 15)) {
+                    ra_use(IL(i, IR_DEST), b, pos, calls, vreg_n, lastuse, defbb, calldef, flags);
+                    unsigned long dd = IL(i, IR_DEST);
+                    if (dd < vreg_n) flags[dd] |= 2;
+                }
+                pos++;
+                continue;
+            }
+            if (op == IR_BR_COND) {
+                ra_use(IL(i, IR_DEST), b, pos, calls, vreg_n, lastuse, defbb, calldef, flags);
+                pos++;
+                continue;
+            }
+            if (op != IR_BR && op != IR_CONST)
+                ra_use(IL(i, IR_SRC2), b, pos, calls, vreg_n, lastuse, defbb, calldef, flags);
+            /* def check */
+            if (op != IR_BR && op != IR_STORE && op != IR_RET) {
+                int is_fp = 0, is_cand = 0;
+                if (op == IR_ALLOCA) is_cand = 1;
+                else {
+                    void *ty = (void *)IL(i, IR_TYPE);
+                    if (ty) {
+                        unsigned long k = IL(ty, TY_KIND);
+                        if (k >= 2 && k <= 7) is_cand = 1;
+                        else if (k >= 8 && k <= 10) { is_cand = 1; is_fp = 1; }
+                        else if (k == 11 || k == 16) is_cand = 1;
+                    }
+                }
+                if (is_cand) {
+                    unsigned long d = IL(i, IR_DEST);
+                    if (d < vreg_n) {
+                        if (is_fp) flags[d] |= 0x8;
+                        defbb[d] = b;
+                        calldef[d] = calls;
+                        flags[d] |= 1;
+                    }
+                }
+            }
+            pos++;
+        }
+    }
+
+    /* ---- promotability (mem2reg) ---- */
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT)) {
+            unsigned long op = IL(i, IR_OP);
+            if (op == IR_ASM) {
+                void *node = (void *)IL(i, IR_TYPE);
+                if (node) for (void *o = (void *)IL(node, AST_F2); o; o = (void *)IL(o, AST_F4)) {
+                    unsigned long a = IL(o, AST_F3) & 0xffffffff;
+                    if (a) ra_disq(a - 1, flags, vreg_n);
+                }
+                continue;
+            }
+            if (op == IR_ALLOCA) {
+                void *et = (void *)IL(i, IR_TYPE);
+                if (!et) continue;
+                if (IL(et, TY_QUALS) & 2) continue;
+                unsigned long k = IL(et, TY_KIND);
+                int scalar = (k >= 2 && k <= 7) || k == 11 || k == 16;
+                if (!scalar) continue;
+                if (IL(i, IR_SRC1) > 1) continue;
+                unsigned long d = IL(i, IR_DEST);
+                if (d < vreg_n) flags[d] |= 0x100;
+                continue;
+            }
+            if (op == IR_STORE) { ra_disq(IL(i, IR_SRC1), flags, vreg_n); continue; }
+            if (op == IR_LOAD || op == IR_VA_START || op == IR_CONST || op == IR_NOP ||
+                op == IR_GLOBAL_REF || op == IR_STRING_LIT || op == IR_BR) continue;
+            if (op == IR_BR_COND) { ra_disq(IL(i, IR_DEST), flags, vreg_n); continue; }
+            if (op == IR_RET) {
+                void *ty = (void *)IL(i, IR_TYPE);
+                if (ty && IL(ty, 0) != TY_VOID) ra_disq(IL(i, IR_SRC1), flags, vreg_n);
+                continue;
+            }
+            if (op == IR_CALL_IND) ra_disq(IL(i, IR_SRC1), flags, vreg_n);
+            if (op == IR_CALL || op == IR_CALL_IND) {
+                unsigned long *args = (unsigned long *)IL(i, IR_SRC2);
+                if (args) {
+                    unsigned long ac = args[0] & 0xffffffff;
+                    for (unsigned long k = 0; k < ac; k++) ra_disq(args[1 + 2 * k], flags, vreg_n);
+                }
+                continue;
+            }
+            if (op == IR_NEG || op == IR_NOT || op >= 50) {
+                ra_disq(IL(i, IR_SRC1), flags, vreg_n);
+            } else {
+                ra_disq(IL(i, IR_SRC1), flags, vreg_n);
+                ra_disq(IL(i, IR_SRC2), flags, vreg_n);
+            }
+        }
+    }
+
+    /* ---- loop detection ---- */
+    int has_loop = 0;
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        unsigned long id = IL(bb, BB_ID);
+        void *term = (void *)IL(bb, BB_LAST);
+        if (!term) continue;
+        unsigned long top = IL(term, IR_OP);
+        if (top == IR_BR) { if (IL(term, IR_SRC1) <= id) has_loop = 1; }
+        else if (top == IR_BR_COND) {
+            if (IL(term, IR_SRC1) <= id || IL(term, IR_SRC2) <= id) has_loop = 1;
+        }
+    }
+
+    /* ---- integer linear scan ---- */
+    long reg_end[13];
+    for (int i = 0; i < 13; i++) reg_end[i] = -1;
+    if (has_loop) {
+        unsigned long slot = 4;                          /* index 4 = x19 */
+        for (unsigned long v = 0; v < vreg_n && slot < 13; v++) {
+            unsigned long fl = flags[v];
+            if (fl & 0x8) continue;
+            if ((fl & 3) != 3) continue;
+            if (!lastuse[v]) continue;
+            unsigned long preg = 15 + slot;
+            map[v] = preg;
+            reg_end[slot] = 0x40000000;
+            kcc_cg_callee_mask |= 1UL << (preg - 19);
+            slot++;
+        }
+    }
+    pos = 0;
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT), pos++) {
+            unsigned long op = IL(i, IR_OP);
+            if (op == IR_BR || op == IR_BR_COND || op == IR_STORE || op == IR_RET) continue;
+            if (op == IR_CALL || op == IR_CALL_IND) {
+                void *ty = (void *)IL(i, IR_TYPE);
+                if (ty && (IL(ty, 0) == 14 || IL(ty, 0) == 15)) continue;
+            }
+            unsigned long d = IL(i, IR_DEST);
+            if (d >= vreg_n) continue;
+            unsigned long fl = flags[d];
+            if (!(fl & 1)) continue;
+            if (fl & 0x8) continue;
+            if (fl & 2) { if (has_loop) continue; }
+            unsigned long lu = lastuse[d];
+            if (lu <= pos) continue;
+            unsigned long start = (fl & 4) ? 4 : 0;
+            for (unsigned long s = start; s < 13; s++) {
+                if (reg_end[s] >= (long)pos) continue;
+                unsigned long preg = (s < 4) ? (12 + s) : (15 + s);
+                map[d] = preg;
+                reg_end[s] = (long)lu;
+                if (s >= 4) kcc_cg_callee_mask |= 1UL << (preg - 19);
+                break;
+            }
+        }
+    }
+
+    /* ---- FP linear scan ---- */
+    long reg_end_fp[24];
+    for (int i = 0; i < 24; i++) reg_end_fp[i] = -1;
+    if (has_loop) {
+        unsigned long slot = 16;                         /* 16 → d8 */
+        for (unsigned long v = 0; v < vreg_n && slot < 24; v++) {
+            unsigned long fl = flags[v];
+            if (!(fl & 0x8)) continue;
+            if ((fl & 3) != 3) continue;
+            if (!lastuse[v]) continue;
+            unsigned long dreg = slot - 8;
+            fpmap[v] = dreg;
+            reg_end_fp[slot] = 0x40000000;
+            kcc_cg_fp_callee_mask |= 1UL << (dreg - 8);
+            slot++;
+        }
+    }
+    pos = 0;
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT), pos++) {
+            unsigned long op = IL(i, IR_OP);
+            if (op == IR_BR || op == IR_BR_COND || op == IR_STORE || op == IR_RET) continue;
+            unsigned long d = IL(i, IR_DEST);
+            if (d >= vreg_n) continue;
+            unsigned long fl = flags[d];
+            if (!(fl & 0x8)) continue;
+            if (fl & 2) { if (has_loop) continue; }
+            unsigned long lu = lastuse[d];
+            if (lu <= pos) continue;
+            unsigned long start = (fl & 4) ? 16 : 0;
+            for (unsigned long s = start; s < 24; s++) {
+                if (reg_end_fp[s] >= (long)pos) continue;
+                unsigned long dreg = (s < 16) ? (16 + s) : (s - 8);
+                fpmap[d] = dreg;
+                reg_end_fp[s] = (long)lu;
+                if (s >= 16) kcc_cg_fp_callee_mask |= 1UL << (dreg - 8);
+                break;
+            }
+        }
+    }
+    kcc_cg_fpregmap = fpmap;
+    { unsigned long m = kcc_cg_fp_callee_mask, c = 0; while (m) { c += m & 1; m >>= 1; } kcc_cg_fp_save_count = c; }
+
+    /* ---- promotion map ---- */
+    for (unsigned long v = 0; v < vreg_n; v++)
+        if ((flags[v] & 0x100) && map[v]) promoted[v] = map[v];
+    kcc_cg_promoted = promoted;
+    kcc_cg_regmap = map;
+    { unsigned long m = kcc_cg_callee_mask, c = 0; while (m) { c += m & 1; m >>= 1; } kcc_cg_save_count = c; }
+
+    kcc_cg_color_slots(func, vreg_n, lastuse, flags);
+}
+@}
+
+\section{Spill-Slot Colouring}
+
+@l c
+@d Selfhost: cg color @{
+void kcc_cg_color_slots(void *func, unsigned long vreg_n, unsigned long *lastuse, unsigned long *flags) {
+    long *slotmap = (long *)kcc_arena_alloc(vreg_n * 8 * 4);
+    unsigned long *active_vreg = (unsigned long *)slotmap + vreg_n;
+    unsigned long *active_slot = active_vreg + vreg_n;
+    unsigned long *free_slot = active_slot + vreg_n;
+    for (unsigned long v = 0; v < vreg_n; v++) slotmap[v] = -1;
+    unsigned long *regmap = (unsigned long *)kcc_cg_regmap;
+    unsigned long *fpmap = (unsigned long *)kcc_cg_fpregmap;
+    unsigned long *promoted = (unsigned long *)kcc_cg_promoted;
+    (void)regmap;
+    unsigned long next_slot = 0, active_count = 0, free_count = 0, pos = 0;
+    void *blocks = (void *)IL(func, IRF_BLOCKS);
+    unsigned long nbb = IL(blocks, VEC_COUNT);
+    unsigned long params = IL(func, IRF_PARAMS);
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT), pos++) {
+            /* expire */
+            unsigned long w = 0;
+            for (unsigned long r = 0; r < active_count; r++) {
+                unsigned long v = active_vreg[r], sl = active_slot[r];
+                if (lastuse[v] >= pos) { active_vreg[w] = v; active_slot[w] = sl; w++; }
+                else free_slot[free_count++] = sl;
+            }
+            active_count = w;
+            /* assign */
+            unsigned long op = IL(i, IR_OP);
+            if (op == IR_STORE || op == IR_BR || op == IR_BR_COND || op == IR_RET) continue;
+            unsigned long d = IL(i, IR_DEST);
+            if (d == 0 || d >= vreg_n) continue;         /* matches asm cbz/hs skip */
+            if (fpmap && fpmap[d]) continue;
+            if (promoted && promoted[d]) continue;
+            if (d < params) { slotmap[d] = next_slot++; continue; }
+            if (flags[d] & 2) { slotmap[d] = next_slot++; continue; }
+            unsigned long slot;
+            if (free_count) slot = free_slot[--free_count];
+            else slot = next_slot++;
+            slotmap[d] = slot;
+            active_vreg[active_count] = d;
+            active_slot[active_count] = slot;
+            active_count++;
+        }
+    }
+    for (unsigned long v = 0; v < vreg_n; v++) {
+        if (slotmap[v] != -1) continue;
+        if (fpmap && fpmap[v]) continue;
+        if (promoted && promoted[v]) continue;
+        slotmap[v] = next_slot++;
+    }
+    kcc_cg_slotmap = slotmap;
+    kcc_cg_max_slot = next_slot;
+}
+@}
+
+\section{Frame, Slots, Transfers, and Marshalling}
+
+@l c
+@d Selfhost: cg frame @{
+void kcc_cg_emit_add_imm(unsigned long rd, unsigned long rn, unsigned long imm) {
+    unsigned long high = imm >> 12;
+    unsigned long run = rn;
+    if (high) {
+        EMIT(kcc_enc_add_imm(rd, run, high, 1) | 0x400000u);
+        run = rd;
+    }
+    unsigned long low = imm & 0xFFF;
+    if (low || !high) EMIT(kcc_enc_add_imm(rd, run, low, 1));
+}
+void kcc_cg_emit_sub_imm(unsigned long rd, unsigned long rn, unsigned long imm) {
+    unsigned long high = imm >> 12;
+    unsigned long run = rn;
+    if (high) {
+        EMIT(kcc_enc_sub_imm(rd, run, high, 1) | 0x400000u);
+        run = rd;
+    }
+    unsigned long low = imm & 0xFFF;
+    if (low || !high) EMIT(kcc_enc_sub_imm(rd, run, low, 1));
+}
+void kcc_cg_emit_frame_ldst(unsigned long rt, unsigned long byte_off, unsigned long kind) {
+    unsigned long rn, imm12;
+    if (byte_off <= 0x7FF8) { rn = 29; imm12 = byte_off >> 3; }
+    else { kcc_cg_emit_add_imm(17, 29, byte_off); rn = 17; imm12 = 0; }
+    if (kind == 0) EMIT(kcc_enc_ldr_imm(rt, rn, imm12, 1));
+    else if (kind == 1) EMIT(kcc_enc_str_imm(rt, rn, imm12, 1));
+    else if (kind == 2) EMIT(kcc_enc_ldr_fp(rt, rn, imm12));
+    else EMIT(kcc_enc_str_fp(rt, rn, imm12));
+}
+
+unsigned long kcc_cg_slot_offset(unsigned long vreg) {
+    long *sm = (long *)kcc_cg_slotmap;
+    unsigned long s = sm ? (unsigned long)sm[vreg] : vreg;
+    return s + 2;
+}
+
+void kcc_cg_load_vreg(unsigned long vreg, unsigned long reg) {
+    unsigned long *fp = (unsigned long *)kcc_cg_fpregmap;
+    if (fp && fp[vreg]) { EMIT(kcc_enc_fmov_x_d(reg, fp[vreg])); return; }
+    unsigned long *rm = (unsigned long *)kcc_cg_regmap;
+    if (rm && rm[vreg]) {
+        if (reg == rm[vreg]) return;
+        EMIT(kcc_enc_mov_reg(reg, rm[vreg], 1));
+        return;
+    }
+    kcc_cg_emit_frame_ldst(reg, kcc_cg_slot_offset(vreg) << 3, 0);
+}
+void kcc_cg_store_vreg(unsigned long vreg, unsigned long reg) {
+    unsigned long *fp = (unsigned long *)kcc_cg_fpregmap;
+    if (fp && fp[vreg]) { EMIT(kcc_enc_fmov_d_x(fp[vreg], reg)); return; }
+    unsigned long *rm = (unsigned long *)kcc_cg_regmap;
+    if (rm && rm[vreg]) {
+        if (reg == rm[vreg]) return;
+        EMIT(kcc_enc_mov_reg(rm[vreg], reg, 1));
+        return;
+    }
+    kcc_cg_emit_frame_ldst(reg, kcc_cg_slot_offset(vreg) << 3, 1);
+}
+unsigned long kcc_cg_promoted_reg(unsigned long vreg) {
+    unsigned long *p = (unsigned long *)kcc_cg_promoted;
+    return p ? p[vreg] : 0;
+}
+void kcc_cg_load_vreg_fp(unsigned long vreg, unsigned long reg) {
+    unsigned long *fp = (unsigned long *)kcc_cg_fpregmap;
+    if (fp && fp[vreg]) {
+        if (reg == fp[vreg]) return;
+        EMIT(kcc_enc_fmov_d_d(reg, fp[vreg]));
+        return;
+    }
+    unsigned long *rm = (unsigned long *)kcc_cg_regmap;
+    if (rm && rm[vreg]) { EMIT(kcc_enc_fmov_d_x(reg, rm[vreg])); return; }
+    kcc_cg_emit_frame_ldst(reg, kcc_cg_slot_offset(vreg) << 3, 2);
+}
+void kcc_cg_store_vreg_fp(unsigned long vreg, unsigned long reg) {
+    unsigned long *fp = (unsigned long *)kcc_cg_fpregmap;
+    if (fp && fp[vreg]) {
+        if (reg == fp[vreg]) return;
+        EMIT(kcc_enc_fmov_d_d(fp[vreg], reg));
+        return;
+    }
+    unsigned long *rm = (unsigned long *)kcc_cg_regmap;
+    if (rm && rm[vreg]) { EMIT(kcc_enc_fmov_x_d(rm[vreg], reg)); return; }
+    kcc_cg_emit_frame_ldst(reg, kcc_cg_slot_offset(vreg) << 3, 3);
+}
+
+void kcc_cg_callee_transfer(unsigned long restore) {
+    unsigned long mask = kcc_cg_callee_mask;
+    if (mask) {
+        unsigned long base = kcc_cg_save_base >> 3;
+        unsigned long k = 0;
+        for (unsigned long r = 19; r < 29; r++) {
+            if (!((mask >> (r - 19)) & 1)) continue;
+            unsigned long off = (base + k) << 3;
+            kcc_cg_emit_frame_ldst(r, off, restore ? 0 : 1);
+            k++;
+        }
+    }
+    unsigned long fmask = kcc_cg_fp_callee_mask;
+    if (!fmask) return;
+    unsigned long base = kcc_cg_fp_save_base >> 3;
+    unsigned long k = 0;
+    for (unsigned long r = 8; r < 16; r++) {
+        if (!((fmask >> (r - 8)) & 1)) continue;
+        unsigned long off = (base + k) << 3;
+        kcc_cg_emit_frame_ldst(r, off, restore ? 2 : 3);
+        k++;
+    }
+}
+
+unsigned long kcc_cg_marshal_args(unsigned long *args, unsigned long count, unsigned long fsi) {
+    if (!fsi) fsi = 1;
+    unsigned long stack_adj = 0;
+    if (!count) return 0;
+    unsigned long ngrn = 0, nsrn = 0;
+    for (unsigned long a = 0; a < count; a++) {
+        unsigned long cls = args[2 + 2 * a];
+        unsigned long vreg = args[1 + 2 * a];
+        if (cls == 1) {                                  /* FP */
+            if (nsrn < 8) { kcc_cg_load_vreg_fp(vreg, nsrn); nsrn++; }
+        } else if (cls == 5) {                           /* x8 sret ptr */
+            kcc_cg_load_vreg(vreg, 8);
+        } else if (cls == 2) {                           /* ST1 */
+            if (ngrn < 8) {
+                kcc_cg_load_vreg(vreg, 9);
+                EMIT(kcc_enc_ldr_imm(ngrn, 9, 0, 1));
+                ngrn++;
+            }
+        } else if (cls == 3) {                           /* ST2 */
+            if (ngrn <= 6) {
+                kcc_cg_load_vreg(vreg, 9);
+                EMIT(kcc_enc_ldr_imm(ngrn, 9, 0, 1));
+                EMIT(kcc_enc_ldr_imm(ngrn + 1, 9, 1, 1));
+                ngrn += 2;
+            }
+        } else {                                         /* GP / REF */
+            if (ngrn < 8) { kcc_cg_load_vreg(vreg, ngrn); ngrn++; }
+        }
+    }
+    if (count > fsi) {
+        stack_adj = (((count - fsi) * 8) + 15) & ~15UL;
+        EMIT(kcc_enc_sub_imm(31, 31, stack_adj, 1));
+        for (unsigned long k = fsi; k < count; k++) {
+            kcc_cg_load_vreg(args[1 + 2 * k], 9);
+            EMIT(kcc_enc_str_imm(9, 31, k - fsi, 1));
+        }
+    }
+    return stack_adj;
+}
+@}
+
+\section{The Function Driver}
+
+@l c
+@d Selfhost: cg func @{
+void kcc_codegen_func(void *func) {
+    unsigned long vreg_n = IL(func, IRF_VREG_N);
+    kcc_cg_vreg_count = vreg_n;
+    kcc_cg_regalloc(func);
+    void *blocks = (void *)IL(func, IRF_BLOCKS);
+    unsigned long nbb = IL(blocks, VEC_COUNT);
+    /* alloca pre-scan */
+    unsigned long off = 0;
+    unsigned long *promoted = (unsigned long *)kcc_cg_promoted;
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT)) {
+            if (IL(i, IR_OP) != IR_ALLOCA) continue;
+            if (promoted && promoted[IL(i, IR_DEST)]) continue;
+            IL(i, IR_SRC2) = off;
+            unsigned long sc = IL(i, IR_SRC1);
+            off += sc ? sc : 1;
+        }
+    }
+    unsigned long total_alloca = off;
+    unsigned long max_slot = kcc_cg_max_slot;
+    unsigned long save_base = 16 + max_slot * 8 + total_alloca * 8;
+    kcc_cg_save_base = save_base;
+    unsigned long fp_save_base = save_base + kcc_cg_save_count * 8;
+    kcc_cg_fp_save_base = fp_save_base;
+    unsigned long frame = fp_save_base + kcc_cg_fp_save_count * 8;
+    frame = (frame + 15) & ~15UL;
+    kcc_cg_frame_size = frame;
+
+    unsigned long func_start = kcc_code_current_pos();
+    IL(func, IRF_LOWPC) = func_start;
+
+    /* bb label ht: next pow2 >= 4*bb_count, min 64 */
+    unsigned long cap = nbb * 4;
+    if (cap <= 64) cap = 64;
+    else { unsigned long p = 64; while (p < cap) p <<= 1; cap = p; }
+    void *bb_labels = kcc_ht_init(cap);
+    void *patch = kcc_arena_alloc(VEC_SIZE);
+    IL(patch, VEC_ELEMSIZE) = PATCH_SIZE;
+    IL(patch, VEC_CAP) = 32;
+    IL(patch, VEC_COUNT) = 0;
+    IL(patch, VEC_DATA) = (unsigned long)kcc_arena_alloc(512);
+
+    /* prologue */
+    if (frame <= 504) {
+        EMIT(kcc_enc_stp_pre(29, 30, 31, (unsigned)(-(long)frame >> 3)));
+    } else {
+        kcc_cg_emit_sub_imm(31, 31, frame);
+        EMIT(0xA9007BFDu);                               /* stp x29,x30,[sp] */
+    }
+    EMIT(kcc_enc_add_imm(29, 31, 0, 1));                 /* mov x29, sp */
+    kcc_cg_callee_transfer(0);
+
+    /* spill incoming params */
+    unsigned long np = IL(func, IRF_PARAMS);
+    void *clsarr = (void *)IL(func, IRF_PARAM_CLS);
+    unsigned long ngrn = 0, nsrn = 0, base = 0;
+    for (unsigned long p = 0; p < np; p++) {
+        unsigned long cls = 0;
+        if (clsarr) cls = ((unsigned long *)clsarr)[p];
+        if (cls == 1) {                                  /* FP */
+            if (nsrn < 8) { kcc_cg_store_vreg_fp(base, nsrn); nsrn++; base++; continue; }
+            goto stack_param;
+        }
+        if (cls == 5) {                                  /* x8 sret */
+            EMIT(kcc_enc_str_imm(8, 29, kcc_cg_slot_offset(base), 1));
+            base++;
+            continue;
+        }
+        if (cls == 3) {                                  /* ST2 */
+            if (ngrn <= 6) {
+                EMIT(kcc_enc_str_imm(ngrn, 29, kcc_cg_slot_offset(base), 1));
+                EMIT(kcc_enc_str_imm(ngrn + 1, 29, kcc_cg_slot_offset(base + 1), 1));
+                ngrn += 2; base += 2;
+                continue;
+            }
+            goto stack_param;
+        }
+        /* GP / ST1 / REF */
+        if (ngrn < 8) {
+            EMIT(kcc_enc_str_imm(ngrn, 29, kcc_cg_slot_offset(base), 1));
+            ngrn++; base++;
+            continue;
+        }
+      stack_param:;
+        unsigned long idx;
+        if (IL(func, IRF_VARIADIC)) idx = base - 8;
+        else idx = p - 1;
+        unsigned long boff = idx * 8 + frame;
+        kcc_cg_emit_frame_ldst(9, boff, 0);
+        kcc_cg_emit_frame_ldst(9, kcc_cg_slot_offset(base) << 3, 1);
+        base++;
+    }
+
+    /* walk BBs */
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        unsigned long *key = (unsigned long *)kcc_arena_alloc(8);
+        *key = IL(bb, BB_ID);
+        kcc_ht_put(bb_labels, key, 8, (void *)(kcc_code_current_pos() + 1));
+        for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT))
+            kcc_codegen_instr(i, bb_labels, patch);
+    }
+    kcc_codegen_patch_branches(bb_labels, patch);
+
+    /* patch the function symbol's value */
+    unsigned long symidx = IL(func, IRF_SYMIDX);
+    char *syms = *(char **)((char *)kcc_linker_syms + VEC_DATA);
+    IL(syms + symidx * SYM_ENTRY_SIZE, SYM_VALUE) = func_start;
+}
+@}
+
+\section{Branch Patching and String Literals}
+
+@l c
+@d Selfhost: cg strings @{
+void kcc_codegen_patch_branches(void *bb_labels, void *patches) {
+    unsigned long n = IL(patches, VEC_COUNT);
+    for (unsigned long i = 0; i < n; i++) {
+        void *e = kcc_vec_get(patches, i);
+        unsigned long branch_off = IL(e, 0);
+        unsigned long target_id = IL(e, 8);
+        void *v = kcc_ht_get(bb_labels, &target_id, 8);
+        if (!v) continue;
+        unsigned long target = (unsigned long)v - 1;
+        unsigned instr = *(unsigned *)((char *)kcc_code_buf + branch_off);
+        long delta = (long)target - (long)branch_off;
+        unsigned top = instr >> 24;
+        if (top == 0x14) {
+            kcc_code_patch32(branch_off, kcc_enc_b(delta));
+        } else {                                         /* CBNZ */
+            unsigned rt = instr & 0x1F;
+            unsigned imm19 = (unsigned)((delta >> 2) & 0x7FFFF);
+            unsigned w = 0xB5000000u | (imm19 << 5) | rt;
+            kcc_code_patch32(branch_off, w);
+        }
+    }
+}
+
+void kcc_cstr_reserve(unsigned long need) {
+    if (need <= kcc_cstr_cap) return;
+    unsigned long ncap = kcc_cstr_cap << 1;
+    if (ncap < need) ncap = need;
+    void *nb = kcc_arena_alloc(ncap);
+    kcc_memcpy(nb, kcc_cstr_buf, kcc_cstr_pos);
+    kcc_cstr_buf = nb;
+    kcc_cstr_cap = ncap;
+}
+
+/* build "l_.str.N" into the 20-byte buffer */
+static void strlit_name(char *b, unsigned long n) {
+    kcc_memcpy(b, "l_.str.", 7);
+    char tmp[20];
+    int t = 0;
+    if (n == 0) tmp[t++] = '0';
+    else while (n) { tmp[t++] = '0' + (n % 10); n /= 10; }
+    int j = 7;
+    while (t) b[j++] = tmp[--t];
+    b[j] = 0;
+}
+
+unsigned long kcc_emit_cstring(const char *data, unsigned long len) {
+    unsigned long off = kcc_cstr_pos;
+    kcc_cstr_reserve(off + len + 1);
+    char *buf = (char *)kcc_cstr_buf;
+    if (len) kcc_memcpy(buf + off, data, len);
+    buf[off + len] = 0;
+    kcc_cstr_pos = off + len + 1;
+    unsigned long n = kcc_cstr_count++;
+    char *name = (char *)kcc_arena_alloc(20);
+    strlit_name(name, n);
+    unsigned long sym = kcc_linker_add_sym(name, 1, 0, N_SECT);
+    unsigned long fix[2] = { sym, off };
+    kcc_vec_push(kcc_cstr_fixups, fix);
+    return sym;
+}
+
+void kcc_codegen_string_lit(void *instr) {
+    unsigned long data = IL(instr, IR_SRC1);
+    unsigned long len = IL(instr, IR_SRC2);
+    unsigned long dest = IL(instr, IR_DEST);
+    unsigned long off = kcc_cstr_pos;
+    kcc_cstr_reserve(off + len + 1);
+    char *buf = (char *)kcc_cstr_buf;
+    if (len) kcc_memcpy(buf + off, (const void *)data, len);
+    buf[off + len] = 0;
+    kcc_cstr_pos = off + len + 1;
+    unsigned long n = kcc_cstr_count++;
+    char *name = (char *)kcc_arena_alloc(20);
+    strlit_name(name, n);
+    unsigned long sym = kcc_linker_add_sym(name, 1, 0, N_SECT);
+    unsigned long fix[2] = { sym, off };
+    kcc_vec_push(kcc_cstr_fixups, fix);
+    kcc_linker_add_reloc(kcc_code_current_pos(), ARM64_RELOC_PAGE21, sym);
+    EMIT(kcc_enc_adrp(CG_REG_DST, 0));
+    kcc_linker_add_reloc(kcc_code_current_pos(), ARM64_RELOC_PAGEOFF12, sym);
+    EMIT(kcc_enc_add_imm(CG_REG_DST, CG_REG_DST, 0, 1));
+    kcc_cg_store_vreg(dest, CG_REG_DST);
+}
+
+void kcc_codegen_emit_strings(void) {
+    if (!kcc_cstr_pos) return;
+    unsigned long code_size = kcc_code_current_pos();
+    void *fx = kcc_cstr_fixups;
+    unsigned long n = IL(fx, VEC_COUNT);
+    char *syms = *(char **)((char *)kcc_linker_syms + VEC_DATA);
+    for (unsigned long i = 0; i < n; i++) {
+        void *e = kcc_vec_get(fx, i);
+        unsigned long sym = IL(e, 0), coff = IL(e, 8);
+        IL(syms + sym * SYM_ENTRY_SIZE, SYM_VALUE) = code_size + coff;
+    }
+    unsigned long csz = kcc_cstr_pos;
+    unsigned long cp = kcc_code_pos;
+    if (cp + csz > kcc_code_cap) {
+        unsigned long ncap = (cp + csz) << 1;
+        void *nb = kcc_arena_alloc(ncap);
+        kcc_memcpy(nb, kcc_code_buf, cp);
+        kcc_code_buf = nb;
+        kcc_code_cap = ncap;
+    }
+    kcc_memcpy((char *)kcc_code_buf + cp, kcc_cstr_buf, csz);
+    kcc_code_pos = cp + csz;
+}
+@}
+
+\section{Per-Opcode Instruction Selection}
+
+@l c
+@d Selfhost: cg dispatch @{
+/* helper for the two-source integer ALU shape */
+static void binop(void *i, unsigned (*enc)(unsigned,unsigned,unsigned,unsigned)) {
+    kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+    kcc_cg_load_vreg(IL(i, IR_SRC2), CG_REG_SRC2);
+    EMIT(enc(CG_REG_DST, CG_REG_SRC1, CG_REG_SRC2, 1));
+    kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+}
+static unsigned long udiv_sf(void *i) {
+    void *ty = (void *)IL(i, IR_TYPE);
+    if ((unsigned long)ty < 0x1000) return 1;
+    return (IL(ty, TY_SIZE) >= 8) ? 1 : 0;
+}
+
+static void cg_normalize_ret(void *ret_type) {
+    if (!ret_type) return;
+    unsigned long w = kcc_ir_load_width(ret_type);
+    if (w == 5) EMIT(0x93401C00u);       /* SXTB x0,w0 */
+    else if (w == 6) EMIT(0x93403C00u);  /* SXTH */
+    else if (w == 7) EMIT(0x93407C00u);  /* SXTW */
+    else if (w == 1) EMIT(0x53001C00u);  /* UXTB w0,w0 */
+    else if (w == 2) EMIT(0x53003C00u);  /* UXTH */
+    else if (w == 4) EMIT(0x2A0003E0u);  /* MOV w0,w0 */
+}
+
+void kcc_codegen_instr(void *i, void *bb_labels, void *patches) {
+    unsigned long op = IL(i, IR_OP);
+    /* FP arithmetic/comparison dispatch */
+    void *ty0 = (void *)IL(i, IR_TYPE);
+    if (ty0) {
+        unsigned long k = IL(ty0, TY_KIND);
+        if (k == TY_FLOAT || k == TY_DOUBLE) {
+            if (op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_SDIV) {
+                unsigned long fop = (op == IR_ADD) ? 2 : (op == IR_SUB) ? 3 : (op == IR_MUL) ? 0 : 1;
+                kcc_cg_load_vreg_fp(IL(i, IR_SRC1), 0);
+                kcc_cg_load_vreg_fp(IL(i, IR_SRC2), 1);
+                EMIT(kcc_enc_fp_dp2(2, 0, 1, fop));
+                kcc_cg_store_vreg_fp(IL(i, IR_DEST), 2);
+                return;
+            }
+            if (op >= IR_CMP_EQ && op <= IR_CMP_SGE) {
+                unsigned long inv;
+                if (op == IR_CMP_EQ) inv = 1;
+                else if (op == IR_CMP_NE) inv = 0;
+                else if (op == IR_CMP_SLT) inv = 5;
+                else if (op == IR_CMP_SLE) inv = 8;
+                else if (op == IR_CMP_SGT) inv = 13;
+                else inv = 11;
+                kcc_cg_load_vreg_fp(IL(i, IR_SRC1), 0);
+                kcc_cg_load_vreg_fp(IL(i, IR_SRC2), 1);
+                EMIT(kcc_enc_fcmp(0, 1));
+                EMIT(kcc_enc_cset(CG_REG_DST, inv, 1));
+                kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+                return;
+            }
+        }
+    }
+    switch (op) {
+    case IR_NOP: return;
+    case IR_CONST: {
+        unsigned long v = IL(i, IR_SRC1);
+        EMIT(kcc_enc_movz(CG_REG_DST, v & 0xFFFF, 0, 1));
+        if ((v >> 16) & 0xFFFF) EMIT(kcc_enc_movk(CG_REG_DST, (v >> 16) & 0xFFFF, 1, 1));
+        if ((v >> 32) & 0xFFFF) EMIT(kcc_enc_movk(CG_REG_DST, (v >> 32) & 0xFFFF, 2, 1));
+        if ((v >> 48) & 0xFFFF) EMIT(kcc_enc_movk(CG_REG_DST, (v >> 48) & 0xFFFF, 3, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_ADD: binop(i, kcc_enc_add_reg); return;
+    case IR_SUB: binop(i, kcc_enc_sub_reg); return;
+    case IR_MUL: binop(i, kcc_enc_mul); return;
+    case IR_SDIV: binop(i, kcc_enc_sdiv); return;
+    case IR_AND: binop(i, kcc_enc_and_reg); return;
+    case IR_OR: binop(i, kcc_enc_orr_reg); return;
+    case IR_XOR: binop(i, kcc_enc_eor_reg); return;
+    case IR_SHL: binop(i, kcc_enc_lsl_reg); return;
+    case IR_LSHR: binop(i, kcc_enc_lsr_reg); return;
+    case IR_ASHR: binop(i, kcc_enc_asr_reg); return;
+    case IR_GEP: binop(i, kcc_enc_add_reg); return;
+    case IR_UDIV: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        kcc_cg_load_vreg(IL(i, IR_SRC2), CG_REG_SRC2);
+        EMIT(kcc_enc_udiv(CG_REG_DST, CG_REG_SRC1, CG_REG_SRC2, udiv_sf(i)));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_SMOD: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        kcc_cg_load_vreg(IL(i, IR_SRC2), CG_REG_SRC2);
+        EMIT(kcc_enc_sdiv(CG_REG_DST, CG_REG_SRC1, CG_REG_SRC2, 1));
+        EMIT(kcc_enc_msub(CG_REG_DST, CG_REG_DST, CG_REG_SRC2, CG_REG_SRC1, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_UMOD: {
+        unsigned long sf = udiv_sf(i);
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        kcc_cg_load_vreg(IL(i, IR_SRC2), CG_REG_SRC2);
+        EMIT(kcc_enc_udiv(CG_REG_DST, CG_REG_SRC1, CG_REG_SRC2, sf));
+        EMIT(kcc_enc_msub(CG_REG_DST, CG_REG_DST, CG_REG_SRC2, CG_REG_SRC1, sf));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_NEG: {
+        void *ty = (void *)IL(i, IR_TYPE);
+        if ((unsigned long)ty >= 0x1000) {
+            unsigned long k = IL(ty, TY_KIND);
+            if (k >= 8 && k <= 10) {
+                kcc_cg_load_vreg_fp(IL(i, IR_SRC1), 0);
+                EMIT(kcc_enc_fneg_d(2, 0));
+                kcc_cg_store_vreg_fp(IL(i, IR_DEST), 2);
+                return;
+            }
+        }
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        EMIT(kcc_enc_sub_reg(CG_REG_DST, 31, CG_REG_SRC1, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_NOT: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        EMIT(kcc_enc_mvn(CG_REG_DST, CG_REG_SRC1, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_CMP_EQ: case IR_CMP_NE: case IR_CMP_SLT: case IR_CMP_SLE:
+    case IR_CMP_SGT: case IR_CMP_SGE: case IR_CMP_ULT: case IR_CMP_ULE: {
+        unsigned long inv;
+        switch (op) {
+        case IR_CMP_EQ: inv = 1; break; case IR_CMP_NE: inv = 0; break;
+        case IR_CMP_SLT: inv = 10; break; case IR_CMP_SLE: inv = 12; break;
+        case IR_CMP_SGT: inv = 13; break; case IR_CMP_SGE: inv = 11; break;
+        case IR_CMP_ULT: inv = 2; break; default: inv = 8; break;
+        }
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        kcc_cg_load_vreg(IL(i, IR_SRC2), CG_REG_SRC2);
+        void *ty = (void *)IL(i, IR_TYPE);
+        unsigned long sf = (!ty || IL(ty, TY_SIZE) == 8) ? 1 : 0;
+        EMIT(kcc_enc_cmp_reg(CG_REG_SRC1, CG_REG_SRC2, sf));
+        EMIT(kcc_enc_cset(CG_REG_DST, inv, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_TRUNC: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        void *ty = (void *)IL(i, IR_TYPE);
+        unsigned long sz = ty ? IL(ty, TY_SIZE) : 8;
+        if (sz == 1) EMIT(kcc_enc_movz(CG_REG_SRC2, 0xFF, 0, 1));
+        else if (sz == 2) EMIT(kcc_enc_movz(CG_REG_SRC2, 0xFFFF, 0, 1));
+        else if (sz == 4) { EMIT(kcc_enc_movz(CG_REG_SRC2, 0xFFFF, 0, 1)); EMIT(kcc_enc_movk(CG_REG_SRC2, 0xFFFF, 1, 1)); }
+        else { EMIT(kcc_enc_add_imm(CG_REG_DST, CG_REG_SRC1, 0, 1)); kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST); return; }
+        EMIT(kcc_enc_and_reg(CG_REG_DST, CG_REG_SRC1, CG_REG_SRC2, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_BITCAST: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        EMIT(kcc_enc_add_imm(CG_REG_DST, CG_REG_SRC1, 0, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_SEXT: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        unsigned long w = IL(i, IR_SRC2);
+        if (w == 1) EMIT(0x93401D2Bu);
+        else if (w == 2) EMIT(0x93403D2Bu);
+        else if (w == 4) EMIT(0x93407D2Bu);
+        else EMIT(kcc_enc_add_imm(CG_REG_DST, CG_REG_SRC1, 0, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_ZEXT: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        unsigned long w = IL(i, IR_SRC2);
+        if (w == 1) EMIT(0xD3401D2Bu);
+        else if (w == 2) EMIT(0xD3403D2Bu);
+        else if (w == 4) EMIT(0xD3407D2Bu);
+        else EMIT(kcc_enc_add_imm(CG_REG_DST, CG_REG_SRC1, 0, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_SITOFP: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        EMIT(kcc_enc_scvtf(0, CG_REG_SRC1));
+        kcc_cg_store_vreg_fp(IL(i, IR_DEST), 0);
+        return;
+    }
+    case IR_UITOFP: {
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        EMIT(kcc_enc_ucvtf(0, CG_REG_SRC1));
+        kcc_cg_store_vreg_fp(IL(i, IR_DEST), 0);
+        return;
+    }
+    case IR_FPTOSI: {
+        kcc_cg_load_vreg_fp(IL(i, IR_SRC1), 0);
+        EMIT(kcc_enc_fcvtzs(CG_REG_SRC1, 0));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_SRC1);
+        return;
+    }
+    case IR_FPROUND: {
+        kcc_cg_load_vreg_fp(IL(i, IR_SRC1), 0);
+        EMIT(kcc_enc_fcvt_s_d(0, 0));
+        EMIT(kcc_enc_fcvt_d_s(0, 0));
+        kcc_cg_store_vreg_fp(IL(i, IR_DEST), 0);
+        return;
+    }
+    case IR_LOAD: {
+        unsigned long pr = kcc_cg_promoted_reg(IL(i, IR_SRC1));
+        if (pr) {
+            unsigned long w = IL(i, IR_SRC2);
+            if (!w) { EMIT(kcc_enc_mov_reg(CG_REG_DST, pr, 1)); }
+            else {
+                EMIT(kcc_enc_mov_reg(CG_REG_SRC1, pr, 1));
+                if (w == 1) EMIT(0xD3401D2Bu); else if (w == 2) EMIT(0xD3403D2Bu);
+                else if (w == 4) EMIT(0xD3407D2Bu); else if (w == 5) EMIT(0x93401D2Bu);
+                else if (w == 6) EMIT(0x93403D2Bu); else if (w == 7) EMIT(0x93407D2Bu);
+                else EMIT(kcc_enc_mov_reg(CG_REG_DST, CG_REG_SRC1, 1));
+            }
+            kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+            return;
+        }
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        unsigned long sz = IL(i, IR_SRC2);
+        if (sz == 8) {
+            EMIT(kcc_enc_ldr_fp_s(0, CG_REG_SRC1, 0));
+            EMIT(kcc_enc_fcvt_d_s(0, 0));
+            kcc_cg_store_vreg_fp(IL(i, IR_DEST), 0);
+            return;
+        }
+        unsigned long enc_sz;
+        if (sz == 1) enc_sz = 2; else if (sz == 2) enc_sz = 3; else if (sz == 4) enc_sz = 0;
+        else if (sz == 5) enc_sz = 5; else if (sz == 6) enc_sz = 6; else if (sz == 7) enc_sz = 4;
+        else enc_sz = 1;
+        EMIT(kcc_enc_ldr_imm(CG_REG_DST, CG_REG_SRC1, 0, enc_sz));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_STORE: {
+        unsigned long pr = kcc_cg_promoted_reg(IL(i, IR_SRC2));
+        if (pr) {
+            kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+            EMIT(kcc_enc_mov_reg(pr, CG_REG_SRC1, 1));
+            return;
+        }
+        kcc_cg_load_vreg(IL(i, IR_SRC1), CG_REG_SRC1);
+        kcc_cg_load_vreg(IL(i, IR_SRC2), CG_REG_SRC2);
+        unsigned long sz = IL(i, IR_DEST);
+        if (sz == 8) {
+            kcc_cg_load_vreg_fp(IL(i, IR_SRC1), 0);
+            EMIT(kcc_enc_fcvt_s_d(0, 0));
+            EMIT(kcc_enc_str_fp_s(0, CG_REG_SRC2, 0));
+            return;
+        }
+        unsigned long enc_sz = (sz == 1) ? 2 : (sz == 2) ? 3 : (sz == 4) ? 0 : 1;
+        EMIT(kcc_enc_str_imm(CG_REG_SRC1, CG_REG_SRC2, 0, enc_sz));
+        return;
+    }
+    case IR_ALLOCA: {
+        if (kcc_cg_promoted_reg(IL(i, IR_DEST))) return;
+        unsigned long offv = IL(i, IR_SRC2);
+        unsigned long imm = 16 + kcc_cg_max_slot * 8 + offv * 8;
+        kcc_cg_emit_add_imm(CG_REG_DST, 29, imm);
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_VA_START: {
+        unsigned long frame = kcc_cg_frame_size;
+        long nfx = (long)IL(i, IR_SRC2) - 8;
+        if (nfx > 0) frame += (unsigned long)nfx * 8;
+        EMIT(kcc_enc_movz(CG_REG_DST, frame & 0xffff, 0, 1));
+        if ((frame >> 16) & 0xffff) EMIT(kcc_enc_movk(CG_REG_DST, (frame >> 16) & 0xffff, 1, 1));
+        EMIT(kcc_enc_add_reg(CG_REG_DST, 29, CG_REG_DST, 1));
+        kcc_cg_store_vreg(IL(i, IR_DEST), CG_REG_DST);
+        return;
+    }
+    case IR_BR: {
+        unsigned long tid = IL(i, IR_SRC1);
+        void *v = kcc_ht_get(bb_labels, &tid, 8);
+        if (v) {
+            unsigned long target = (unsigned long)v - 1;
+            EMIT(kcc_enc_b((long)target - (long)kcc_code_current_pos()));
+        } else {
+            unsigned long poff = kcc_code_current_pos();
+            EMIT(0x14000000u);
+            unsigned long ent[2] = { poff, IL(i, IR_SRC1) };
+            kcc_vec_push(patches, ent);
+        }
+        return;
+    }
+    case IR_BR_COND: {
+        kcc_cg_load_vreg(IL(i, IR_DEST), CG_REG_SRC1);
+        unsigned long tt = IL(i, IR_SRC1);
+        void *v = kcc_ht_get(bb_labels, &tt, 8);
+        if (v) {
+            unsigned long target = (unsigned long)v - 1;
+            EMIT(kcc_enc_cbnz(CG_REG_SRC1, (long)target - (long)kcc_code_current_pos(), 1));
+        } else {
+            unsigned long poff = kcc_code_current_pos();
+            EMIT(0xB5000000u + CG_REG_SRC1);
+            unsigned long ent[2] = { poff, IL(i, IR_SRC1) };
+            kcc_vec_push(patches, ent);
+        }
+        unsigned long tf = IL(i, IR_SRC2);
+        void *vf = kcc_ht_get(bb_labels, &tf, 8);
+        if (vf) {
+            unsigned long target = (unsigned long)vf - 1;
+            EMIT(kcc_enc_b((long)target - (long)kcc_code_current_pos()));
+        } else {
+            unsigned long poff = kcc_code_current_pos();
+            EMIT(0x14000000u);
+            unsigned long ent[2] = { poff, IL(i, IR_SRC2) };
+            kcc_vec_push(patches, ent);
+        }
+        return;
+    }
+    case IR_RET: {
+        unsigned long rv = IL(i, IR_SRC1);
+        void *ty = (void *)IL(i, IR_TYPE);
+        if (ty) {
+            unsigned long k = IL(ty, TY_KIND);
+            if (k != TY_VOID) {
+                if (k == TY_FLOAT || k == TY_DOUBLE) kcc_cg_load_vreg_fp(rv, 0);
+                else if (k == TY_STRUCT || k == TY_UNION) {
+                    unsigned long sz = IL(ty, TY_SIZE);
+                    if (sz) {
+                        kcc_cg_load_vreg(rv, 9);
+                        EMIT(kcc_enc_ldr_imm(0, 9, 0, 1));
+                        if (sz > 8) EMIT(kcc_enc_ldr_imm(1, 9, 1, 1));
+                    }
+                } else kcc_cg_load_vreg(rv, 0);
+            }
+        }
+        kcc_cg_callee_transfer(1);
+        unsigned long frame = kcc_cg_frame_size;
+        if (frame <= 504) EMIT(kcc_enc_ldp_post(29, 30, 31, frame >> 3));
+        else { EMIT(0xA9407BFDu); kcc_cg_emit_add_imm(31, 31, frame); }
+        EMIT(kcc_enc_ret());
+        return;
+    }
+    case IR_CALL: case IR_CALL_IND: {
+        int ind = (op == IR_CALL_IND);
+        unsigned long callee = IL(i, IR_SRC1);
+        unsigned long dest = IL(i, IR_DEST);
+        unsigned long *aa = (unsigned long *)IL(i, IR_SRC2);
+        unsigned long count = 0, fsi = 1;
+        if (aa) { count = aa[0] & 0xffffffff; fsi = aa[0] >> 32; }
+        unsigned long adj = kcc_cg_marshal_args(aa, count, fsi);
+        if (ind) {
+            kcc_cg_load_vreg(callee, 9);
+            EMIT(kcc_enc_blr(9));
+        } else {
+            unsigned long sym = kcc_linker_extern(underscore((const char *)callee));
+            kcc_linker_add_reloc(kcc_code_current_pos(), ARM64_RELOC_BRANCH26, sym);
+            EMIT(kcc_enc_bl(0));
+        }
+        void *ty = (void *)IL(i, IR_TYPE);
+        if (!ty) { cg_normalize_ret(0); kcc_cg_store_vreg(dest, 0); }
+        else {
+            unsigned long k = IL(ty, TY_KIND);
+            if (k == TY_FLOAT || k == TY_DOUBLE) kcc_cg_store_vreg_fp(dest, 0);
+            else if (k == TY_STRUCT || k == TY_UNION) {
+                unsigned long sz = IL(ty, TY_SIZE);
+                if (sz && sz <= 16) {
+                    kcc_cg_load_vreg(dest, 9);
+                    EMIT(kcc_enc_str_imm(0, 9, 0, 1));
+                    if (sz > 8) EMIT(kcc_enc_str_imm(1, 9, 1, 1));
+                }
+            } else { cg_normalize_ret(ty); kcc_cg_store_vreg(dest, 0); }
+        }
+        if (adj) EMIT(kcc_enc_add_imm(31, 31, adj, 1));
+        return;
+    }
+    case IR_GLOBAL_REF: {
+        const char *name = (const char *)IL(i, IR_SRC1);
+        unsigned long dest = IL(i, IR_DEST);
+        char *uname = underscore(name);
+        void *defined = kcc_ht_get(kcc_cg_defined_globals, name, kcc_strlen(name));
+        if (defined) {
+            unsigned long sym = kcc_linker_global_sym(uname, 8);
+            kcc_linker_add_reloc(kcc_code_current_pos(), ARM64_RELOC_PAGE21, sym);
+            EMIT(kcc_enc_adrp(CG_REG_DST, 0));
+            kcc_linker_add_reloc(kcc_code_current_pos(), ARM64_RELOC_PAGEOFF12, sym);
+            EMIT(kcc_enc_add_imm(CG_REG_DST, CG_REG_DST, 0, 1));
+        } else {
+            unsigned long sym = kcc_linker_extern(uname);
+            kcc_linker_add_reloc(kcc_code_current_pos(), ARM64_RELOC_GOT_LOAD_PAGE21, sym);
+            EMIT(kcc_enc_adrp(CG_REG_DST, 0));
+            kcc_linker_add_reloc(kcc_code_current_pos(), ARM64_RELOC_GOT_LOAD_PAGEOFF12, sym);
+            EMIT(kcc_enc_ldr_imm(CG_REG_DST, CG_REG_DST, 0, 1));
+        }
+        kcc_cg_store_vreg(dest, CG_REG_DST);
+        return;
+    }
+    case IR_STRING_LIT: kcc_codegen_string_lit(i); return;
+    case IR_ASM: {
+        void *node = (void *)IL(i, IR_TYPE);
+        if (node && IL(node, AST_F2)) { kcc_cg_asm_extended(node); return; }
+        kcc_as_add_snip(kcc_code_current_pos(), (const char *)IL(i, IR_SRC1), IL(i, IR_SRC2));
+        EMIT(kcc_enc_nop());
+        return;
+    }
+    default: return;
+    }
+}
+@}
+
+\section{Global Reference to a Defined Symbol, and Extended Asm}
+
+The \texttt{IR\_GLOBAL\_REF} of a locally defined global reserves BSS storage and
+addresses it directly; the assembly did this by calling
+\texttt{kcc\_linker\_global\_sym} then emitting a direct ADRP/ADD to a
+\texttt{PAGE21}/\texttt{PAGEOFF12} relocation against the freshly minted symbol.
+
+@l c
+@d Selfhost: cg asm @{
+static const char *asm_err = "kcc: error: unsupported extended asm (only r/=r/+r/i constraints, up to 2 operands)\n";
+
+static int cg_asm_validate(void *node) {
+    void *op = (void *)IL(node, AST_F2);
+    unsigned long count = 0;
+    while (op) {
+        count++;
+        const char *c = (const char *)IL(op, AST_F0);
+        char ch = c[0];
+        if (ch == '=' || ch == '+') ch = c[1];
+        if (ch != 'r' && ch != 'i') { kcc_io_err(asm_err); return 1; }
+        op = (void *)IL(op, AST_F4);
+    }
+    if (count > 2) { kcc_io_err(asm_err); return 1; }
+    return 0;
+}
+
+/* Build the template with %N / %wN / %xN → operand register, %% → %. */
+static char *cg_asm_subst(void *node, unsigned long *lo) {
+    const char *tmpl = (const char *)IL(node, AST_F0);
+    unsigned long len = IL(node, AST_F1);
+    char *out = (char *)kcc_arena_alloc(len * 4 + 64);
+    unsigned long o = 0, in = 0;
+    while (in < len) {
+        char c = tmpl[in++];
+        if (c != '%') { out[o++] = c; continue; }
+        if (in >= len) { out[o++] = '%'; break; }
+        char n = tmpl[in];
+        if (n == '%') { in++; out[o++] = '%'; continue; }
+        char width = 'x';
+        if (n == 'w') { width = 'w'; in++; }
+        else if (n == 'x') { width = 'x'; in++; }
+        unsigned long num = 0;
+        while (in < len && tmpl[in] >= '0' && tmpl[in] <= '9') { num = num * 10 + (tmpl[in] - '0'); in++; }
+        out[o++] = width;
+        num += 9;
+        if (num >= 10) { out[o++] = '1'; num -= 10; }
+        out[o++] = '0' + num;
+    }
+    *lo = o;
+    return out;
+}
+
+void kcc_cg_asm_extended(void *node) {
+    if (cg_asm_validate(node)) return;
+    unsigned long k = 0;
+    for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        unsigned long v = IL(op, AST_F2) & 0xffffffff;
+        if (v) kcc_cg_load_vreg(v - 1, k + 9);
+    }
+    unsigned long off = kcc_code_current_pos();
+    unsigned long slen;
+    char *sub = cg_asm_subst(node, &slen);
+    kcc_as_add_snip(off, sub, slen);
+    EMIT(kcc_enc_nop());
+    k = 0;
+    for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        unsigned long ah = IL(op, AST_F3);
+        unsigned long a = ah & 0xffffffff;
+        if (!a) continue;
+        kcc_cg_load_vreg(a - 1, 8);
+        unsigned long size = ah >> 32;
+        unsigned long enc_sz = (size == 1) ? 2 : (size == 2) ? 3 : (size == 4) ? 0 : 1;
+        EMIT(kcc_enc_str_imm(k + 9, 8, 0, enc_sz));
+    }
+}
+@}
+
+@l c
+@d Selfhost: codegen @{
+@<Selfhost: cg preamble@>
+@<Selfhost: cg init@>
+@<Selfhost: cg rodata@>
+@<Selfhost: cg prereg@>
+@<Selfhost: cg regalloc@>
+@<Selfhost: cg color@>
+@<Selfhost: cg frame@>
+@<Selfhost: cg func@>
+@<Selfhost: cg strings@>
+@<Selfhost: cg asm@>
+@<Selfhost: cg dispatch@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-codegen-verify}
+
+\texttt{make selfhost-codegen} runs the strongest oracle: \texttt{difftest}
+byte-compares every generated object against clang, exercising the register
+allocator, slot colouring, marshalling, and every instruction handler, plus the
+code-generation and diagnostic suites.  A clean sweep means \kcc{} generated its
+own machine code---down to the last register and slot---identically to the
+assembly it replaces.
+
+@d Selfhost: codegen verify @{
+#!/usr/bin/env bash
+# make selfhost-codegen — compile kcc's ARM64 code generator in C with kcc,
+# relink, run difftest + diagtest + codegen.
+set -euo pipefail
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+echo "[1/4] compiling tmp/selfhost/codegen.c with kcc"
+tmp/kcc -c "$SH/codegen.c" -o "$SH/codegen_c.o" >/dev/null
+echo "[2/4] linking tmp/kcc_selfhost_codegen (codegen.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "codegen" ]; then OBJ="$OBJ $SH/codegen_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_codegen $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+cp tmp/kcc "$SH/kcc_asm_backup_codegen"
+cp tmp/kcc_selfhost_codegen tmp/kcc
+echo "[3/4] difftest (byte-compare) + diagtest"
+set +e
+bash tmp/tests/difftest.sh >/tmp/cg_difftest.log 2>&1; dstatus=$?
+tail -1 /tmp/cg_difftest.log
+bash tmp/tests/diagtest.sh >/tmp/cg_diag.log 2>&1; diagst=$?
+tail -1 /tmp/cg_diag.log
+set -e
+if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_codegen" tmp/kcc; exit 1; fi
+echo "[4/4] codegen suite with the self-hosted code generator"
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_codegen" tmp/kcc
+exit $status
+@}

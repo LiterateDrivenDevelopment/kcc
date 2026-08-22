@@ -1,0 +1,470 @@
+% 48k-self-hosting-types.weft — Stage 8l: the type system, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Type System in C}
+\label{ch:self-hosting-types}
+
+The type system of Chapter~\ref{ch:types} is the semantic core the whole
+front end stands on: every declaration resolves to one of its descriptors,
+every expression is assigned one, and the code generator reads a descriptor's
+size, alignment, and kind to lay out storage and select instructions.  Porting
+it is the largest single step so far---fifteen exported functions and fifteen
+canonical descriptor globals---but the logic is uniform: allocate a forty-eight
+byte record, fill six fields, and read those same six fields back.  Because the
+conversions ported in Chapter~\ref{ch:self-hosting-conversions} already call
+into this module, a green suite with \emph{both} in C means the compiler's type
+arithmetic runs top to bottom through code kcc produced.
+
+\section{The Descriptor}
+
+A type descriptor is the same forty-eight byte record the assembly used: a
+\texttt{kind} tag at offset~0, the object \texttt{size} and \texttt{align} at
+8 and 16, the qualifier bits (\texttt{const}~1, \texttt{volatile}~2) at 24, and
+two general-purpose slots \texttt{f0} and \texttt{f1} at 32 and 40.  The two
+slots carry whatever a kind needs---for a basic integer type \texttt{f0} holds
+its signedness (1~signed, 0~unsigned); for a pointer, array, function, or
+aggregate it holds the pointee, element, return, or declaration; and \texttt{f1}
+holds an array's length or a function's parameter vector.  Every field is an
+\texttt{unsigned long} so the port mirrors the assembly's untyped machine words
+exactly, casting to a pointer only where a slot is dereferenced.
+
+The kind constants are the type module's: void~1, \_Bool~2, char~3, short~4,
+int~5, long~6, long long~7, float~8, double~9, long double~10, pointer~11,
+array~12, function~13, struct~14, union~15, enum~16.  Three externs remain in
+the (still-assembly) rest of the compiler: the arena allocator, the layout pass
+that sizes an aggregate on demand (\texttt{kcc\_type\_layout}, which lives in
+declarations), and the two buffered-output helpers the dump routine prints
+through.
+
+@l c
+@d Selfhost: types preamble @{
+struct Type {
+    unsigned long kind;   /* TY_KIND,  offset 0  */
+    unsigned long size;   /* TY_SIZE,  offset 8  */
+    unsigned long align;  /* TY_ALIGN, offset 16 */
+    unsigned long quals;  /* TY_QUALS, offset 24 */
+    unsigned long f0;     /* TY_F0,    offset 32 */
+    unsigned long f1;     /* TY_F1,    offset 40 */
+};
+
+void *kcc_arena_alloc(long size);
+unsigned long kcc_type_layout(void *t);
+void kcc_io_puts(const char *s);
+void kcc_io_putu(unsigned long n);
+
+void *kcc_type_void = 0;
+void *kcc_type_bool = 0;
+void *kcc_type_char_s = 0;
+void *kcc_type_char_u = 0;
+void *kcc_type_short_s = 0;
+void *kcc_type_short_u = 0;
+void *kcc_type_int_s = 0;
+void *kcc_type_int_u = 0;
+void *kcc_type_long_s = 0;
+void *kcc_type_long_u = 0;
+void *kcc_type_llong_s = 0;
+void *kcc_type_llong_u = 0;
+void *kcc_type_float = 0;
+void *kcc_type_double = 0;
+void *kcc_type_ldouble = 0;
+@}
+
+\section{Initialising the Canonical Descriptors}
+
+\texttt{kcc\_types\_init} allocates one singleton per basic type at startup and
+records it in the matching global.  A file-local helper \texttt{mk} captures the
+shared shape---allocate, set kind/size/align, zero the qualifiers, store the
+signedness in \texttt{f0} and zero \texttt{f1}---so the fourteen allocations
+read as a table.  Plain \texttt{char} maps to \emph{signed} char, following the
+Apple ARM64 sign convention; the integer types carry their width (1, 2, 4, 8)
+and signedness; and \texttt{long double} is not allocated at all but
+\emph{aliased} to the \texttt{double} descriptor, because the Apple ARM64 ABI
+defines it as a 64-bit IEEE double---so every path that recognises a floating
+type by its kind treats a long double exactly as a double.
+
+@l c
+@d Selfhost: types init @{
+static void *mk(unsigned long kind, unsigned long size,
+                unsigned long align, unsigned long f0) {
+    struct Type *t = (struct Type *)kcc_arena_alloc(48);
+    t->kind = kind;
+    t->size = size;
+    t->align = align;
+    t->quals = 0;
+    t->f0 = f0;
+    t->f1 = 0;
+    return t;
+}
+
+void kcc_types_init(void) {
+    kcc_type_void    = mk(1, 0, 0, 0);
+    kcc_type_bool    = mk(2, 1, 1, 0);
+    kcc_type_char_s  = mk(3, 1, 1, 1);
+    kcc_type_char_u  = mk(3, 1, 1, 0);
+    kcc_type_short_s = mk(4, 2, 2, 1);
+    kcc_type_short_u = mk(4, 2, 2, 0);
+    kcc_type_int_s   = mk(5, 4, 4, 1);
+    kcc_type_int_u   = mk(5, 4, 4, 0);
+    kcc_type_long_s  = mk(6, 8, 8, 1);
+    kcc_type_long_u  = mk(6, 8, 8, 0);
+    kcc_type_llong_s = mk(7, 8, 8, 1);
+    kcc_type_llong_u = mk(7, 8, 8, 0);
+    kcc_type_float   = mk(8, 4, 4, 0);
+    kcc_type_double  = mk(9, 8, 8, 0);
+    kcc_type_ldouble = kcc_type_double;
+}
+@}
+
+\section{Constructors}
+
+The derived-type constructors each allocate a fresh descriptor and wire the
+component types into \texttt{f0}/\texttt{f1}.  A pointer is eight bytes wide and
+holds its pointee in \texttt{f0}.  \texttt{kcc\_type\_param\_adjust} applies the
+parameter rule of \stdref{6.7.6.3}: an array parameter decays to a pointer to
+its element, a function parameter to a pointer to the function, and anything
+else passes through---so the callee indexes the passed address rather than
+inline storage.  An array lays its element out \emph{first}
+(\texttt{kcc\_type\_layout} is idempotent) so that an aggregate element declared
+before it is otherwise referenced still contributes a correct size; the total
+is element-size times length, alignment is inherited, and length lives in
+\texttt{f1} (zero meaning incomplete).  A function type has no size; its return
+type sits in \texttt{f0} and its parameter vector in \texttt{f1}.
+
+@l c
+@d Selfhost: types constructors @{
+void *kcc_type_ptr(void *pointee) {
+    struct Type *t = (struct Type *)kcc_arena_alloc(48);
+    t->kind = 11;
+    t->size = 8;
+    t->align = 8;
+    t->quals = 0;
+    t->f0 = (unsigned long)pointee;
+    t->f1 = 0;
+    return t;
+}
+
+void *kcc_type_param_adjust(void *type) {
+    if (type == 0) return type;
+    struct Type *t = (struct Type *)type;
+    if (t->kind == 12) return kcc_type_ptr((void *)t->f0);
+    if (t->kind == 13) return kcc_type_ptr(type);
+    return type;
+}
+
+void *kcc_type_array(void *elem, unsigned long len) {
+    struct Type *a = (struct Type *)kcc_arena_alloc(48);
+    a->kind = 12;
+    a->size = kcc_type_layout(elem) * len;
+    a->align = ((struct Type *)elem)->align;
+    a->quals = 0;
+    a->f0 = (unsigned long)elem;
+    a->f1 = len;
+    return a;
+}
+
+void *kcc_type_func(void *ret, void *params) {
+    struct Type *f = (struct Type *)kcc_arena_alloc(48);
+    f->kind = 13;
+    f->size = 0;
+    f->align = 0;
+    f->quals = 0;
+    f->f0 = (unsigned long)ret;
+    f->f1 = (unsigned long)params;
+    return f;
+}
+@}
+
+\section{Aggregate Constructors}
+
+Struct and union descriptors are \emph{memoised} on the defining AST node.  The
+node's spare field at offset~40 (\texttt{AST\_F2}, zero-initialised by
+\texttt{ast\_alloc}) caches the descriptor, and re-resolving the same
+definition---particularly an anonymous one, which has no tag to deduplicate
+through---returns the same record.  A second descriptor would share the field
+AST nodes and, on layout, re-run the destructive bit-field packing that rewrites
+those nodes, corrupting a definition the first layout already consumed.  Struct
+and union differ only in kind (14 versus 15); both leave size and alignment at
+zero for the layout pass to fill.  An enum needs no memoisation: its underlying
+type is \texttt{int}, so it is four bytes, four-aligned, with the declaration in
+\texttt{f0} (\stdref{6.7.2.2}).
+
+@l c
+@d Selfhost: types aggregates @{
+void *kcc_type_struct(void *decl) {
+    if (decl) {
+        unsigned long cached = *(unsigned long *)((char *)decl + 40);
+        if (cached) return (void *)cached;
+    }
+    struct Type *t = (struct Type *)kcc_arena_alloc(48);
+    t->kind = 14;
+    t->size = 0;
+    t->align = 0;
+    t->quals = 0;
+    t->f0 = (unsigned long)decl;
+    t->f1 = 0;
+    if (decl) *(unsigned long *)((char *)decl + 40) = (unsigned long)t;
+    return t;
+}
+
+void *kcc_type_union(void *decl) {
+    if (decl) {
+        unsigned long cached = *(unsigned long *)((char *)decl + 40);
+        if (cached) return (void *)cached;
+    }
+    struct Type *t = (struct Type *)kcc_arena_alloc(48);
+    t->kind = 15;
+    t->size = 0;
+    t->align = 0;
+    t->quals = 0;
+    t->f0 = (unsigned long)decl;
+    t->f1 = 0;
+    if (decl) *(unsigned long *)((char *)decl + 40) = (unsigned long)t;
+    return t;
+}
+
+void *kcc_type_enum(void *decl) {
+    struct Type *t = (struct Type *)kcc_arena_alloc(48);
+    t->kind = 16;
+    t->size = 4;
+    t->align = 4;
+    t->quals = 0;
+    t->f0 = (unsigned long)decl;
+    t->f1 = 0;
+    return t;
+}
+@}
+
+\section{Specifier Bitmask Resolution}
+
+The parser accumulates type keywords into a bitmask, and
+\texttt{kcc\_type\_from\_specmask} maps each valid combination to a canonical
+descriptor.  The bit values are the specifier constants (void~1, char~2,
+short~4, int~8, long~16, long long~32, float~64, double~128, signed~256,
+unsigned~512, \_Bool~1024), and the accepted combinations are exactly those
+\stdref{6.7.2} permits: \texttt{signed}/\texttt{unsigned} may qualify any
+integer, a redundant \texttt{int} may accompany \texttt{short}/\texttt{long},
+and two \texttt{long}s (or \texttt{long}~plus the internal long-long bit) name
+\texttt{long long}.  Plain and \texttt{signed} forms select the signed
+singleton; an \texttt{unsigned} bit selects the unsigned one.  Any bitmask that
+matches nothing---an invalid soup like \texttt{float unsigned}---returns zero,
+and semantic analysis reports the error.
+
+@l c
+@d Selfhost: types specmask @{
+#define SPEC_VOID     1
+#define SPEC_CHAR     2
+#define SPEC_SHORT    4
+#define SPEC_INT      8
+#define SPEC_LONG     16
+#define SPEC_LLONG    32
+#define SPEC_FLOAT    64
+#define SPEC_DOUBLE   128
+#define SPEC_SIGNED   256
+#define SPEC_UNSIGNED 512
+#define SPEC_BOOL     1024
+
+void *kcc_type_from_specmask(unsigned long m) {
+    if (m == SPEC_VOID) return kcc_type_void;
+    if (m == SPEC_BOOL) return kcc_type_bool;
+
+    if (m == SPEC_CHAR || m == (SPEC_SIGNED | SPEC_CHAR)) return kcc_type_char_s;
+    if (m == (SPEC_UNSIGNED | SPEC_CHAR)) return kcc_type_char_u;
+
+    if (m == SPEC_SHORT || m == (SPEC_SIGNED | SPEC_SHORT) ||
+        m == (SPEC_SHORT | SPEC_INT) ||
+        m == (SPEC_SIGNED | SPEC_SHORT | SPEC_INT)) return kcc_type_short_s;
+    if (m == (SPEC_UNSIGNED | SPEC_SHORT) ||
+        m == (SPEC_UNSIGNED | SPEC_SHORT | SPEC_INT)) return kcc_type_short_u;
+
+    if (m == SPEC_INT || m == SPEC_SIGNED ||
+        m == (SPEC_SIGNED | SPEC_INT)) return kcc_type_int_s;
+    if (m == SPEC_UNSIGNED ||
+        m == (SPEC_UNSIGNED | SPEC_INT)) return kcc_type_int_u;
+
+    if (m == SPEC_LONG || m == (SPEC_SIGNED | SPEC_LONG) ||
+        m == (SPEC_LONG | SPEC_INT) ||
+        m == (SPEC_SIGNED | SPEC_LONG | SPEC_INT)) return kcc_type_long_s;
+    if (m == (SPEC_UNSIGNED | SPEC_LONG) ||
+        m == (SPEC_UNSIGNED | SPEC_LONG | SPEC_INT)) return kcc_type_long_u;
+
+    if (m == SPEC_LLONG || m == (SPEC_SIGNED | SPEC_LLONG) ||
+        m == (SPEC_LLONG | SPEC_INT) ||
+        m == (SPEC_SIGNED | SPEC_LLONG | SPEC_INT) ||
+        m == (SPEC_LONG | SPEC_LLONG) ||
+        m == (SPEC_SIGNED | SPEC_LONG | SPEC_LLONG) ||
+        m == (SPEC_LONG | SPEC_LLONG | SPEC_INT) ||
+        m == (SPEC_SIGNED | SPEC_LONG | SPEC_LLONG | SPEC_INT))
+        return kcc_type_llong_s;
+    if (m == (SPEC_UNSIGNED | SPEC_LLONG) ||
+        m == (SPEC_UNSIGNED | SPEC_LLONG | SPEC_INT) ||
+        m == (SPEC_UNSIGNED | SPEC_LONG | SPEC_LLONG) ||
+        m == (SPEC_UNSIGNED | SPEC_LONG | SPEC_LLONG | SPEC_INT))
+        return kcc_type_llong_u;
+
+    if (m == SPEC_FLOAT) return kcc_type_float;
+    if (m == SPEC_DOUBLE) return kcc_type_double;
+    if (m == (SPEC_LONG | SPEC_DOUBLE)) return kcc_type_ldouble;
+
+    return 0;
+}
+@}
+
+\section{Predicates and Rank}
+
+The predicates classify a type by kind.  \texttt{kcc\_type\_compatible} treats
+pointer identity as trivially compatible, then requires the same kind; for a
+basic type it additionally compares signedness (\texttt{f0}), and for a derived
+type only pointers are (permissively) accepted, deferring a deeper structural
+check.  \texttt{kcc\_type\_is\_integer} recognises the integer kinds including
+\texttt{enum}; \texttt{kcc\_type\_is\_arithmetic} adds the three floating kinds;
+and \texttt{kcc\_type\_is\_scalar} adds pointers.  \texttt{kcc\_type\_rank}
+assigns the integer conversion rank of \stdref{6.3.1.1}---\_Bool~1 through long
+long~6, with \texttt{enum} ranking as \texttt{int}---so callers pick the wider
+operand with a single comparison.
+
+@l c
+@d Selfhost: types predicates @{
+int kcc_type_compatible(void *a, void *b) {
+    if (a == b) return 1;
+    struct Type *t1 = (struct Type *)a;
+    struct Type *t2 = (struct Type *)b;
+    if (t1->kind != t2->kind) return 0;
+    if (t1->kind >= 11) {
+        if (t1->kind == 11) return 1;
+        return 0;
+    }
+    if (t1->f0 != t2->f0) return 0;
+    return 1;
+}
+
+int kcc_type_is_integer(void *type) {
+    unsigned long k = ((struct Type *)type)->kind;
+    if (k == 2 || k == 3 || k == 4 || k == 5 || k == 6 || k == 7 || k == 16)
+        return 1;
+    return 0;
+}
+
+int kcc_type_is_arithmetic(void *type) {
+    if (kcc_type_is_integer(type)) return 1;
+    unsigned long k = ((struct Type *)type)->kind;
+    if (k == 8 || k == 9 || k == 10) return 1;
+    return 0;
+}
+
+int kcc_type_is_scalar(void *type) {
+    if (kcc_type_is_arithmetic(type)) return 1;
+    if (((struct Type *)type)->kind == 11) return 1;
+    return 0;
+}
+
+unsigned long kcc_type_rank(void *type) {
+    unsigned long k = ((struct Type *)type)->kind;
+    if (k == 2) return 1;
+    if (k == 3) return 2;
+    if (k == 4) return 3;
+    if (k == 5) return 4;
+    if (k == 16) return 4;
+    if (k == 6) return 5;
+    if (k == 7) return 6;
+    return 0;
+}
+@}
+
+\section{Dump}
+
+\texttt{kcc\_type\_dump} prints a type the way a diagnostic shows it, and its
+bytes must match the assembly's exactly.  It leads with any qualifier words
+(\texttt{const~}, \texttt{volatile~}), then the kind: the integer kinds choose
+between the plain and \texttt{unsigned} spelling on the signedness flag, the
+floating kinds print a fixed word, a pointer recurses on its pointee and appends
+\texttt{~*}, an array recurses and appends the bracketed length, a function
+recurses on its return type and appends \texttt{~()}, and the aggregates print
+their keyword.  A null descriptor prints \texttt{<null>} and an unrecognised
+kind \texttt{<unknown>}.
+
+@l c
+@d Selfhost: types dump @{
+void kcc_type_dump(void *type) {
+    if (type == 0) { kcc_io_puts("<null>"); return; }
+    struct Type *t = (struct Type *)type;
+    if (t->quals & 1) kcc_io_puts("const ");
+    if (t->quals & 2) kcc_io_puts("volatile ");
+    unsigned long k = t->kind;
+    if (k == 1) { kcc_io_puts("void"); return; }
+    if (k == 2) { kcc_io_puts("_Bool"); return; }
+    if (k == 3) { kcc_io_puts(t->f0 ? "char" : "unsigned char"); return; }
+    if (k == 4) { kcc_io_puts(t->f0 ? "short" : "unsigned short"); return; }
+    if (k == 5) { kcc_io_puts(t->f0 ? "int" : "unsigned int"); return; }
+    if (k == 6) { kcc_io_puts(t->f0 ? "long" : "unsigned long"); return; }
+    if (k == 7) { kcc_io_puts(t->f0 ? "long long" : "unsigned long long"); return; }
+    if (k == 8) { kcc_io_puts("float"); return; }
+    if (k == 9) { kcc_io_puts("double"); return; }
+    if (k == 10) { kcc_io_puts("long double"); return; }
+    if (k == 11) { kcc_type_dump((void *)t->f0); kcc_io_puts(" *"); return; }
+    if (k == 12) {
+        kcc_type_dump((void *)t->f0);
+        kcc_io_puts("[");
+        kcc_io_putu(t->f1);
+        kcc_io_puts("]");
+        return;
+    }
+    if (k == 13) { kcc_type_dump((void *)t->f0); kcc_io_puts(" ()"); return; }
+    if (k == 14) { kcc_io_puts("struct"); return; }
+    if (k == 15) { kcc_io_puts("union"); return; }
+    if (k == 16) { kcc_io_puts("enum"); return; }
+    kcc_io_puts("<unknown>");
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: types @{
+@<Selfhost: types preamble@>
+@<Selfhost: types init@>
+@<Selfhost: types constructors@>
+@<Selfhost: types aggregates@>
+@<Selfhost: types specmask@>
+@<Selfhost: types predicates@>
+@<Selfhost: types dump@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-types-verify}
+
+\texttt{make selfhost-types} runs the drop-in loop.  Because every declaration
+resolves through these constructors and every expression is typed through these
+predicates, a green code-generation suite means \kcc{} compiled its own type
+system---descriptors, layout hooks, promotions, and all---correctly.
+
+@d Selfhost: types verify @{
+#!/usr/bin/env bash
+# make selfhost-types — compile kcc's type system in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/types.c with kcc"
+tmp/kcc -c "$SH/types.c" -o "$SH/types_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_types (types.o -> kcc-compiled types_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "types" ]; then OBJ="$OBJ $SH/types_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_types $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted type system"
+cp tmp/kcc "$SH/kcc_asm_backup_types"
+cp tmp/kcc_selfhost_types tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_types" tmp/kcc
+exit $status
+@}

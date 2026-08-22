@@ -25,8 +25,8 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 .DEFAULT_GOAL := build
 
 .PHONY: all default tangle assemble build test selfhost selfhost-lexer \
-        difftest interop e2e diagtest warntest test-codegen doc weave \
-        clean run map
+        selfhost-types difftest interop e2e diagtest warntest test-codegen \
+        doc weave clean run map
 
 # Default: build everything
 all default: build
@@ -111,6 +111,11 @@ selfhost-symtab: build
 selfhost-conversions: build
 	chmod +x tmp/selfhost/conversions_verify.sh
 	tmp/selfhost/conversions_verify.sh
+
+# Self-hosting (Stage 8l): compile kcc's type system in C, relink, run suite
+selfhost-types: build
+	chmod +x tmp/selfhost/types_verify.sh
+	tmp/selfhost/types_verify.sh
 
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build

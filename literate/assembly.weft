@@ -851,6 +851,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: conversions verify@>
 @}
 
+\noindent The type system itself, ported to C
+(Chapter~\ref{ch:self-hosting-types}), a drop-in replacement:
+
+@o tmp/selfhost/types.c @{
+@<Selfhost: types@>
+@}
+
+@o tmp/selfhost/types_verify.sh @{
+@<Selfhost: types verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

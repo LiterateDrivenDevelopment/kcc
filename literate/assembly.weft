@@ -862,6 +862,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: types verify@>
 @}
 
+\noindent The optimizer, ported to C
+(Chapter~\ref{ch:self-hosting-opt}), a drop-in replacement:
+
+@o tmp/selfhost/opt.c @{
+@<Selfhost: opt@>
+@}
+
+@o tmp/selfhost/opt_verify.sh @{
+@<Selfhost: opt verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

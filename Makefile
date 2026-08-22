@@ -25,8 +25,8 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 .DEFAULT_GOAL := build
 
 .PHONY: all default tangle assemble build test selfhost selfhost-lexer \
-        selfhost-types meta-a difftest interop e2e diagtest warntest \
-        test-codegen doc weave clean run map
+        selfhost-types selfhost-opt meta-a difftest interop e2e diagtest \
+        warntest test-codegen doc weave clean run map
 
 # Default: build everything
 all default: build
@@ -116,6 +116,11 @@ selfhost-conversions: build
 selfhost-types: build
 	chmod +x tmp/selfhost/types_verify.sh
 	tmp/selfhost/types_verify.sh
+
+# Self-hosting (Stage 8m): compile kcc's optimizer in C, relink, run suite
+selfhost-opt: build
+	chmod +x tmp/selfhost/opt_verify.sh
+	tmp/selfhost/opt_verify.sh
 
 # Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link against the Linux runtime (no libc), run it natively (Chapter: Runtime).

@@ -1,0 +1,706 @@
+% 48l-self-hosting-opt.weft — Stage 8m: the optimizer, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Optimizer in C}
+\label{ch:self-hosting-opt}
+
+The optimizer of Part~\ref{ch:ir-passes} is the first \emph{middle-end}
+subsystem to port, and the most thoroughly exercised: every one of the
+code-generation tests runs its program through the whole fixed-point
+loop---constant folding, strength reduction, common-subexpression elimination,
+store-to-load forwarding, and dead-code elimination---so a byte-identical
+code-generation suite is a strong witness that the C port reproduces each pass
+exactly.  The passes are pure IR-to-IR transforms with no I/O and no target
+knowledge, so they read only as walks over the IR data structures; the whole
+subsystem is arithmetic over three record layouts.
+
+\section{Reading the IR}
+
+The port declares the three IR records at the offsets
+Chapter~\ref{ch:ir-design} fixed: an instruction (opcode, destination vreg, two
+sources, a type pointer, and the next-instruction link), a basic block (its
+first instruction and its next-block link), and a function (its entry block, its
+vector of blocks, and its running vreg counter).  It also declares the vector
+header, so a pass can read a block-vector's count directly, and a minimal view
+of a type descriptor---its kind and qualifier bits---so the passes can refuse to
+fold or strength-reduce a floating-point instruction (whose constant operand is
+an IEEE-754 bit pattern, not an integer) and can honour \texttt{volatile}.  The
+externs are the arena, the vector accessor, the instruction allocator (used by
+strength reduction to splice in a fresh constant), and the global list of IR
+functions and the canonical \texttt{int} type.
+
+@l c
+@d Selfhost: opt preamble @{
+struct Instr {
+    unsigned long op;    /* IR_OP,   0  */
+    unsigned long dest;  /* IR_DEST, 8  */
+    unsigned long src1;  /* IR_SRC1, 16 */
+    unsigned long src2;  /* IR_SRC2, 24 */
+    void *type;          /* IR_TYPE, 32 */
+    struct Instr *next;  /* IR_NEXT, 40 */
+};
+
+struct BB {
+    unsigned long id;    /* BB_ID,    0  */
+    struct Instr *first; /* BB_FIRST, 8  */
+    struct Instr *last;  /* BB_LAST,  16 */
+    struct BB *next;     /* BB_NEXT,  24 */
+    unsigned long flags; /* BB_FLAGS, 32 */
+    unsigned long pad;   /* to 48 bytes  */
+};
+
+struct Func {
+    void *name;              /* IRF_NAME,   0  */
+    struct BB *entry;        /* IRF_ENTRY,  8  */
+    void *blocks;            /* IRF_BLOCKS, 16 (vec of BB*) */
+    unsigned long vreg_n;    /* IRF_VREG_N, 24 */
+    /* remaining fields (rettype, params, ...) are not read by the optimizer */
+};
+
+struct Vec {
+    void *data;
+    unsigned long count;     /* VEC_COUNT, 8 */
+    unsigned long cap;
+    unsigned long elem_size;
+};
+
+struct Type {
+    unsigned long kind;      /* TY_KIND,  0  */
+    unsigned long size;      /* TY_SIZE,  8  */
+    unsigned long align;     /* TY_ALIGN, 16 */
+    unsigned long quals;     /* TY_QUALS, 24 */
+};
+
+void *kcc_arena_alloc(long size);
+void *kcc_vec_get(void *vec, unsigned long index);
+void *kcc_ir_alloc_instr(long op);
+extern void *kcc_ir_funcs;
+extern void *kcc_type_int_s;
+
+/* IR opcodes (Chapter: IR design). */
+enum {
+    IR_ADD = 1, IR_SUB = 2, IR_MUL = 3, IR_SDIV = 4, IR_UDIV = 5,
+    IR_SMOD = 6, IR_UMOD = 7, IR_NEG = 8, IR_AND = 10, IR_OR = 11,
+    IR_XOR = 12, IR_SHL = 13, IR_LSHR = 14, IR_ASHR = 15, IR_NOT = 16,
+    IR_CMP_EQ = 20, IR_CMP_NE = 21, IR_CMP_SLT = 22, IR_CMP_SLE = 23,
+    IR_CMP_SGT = 24, IR_CMP_SGE = 25, IR_CMP_ULT = 26, IR_CMP_ULE = 27,
+    IR_LOAD = 30, IR_STORE = 31, IR_ALLOCA = 32, IR_GEP = 33,
+    IR_BR = 40, IR_BR_COND = 41, IR_RET = 42, IR_CALL = 43, IR_CALL_IND = 44,
+    IR_SEXT = 50, IR_ZEXT = 51, IR_TRUNC = 52, IR_VA_START = 56, IR_FPROUND = 57,
+    IR_CONST = 60, IR_NOP = 61, IR_GLOBAL_REF = 63, IR_STRING_LIT = 64, IR_ASM = 65
+};
+
+/* A floating type: kind FLOAT(8), DOUBLE(9), or LDOUBLE(10).  The pointer
+ * guard mirrors the assembly, which treats a small non-pointer type slot as
+ * non-floating. */
+static int opt_is_fp(void *type) {
+    if ((unsigned long)type < 0x1000) return 0;
+    unsigned long k = ((struct Type *)type)->kind;
+    return k >= 8 && k <= 10;
+}
+
+/* A volatile-qualified type: quals bit 2 (0x2) set. */
+static int opt_is_vol(void *type) {
+    if ((unsigned long)type < 0x1000) return 0;
+    return (((struct Type *)type)->quals & 2) != 0;
+}
+@}
+
+\section{Constant Folding}
+
+Constant folding runs two linear passes over the blocks.  The first records,
+in a dense per-vreg map, every value produced by an \texttt{IR\_CONST}; the
+second rewrites in place any instruction all of whose register inputs are
+known constants.  Three shapes fold: a binary arithmetic, bitwise, shift, or
+comparison instruction with two constant sources; a unary \texttt{NEG} or
+\texttt{NOT} of a constant; and---the load-bearing case---a width cast
+(\texttt{SEXT}/\texttt{ZEXT}/\texttt{TRUNC}) of a constant, without which a
+constant chain stalls at the first cast the front end inserts.  A folded
+instruction becomes an \texttt{IR\_CONST}, and its value is entered in the map
+so a later instruction in the same pass can fold on top of it.  Floating-point
+instructions are skipped so their bit patterns are never mangled by integer
+arithmetic.  Shift amounts are masked to six bits to match the machine's
+register-shift semantics.
+
+@l c
+@d Selfhost: opt constfold @{
+static void opt_cf_replace(struct Instr *in, unsigned long result,
+                           unsigned long *values, unsigned long *valid,
+                           unsigned long n, unsigned long *count) {
+    in->op = IR_CONST;
+    in->src1 = result;
+    in->src2 = 0;
+    if (in->dest < n) { valid[in->dest] = 1; values[in->dest] = result; }
+    *count += 1;
+}
+
+unsigned long kcc_opt_constfold(void *fn) {
+    struct Func *func = (struct Func *)fn;
+    unsigned long count = 0;
+    unsigned long n = func->vreg_n;
+    if (n == 0) return 0;
+    n = n + 1;
+
+    unsigned long *values = (unsigned long *)kcc_arena_alloc((long)(n * 8));
+    unsigned long *valid = (unsigned long *)kcc_arena_alloc((long)(n * 8));
+    for (unsigned long i = 0; i < n; i++) valid[i] = 0;
+
+    struct Vec *blocks = (struct Vec *)func->blocks;
+    if (blocks == 0) return 0;
+    unsigned long nb = blocks->count;
+
+    /* Pass 1: collect constants. */
+    for (unsigned long b = 0; b < nb; b++) {
+        struct BB *bb = *(struct BB **)kcc_vec_get(blocks, b);
+        for (struct Instr *in = bb->first; in; in = in->next) {
+            if (in->op == IR_CONST && in->dest < n) {
+                valid[in->dest] = 1;
+                values[in->dest] = in->src1;
+            }
+        }
+    }
+
+    /* Pass 2: fold. */
+    for (unsigned long b = 0; b < nb; b++) {
+        struct BB *bb = *(struct BB **)kcc_vec_get(blocks, b);
+        for (struct Instr *in = bb->first; in; in = in->next) {
+            if (opt_is_fp(in->type)) continue;
+            unsigned long op = in->op;
+
+            if (op == IR_SEXT || op == IR_ZEXT || op == IR_TRUNC) {
+                unsigned long s1 = in->src1;
+                if (s1 >= n || !valid[s1]) continue;
+                unsigned long val = values[s1];
+                unsigned long result, width;
+                if (op == IR_TRUNC) {
+                    struct Type *t = (struct Type *)in->type;
+                    if (t == 0 || t->size == 0) continue;
+                    width = t->size;
+                    if (width >= 8) result = val;
+                    else result = val & ((1UL << (width * 8)) - 1);
+                } else {
+                    width = in->src2;               /* source width in bytes */
+                    if (width == 0) continue;
+                    if (width >= 8) result = val;
+                    else if (op == IR_ZEXT) result = val & ((1UL << (width * 8)) - 1);
+                    else {                            /* SEXT */
+                        unsigned long sh = 64 - width * 8;
+                        result = (unsigned long)(((long)(val << sh)) >> sh);
+                    }
+                }
+                opt_cf_replace(in, result, values, valid, n, &count);
+                continue;
+            }
+
+            if (op < IR_ADD || op > IR_CMP_SGE) continue;
+
+            if (op == IR_NEG || op == IR_NOT) {
+                unsigned long s1 = in->src1;
+                if (s1 >= n || !valid[s1]) continue;
+                unsigned long val = values[s1];
+                unsigned long result = (op == IR_NEG) ? (unsigned long)(-(long)val)
+                                                      : ~val;
+                opt_cf_replace(in, result, values, valid, n, &count);
+                continue;
+            }
+
+            /* Binary: both sources must be constant. */
+            unsigned long s1 = in->src1, s2 = in->src2;
+            if (s1 >= n || !valid[s1]) continue;
+            if (s2 >= n || !valid[s2]) continue;
+            unsigned long a = values[s1], bb2 = values[s2];
+            unsigned long r;
+            /* An if-else chain (not a switch): it mirrors the assembly's
+             * compare-and-branch dispatch, and keeps `continue` directly in
+             * the enclosing for-loop. */
+            if (op == IR_ADD) r = a + bb2;
+            else if (op == IR_SUB) r = a - bb2;
+            else if (op == IR_MUL) r = a * bb2;
+            else if (op == IR_SDIV) {
+                if (bb2 == 0) continue;
+                r = (unsigned long)((long)a / (long)bb2);
+            }
+            else if (op == IR_AND) r = a & bb2;
+            else if (op == IR_OR)  r = a | bb2;
+            else if (op == IR_XOR) r = a ^ bb2;
+            else if (op == IR_SHL) r = a << (bb2 & 63);
+            else if (op == IR_ASHR) r = (unsigned long)((long)a >> (bb2 & 63));
+            else if (op == IR_CMP_EQ)  r = (a == bb2) ? 1 : 0;
+            else if (op == IR_CMP_NE)  r = (a != bb2) ? 1 : 0;
+            else if (op == IR_CMP_SLT) r = ((long)a < (long)bb2) ? 1 : 0;
+            else if (op == IR_CMP_SGT) r = ((long)a > (long)bb2) ? 1 : 0;
+            else continue;                 /* not a foldable binary op */
+            opt_cf_replace(in, r, values, valid, n, &count);
+        }
+    }
+    return count;
+}
+@}
+
+\section{Strength Reduction}
+
+Where folding needs \emph{both} operands constant, strength reduction handles a
+single constant operand that is a power of two: a multiply becomes a left shift
+(for signed and unsigned alike), an unsigned divide a logical right shift, and
+an unsigned remainder a mask; a multiply by zero collapses to the constant
+zero.  Signed divide and remainder are left alone, since an arithmetic shift
+rounds the wrong way.  A shift or mask needs a fresh constant for its amount, so
+the pass allocates an \texttt{IR\_CONST}, draws a new vreg from the function's
+counter, and splices it in just before the rewritten instruction---which is why
+the walk tracks the previous instruction to relink the list.  Floating-point
+instructions are skipped so a \texttt{2.0} bit pattern is never mistaken for a
+power of two.
+
+@l c
+@d Selfhost: opt strength @{
+static int opt_sr_cval(unsigned long vreg, unsigned long n,
+                       unsigned long *values, unsigned long *valid,
+                       unsigned long *out) {
+    if (vreg >= n) return 0;
+    if (!valid[vreg]) return 0;
+    *out = values[vreg];
+    return 1;
+}
+
+/* log2 of a power of two, matching 63 - clz. */
+static unsigned long opt_log2(unsigned long c) {
+    unsigned long k = 0;
+    while ((c >> k) != 1) k++;
+    return k;
+}
+
+unsigned long kcc_opt_strength(void *fn) {
+    struct Func *func = (struct Func *)fn;
+    unsigned long count = 0;
+    unsigned long n = func->vreg_n;
+    if (n == 0) return 0;
+    n = n + 1;
+
+    unsigned long *values = (unsigned long *)kcc_arena_alloc((long)(n * 8));
+    unsigned long *valid = (unsigned long *)kcc_arena_alloc((long)(n * 8));
+    for (unsigned long i = 0; i < n; i++) valid[i] = 0;
+
+    /* Pass 1: collect constants (via the entry chain). */
+    for (struct BB *bb = func->entry; bb; bb = bb->next)
+        for (struct Instr *in = bb->first; in; in = in->next)
+            if (in->op == IR_CONST && in->dest < n) {
+                valid[in->dest] = 1;
+                values[in->dest] = in->src1;
+            }
+
+    /* Pass 2: rewrite. */
+    for (struct BB *bb = func->entry; bb; bb = bb->next) {
+        struct Instr *prev = 0;
+        for (struct Instr *cur = bb->first; cur; ) {
+            if (opt_is_fp(cur->type)) { prev = cur; cur = cur->next; continue; }
+            unsigned long op = cur->op;
+            unsigned long C = 0, x = 0, amount = 0, newop = 0;
+            int to_zero = 0, rewrite = 0;
+
+            if (op == IR_MUL) {
+                unsigned long v;
+                if (opt_sr_cval(cur->src2, n, values, valid, &v)) {
+                    C = v; x = cur->src1;
+                } else if (opt_sr_cval(cur->src1, n, values, valid, &v)) {
+                    C = v; x = cur->src2;
+                } else { prev = cur; cur = cur->next; continue; }
+                if (C == 0) { to_zero = 1; }
+                else if ((long)C < 2) { prev = cur; cur = cur->next; continue; }
+                else if (C & (C - 1)) { prev = cur; cur = cur->next; continue; }
+                else { amount = opt_log2(C); newop = IR_SHL; rewrite = 1; }
+            } else if (op == IR_UDIV) {
+                unsigned long v;
+                if (!opt_sr_cval(cur->src2, n, values, valid, &v)) { prev = cur; cur = cur->next; continue; }
+                C = v;
+                if ((long)C < 2) { prev = cur; cur = cur->next; continue; }
+                if (C & (C - 1)) { prev = cur; cur = cur->next; continue; }
+                amount = opt_log2(C); x = cur->src1; newop = IR_LSHR; rewrite = 1;
+            } else if (op == IR_UMOD) {
+                unsigned long v;
+                if (!opt_sr_cval(cur->src2, n, values, valid, &v)) { prev = cur; cur = cur->next; continue; }
+                C = v;
+                if ((long)C < 1) { prev = cur; cur = cur->next; continue; }
+                if (C & (C - 1)) { prev = cur; cur = cur->next; continue; }
+                amount = C - 1; x = cur->src1; newop = IR_AND; rewrite = 1;
+            } else { prev = cur; cur = cur->next; continue; }
+
+            if (to_zero) {
+                cur->op = IR_CONST;
+                cur->src1 = 0;
+                cur->src2 = 0;
+                count++;
+                prev = cur; cur = cur->next; continue;
+            }
+
+            if (rewrite) {
+                struct Instr *k = (struct Instr *)kcc_ir_alloc_instr(IR_CONST);
+                k->type = kcc_type_int_s;
+                k->src1 = amount;
+                k->src2 = 0;
+                unsigned long v = func->vreg_n;
+                func->vreg_n = v + 1;
+                k->dest = v;
+                k->next = cur;
+                if (prev) prev->next = k;
+                else bb->first = k;
+                cur->op = newop;
+                cur->src1 = x;
+                cur->src2 = v;
+                count++;
+                prev = cur; cur = cur->next; continue;
+            }
+        }
+    }
+    return count;
+}
+@}
+
+\section{Common Subexpression Elimination}
+
+CSE value-numbers within a single basic block: two pure instructions with the
+same opcode and the same (already-canonicalised) source registers compute the
+same value, so the second's destination is mapped to the first's, and a redundant
+load reuses an earlier load of the same address when no store, call, or inline
+asm has intervened.  A function-wide replacement map records these equivalences,
+and every instruction's operands are first rewritten through it, so a later use
+reads the surviving register; dead-code elimination then removes the instruction
+left with no users.  The canonicaliser rewrites exactly the fields that hold a
+register---skipping immediates, widths, block ids, and symbols---and a volatile
+load acts as a barrier that is neither reused nor recorded.
+
+@l c
+@d Selfhost: opt cse @{
+static unsigned long opt_canon(unsigned long vreg, unsigned long n,
+                               unsigned long *map) {
+    if (vreg >= n) return vreg;
+    return map[vreg];
+}
+
+static void opt_canon_ops(struct Instr *in, unsigned long n, unsigned long *map) {
+    unsigned long op = in->op;
+
+    if (!(op == IR_CONST || op == IR_CALL || op == IR_BR ||
+          op == IR_GLOBAL_REF || op == IR_ALLOCA || op == IR_NOP ||
+          op == IR_BR_COND || op == IR_STRING_LIT || op == IR_VA_START))
+        in->src1 = opt_canon(in->src1, n, map);
+
+    if (op == IR_GEP || op == IR_STORE ||
+        (op >= 1 && op <= 7) || (op >= 10 && op <= 15) ||
+        (op >= 20 && op <= 27))
+        in->src2 = opt_canon(in->src2, n, map);
+
+    if (op == IR_BR_COND)
+        in->dest = opt_canon(in->dest, n, map);
+}
+
+unsigned long kcc_opt_cse(void *fn) {
+    struct Func *func = (struct Func *)fn;
+    unsigned long count = 0;
+    unsigned long n = func->vreg_n;
+    if (n == 0) return 0;
+    n = n + 1;
+
+    unsigned long *map = (unsigned long *)kcc_arena_alloc((long)(n * 8));
+    unsigned long *vtab = (unsigned long *)kcc_arena_alloc((long)(n * 32)); /* op,s1,s2,dest */
+    unsigned long *ltab = (unsigned long *)kcc_arena_alloc((long)(n * 16)); /* addr,dest */
+    for (unsigned long i = 0; i < n; i++) map[i] = i;
+
+    struct Vec *blocks = (struct Vec *)func->blocks;
+    unsigned long nb = blocks->count;
+
+    for (unsigned long b = 0; b < nb; b++) {
+        unsigned long vcount = 0, lcount = 0;
+        struct BB *bb = *(struct BB **)kcc_vec_get(blocks, b);
+        for (struct Instr *in = bb->first; in; in = in->next) {
+            opt_canon_ops(in, n, map);
+            unsigned long op = in->op;
+
+            if (op == IR_STORE || op == IR_CALL || op == IR_CALL_IND || op == IR_ASM) {
+                lcount = 0;
+                continue;
+            }
+
+            if (op == IR_LOAD) {
+                if (opt_is_vol(in->type)) { lcount = 0; continue; }
+                unsigned long addr = in->src1;
+                unsigned long i;
+                for (i = 0; i < lcount; i++) {
+                    if (ltab[i * 2] == addr) {
+                        unsigned long earlier = ltab[i * 2 + 1];
+                        if (in->dest >= n) break;
+                        map[in->dest] = earlier;
+                        count++;
+                        break;
+                    }
+                }
+                if (i >= lcount) {          /* no hit: record this load */
+                    ltab[lcount * 2] = addr;
+                    ltab[lcount * 2 + 1] = in->dest;
+                    lcount++;
+                }
+                continue;
+            }
+
+            int pure = (op >= 1 && op <= 16) || (op >= 20 && op <= 27) ||
+                       op == IR_GEP || (op >= 50 && op <= 55) || op == IR_FPROUND;
+            if (!pure) continue;
+
+            unsigned long s1 = in->src1, s2 = in->src2;
+            unsigned long i;
+            for (i = 0; i < vcount; i++) {
+                if (vtab[i * 4] == op && vtab[i * 4 + 1] == s1 && vtab[i * 4 + 2] == s2) {
+                    unsigned long earlier = vtab[i * 4 + 3];
+                    if (in->dest >= n) break;
+                    map[in->dest] = earlier;
+                    count++;
+                    break;
+                }
+            }
+            if (i >= vcount) {
+                vtab[vcount * 4] = op;
+                vtab[vcount * 4 + 1] = s1;
+                vtab[vcount * 4 + 2] = s2;
+                vtab[vcount * 4 + 3] = in->dest;
+                vcount++;
+            }
+        }
+    }
+    return count;
+}
+@}
+
+\section{Store-to-Load Forwarding}
+
+Copy propagation forwards a stored value to a following load of the same
+address, but only when it is provably safe: within one block it tracks the
+single most recent store, and forwards to a load only if no store, call, or
+\texttt{va\_start} intervened and both the store and the load are the natural
+eight-byte access (so no truncation can make the values differ).  The forward is
+recorded in the same replacement map the canonicaliser reads, so subsequent uses
+pick up the stored register directly; dead-code elimination sweeps the load left
+behind.
+
+@l c
+@d Selfhost: opt copyprop @{
+unsigned long kcc_opt_copyprop(void *fn) {
+    struct Func *func = (struct Func *)fn;
+    unsigned long count = 0;
+    unsigned long n = func->vreg_n;
+    if (n == 0) return 0;
+    n = n + 1;
+
+    unsigned long *map = (unsigned long *)kcc_arena_alloc((long)(n * 8));
+
+    for (struct BB *bb = func->entry; bb; bb = bb->next) {
+        for (unsigned long i = 0; i < n; i++) map[i] = i;
+        int have = 0;
+        unsigned long st_addr = 0, st_val = 0, st_size = 0;
+        for (struct Instr *in = bb->first; in; in = in->next) {
+            opt_canon_ops(in, n, map);
+            unsigned long op = in->op;
+            if (op == IR_STORE) {
+                st_addr = in->src2;
+                st_val = in->src1;
+                st_size = in->dest;
+                have = 1;
+            } else if (op == IR_LOAD) {
+                if (!have) continue;
+                if (in->src1 != st_addr) continue;
+                if (st_size != 0) continue;
+                if (in->src2 != 0) continue;
+                if (in->dest >= n) continue;
+                map[in->dest] = st_val;
+                count++;
+            } else if (op == IR_CALL || op == IR_CALL_IND ||
+                       op == IR_ASM || op == IR_VA_START) {
+                have = 0;
+            }
+        }
+    }
+    return count;
+}
+@}
+
+\section{Dead-Code Elimination}
+
+Dead-code elimination is mark-and-sweep.  The mark pass records every vreg that
+appears as a source operand---taking care that a folded \texttt{IR\_CONST}'s
+immediate, a call's name and argument array, and a branch's block ids are not
+mistaken for registers, and that an \texttt{IR\_NOP} left by an earlier sweep
+references nothing.  The sweep pass then turns into a \texttt{NOP} any
+instruction whose destination was never marked and that has no side effect;
+stores, branches, returns, calls, allocas, and volatile loads are always kept.
+
+@l c
+@d Selfhost: opt dce @{
+unsigned long kcc_opt_dce(void *fn) {
+    struct Func *func = (struct Func *)fn;
+    unsigned long count = 0;
+    unsigned long n = func->vreg_n;
+    if (n == 0) return 0;
+    n = n + 1;
+
+    unsigned long *used = (unsigned long *)kcc_arena_alloc((long)(n * 8));
+    for (unsigned long i = 0; i < n; i++) used[i] = 0;
+
+    struct Vec *blocks = (struct Vec *)func->blocks;
+    if (blocks == 0) return 0;
+    unsigned long nb = blocks->count;
+
+    /* Mark. */
+    for (unsigned long b = 0; b < nb; b++) {
+        struct BB *bb = *(struct BB **)kcc_vec_get(blocks, b);
+        for (struct Instr *in = bb->first; in; in = in->next) {
+            unsigned long op = in->op;
+            if (op == IR_NOP) continue;
+
+            /* src1, unless it is not a register for this opcode */
+            if (!(op == IR_CONST || op == IR_CALL || op == IR_BR ||
+                  op == IR_GLOBAL_REF)) {
+                unsigned long s1 = in->src1;
+                if (s1 < n) used[s1] = 1;
+            }
+
+            /* src2 */
+            if (op == IR_BR_COND || op == IR_BR || op == IR_CONST) {
+                /* no src2 register */
+            } else if (op == IR_CALL || op == IR_CALL_IND) {
+                unsigned long *args = (unsigned long *)in->src2;
+                if (args) {
+                    unsigned long cnt = args[0] & 0xffffffffUL;
+                    for (unsigned long i = 0; i < cnt; i++) {
+                        unsigned long v = args[1 + i * 2];
+                        if (v < n) used[v] = 1;
+                    }
+                }
+            } else {
+                unsigned long s2 = in->src2;
+                if (s2 < n) used[s2] = 1;
+            }
+
+            /* br_cond condition is in dest */
+            if (op == IR_BR_COND) {
+                unsigned long d = in->dest;
+                if (d < n) used[d] = 1;
+            }
+
+            /* ret value in src1; store marks both (redundant but faithful) */
+            if (op == IR_RET) {
+                unsigned long s1 = in->src1;
+                if (s1 < n) used[s1] = 1;
+            } else if (op == IR_STORE) {
+                unsigned long s1 = in->src1, s2 = in->src2;
+                if (s1 < n) used[s1] = 1;
+                if (s2 < n) used[s2] = 1;
+            }
+        }
+    }
+
+    /* Sweep. */
+    for (unsigned long b = 0; b < nb; b++) {
+        struct BB *bb = *(struct BB **)kcc_vec_get(blocks, b);
+        for (struct Instr *in = bb->first; in; in = in->next) {
+            unsigned long op = in->op;
+            if (op == IR_STORE || op == IR_BR || op == IR_BR_COND ||
+                op == IR_RET || op == IR_CALL || op == IR_CALL_IND ||
+                op == IR_NOP || op == IR_ALLOCA)
+                continue;
+            if (op == IR_LOAD) {
+                struct Type *t = (struct Type *)in->type;
+                if ((unsigned long)t >= 0x1000 && (t->quals & 2)) continue;
+            }
+            if (in->dest >= n) continue;
+            if (used[in->dest]) continue;
+            in->op = IR_NOP;
+            count++;
+        }
+    }
+    return count;
+}
+@}
+
+\section{The Pass Manager}
+
+The manager runs the passes over every function to a fixed point: for each
+function it repeats folding, strength reduction, CSE, copy propagation, and DCE
+until a round makes no change, capped at ten rounds for safety.  Running them
+together is what lets each unblock the next---a fold exposes a subexpression, a
+strength-reduced shift exposes a constant, a forwarded store leaves a load dead.
+
+@l c
+@d Selfhost: opt run @{
+void kcc_opt_run_func(void *fn) {
+    for (int iter = 0; iter < 10; iter++) {
+        unsigned long changed = 0;
+        changed += kcc_opt_constfold(fn);
+        changed += kcc_opt_strength(fn);
+        changed += kcc_opt_cse(fn);
+        changed += kcc_opt_copyprop(fn);
+        changed += kcc_opt_dce(fn);
+        if (changed == 0) break;
+    }
+}
+
+void kcc_opt_run(void) {
+    struct Vec *funcs = (struct Vec *)kcc_ir_funcs;
+    if (funcs == 0) return;
+    unsigned long cnt = funcs->count;
+    for (unsigned long i = 0; i < cnt; i++) {
+        void *fn = *(void **)kcc_vec_get(funcs, i);
+        kcc_opt_run_func(fn);
+    }
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: opt @{
+@<Selfhost: opt preamble@>
+@<Selfhost: opt constfold@>
+@<Selfhost: opt strength@>
+@<Selfhost: opt cse@>
+@<Selfhost: opt copyprop@>
+@<Selfhost: opt dce@>
+@<Selfhost: opt run@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-opt-verify}
+
+\texttt{make selfhost-opt} runs the drop-in loop.  Because every optimized
+program passes through this fixed-point loop, a green code-generation suite
+means \kcc{} compiled its own middle end---folding, strength reduction, CSE,
+forwarding, and DCE---so faithfully that the generated code is byte-for-byte
+unchanged.
+
+@d Selfhost: opt verify @{
+#!/usr/bin/env bash
+# make selfhost-opt — compile kcc's optimizer in C with kcc, relink, run suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/opt.c with kcc"
+tmp/kcc -c "$SH/opt.c" -o "$SH/opt_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_opt (opt.o -> kcc-compiled opt_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "opt" ]; then OBJ="$OBJ $SH/opt_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_opt $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted optimizer"
+cp tmp/kcc "$SH/kcc_asm_backup_opt"
+cp tmp/kcc_selfhost_opt tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_opt" tmp/kcc
+exit $status
+@}

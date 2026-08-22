@@ -917,6 +917,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: emit-macho verify@>
 @}
 
+\noindent The expression parser, ported to C
+(Chapter~\ref{ch:self-hosting-expressions}), a drop-in replacement:
+
+@o tmp/selfhost/expressions.c @{
+@<Selfhost: expressions@>
+@}
+
+@o tmp/selfhost/expressions_verify.sh @{
+@<Selfhost: expressions verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

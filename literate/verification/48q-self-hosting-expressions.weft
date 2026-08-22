@@ -1,0 +1,738 @@
+% 48q-self-hosting-expressions.weft — Stage 8r: the expression parser, written
+% in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Expression Parser in C}
+\label{ch:self-hosting-expressions}
+
+The expression parser of Chapter~\ref{ch:expressions} is the companion to the
+statement parser already ported (Chapter~\ref{ch:self-hosting-statements}): the
+precedence-climbing core, the unary/cast/postfix chain, primary expressions, and
+the literal converters that turn a token's text into an integer or a floating
+value.  Porting it puts the operator-rich heart of the front end through
+kcc-compiled C.
+
+It is the first port that computes with \emph{floating point}: the compiler
+evaluates a floating constant on the host FPU at translation time, so
+\texttt{parse\_atof} and \texttt{round\_to\_float} use \texttt{double} and
+\texttt{float} arithmetic.  The port replays the assembly's exact sequence of
+floating operations, so the 64-bit result is bit-identical.  (Because \kcc{}'s
+x86-64 back end does not yet emit floating point, this is the first subsystem
+whose C does not also cross-compile to x86---its ARM64 self-host is what the
+drop-in verifies.)
+
+\section{Nodes, Tokens, and the Parser API}
+
+The port declares the 64-byte AST node, the token codes and node tags the grammar
+dispatches on, the precedence table, and the parser primitives as externs.  Two
+helpers reinterpret a \texttt{double} as its 64-bit pattern and back---the
+literal node stores the pattern, and the FPU produces and consumes it.
+
+@l c
+@d Selfhost: expressions preamble @{
+struct Node {
+    unsigned long tag;   /* AST_TAG,  0  */
+    unsigned long line;
+    unsigned long col;
+    unsigned long f0;    /* AST_F0,   24 */
+    unsigned long f1;
+    unsigned long f2;
+    unsigned long f3;
+    unsigned long f4;    /* AST_F4,   56 */
+};
+
+struct StrLit { void *ptr; unsigned long len; };
+
+extern unsigned long kcc_tok_type;
+extern const char *kcc_tok_start;
+extern unsigned long kcc_tok_len;
+
+void kcc_pp_next(void);
+void kcc_parse_expect(unsigned long tok_type);
+void kcc_parse_error(const char *msg);
+void *kcc_ast_alloc(unsigned long tag);
+unsigned long kcc_parse_is_type_token(void);
+void *kcc_parse_type_name(void);
+void *kcc_parse_compound(void);
+void *kcc_parse_initializer(void);
+int kcc_strcmp(const char *a, const char *b);
+struct StrLit kcc_strlit_gather(void);
+void *kcc_strlit_process(const char *ptr, unsigned long len);
+void *kcc_strtab_intern(const void *ptr, unsigned long len);
+
+enum {
+    TOK_NUMBER = 2, TOK_CHAR_LIT = 3, TOK_STRING_LIT = 4, TOK_IDENT = 1,
+    TOK_SIZEOF = 34, TOK__ALIGNOF = 45, TOK__GENERIC = 49, TOK_DEFAULT = 16,
+    TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62,
+    TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_COMMA = 67, TOK_DOT = 68,
+    TOK_ARROW = 69, TOK_INC = 70, TOK_DEC = 71, TOK_AMP = 72, TOK_STAR = 73,
+    TOK_PLUS = 74, TOK_MINUS = 75, TOK_TILDE = 76, TOK_BANG = 77,
+    TOK_QUESTION = 92, TOK_COLON = 93, TOK_ASSIGN = 94, TOK_OR_ASSIGN = 104
+};
+
+enum {
+    AST_TAG = 0, AST_BINARY_EXPR = 54, AST_UNARY_EXPR = 55, AST_ASSIGN_EXPR = 56,
+    AST_COND_EXPR = 57, AST_CALL_EXPR = 58, AST_SUBSCRIPT = 59, AST_MEMBER = 60,
+    AST_CAST_EXPR = 61, AST_SIZEOF_EXPR = 62, AST_ALIGNOF_EXPR = 63,
+    AST_COMMA_EXPR = 64, AST_COMPOUND_LIT = 67, AST_PAREN_EXPR = 68,
+    AST_GENERIC = 69, AST_GENERIC_ASSOC = 70, AST_IDENT_EXPR = 50,
+    AST_INT_LIT = 51, AST_STR_LIT = 52, AST_CHAR_LIT = 53, AST_FLOAT_LIT = 71,
+    AST_VA_ARG = 72, AST_STMT_EXPR = 73
+};
+
+static unsigned char prec_table[48] = {
+    0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  8, 13, 12, 12,
+    0,  0, 13, 13, 11, 11, 10, 10,
+   10, 10,  9,  9,  7,  6,  5,  4,
+    0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0
+};
+
+static double bits_to_double(unsigned long b) {
+    union { unsigned long u; double d; } x;
+    x.u = b;
+    return x.d;
+}
+static unsigned long double_to_bits(double d) {
+    union { double d; unsigned long u; } x;
+    x.d = d;
+    return x.u;
+}
+
+/* Forward declarations of the module's own functions. */
+unsigned long kcc_prec_lookup(unsigned long tok);
+void *kcc_parse_expr(void);
+void *kcc_parse_assign_expr(void);
+void *kcc_parse_cond_expr(void);
+void *kcc_parse_binary_expr(unsigned long min_prec);
+void *kcc_parse_unary_expr(void);
+void *kcc_parse_cast_expr(void);
+void *kcc_parse_postfix_expr(void);
+void *kcc_parse_postfix_tail(void *expr);
+void *kcc_parse_primary_expr(void);
+unsigned long kcc_parse_atoi(const char *str, unsigned long len);
+unsigned long kcc_is_float_literal(const char *str, unsigned long len);
+unsigned long kcc_parse_atof(const char *str, unsigned long len);
+unsigned long kcc_round_to_float(unsigned long bits);
+void *kcc_parse_arg_list(void);
+@}
+
+\section{Precedence, Comma, Assignment, Conditional}
+
+\texttt{prec\_lookup} maps a punctuator to its precedence through the table;
+\texttt{parse\_expr} folds comma operators; \texttt{parse\_assign\_expr} is
+right-associative on the assignment operators; and \texttt{parse\_cond\_expr}
+parses a binary expression at precedence four and, on a \texttt{?}, the two arms
+of the ternary.
+
+@l c
+@d Selfhost: expressions core @{
+unsigned long kcc_prec_lookup(unsigned long tok) {
+    if (tok < 60) return 0;
+    unsigned long t = tok - 60;
+    if (t >= 48) return 0;
+    return prec_table[t];
+}
+
+void *kcc_parse_expr(void) {
+    struct Node *lhs = (struct Node *)kcc_parse_assign_expr();
+    while (kcc_tok_type == TOK_COMMA) {
+        kcc_pp_next();
+        void *rhs = kcc_parse_assign_expr();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_COMMA_EXPR);
+        n->f0 = (unsigned long)lhs;
+        n->f1 = (unsigned long)rhs;
+        lhs = n;
+    }
+    return lhs;
+}
+
+void *kcc_parse_assign_expr(void) {
+    struct Node *lhs = (struct Node *)kcc_parse_cond_expr();
+    unsigned long t = kcc_tok_type;
+    if (t >= TOK_ASSIGN && t <= TOK_OR_ASSIGN) {
+        unsigned long op = t;
+        kcc_pp_next();
+        void *rhs = kcc_parse_assign_expr();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_ASSIGN_EXPR);
+        n->f0 = op;
+        n->f1 = (unsigned long)lhs;
+        n->f2 = (unsigned long)rhs;
+        lhs = n;
+    }
+    return lhs;
+}
+
+void *kcc_parse_cond_expr(void) {
+    struct Node *cond = (struct Node *)kcc_parse_binary_expr(4);
+    if (kcc_tok_type != TOK_QUESTION) return cond;
+    kcc_pp_next();
+    void *then = kcc_parse_expr();
+    kcc_parse_expect(TOK_COLON);
+    void *els = kcc_parse_cond_expr();
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_COND_EXPR);
+    n->f0 = (unsigned long)cond;
+    n->f1 = (unsigned long)then;
+    n->f2 = (unsigned long)els;
+    return n;
+}
+
+void *kcc_parse_binary_expr(unsigned long min_prec) {
+    struct Node *lhs = (struct Node *)kcc_parse_cast_expr();
+    for (;;) {
+        unsigned long op = kcc_tok_type;
+        unsigned long prec = kcc_prec_lookup(op);
+        if (prec == 0 || prec < min_prec) break;
+        kcc_pp_next();
+        void *rhs = kcc_parse_binary_expr(prec + 1);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_BINARY_EXPR);
+        n->f0 = op;
+        n->f1 = (unsigned long)lhs;
+        n->f2 = (unsigned long)rhs;
+        lhs = n;
+    }
+    return lhs;
+}
+@}
+
+\section{Unary, Cast, Postfix}
+
+Unary parses the prefix operators, \texttt{sizeof} (of a parenthesised type or of
+an expression), and \texttt{\_Alignof}.  Cast distinguishes a parenthesised type
+(a cast, or a compound literal on \texttt{\{}) from a parenthesised expression and
+a GNU statement expression (on \texttt{(\{}); each non-cast form runs through the
+postfix tail so suffixes can chain.  Postfix applies subscript, call (with the
+\texttt{va\_arg} special form), member access, and postfix \texttt{++}/\texttt{--}.
+
+@l c
+@d Selfhost: expressions unary @{
+void *kcc_parse_unary_expr(void) {
+    unsigned long t = kcc_tok_type;
+    if (t == TOK_INC || t == TOK_DEC || t == TOK_AMP || t == TOK_STAR ||
+        t == TOK_PLUS || t == TOK_MINUS || t == TOK_TILDE || t == TOK_BANG) {
+        unsigned long op = t;
+        kcc_pp_next();
+        void *operand = kcc_parse_cast_expr();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_UNARY_EXPR);
+        n->f0 = op;
+        n->f1 = (unsigned long)operand;
+        n->f2 = 1;                          /* prefix */
+        return n;
+    }
+    if (t == TOK_SIZEOF) {
+        kcc_pp_next();
+        if (kcc_tok_type == TOK_LPAREN) {
+            kcc_pp_next();
+            if (kcc_parse_is_type_token()) {
+                void *ty = kcc_parse_type_name();
+                kcc_parse_expect(TOK_RPAREN);
+                struct Node *n = (struct Node *)kcc_ast_alloc(AST_SIZEOF_EXPR);
+                n->f0 = (unsigned long)ty;
+                n->f1 = 1;                  /* is_type */
+                return n;
+            }
+            void *e = kcc_parse_expr();
+            kcc_parse_expect(TOK_RPAREN);
+            struct Node *par = (struct Node *)kcc_ast_alloc(AST_PAREN_EXPR);
+            par->f0 = (unsigned long)e;
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_SIZEOF_EXPR);
+            n->f0 = (unsigned long)par;
+            n->f1 = 0;
+            return n;
+        }
+        void *u = kcc_parse_unary_expr();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_SIZEOF_EXPR);
+        n->f0 = (unsigned long)u;
+        n->f1 = 0;
+        return n;
+    }
+    if (t == TOK__ALIGNOF) {
+        kcc_pp_next();
+        kcc_parse_expect(TOK_LPAREN);
+        void *ty = kcc_parse_type_name();
+        kcc_parse_expect(TOK_RPAREN);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_ALIGNOF_EXPR);
+        n->f0 = (unsigned long)ty;
+        return n;
+    }
+    return kcc_parse_postfix_expr();
+}
+
+void *kcc_parse_cast_expr(void) {
+    if (kcc_tok_type != TOK_LPAREN) return kcc_parse_unary_expr();
+    kcc_pp_next();                          /* consume '(' */
+    if (kcc_tok_type == TOK_LBRACE) {
+        void *body = kcc_parse_compound();
+        kcc_parse_expect(TOK_RPAREN);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_STMT_EXPR);
+        n->f0 = (unsigned long)body;
+        return kcc_parse_postfix_tail(n);
+    }
+    if (kcc_parse_is_type_token()) {
+        void *ty = kcc_parse_type_name();
+        kcc_parse_expect(TOK_RPAREN);
+        if (kcc_tok_type == TOK_LBRACE) {
+            void *init = kcc_parse_initializer();
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_COMPOUND_LIT);
+            n->f0 = (unsigned long)ty;
+            n->f1 = (unsigned long)init;
+            return kcc_parse_postfix_tail(n);
+        }
+        void *inner = kcc_parse_cast_expr();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_CAST_EXPR);
+        n->f0 = (unsigned long)ty;
+        n->f1 = (unsigned long)inner;
+        return n;
+    }
+    void *e = kcc_parse_expr();
+    kcc_parse_expect(TOK_RPAREN);
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_PAREN_EXPR);
+    n->f0 = (unsigned long)e;
+    return kcc_parse_postfix_tail(n);
+}
+@}
+
+@l c
+@d Selfhost: expressions postfix @{
+void *kcc_parse_postfix_expr(void) {
+    void *prim = kcc_parse_primary_expr();
+    return kcc_parse_postfix_tail(prim);
+}
+
+void *kcc_parse_postfix_tail(void *expr) {
+    struct Node *cur = (struct Node *)expr;
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_LBRACKET) {
+            kcc_pp_next();
+            void *idx = kcc_parse_expr();
+            kcc_parse_expect(TOK_RBRACKET);
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_SUBSCRIPT);
+            n->f0 = (unsigned long)cur;
+            n->f1 = (unsigned long)idx;
+            cur = n;
+        } else if (t == TOK_LPAREN) {
+            if (cur->tag == AST_IDENT_EXPR &&
+                kcc_strcmp((const char *)cur->f0, "va_arg") == 0) {
+                kcc_pp_next();
+                void *ap = kcc_parse_assign_expr();
+                kcc_parse_expect(TOK_COMMA);
+                void *ty = kcc_parse_type_name();
+                kcc_parse_expect(TOK_RPAREN);
+                struct Node *n = (struct Node *)kcc_ast_alloc(AST_VA_ARG);
+                n->f0 = (unsigned long)ap;
+                n->f1 = (unsigned long)ty;
+                cur = n;
+            } else {
+                kcc_pp_next();
+                void *args = kcc_parse_arg_list();
+                kcc_parse_expect(TOK_RPAREN);
+                struct Node *n = (struct Node *)kcc_ast_alloc(AST_CALL_EXPR);
+                n->f0 = (unsigned long)cur;
+                n->f1 = (unsigned long)args;
+                cur = n;
+            }
+        } else if (t == TOK_DOT || t == TOK_ARROW) {
+            unsigned long arrow = (t == TOK_ARROW) ? 1 : 0;
+            kcc_pp_next();
+            void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+            kcc_pp_next();
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_MEMBER);
+            n->f0 = (unsigned long)cur;
+            n->f1 = (unsigned long)name;
+            n->f2 = arrow;
+            cur = n;
+        } else if (t == TOK_INC || t == TOK_DEC) {
+            kcc_pp_next();
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_UNARY_EXPR);
+            n->f0 = t;
+            n->f1 = (unsigned long)cur;
+            n->f2 = 0;                      /* postfix */
+            cur = n;
+        } else {
+            break;
+        }
+    }
+    return cur;
+}
+@}
+
+\section{Primary Expressions}
+
+Primary handles identifiers (whose node is allocated \emph{before} the token is
+consumed, so its caret points at the identifier), integer and floating constants
+(classified and converted below), string and character literals (escape-processed),
+parenthesised expressions, and \texttt{\_Generic} selection.  An integer
+constant's suffix and magnitude set its type flags per \stdref{6.4.4.1}: the
+suffix fixes a floor, then the value climbs the suffix- and base-dependent list to
+the first type that can hold it.
+
+@l c
+@d Selfhost: expressions primary @{
+/* Value-directed integer type (§6.4.4.1): flags bit0=unsigned, bits1-2=rank. */
+static unsigned long widen_int(unsigned long value, unsigned long sfx,
+                               int is_decimal) {
+    unsigned long ufloor = sfx & 1;
+    unsigned long rfloor = (sfx >> 1) & 3;
+    int fits_sint = value <= 0x7FFFFFFFUL;
+    int fits_uint = value <= 0xFFFFFFFFUL;
+    int fits_slong = (long)value >= 0;
+    unsigned long rank, uns;
+    if (ufloor) {
+        uns = 1;
+        if (rfloor) rank = rfloor;
+        else if (fits_uint) rank = 0;
+        else rank = 1;
+    } else if (is_decimal) {
+        if (rfloor) { rank = rfloor; uns = fits_slong ? 0 : 1; }
+        else if (fits_sint) { rank = 0; uns = 0; }
+        else if (fits_slong) { rank = 1; uns = 0; }
+        else { rank = 1; uns = 1; }
+    } else {
+        if (rfloor) { rank = rfloor; uns = fits_slong ? 0 : 1; }
+        else if (fits_sint) { rank = 0; uns = 0; }
+        else if (fits_uint) { rank = 0; uns = 1; }
+        else if (fits_slong) { rank = 1; uns = 0; }
+        else { rank = 1; uns = 1; }
+    }
+    return uns | (rank << 1);
+}
+
+void *kcc_parse_primary_expr(void) {
+    unsigned long t = kcc_tok_type;
+    const char *start = kcc_tok_start;
+    unsigned long len = kcc_tok_len;
+
+    if (t == TOK_IDENT) {
+        void *name = kcc_strtab_intern(start, len);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_IDENT_EXPR);
+        n->f0 = (unsigned long)name;
+        kcc_pp_next();
+        return n;
+    }
+    if (t == TOK_NUMBER) {
+        if (kcc_is_float_literal(start, len)) {
+            char suffix = start[len - 1];
+            int is_float = (suffix == 'f' || suffix == 'F');
+            unsigned long bits = kcc_parse_atof(start, len);
+            if (is_float) bits = kcc_round_to_float(bits);
+            kcc_pp_next();
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_FLOAT_LIT);
+            n->f0 = bits;
+            n->f2 = is_float;
+            return n;
+        }
+        unsigned long value = kcc_parse_atoi(start, len);
+        unsigned long sfx = 0, lcount = 0;
+        for (unsigned long i = 0; i < len; i++) {
+            char c = start[i] | 0x20;
+            if (c == 'u') sfx |= 1;
+            else if (c == 'l') lcount++;
+        }
+        if (lcount > 2) lcount = 2;
+        sfx |= (lcount << 1);
+        int is_decimal = start[0] != '0';
+        unsigned long flags = widen_int(value, sfx, is_decimal);
+        kcc_pp_next();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_INT_LIT);
+        n->f0 = value;
+        n->f2 = flags;
+        return n;
+    }
+    if (t == TOK_STRING_LIT) {
+        struct StrLit s = kcc_strlit_gather();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_STR_LIT);
+        n->f0 = (unsigned long)s.ptr;
+        n->f1 = s.len;
+        return n;
+    }
+    if (t == TOK_CHAR_LIT) {
+        unsigned char *p = (unsigned char *)kcc_strlit_process(start + 1, len - 2);
+        unsigned long value = p[0];
+        kcc_pp_next();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_CHAR_LIT);
+        n->f0 = value;
+        return n;
+    }
+    if (t == TOK_LPAREN) {
+        kcc_pp_next();
+        void *e = kcc_parse_expr();
+        kcc_parse_expect(TOK_RPAREN);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_PAREN_EXPR);
+        n->f0 = (unsigned long)e;
+        return n;
+    }
+    if (t == TOK__GENERIC) {
+        kcc_pp_next();
+        kcc_parse_expect(TOK_LPAREN);
+        void *ctrl = kcc_parse_assign_expr();
+        kcc_parse_expect(TOK_COMMA);
+        struct Node *first = 0, *last = 0;
+        for (;;) {
+            void *ty;
+            if (kcc_tok_type == TOK_DEFAULT) { kcc_pp_next(); ty = 0; }
+            else ty = kcc_parse_type_name();
+            kcc_parse_expect(TOK_COLON);
+            void *e = kcc_parse_assign_expr();
+            struct Node *a = (struct Node *)kcc_ast_alloc(AST_GENERIC_ASSOC);
+            a->f0 = (unsigned long)ty;
+            a->f1 = (unsigned long)e;
+            if (first == 0) { first = a; last = a; }
+            else { last->f4 = (unsigned long)a; last = a; }
+            if (kcc_tok_type != TOK_COMMA) break;
+            kcc_pp_next();
+        }
+        kcc_parse_expect(TOK_RPAREN);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_GENERIC);
+        n->f0 = (unsigned long)ctrl;
+        n->f1 = (unsigned long)first;
+        return n;
+    }
+    kcc_parse_error("expected expression");
+    return 0;
+}
+@}
+
+\section{Literal Conversion}
+
+\texttt{parse\_atoi} reads decimal, hex (\texttt{0x}), octal (leading \texttt{0}),
+or binary (\texttt{0b}) digits, stopping at a type suffix.
+\texttt{is\_float\_literal} classifies a pp-number (a hex literal is a float only
+on \texttt{.} or \texttt{p}/\texttt{P}, since \texttt{f} there is a digit).
+\texttt{parse\_atof} evaluates the constant on the host FPU into a double bit
+pattern, folding all significant digits into one mantissa and applying a single
+decimal (or binary, for hex floats) scale so the result rounds once; the exact
+sequence of floating operations matches the assembly so the bits agree.
+\texttt{round\_to\_float} narrows a double to single precision and widens it back.
+
+@l c
+@d Selfhost: expressions literals @{
+static long hexdig(unsigned char c) {
+    unsigned long t = (unsigned long)(c - '0');
+    if (t <= 9) return (long)t;
+    unsigned long h = (unsigned long)((c | 0x20) - 'a');
+    if (h <= 5) return (long)(h + 10);
+    return -1;
+}
+
+unsigned long kcc_parse_atoi(const char *str, unsigned long len) {
+    if (len == 0) return 0;
+    unsigned long acc = 0;
+    if (str[0] == '0') {
+        if (len == 1) return 0;
+        char c1 = str[1];
+        if (c1 == 'x' || c1 == 'X') {
+            for (unsigned long i = 2; i < len; i++) {
+                unsigned char c = (unsigned char)str[i];
+                if (c=='u'||c=='U'||c=='l'||c=='L') break;
+                acc = (acc << 4) + (unsigned long)hexdig(c);
+            }
+            return acc;
+        }
+        if (c1 == 'b' || c1 == 'B') {
+            for (unsigned long i = 2; i < len; i++) {
+                unsigned char c = (unsigned char)str[i];
+                if (c=='u'||c=='U'||c=='l'||c=='L') break;
+                acc = (acc << 1) + (unsigned long)(c - '0');
+            }
+            return acc;
+        }
+        /* octal, including the leading '0' (contributes 0). */
+        for (unsigned long i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)str[i];
+            if (c=='u'||c=='U'||c=='l'||c=='L') break;
+            acc = (acc << 3) + (unsigned long)(c - '0');
+        }
+        return acc;
+    }
+    for (unsigned long i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if (c=='u'||c=='U'||c=='l'||c=='L') break;
+        acc = acc * 10 + (unsigned long)(c - '0');
+    }
+    return acc;
+}
+
+unsigned long kcc_is_float_literal(const char *str, unsigned long len) {
+    if (len == 0) return 0;
+    if (len >= 2 && str[0] == '0' && (((unsigned char)str[1] | 0x20) == 'x')) {
+        for (unsigned long i = 2; i < len; i++) {
+            unsigned char c = (unsigned char)str[i];
+            if (c == '.') return 1;
+            if ((c | 0x20) == 'p') return 1;
+        }
+        return 0;
+    }
+    for (unsigned long i = 0; i < len; i++) {
+        char c = str[i];
+        if (c=='.'||c=='e'||c=='E'||c=='f'||c=='F') return 1;
+    }
+    return 0;
+}
+
+unsigned long kcc_parse_atof(const char *str, unsigned long len) {
+    const char *end = str + len;
+    if (len >= 2 && str[0] == '0' && (((unsigned char)str[1] | 0x20) == 'x')) {
+        const char *p = str + 2;
+        double d = 0.0;
+        while (p < end) {
+            unsigned char c = (unsigned char)*p;
+            if (c == '.' || (c | 0x20) == 'p') break;
+            long dig = hexdig(c);
+            if (dig < 0) break;
+            d = d * 16.0 + (double)dig;
+            p++;
+        }
+        if (p < end && *p == '.') {
+            p++;
+            double div = 1.0;
+            while (p < end) {
+                unsigned char c = (unsigned char)*p;
+                if ((c | 0x20) == 'p') break;
+                long dig = hexdig(c);
+                if (dig < 0) break;
+                div = div * 16.0;
+                d = d + (double)dig / div;
+                p++;
+            }
+        }
+        long emag = 0; int esign = 0;
+        if (p < end && ((unsigned char)*p | 0x20) == 'p') {
+            p++;
+            if (p < end) {
+                char c = *p;
+                if (c == '+') p++;
+                else if (c == '-') { esign = 1; p++; }
+            }
+            while (p < end) {
+                unsigned long dv = (unsigned long)((unsigned char)*p - '0');
+                if (dv > 9) break;
+                emag = emag * 10 + (long)dv;
+                p++;
+            }
+        }
+        if (emag != 0) {
+            if (!esign) for (long i = 0; i < emag; i++) d = d * 2.0;
+            else for (long i = 0; i < emag; i++) d = d / 2.0;
+        }
+        return double_to_bits(d);
+    }
+    /* decimal */
+    const char *p = str;
+    unsigned long M = 0, F = 0;
+    long emag = 0; int esign = 0;
+    while (p < end) {
+        char c = *p;
+        if (c == '.' || c == 'e' || c == 'E') break;
+        unsigned long dv = (unsigned long)((unsigned char)c - '0');
+        if (dv > 9) break;
+        M = M * 10 + dv;
+        p++;
+    }
+    if (p < end && *p == '.') {
+        p++;
+        while (p < end) {
+            char c = *p;
+            if (c == 'e' || c == 'E') break;
+            unsigned long dv = (unsigned long)((unsigned char)c - '0');
+            if (dv > 9) break;
+            M = M * 10 + dv; F++;
+            p++;
+        }
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        if (p < end) {
+            char c = *p;
+            if (c == '+') p++;
+            else if (c == '-') { esign = 1; p++; }
+        }
+        while (p < end) {
+            unsigned long dv = (unsigned long)((unsigned char)*p - '0');
+            if (dv > 9) break;
+            emag = emag * 10 + (long)dv;
+            p++;
+        }
+    }
+    long net = (esign ? -emag : emag) - (long)F;
+    double m = (double)(long)M;
+    long k = net < 0 ? -net : net;
+    double pw = 1.0;
+    for (long i = 0; i < k; i++) pw = pw * 10.0;
+    double r = (net >= 0) ? (m * pw) : (m / pw);
+    return double_to_bits(r);
+}
+
+unsigned long kcc_round_to_float(unsigned long bits) {
+    double d = bits_to_double(bits);
+    float f = (float)d;
+    double d2 = (double)f;
+    return double_to_bits(d2);
+}
+
+void *kcc_parse_arg_list(void) {
+    if (kcc_tok_type == TOK_RPAREN) return 0;
+    struct Node *first = 0, *last = 0;
+    for (;;) {
+        struct Node *arg = (struct Node *)kcc_parse_assign_expr();
+        if (first == 0) { first = arg; last = arg; }
+        else { last->f4 = (unsigned long)arg; last = arg; }
+        if (kcc_tok_type != TOK_COMMA) break;
+        kcc_pp_next();
+    }
+    return first;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: expressions @{
+@<Selfhost: expressions preamble@>
+@<Selfhost: expressions core@>
+@<Selfhost: expressions unary@>
+@<Selfhost: expressions postfix@>
+@<Selfhost: expressions primary@>
+@<Selfhost: expressions literals@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-expressions-verify}
+
+\texttt{make selfhost-expressions} runs the drop-in loop.  Because every
+expression in every function the suite compiles is parsed here, a green
+code-generation suite---and \texttt{difftest}, which checks the values programs
+compute, floating constants included---means \kcc{} compiled its own expression
+grammar and literal arithmetic correctly.
+
+@d Selfhost: expressions verify @{
+#!/usr/bin/env bash
+# make selfhost-expressions — compile kcc's expression parser in C with kcc,
+# relink, run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/expressions.c with kcc"
+tmp/kcc -c "$SH/expressions.c" -o "$SH/expressions_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_expressions (expressions.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "expressions" ]; then OBJ="$OBJ $SH/expressions_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_expressions $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted expression parser"
+cp tmp/kcc "$SH/kcc_asm_backup_expressions"
+cp tmp/kcc_selfhost_expressions tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_expressions" tmp/kcc
+exit $status
+@}

@@ -1,0 +1,603 @@
+% 48p-self-hosting-emit-macho.weft — Stage 8q: the Mach-O object writer,
+% written in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Mach-O Writer in C}
+\label{ch:self-hosting-emit-macho}
+
+The Mach-O writer of Chapter~\ref{ch:emit-macho} is the compiler's last step: it
+packages the generated code, the symbol and relocation tables the linker module
+(Chapter~\ref{ch:self-hosting-linker}) accumulated, and the string table into the
+bytes an object file is made of.  Porting it completes the back-end pair---the
+tables built in C are now also \emph{serialised} in C---and because every test in
+the code-generation suite links and runs the object this file writes, and
+\texttt{difftest} compares those objects to \texttt{clang}'s behaviour, a green
+sweep means \kcc{} reproduced its own object layout byte for byte.
+
+It is the largest single function ported so far: \texttt{finalize} computes the
+file layout and writes every structure in order, with conditional
+sections---a module-init pointer, a \texttt{\_\_const} pointer table, and a DWARF
+segment under \texttt{-g}---each shifting the downstream offsets.  The port keeps
+the assembly's exact arithmetic so the two agree to the byte.
+
+\section{Buffer, State, and the Primitive Writers}
+
+The writer builds the whole object in one arena buffer and flushes it with a
+single \texttt{write}.  The port owns the four module globals (the file
+descriptor, buffer pointer, write position, and capacity) and the little-endian
+append primitives---\texttt{write8}/\texttt{16}/\texttt{32}/\texttt{64},
+\texttt{write\_bytes} (with the capacity guard), and \texttt{pad\_to}.  These are
+exported because the DWARF emitter (still assembly) writes through them.  It
+declares the Mach-O constants, the linker-table record offsets, and---as
+externs---the code buffer and size, the linker tables, the module-init and
+const-data state, and the DWARF hooks.
+
+@l c
+@d Selfhost: emit-macho preamble @{
+struct Vec {
+    void *data;              /* VEC_DATA,     0  */
+    unsigned long count;     /* VEC_COUNT,    8  */
+    unsigned long cap;
+    unsigned long elem_size;
+};
+
+struct MSym {
+    const char *name;        /* SYM_NAME,    0  */
+    unsigned long section;   /* SYM_SECTION, 8  */
+    unsigned long value;     /* SYM_VALUE,   16 */
+    unsigned long flags;     /* SYM_FLAGS,   24 */
+};
+
+void *kcc_arena_alloc(long size);
+void *kcc_memcpy(void *dst, const void *src, unsigned long n);
+void *kcc_vec_get(void *vec, unsigned long index);
+unsigned long kcc_strlen(const char *s);
+void kcc_io_err(const char *s);
+long kcc_sys_open(const char *path, long flags, long mode);
+long kcc_sys_write(long fd, const void *buf, unsigned long n);
+long kcc_sys_close(long fd);
+void kcc_sys_exit(int status);
+
+/* Contributors and target state, all defined elsewhere (codegen, linker, ir). */
+extern unsigned long kcc_code_pos;          /* code size */
+extern void *kcc_code_buf;
+extern void *kcc_linker_syms;
+extern void *kcc_linker_relocs;
+extern unsigned long kcc_globals_size;
+extern unsigned long kcc_modinit_present;
+extern unsigned long kcc_modinit_fileoff;
+extern unsigned long kcc_modinit_sym;
+extern unsigned long kcc_rodata_const_present;
+extern unsigned long kcc_rodata_const_fileoff;
+extern unsigned long kcc_rodata_const_size;
+extern void *kcc_rodata_const_relocs;
+extern unsigned long kcc_dwarf_enabled;
+unsigned long kcc_dwarf_total_len(void);
+void kcc_dwarf_emit_macho(unsigned long file_base, unsigned long vmaddr);
+void kcc_dwarf_append_blob(void);
+
+/* Module globals (defined here; the DWARF emitter reads buf/pos). */
+long kcc_macho_fd = 0;
+void *kcc_macho_buf = 0;
+unsigned long kcc_macho_pos = 0;
+unsigned long kcc_macho_cap = 0;
+
+static const char macho_err_open[] = "kcc: error: cannot open output file\n";
+static const char macho_err_overflow[] =
+    "kcc: error: object file exceeds output buffer\n";
+
+/* Mach-O relocation types read by the packer. */
+#define ARM64_RELOC_PAGEOFF12          4
+#define ARM64_RELOC_GOT_LOAD_PAGEOFF12 6
+#define N_EXT  0x01
+#define N_SECT 0x0E
+@}
+
+@l c
+@d Selfhost: emit-macho writers @{
+void kcc_macho_write8(unsigned long v) {
+    unsigned char *b = (unsigned char *)kcc_macho_buf;
+    unsigned long p = kcc_macho_pos;
+    b[p] = (unsigned char)(v & 0xff);
+    kcc_macho_pos = p + 1;
+}
+
+void kcc_macho_write16(unsigned long v) {
+    unsigned char *b = (unsigned char *)kcc_macho_buf;
+    unsigned long p = kcc_macho_pos;
+    b[p] = (unsigned char)(v & 0xff);
+    b[p + 1] = (unsigned char)((v >> 8) & 0xff);
+    kcc_macho_pos = p + 2;
+}
+
+void kcc_macho_write32(unsigned long v) {
+    unsigned char *b = (unsigned char *)kcc_macho_buf;
+    unsigned long p = kcc_macho_pos;
+    b[p] = (unsigned char)(v & 0xff);
+    b[p + 1] = (unsigned char)((v >> 8) & 0xff);
+    b[p + 2] = (unsigned char)((v >> 16) & 0xff);
+    b[p + 3] = (unsigned char)((v >> 24) & 0xff);
+    kcc_macho_pos = p + 4;
+}
+
+void kcc_macho_write64(unsigned long v) {
+    unsigned char *b = (unsigned char *)kcc_macho_buf;
+    unsigned long p = kcc_macho_pos;
+    for (int i = 0; i < 8; i++) b[p + i] = (unsigned char)((v >> (i * 8)) & 0xff);
+    kcc_macho_pos = p + 8;
+}
+
+void kcc_macho_write_bytes(const void *src, unsigned long len) {
+    if (kcc_macho_pos + len > kcc_macho_cap) {
+        kcc_io_err(macho_err_overflow);
+        kcc_sys_exit(1);
+    }
+    kcc_memcpy((unsigned char *)kcc_macho_buf + kcc_macho_pos, src, len);
+    kcc_macho_pos += len;
+}
+
+void kcc_macho_pad_to(unsigned long align) {
+    unsigned char *b = (unsigned char *)kcc_macho_buf;
+    unsigned long p = kcc_macho_pos;
+    unsigned long a = (p + align - 1) & ~(align - 1);
+    while (p < a) { b[p] = 0; p++; }
+    kcc_macho_pos = a;
+}
+
+void kcc_macho_init(const char *filename) {
+    long fd = kcc_sys_open(filename, 0x601, 420);
+    if (fd < 0) { kcc_io_err(macho_err_open); kcc_sys_exit(1); }
+    kcc_macho_fd = fd;
+    unsigned long sz = kcc_dwarf_total_len();
+    sz += kcc_code_pos;
+    sz += ((struct Vec *)kcc_linker_syms)->count * 288;
+    sz += ((struct Vec *)kcc_linker_relocs)->count * 8;
+    sz += 65536;
+    kcc_macho_buf = kcc_arena_alloc((long)sz);
+    kcc_macho_cap = sz;
+    kcc_macho_pos = 0;
+}
+@}
+
+\section{Layout Computation}
+
+Finalize first reads the code size and the symbol, relocation, and globals
+counts, then computes each structure's file offset.  The load-command size grows
+by 80 bytes for a \texttt{\_\_mod\_init\_func} section, 80 for a
+\texttt{\_\_const} section, and a whole \texttt{72+80\(\times\)3} for a DWARF
+segment; the section-data offset follows the header and commands; the relocation
+offset follows the code (and the reserved DWARF blob, the 8-aligned module-init
+pointer, and the 8-aligned const data); and the symbol and string tables follow
+in turn.  The string-table size is one (its leading NUL) plus each name and its
+terminator, and the defined-symbol count drives \texttt{LC\_DYSYMTAB}.
+
+@l c
+@d Selfhost: emit-macho layout @{
+void kcc_macho_finalize(void) {
+    unsigned long code_size = kcc_code_pos;
+    unsigned long nsyms = ((struct Vec *)kcc_linker_syms)->count;
+    unsigned long nrelocs = ((struct Vec *)kcc_linker_relocs)->count;
+    unsigned long globals_size = kcc_globals_size;
+
+    /* Load-commands size. */
+    unsigned long cmdsz = 232 + 24 + 24 + 80;       /* segment + build + symtab + dysymtab */
+    if (kcc_modinit_present) cmdsz += 80;
+    if (kcc_rodata_const_present) cmdsz += 80;
+    if (kcc_dwarf_enabled) cmdsz += 72 + 80 * 3;
+
+    unsigned long text_offset = cmdsz + 32;         /* MACH_HEADER_SIZE */
+
+    /* Relocation offset: after code (+ reserved DWARF blob, modinit ptr, const data). */
+    unsigned long roff = text_offset + code_size;
+    if (kcc_dwarf_enabled) roff += kcc_dwarf_total_len();
+    if (kcc_modinit_present) {
+        roff = (roff + 7) & ~7UL;
+        kcc_modinit_fileoff = roff;
+        roff += 8;
+    }
+    if (kcc_rodata_const_present) {
+        roff = (roff + 7) & ~7UL;
+        kcc_rodata_const_fileoff = roff;
+        roff += kcc_rodata_const_size;
+    }
+    roff = (roff + 3) & ~3UL;                        /* 4-byte aligned */
+
+    /* Symbol table offset: after the text relocs, the modinit reloc, the const relocs. */
+    unsigned long symoff = roff + nrelocs * 8;
+    if (kcc_modinit_present) symoff += 8;
+    if (kcc_rodata_const_present)
+        symoff += ((struct Vec *)kcc_rodata_const_relocs)->count * 8;
+
+    unsigned long stroff = symoff + nsyms * 16;
+
+    /* String-table size and the defined-symbol count. */
+    unsigned long strsize = 1;
+    unsigned long nextdef = 0;
+    for (unsigned long i = 0; i < nsyms; i++) {
+        struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
+        strsize += kcc_strlen(s->name) + 1;
+        if (s->section != 0) nextdef++;
+    }
+@}
+
+\section{Header, Segment, and Sections}
+
+The header records the magic, CPU type, \texttt{MH\_OBJECT}, the command count
+(four, plus one for a DWARF segment) and size, and the subsections-via-symbols
+flag.  The single \texttt{LC\_SEGMENT\_64} carries the \texttt{\_\_text} section
+(the code, its relocations, pure-instructions flags), a \texttt{\_\_common}
+zerofill section for globals, and---conditionally---the \texttt{\_\_const}
+pointer table and the \texttt{\_\_mod\_init\_func} pointer.  Section and segment
+names are emitted as the exact little-endian words the assembly used, so the
+bytes match including their embedded NULs.
+
+@l c
+@d Selfhost: emit-macho header @{
+    /* ---- Mach-O header ---- */
+    kcc_macho_write32(0xFEEDFACF);                  /* magic */
+    kcc_macho_write32(0x0100000C);                  /* cputype ARM64 */
+    kcc_macho_write32(0);                           /* cpusubtype */
+    kcc_macho_write32(0x01);                         /* MH_OBJECT */
+    kcc_macho_write32(kcc_dwarf_enabled ? 5 : 4);   /* ncmds */
+    kcc_macho_write32(cmdsz);                        /* sizeofcmds */
+    kcc_macho_write32(0x2000);                       /* MH_SUBSECTIONS_VIA_SYMBOLS */
+    kcc_macho_write32(0);                            /* reserved */
+
+    /* ---- LC_SEGMENT_64 ---- */
+    kcc_macho_write32(0x19);                         /* cmd */
+    {
+        unsigned long segcmdsz = 232;
+        if (kcc_modinit_present) segcmdsz += 80;
+        if (kcc_rodata_const_present) segcmdsz += 80;
+        kcc_macho_write32(segcmdsz);
+    }
+    kcc_macho_write64(0);                            /* segname (16 bytes, empty) */
+    kcc_macho_write64(0);
+    kcc_macho_write64(0);                            /* vmaddr */
+    {
+        unsigned long vmsize = globals_size + code_size;
+        if (kcc_modinit_present) { vmsize = (vmsize + 7) & ~7UL; vmsize += 8; }
+        if (kcc_rodata_const_present) {
+            vmsize = (vmsize + 7) & ~7UL;
+            vmsize += kcc_rodata_const_size;
+        }
+        kcc_macho_write64(vmsize);
+    }
+    kcc_macho_write64(text_offset);                 /* fileoff */
+    {
+        unsigned long filesize = code_size;
+        if (kcc_modinit_present)
+            filesize = (kcc_modinit_fileoff + 8) - text_offset;
+        if (kcc_rodata_const_present)
+            filesize = (kcc_rodata_const_fileoff + kcc_rodata_const_size) - text_offset;
+        kcc_macho_write64(filesize);
+    }
+    kcc_macho_write32(7);                            /* maxprot */
+    kcc_macho_write32(7);                            /* initprot */
+    {
+        unsigned long nsects = 2;
+        if (kcc_modinit_present) nsects++;
+        if (kcc_rodata_const_present) nsects++;
+        kcc_macho_write32(nsects);
+    }
+    kcc_macho_write32(0);                            /* flags */
+
+    /* ---- Section: __text ---- */
+    kcc_macho_write64(0x0000747865745F5FUL);        /* "__text\0\0" */
+    kcc_macho_write64(0);
+    kcc_macho_write64(0x0000545845545F5FUL);        /* "__TEXT\0\0" */
+    kcc_macho_write64(0);
+    kcc_macho_write64(0);                            /* addr */
+    kcc_macho_write64(code_size);                   /* size */
+    kcc_macho_write32(text_offset);                 /* offset */
+    kcc_macho_write32(2);                            /* align = 4 */
+    kcc_macho_write32(roff);                         /* reloff */
+    kcc_macho_write32(nrelocs);                      /* nreloc */
+    kcc_macho_write32(0x80000400);                  /* PURE|SOME instructions */
+    kcc_macho_write32(0);
+    kcc_macho_write32(0);
+    kcc_macho_write32(0);
+
+    /* ---- Section: __DATA,__common (S_ZEROFILL) ---- */
+    kcc_macho_write64(0x6E6F6D6D6F635F5FUL);        /* "__common" */
+    kcc_macho_write64(0);
+    kcc_macho_write64(0x0000415441445F5FUL);        /* "__DATA\0\0" */
+    kcc_macho_write64(0);
+    kcc_macho_write64(code_size);                   /* addr */
+    kcc_macho_write64(globals_size);                /* size */
+    kcc_macho_write32(0);                           /* offset */
+    kcc_macho_write32(3);                           /* align = 8 */
+    kcc_macho_write32(0);                           /* reloff */
+    kcc_macho_write32(0);                           /* nreloc */
+    kcc_macho_write32(1);                           /* S_ZEROFILL */
+    kcc_macho_write32(0);
+    kcc_macho_write32(0);
+    kcc_macho_write32(0);
+@}
+
+The two conditional sections mirror the assembly exactly.  The
+\texttt{\_\_const} pointer table follows \texttt{\_\_common} (and the module-init
+pointer, when present) in memory, so its address is 8-aligned past them; its
+relocations trail the text and module-init relocations.  The
+\texttt{\_\_mod\_init\_func} section is a single \texttt{dyld}-called pointer
+whose one \texttt{ARM64\_RELOC\_UNSIGNED} relocation supplies its value.
+
+@l c
+@d Selfhost: emit-macho sections @{
+    /* ---- Section: __DATA_CONST,__const ---- */
+    if (kcc_rodata_const_present) {
+        kcc_macho_write64(0x0074736E6F635F5FUL);    /* "__const\0" */
+        kcc_macho_write64(0);
+        kcc_macho_write64(0x435F415441445F5FUL);    /* "__DATA_C" */
+        kcc_macho_write64(0x0000000054534E4FUL);    /* "ONST\0\0\0\0" */
+        {
+            unsigned long addr = globals_size + code_size;
+            if (kcc_modinit_present) { addr = (addr + 7) & ~7UL; addr += 8; }
+            addr = (addr + 7) & ~7UL;
+            kcc_macho_write64(addr);                /* addr */
+        }
+        kcc_macho_write64(kcc_rodata_const_size);   /* size */
+        kcc_macho_write32(kcc_rodata_const_fileoff);/* offset */
+        kcc_macho_write32(3);                       /* align = 8 */
+        {
+            unsigned long r = roff + nrelocs * 8;
+            if (kcc_modinit_present) r += 8;
+            kcc_macho_write32(r);                   /* reloff */
+        }
+        kcc_macho_write32(((struct Vec *)kcc_rodata_const_relocs)->count); /* nreloc */
+        kcc_macho_write32(0);                       /* S_REGULAR */
+        kcc_macho_write32(0);
+        kcc_macho_write32(0);
+        kcc_macho_write32(0);
+    }
+
+    /* ---- Section: __DATA,__mod_init_func ---- */
+    if (kcc_modinit_present) {
+        kcc_macho_write64(0x6E695F646F6D5F5FUL);    /* "__mod_in" */
+        kcc_macho_write64(0x0063756E665F7469UL);    /* "it_func\0" */
+        kcc_macho_write64(0x0000415441445F5FUL);    /* "__DATA\0\0" */
+        kcc_macho_write64(0);
+        {
+            unsigned long addr = globals_size + code_size;
+            addr = (addr + 7) & ~7UL;
+            kcc_macho_write64(addr);                /* addr */
+        }
+        kcc_macho_write64(8);                       /* size = 8 (one pointer) */
+        kcc_macho_write32(kcc_modinit_fileoff);     /* offset */
+        kcc_macho_write32(3);                       /* align = 8 */
+        kcc_macho_write32(roff + nrelocs * 8);      /* reloff */
+        kcc_macho_write32(1);                       /* nreloc = 1 */
+        kcc_macho_write32(0x09);                    /* S_MOD_INIT_FUNC_POINTERS */
+        kcc_macho_write32(0);
+        kcc_macho_write32(0);
+        kcc_macho_write32(0);
+    }
+@}
+
+\section{Auxiliary Load Commands}
+
+\texttt{LC\_BUILD\_VERSION} names the platform (macOS 14) to quiet the linker;
+\texttt{LC\_SYMTAB} gives the symbol- and string-table offsets and sizes; and
+\texttt{LC\_DYSYMTAB} partitions the symbols into the defined-external range (from
+zero) and the undefined-external range (from the defined count), the rest of its
+fields zero.
+
+@l c
+@d Selfhost: emit-macho auxcmds @{
+    /* ---- LC_BUILD_VERSION ---- */
+    kcc_macho_write32(0x32);                        /* cmd */
+    kcc_macho_write32(24);                          /* cmdsize */
+    kcc_macho_write32(1);                           /* PLATFORM_MACOS */
+    kcc_macho_write32(14 << 16);                    /* minos 14.0.0 */
+    kcc_macho_write32(14 << 16);                    /* sdk 14.0.0 */
+    kcc_macho_write32(0);                           /* ntools */
+
+    /* ---- LC_SYMTAB ---- */
+    kcc_macho_write32(0x02);                        /* cmd */
+    kcc_macho_write32(24);                          /* cmdsize */
+    kcc_macho_write32(symoff);
+    kcc_macho_write32(nsyms);
+    kcc_macho_write32(stroff);
+    kcc_macho_write32(strsize);
+
+    /* ---- LC_DYSYMTAB ---- */
+    kcc_macho_write32(0x0B);                        /* cmd */
+    kcc_macho_write32(80);                          /* cmdsize */
+    kcc_macho_write32(0);                           /* ilocalsym */
+    kcc_macho_write32(0);                           /* nlocalsym */
+    kcc_macho_write32(0);                           /* iextdefsym */
+    kcc_macho_write32(nextdef);                     /* nextdefsym */
+    kcc_macho_write32(nextdef);                     /* iundefsym */
+    kcc_macho_write32(nsyms - nextdef);             /* nundefsym */
+    for (int i = 0; i < 12; i++) kcc_macho_write32(0);
+@}
+
+\section{Code, Relocations, Symbols, and Flush}
+
+After the commands come the DWARF segment (its blob laid after the code), the raw
+code bytes, the module-init and const bodies (zeros filled by relocations), and
+the LINKEDIT region.  The relocations are written against a \emph{remap} array
+that reorders symbol indices into the defined-then-undefined order Mach-O
+requires; each 8-byte record packs the remapped symbol number, the PC-relative
+flag (cleared for the two \texttt{PAGEOFF12} forms), a length code, the extern
+bit, and the type.  The symbol table writes the same two passes of
+\texttt{nlist\_64} entries---a defined symbol's value rebased to its section's VM
+start, a local string literal kept unexported---and the string table their names
+in the same order.  One \texttt{write} flushes it all.
+
+@l c
+@d Selfhost: emit-macho body @{
+    /* ---- DWARF segment (under -g) ---- */
+    if (kcc_dwarf_enabled)
+        kcc_dwarf_emit_macho(text_offset + code_size, code_size + globals_size);
+
+    /* ---- Code bytes ---- */
+    kcc_macho_write_bytes(kcc_code_buf, code_size);
+
+    if (kcc_dwarf_enabled) kcc_dwarf_append_blob();
+
+    /* ---- Module-init pointer (8 zero bytes) ---- */
+    if (kcc_modinit_present) {
+        kcc_macho_pad_to(8);
+        kcc_macho_write64(0);
+    }
+
+    /* ---- __const section data (zeros; values come from relocations) ---- */
+    if (kcc_rodata_const_present) {
+        kcc_macho_pad_to(8);
+        unsigned long rem = kcc_rodata_const_size;
+        while (rem) { kcc_macho_write64(0); rem -= 8; }
+    }
+
+    kcc_macho_pad_to(4);
+
+    /* ---- Symbol index remap: defined first, then undefined ---- */
+    unsigned long *remap = (unsigned long *)kcc_arena_alloc((long)(nsyms * 8));
+    unsigned long out = 0;
+    for (unsigned long i = 0; i < nsyms; i++) {
+        struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
+        if (s->section != 0) remap[i] = out++;
+    }
+    for (unsigned long i = 0; i < nsyms; i++) {
+        struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
+        if (s->section == 0) remap[i] = out++;
+    }
+
+    /* ---- Text relocations ---- */
+    for (unsigned long i = 0; i < nrelocs; i++) {
+        unsigned long *r = (unsigned long *)kcc_vec_get(kcc_linker_relocs, i);
+        kcc_macho_write32(r[0]);                    /* r_address = offset */
+        unsigned long type = r[1];
+        unsigned long rsym = remap[r[2]];
+        unsigned long info = rsym & 0xFFFFFF;
+        if (type != ARM64_RELOC_PAGEOFF12 && type != ARM64_RELOC_GOT_LOAD_PAGEOFF12)
+            info |= (1u << 24);                     /* r_pcrel */
+        info |= (2u << 25);                         /* r_length = 2 */
+        info |= (1u << 27);                         /* r_extern */
+        info |= (type << 28);                       /* r_type */
+        kcc_macho_write32(info);
+    }
+
+    /* ---- Module-init pointer relocation ---- */
+    if (kcc_modinit_present) {
+        kcc_macho_write32(0);                       /* r_address */
+        unsigned long rsym = remap[kcc_modinit_sym - 1];
+        unsigned long info = (rsym & 0xFFFFFF) | (3u << 25) | (1u << 27);
+        kcc_macho_write32(info);                    /* UNSIGNED, length 3, extern */
+    }
+
+    /* ---- __const relocations ---- */
+    if (kcc_rodata_const_present) {
+        struct Vec *cr = (struct Vec *)kcc_rodata_const_relocs;
+        for (unsigned long i = 0; i < cr->count; i++) {
+            unsigned long *e = (unsigned long *)kcc_vec_get(cr, i);
+            kcc_macho_write32(e[0]);                /* r_address = slot offset */
+            unsigned long rsym = remap[e[1]];
+            unsigned long info = (rsym & 0xFFFFFF) | (3u << 25) | (1u << 27);
+            kcc_macho_write32(info);
+        }
+    }
+
+    /* ---- Symbol table: nlist_64, defined then undefined ---- */
+    unsigned long strpos = 1;
+    for (unsigned long i = 0; i < nsyms; i++) {
+        struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
+        if (s->section == 0) continue;
+        kcc_macho_write32(strpos);                  /* n_strx */
+        kcc_macho_write8((s->flags & N_EXT) | N_SECT); /* n_type */
+        kcc_macho_write8(s->section);               /* n_sect */
+        kcc_macho_write16(0);                       /* n_desc */
+        unsigned long val = s->value;
+        if (s->section == 2) {
+            val += code_size;
+        } else if (s->section == 3) {
+            unsigned long base = code_size + globals_size;
+            if (kcc_modinit_present) { base = (base + 7) & ~7UL; base += 8; }
+            base = (base + 7) & ~7UL;
+            val += base;
+        }
+        kcc_macho_write64(val);                     /* n_value */
+        strpos += kcc_strlen(s->name) + 1;
+    }
+    for (unsigned long i = 0; i < nsyms; i++) {
+        struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
+        if (s->section != 0) continue;
+        kcc_macho_write32(strpos);                  /* n_strx */
+        kcc_macho_write8(0x01);                     /* N_UNDF | N_EXT */
+        kcc_macho_write8(0);                        /* n_sect */
+        kcc_macho_write16(0);                       /* n_desc */
+        kcc_macho_write64(0);                       /* n_value */
+        strpos += kcc_strlen(s->name) + 1;
+    }
+
+    /* ---- String table ---- */
+    kcc_macho_write8(0);                            /* leading NUL */
+    for (unsigned long i = 0; i < nsyms; i++) {
+        struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
+        if (s->section == 0) continue;
+        kcc_macho_write_bytes(s->name, kcc_strlen(s->name) + 1);
+    }
+    for (unsigned long i = 0; i < nsyms; i++) {
+        struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
+        if (s->section != 0) continue;
+        kcc_macho_write_bytes(s->name, kcc_strlen(s->name) + 1);
+    }
+
+    /* ---- Flush ---- */
+    kcc_sys_write(kcc_macho_fd, kcc_macho_buf, kcc_macho_pos);
+    kcc_sys_close(kcc_macho_fd);
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: emit-macho @{
+@<Selfhost: emit-macho preamble@>
+@<Selfhost: emit-macho writers@>
+@<Selfhost: emit-macho layout@>
+@<Selfhost: emit-macho header@>
+@<Selfhost: emit-macho sections@>
+@<Selfhost: emit-macho auxcmds@>
+@<Selfhost: emit-macho body@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-emit-macho-verify}
+
+\texttt{make selfhost-emit-macho} runs the drop-in loop.  Because every test in
+the code-generation suite links and runs the object this file writes, and
+\texttt{difftest} compares behaviour against \texttt{clang}, a green sweep means
+\kcc{} reproduced its own Mach-O layout byte for byte.
+
+@d Selfhost: emit-macho verify @{
+#!/usr/bin/env bash
+# make selfhost-emit-macho — compile kcc's Mach-O writer in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/emit_macho.c with kcc"
+tmp/kcc -c "$SH/emit_macho.c" -o "$SH/emit_macho_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_emit_macho (emit_macho.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "emit_macho" ]; then OBJ="$OBJ $SH/emit_macho_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_emit_macho $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted Mach-O writer"
+cp tmp/kcc "$SH/kcc_asm_backup_emit_macho"
+cp tmp/kcc_selfhost_emit_macho tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_emit_macho" tmp/kcc
+exit $status
+@}
+

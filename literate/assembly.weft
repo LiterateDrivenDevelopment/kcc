@@ -906,6 +906,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: statements verify@>
 @}
 
+\noindent The Mach-O object writer, ported to C
+(Chapter~\ref{ch:self-hosting-emit-macho}), a drop-in replacement:
+
+@o tmp/selfhost/emit_macho.c @{
+@<Selfhost: emit-macho@>
+@}
+
+@o tmp/selfhost/emit_macho_verify.sh @{
+@<Selfhost: emit-macho verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

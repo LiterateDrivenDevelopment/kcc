@@ -1,0 +1,487 @@
+% 48r-self-hosting-parser.weft — Stage 8s: the parser spine, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Parser Spine in C}
+\label{ch:self-hosting-parser}
+
+With the statement and expression parsers already in C
+(Chapters~\ref{ch:self-hosting-statements} and~\ref{ch:self-hosting-expressions}),
+this port completes the parser: the spine they stand on.  It is the node
+allocator that stamps every AST node with its source location, the token-consumption
+helpers, the ``expected'' diagnostic, the typedef-name scope stack that resolves C's
+declaration/expression ambiguity, the translation-unit driver, and the
+\texttt{--dump-ast} tree printer.  The code-generation suite exercises the whole
+spine on every compile; the tree printer is checked separately by comparing
+\texttt{--dump-ast} output against the assembly's.
+
+\section{Nodes, State, and the Tag Table}
+
+The port declares the 64-byte node and the vector header (so it can pop a typedef
+scope by decrementing the count), owns the parser's three globals (the error flag,
+the typedef scope stack, and the dump indentation), and carries the tag-name table
+the dumper looks names up in.  Externs are the arena, the containers, the token
+stream, the diagnostic engine, the token-name helper, buffered output, and the
+declaration parser.
+
+@l c
+@d Selfhost: parser preamble @{
+struct Node {
+    unsigned long tag;
+    unsigned long line;
+    unsigned long col;
+    unsigned long f0;
+    unsigned long f1;
+    unsigned long f2;
+    unsigned long f3;
+    unsigned long f4;
+};
+
+struct Vec {
+    void *data;
+    unsigned long count;     /* VEC_COUNT, 8 */
+    unsigned long cap;
+    unsigned long elem_size;
+};
+
+void *kcc_arena_alloc(long size);
+void *kcc_vec_init(unsigned long elem_size);
+void kcc_vec_push(void *vec, const void *elem);
+void *kcc_vec_get(void *vec, unsigned long index);
+void *kcc_ht_init(unsigned long capacity);
+unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen,
+                unsigned long value);
+int kcc_memcmp(const void *a, const void *b, unsigned long n);
+void kcc_pp_next(void);
+void kcc_diag_emit(int severity, unsigned long line, unsigned long col,
+                   const char *msg);
+const char *kcc_lex_type_name(unsigned long type);
+void kcc_io_puts(const char *s);
+void kcc_io_putc(unsigned long c);
+void kcc_io_putu(unsigned long n);
+void kcc_io_write(const void *buf, unsigned long len);
+void *kcc_parse_decl(void);
+
+extern unsigned long kcc_tok_type;
+extern unsigned long kcc_tok_line;
+extern unsigned long kcc_tok_col;
+
+unsigned long kcc_parse_error_flag = 0;
+void *kcc_typedef_scopes = 0;
+unsigned long kcc_ast_indent = 0;
+
+enum {
+    TOK_EOF = 0, TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62,
+    TOK_RBRACE = 63, TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66,
+    TOK_COMMA = 67, TOK_COLON = 93
+};
+
+enum {
+    AST_TRANS_UNIT = 1, AST_VAR_DECL = 10, AST_FUNC_DECL = 11,
+    AST_PARAM_DECL = 12, AST_TYPEDEF_DECL = 13, AST_STRUCT_DECL = 14,
+    AST_UNION_DECL = 15, AST_ENUM_DECL = 16, AST_ENUMERATOR = 17,
+    AST_FIELD_DECL = 18, AST_TYPE_BUILTIN = 20, AST_TYPE_NAME = 21,
+    AST_TYPE_PTR = 22, AST_TYPE_ARRAY = 23, AST_TYPE_FUNC = 24,
+    AST_COMPOUND = 30, AST_IF_STMT = 32, AST_SWITCH_STMT = 33,
+    AST_WHILE_STMT = 34, AST_DO_STMT = 35, AST_FOR_STMT = 36,
+    AST_CASE_STMT = 42, AST_LABEL_STMT = 41, AST_DEFAULT_STMT = 43,
+    AST_IDENT_EXPR = 50, AST_INT_LIT = 51, AST_STR_LIT = 52, AST_CHAR_LIT = 53,
+    AST_BINARY_EXPR = 54, AST_UNARY_EXPR = 55, AST_ASSIGN_EXPR = 56,
+    AST_CALL_EXPR = 58, AST_MEMBER = 60, AST_SIZEOF_EXPR = 62,
+    AST_CAST_EXPR = 61, AST_FLOAT_LIT = 71
+};
+
+struct TagName { unsigned long tag; const char *name; };
+static struct TagName tag_table[] = {
+    {1,"TranslationUnit"}, {10,"VarDecl"}, {11,"FuncDecl"}, {12,"ParamDecl"},
+    {13,"TypedefDecl"}, {14,"StructDecl"}, {15,"UnionDecl"}, {16,"EnumDecl"},
+    {17,"Enumerator"}, {18,"FieldDecl"}, {19,"StaticAssert"}, {20,"BuiltinType"},
+    {21,"TypeName"}, {22,"PointerType"}, {23,"ArrayType"}, {24,"FuncType"},
+    {25,"StructType"}, {26,"UnionType"}, {27,"EnumType"}, {28,"QualType"},
+    {30,"CompoundStmt"}, {31,"ExprStmt"}, {32,"IfStmt"}, {33,"SwitchStmt"},
+    {34,"WhileStmt"}, {35,"DoStmt"}, {36,"ForStmt"}, {37,"GotoStmt"},
+    {38,"ContinueStmt"}, {39,"BreakStmt"}, {40,"ReturnStmt"}, {41,"LabelStmt"},
+    {42,"CaseStmt"}, {43,"DefaultStmt"}, {44,"NullStmt"}, {50,"IdentExpr"},
+    {51,"IntLit"}, {71,"FloatLit"}, {72,"VaArg"}, {52,"StrLit"}, {53,"CharLit"},
+    {54,"BinaryExpr"}, {55,"UnaryExpr"}, {56,"AssignExpr"}, {57,"CondExpr"},
+    {58,"CallExpr"}, {59,"Subscript"}, {60,"MemberExpr"}, {61,"CastExpr"},
+    {62,"SizeofExpr"}, {63,"AlignofExpr"}, {64,"CommaExpr"}, {65,"InitList"},
+    {67,"CompoundLit"}, {68,"ParenExpr"}, {69,"GenericExpr"},
+    {70,"GenericAssoc"}, {0,0}
+};
+
+void *kcc_ast_alloc(unsigned long tag);
+void kcc_ast_dump(void *node);
+void kcc_ast_indent_inc(void);
+void kcc_ast_indent_dec(void);
+void kcc_ast_print_indent(void);
+void kcc_ast_print_name_field(const char *name);
+const char *kcc_ast_tag_name(unsigned long tag);
+@}
+
+\section{Allocation, Token Helpers, Errors}
+
+\texttt{ast\_alloc} zeroes a 64-byte node, tags it, and stamps the current token's
+line and column so a diagnostic caret lands on the right token.
+\texttt{peek}/\texttt{advance}/\texttt{match}/\texttt{expect} are the token
+interface; \texttt{expect} reads a specific ``expected '\,X\,'\,'' message for the
+common punctuators.  \texttt{error} sets the error flag and emits at the current
+location; \texttt{sync} skips to the next \texttt{;} or \texttt{\}}.
+
+@l c
+@d Selfhost: parser core @{
+void *kcc_ast_alloc(unsigned long tag) {
+    struct Node *n = (struct Node *)kcc_arena_alloc(64);
+    n->tag = tag; n->line = kcc_tok_line; n->col = kcc_tok_col;
+    n->f0 = 0; n->f1 = 0; n->f2 = 0; n->f3 = 0; n->f4 = 0;
+    return n;
+}
+
+unsigned long kcc_parse_peek(void) { return kcc_tok_type; }
+void kcc_parse_advance(void) { kcc_pp_next(); }
+
+int kcc_parse_match(unsigned long tok_type) {
+    if (kcc_tok_type == tok_type) { kcc_pp_next(); return 1; }
+    return 0;
+}
+
+void kcc_parse_error(const char *msg) {
+    kcc_parse_error_flag = 1;
+    kcc_diag_emit(0, kcc_tok_line, kcc_tok_col, msg);  /* DIAG_ERROR */
+}
+
+void kcc_parse_expect(unsigned long tok_type) {
+    if (kcc_tok_type == tok_type) { kcc_pp_next(); return; }
+    const char *msg;
+    if (tok_type == TOK_SEMI) msg = "expected ';'";
+    else if (tok_type == TOK_LPAREN) msg = "expected '('";
+    else if (tok_type == TOK_RPAREN) msg = "expected ')'";
+    else if (tok_type == TOK_LBRACE) msg = "expected '{'";
+    else if (tok_type == TOK_RBRACE) msg = "expected '}'";
+    else if (tok_type == TOK_LBRACKET) msg = "expected '['";
+    else if (tok_type == TOK_RBRACKET) msg = "expected ']'";
+    else if (tok_type == TOK_COMMA) msg = "expected ','";
+    else if (tok_type == TOK_COLON) msg = "expected ':'";
+    else msg = "expected token";
+    kcc_parse_error(msg);
+}
+
+void kcc_parse_sync(void) {
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_EOF) return;
+        if (t == TOK_SEMI) { kcc_pp_next(); return; }
+        if (t == TOK_RBRACE) return;
+        kcc_pp_next();
+    }
+}
+@}
+
+\section{Typedef Scopes and the Translation Unit}
+
+The typedef stack is a vector of hash tables, one per scope.  \texttt{init} makes
+the vector and a file-scope table; \texttt{push\_scope} appends a fresh table and
+\texttt{pop\_scope} drops the top by decrementing the count (the arena reclaims
+it).  \texttt{add} inserts a name in the innermost scope; \texttt{lookup} searches
+top-down (so an inner typedef shadows an outer name) and treats \texttt{va\_list}
+as a built-in.  \texttt{parse} reads the first token and appends external
+declarations---following each declarator group's \texttt{f4} tail---into a
+translation-unit node.
+
+@l c
+@d Selfhost: parser typedef @{
+void kcc_typedef_init(void) {
+    kcc_typedef_scopes = kcc_vec_init(8);
+    void *ht = kcc_ht_init(64);
+    kcc_vec_push(kcc_typedef_scopes, &ht);
+}
+
+void kcc_typedef_push_scope(void) {
+    void *ht = kcc_ht_init(32);
+    kcc_vec_push(kcc_typedef_scopes, &ht);
+}
+
+void kcc_typedef_pop_scope(void) {
+    ((struct Vec *)kcc_typedef_scopes)->count -= 1;
+}
+
+void kcc_typedef_add(const char *name, unsigned long len) {
+    struct Vec *v = (struct Vec *)kcc_typedef_scopes;
+    void *ht = *(void **)kcc_vec_get(v, v->count - 1);
+    kcc_ht_put(ht, name, len, 1);
+}
+
+int kcc_typedef_lookup(const char *name, unsigned long len) {
+    if (len == 7 && kcc_memcmp(name, "va_list", 7) == 0) return 1;
+    struct Vec *v = (struct Vec *)kcc_typedef_scopes;
+    unsigned long i = v->count;
+    while (i > 0) {
+        i = i - 1;
+        void *ht = *(void **)kcc_vec_get(v, i);
+        if (kcc_ht_get(ht, name, len)) return 1;
+    }
+    return 0;
+}
+
+void *kcc_parse(void) {
+    kcc_pp_next();
+    struct Node *tu = (struct Node *)kcc_ast_alloc(AST_TRANS_UNIT);
+    struct Node *first = 0, *last = 0;
+    while (kcc_tok_type != TOK_EOF) {
+        struct Node *d = (struct Node *)kcc_parse_decl();
+        if (d == 0) continue;
+        struct Node *tail = d;
+        while (tail->f4) tail = (struct Node *)tail->f4;
+        if (first == 0) { first = d; last = tail; }
+        else { last->f4 = (unsigned long)d; last = tail; }
+    }
+    tu->f0 = (unsigned long)first;
+    return tu;
+}
+@}
+
+\section{The AST Dumper}
+
+\texttt{ast\_dump} prints a node's tag and location, then dispatches on the tag to
+print its fields and recurse into its children, indenting by depth.  The handlers
+mirror the assembly one for one---which fields are children, which are names,
+operators, or flags---so the \texttt{--dump-ast} output matches byte for byte.
+
+@l c
+@d Selfhost: parser dump @{
+const char *kcc_ast_tag_name(unsigned long tag) {
+    for (struct TagName *e = tag_table; e->name; e++)
+        if (e->tag == tag) return e->name;
+    return "<unknown>";
+}
+
+void kcc_ast_indent_inc(void) { kcc_ast_indent += 1; }
+void kcc_ast_indent_dec(void) { kcc_ast_indent -= 1; }
+
+void kcc_ast_print_indent(void) {
+    unsigned long n = kcc_ast_indent * 2;
+    while (n) { kcc_io_putc(' '); n--; }
+}
+
+void kcc_ast_print_name_field(const char *name) {
+    if (name == 0) return;
+    kcc_io_puts(" ");
+    kcc_io_putc('\'');
+    kcc_io_puts(name);
+    kcc_io_putc('\'');
+}
+
+static void dump_list(struct Node *head) {
+    for (struct Node *c = head; c; c = (struct Node *)c->f4)
+        kcc_ast_dump(c);
+}
+
+void kcc_ast_dump(void *nodep) {
+    struct Node *n = (struct Node *)nodep;
+    if (n == 0) return;
+    kcc_ast_print_indent();
+    kcc_io_puts(kcc_ast_tag_name(n->tag));
+    kcc_io_puts(" @@ ");
+    kcc_io_putu(n->line);
+    kcc_io_putc(':');
+    kcc_io_putu(n->col);
+
+    unsigned long t = n->tag;
+
+    if (t == AST_TRANS_UNIT || t == AST_COMPOUND) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        dump_list((struct Node *)n->f0);
+        kcc_ast_indent_dec();
+        return;
+    }
+    if (t == AST_VAR_DECL) {
+        kcc_ast_print_name_field((const char *)n->f1); kcc_io_putc('\n');
+        kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_dump((void *)n->f2);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_FUNC_DECL) {
+        kcc_ast_print_name_field((const char *)n->f1); kcc_io_putc('\n');
+        kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0);
+        dump_list((struct Node *)n->f2);
+        kcc_ast_dump((void *)n->f3);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_PARAM_DECL || t == AST_TYPEDEF_DECL || t == AST_FIELD_DECL) {
+        kcc_ast_print_name_field((const char *)n->f1); kcc_io_putc('\n');
+        kcc_ast_indent_inc(); kcc_ast_dump((void *)n->f0); kcc_ast_indent_dec();
+        return;
+    }
+    if (t == AST_STRUCT_DECL || t == AST_UNION_DECL || t == AST_ENUM_DECL) {
+        kcc_ast_print_name_field((const char *)n->f0); kcc_io_putc('\n');
+        kcc_ast_indent_inc(); dump_list((struct Node *)n->f1); kcc_ast_indent_dec();
+        return;
+    }
+    if (t == AST_ENUMERATOR) {
+        kcc_ast_print_name_field((const char *)n->f0); kcc_io_putc('\n');
+        kcc_ast_indent_inc(); kcc_ast_dump((void *)n->f1); kcc_ast_indent_dec();
+        return;
+    }
+    if (t == AST_TYPE_BUILTIN) {
+        kcc_io_puts(" "); kcc_io_puts(kcc_lex_type_name(n->f0)); kcc_io_putc('\n');
+        return;
+    }
+    if (t == AST_TYPE_NAME || t == AST_IDENT_EXPR) {
+        kcc_ast_print_name_field((const char *)n->f0); kcc_io_putc('\n');
+        return;
+    }
+    if (t == AST_TYPE_PTR) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_TYPE_ARRAY) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_dump((void *)n->f1);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_TYPE_FUNC) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0);
+        dump_list((struct Node *)n->f1);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_INT_LIT || t == AST_FLOAT_LIT || t == AST_CHAR_LIT) {
+        kcc_io_puts(" "); kcc_io_putu(n->f0); kcc_io_putc('\n'); return;
+    }
+    if (t == AST_STR_LIT) {
+        kcc_io_puts(" "); kcc_io_putc('"');
+        kcc_io_write((const void *)n->f0, n->f1);
+        kcc_io_putc('"'); kcc_io_putc('\n'); return;
+    }
+    if (t == AST_BINARY_EXPR || t == AST_ASSIGN_EXPR) {
+        kcc_io_puts(" op="); kcc_io_puts(kcc_lex_type_name(n->f0)); kcc_io_putc('\n');
+        kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f1); kcc_ast_dump((void *)n->f2);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_UNARY_EXPR) {
+        kcc_io_puts(" op="); kcc_io_puts(kcc_lex_type_name(n->f0));
+        kcc_io_puts(n->f2 ? " prefix" : " postfix");
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f1); kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_CALL_EXPR) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0);
+        dump_list((struct Node *)n->f1);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_MEMBER) {
+        kcc_ast_print_name_field((const char *)n->f1);
+        kcc_io_puts(n->f2 ? " ->" : " .");
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_SIZEOF_EXPR) {
+        kcc_io_puts(n->f1 ? " type" : " expr");
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_CAST_EXPR) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_dump((void *)n->f1);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_IF_STMT) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_dump((void *)n->f1);
+        kcc_ast_dump((void *)n->f2); kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_WHILE_STMT || t == AST_DO_STMT || t == AST_SWITCH_STMT ||
+        t == AST_CASE_STMT) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_dump((void *)n->f1);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_FOR_STMT) {
+        kcc_io_putc('\n'); kcc_ast_indent_inc();
+        kcc_ast_dump((void *)n->f0); kcc_ast_dump((void *)n->f1);
+        kcc_ast_dump((void *)n->f2); kcc_ast_dump((void *)n->f3);
+        kcc_ast_indent_dec(); return;
+    }
+    if (t == AST_LABEL_STMT) {
+        kcc_ast_print_name_field((const char *)n->f0); kcc_io_putc('\n');
+        kcc_ast_indent_inc(); kcc_ast_dump((void *)n->f1); kcc_ast_indent_dec();
+        return;
+    }
+    /* Generic: newline, then the first child only. */
+    kcc_io_putc('\n'); kcc_ast_indent_inc();
+    if (n->f0) kcc_ast_dump((void *)n->f0);
+    kcc_ast_indent_dec();
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: parser @{
+@<Selfhost: parser preamble@>
+@<Selfhost: parser core@>
+@<Selfhost: parser typedef@>
+@<Selfhost: parser dump@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-parser-verify}
+
+\texttt{make selfhost-parser} runs the drop-in loop through the code-generation
+suite (which drives \texttt{kcc\_parse}, \texttt{ast\_alloc}, the token helpers,
+and the typedef stack on every program) and additionally diffs \texttt{--dump-ast}
+output against the assembly writer's, so the tree printer is verified too.
+
+@d Selfhost: parser verify @{
+#!/usr/bin/env bash
+# make selfhost-parser — compile kcc's parser spine in C with kcc, relink, run
+# the codegen suite and check --dump-ast byte-identical.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/4] compiling tmp/selfhost/parser.c with kcc"
+tmp/kcc -c "$SH/parser.c" -o "$SH/parser_c.o" >/dev/null
+
+echo "[2/4] linking tmp/kcc_selfhost_parser (parser.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "parser" ]; then OBJ="$OBJ $SH/parser_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_parser $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/4] --dump-ast byte-identical check"
+cat > "$SH/dump_probe.c" <<'PROBE'
+typedef int myint;
+struct P { int x; int y; };
+int add(int a, int b) { return a + b; }
+int main(void) {
+    myint n = 3;
+    int arr[2] = {1, 2};
+    for (int i = 0; i < n; i++) { arr[0] += add(i, arr[1]) * (i ? 2 : 3); }
+    return arr[0] > 5 ? sizeof(int) : arr[0];
+}
+PROBE
+tmp/kcc --dump-ast "$SH/dump_probe.c" > "$SH/dump_asm.txt" 2>/dev/null || true
+tmp/kcc_selfhost_parser --dump-ast "$SH/dump_probe.c" > "$SH/dump_c.txt" 2>/dev/null || true
+if ! diff -q "$SH/dump_asm.txt" "$SH/dump_c.txt" >/dev/null; then
+    echo "  --dump-ast MISMATCH:"; diff "$SH/dump_asm.txt" "$SH/dump_c.txt" | head -20; exit 1
+fi
+echo "  --dump-ast identical"
+
+echo "[4/4] running the codegen suite with the self-hosted parser spine"
+cp tmp/kcc "$SH/kcc_asm_backup_parser"
+cp tmp/kcc_selfhost_parser tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_parser" tmp/kcc
+exit $status
+@}

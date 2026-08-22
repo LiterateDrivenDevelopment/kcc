@@ -928,6 +928,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: expressions verify@>
 @}
 
+\noindent The parser spine, ported to C
+(Chapter~\ref{ch:self-hosting-parser}), a drop-in replacement:
+
+@o tmp/selfhost/parser.c @{
+@<Selfhost: parser@>
+@}
+
+@o tmp/selfhost/parser_verify.sh @{
+@<Selfhost: parser verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

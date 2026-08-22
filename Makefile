@@ -26,7 +26,7 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 
 .PHONY: all default tangle assemble build test selfhost selfhost-lexer \
         selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
-        selfhost-statements selfhost-emit-macho selfhost-expressions meta-a \
+        selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser meta-a \
         difftest interop e2e diagtest warntest test-codegen doc weave clean \
         run map
 
@@ -148,6 +148,11 @@ selfhost-emit-macho: build
 selfhost-expressions: build
 	chmod +x tmp/selfhost/expressions_verify.sh
 	tmp/selfhost/expressions_verify.sh
+
+# Self-hosting (Stage 8s): compile kcc's parser spine in C, relink, run suite
+selfhost-parser: build
+	chmod +x tmp/selfhost/parser_verify.sh
+	tmp/selfhost/parser_verify.sh
 
 # Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link against the Linux runtime (no libc), run it natively (Chapter: Runtime).

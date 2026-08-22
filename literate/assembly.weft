@@ -895,6 +895,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: linker verify@>
 @}
 
+\noindent The statement parser, ported to C
+(Chapter~\ref{ch:self-hosting-statements}), a drop-in replacement:
+
+@o tmp/selfhost/statements.c @{
+@<Selfhost: statements@>
+@}
+
+@o tmp/selfhost/statements_verify.sh @{
+@<Selfhost: statements verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

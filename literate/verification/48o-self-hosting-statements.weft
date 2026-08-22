@@ -1,0 +1,555 @@
+% 48o-self-hosting-statements.weft — Stage 8p: the statement parser, written in
+% C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Statement Parser in C}
+\label{ch:self-hosting-statements}
+
+The statement parser of Chapter~\ref{ch:statements} is the first slice of the
+recursive-descent \emph{parser} to port.  It is the layer that turns a token
+stream into the control-flow skeleton of a function---compound blocks, the
+selection and iteration statements, jumps, labels, and inline assembly---so
+every function the code-generation suite compiles is shaped by it.  It stands on
+the parser's token API (the current-token globals, the token advance, and the
+``expect'' helper) and calls out to the expression and declaration parsers,
+which stay in assembly; the port is the statement grammar itself, node-building
+walk for node-building walk.
+
+\section{Nodes, Tokens, and the Parser API}
+
+An AST node is the 64-byte record Chapter~\ref{ch:parser} fixed: a tag, a source
+line and column, and five general-purpose fields \texttt{f0}--\texttt{f4}
+(\texttt{f4} is the sibling link that threads statement and declarator lists).
+The port declares that struct, the token codes and node tags it dispatches on,
+and the parser primitives as externs: the current token's type, text pointer,
+and length; \texttt{pp\_next} to advance; \texttt{parse\_expect} to consume an
+expected token or diagnose; \texttt{ast\_alloc} to make a node; and the
+expression/declaration entry points.  \texttt{strlit\_gather} returns two values
+(the gathered string pointer and its length), so it is declared as returning a
+16-byte struct, which the ABI hands back in the first two registers exactly as
+the assembly leaves them.
+
+@l c
+@d Selfhost: statements preamble @{
+struct Node {
+    unsigned long tag;   /* AST_TAG,  0  */
+    unsigned long line;  /* AST_LINE, 8  */
+    unsigned long col;   /* AST_COL,  16 */
+    unsigned long f0;    /* AST_F0,   24 */
+    unsigned long f1;    /* AST_F1,   32 */
+    unsigned long f2;    /* AST_F2,   40 */
+    unsigned long f3;    /* AST_F3,   48 */
+    unsigned long f4;    /* AST_F4,   56 */
+};
+
+struct StrLit { void *ptr; unsigned long len; };   /* returned in x0:x1 */
+
+extern unsigned long kcc_tok_type;
+extern const char *kcc_tok_start;
+extern unsigned long kcc_tok_len;
+
+void kcc_pp_next(void);
+void kcc_parse_expect(unsigned long tok_type);
+void *kcc_ast_alloc(unsigned long tag);
+void *kcc_parse_expr(void);
+void *kcc_parse_assign_expr(void);
+void *kcc_parse_cond_expr(void);
+void *kcc_parse_binary_expr(unsigned long min_prec);
+void *kcc_parse_postfix_tail(void *lhs);
+unsigned long kcc_prec_lookup(unsigned long op);
+void *kcc_parse_decl(void);
+unsigned long kcc_parse_is_type_token(void);
+struct StrLit kcc_strlit_gather(void);
+void *kcc_strtab_intern(const void *ptr, unsigned long len);
+void kcc_typedef_push_scope(void);
+void kcc_typedef_pop_scope(void);
+
+/* Token codes (Chapter: lexer). */
+enum {
+    TOK_EOF = 0, TOK_IDENT = 1, TOK_BREAK = 11, TOK_CASE = 12,
+    TOK_CONTINUE = 15, TOK_DEFAULT = 16, TOK_DO = 17, TOK_ELSE = 19,
+    TOK_EXTERN = 21, TOK_FOR = 23, TOK_GOTO = 24, TOK_IF = 25,
+    TOK_REGISTER = 29, TOK_RETURN = 31, TOK_STATIC = 35, TOK_SWITCH = 37,
+    TOK_TYPEDEF = 38, TOK_WHILE = 43, TOK_STATIC_ASSERT = 52, TOK_ASM = 56,
+    TOK_AUTO = 10,
+    TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62, TOK_RBRACE = 63,
+    TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66, TOK_COMMA = 67,
+    TOK_QUESTION = 92, TOK_COLON = 93,
+    TOK_ASSIGN = 94, TOK_OR_ASSIGN = 104
+};
+
+/* AST node tags (Chapter: parser). */
+enum {
+    AST_COMPOUND = 30, AST_EXPR_STMT = 31, AST_IF_STMT = 32,
+    AST_SWITCH_STMT = 33, AST_WHILE_STMT = 34, AST_DO_STMT = 35,
+    AST_FOR_STMT = 36, AST_GOTO_STMT = 37, AST_CONTINUE_STMT = 38,
+    AST_BREAK_STMT = 39, AST_RETURN_STMT = 40, AST_LABEL_STMT = 41,
+    AST_CASE_STMT = 42, AST_DEFAULT_STMT = 43, AST_NULL_STMT = 44,
+    AST_IDENT_EXPR = 50, AST_BINARY_EXPR = 54, AST_ASSIGN_EXPR = 56,
+    AST_COND_EXPR = 57, AST_COMMA_EXPR = 64,
+    AST_ASM_STMT = 74, AST_ASM_OPERAND = 75
+};
+
+/* Forward declarations for the module's own functions. */
+void *kcc_parse_stmt(void);
+void *kcc_parse_compound(void);
+void *kcc_parse_if(void);
+void *kcc_parse_switch(void);
+void *kcc_parse_while(void);
+void *kcc_parse_do(void);
+void *kcc_parse_for(void);
+void *kcc_parse_goto(void);
+void *kcc_parse_return(void);
+void *kcc_parse_case(void);
+void *kcc_parse_default(void);
+void *kcc_parse_expr_rest(void *lhs);
+void *kcc_parse_asm_extended(const char *tmpl, unsigned long len);
+void kcc_parse_asm_opsec(void *asm_stmt, unsigned long is_output);
+void kcc_parse_asm_clobbers(void);
+@}
+
+\section{The Dispatcher}
+
+\texttt{kcc\_parse\_stmt} chooses a handler by the leading token: a brace opens a
+compound; a bare semicolon is the null statement; the keywords route to their
+handlers; \texttt{continue} and \texttt{break} are built inline (each followed by
+its semicolon); \texttt{asm} captures a template and hands off to the extended
+form.  An identifier needs one-token lookahead---interned in case it is a label,
+then consumed to see whether a colon follows.  If it does, the statement is a
+label; otherwise the identifier is the start of an expression statement, and
+parsing resumes from the already-built identifier node through
+\texttt{postfix\_tail} and \texttt{expr\_rest}.
+
+@l c
+@d Selfhost: statements dispatch @{
+void *kcc_parse_stmt(void) {
+    unsigned long t = kcc_tok_type;
+    if (t == TOK_LBRACE) return kcc_parse_compound();
+    if (t == TOK_SEMI) { kcc_pp_next(); return kcc_ast_alloc(AST_NULL_STMT); }
+    if (t == TOK_IF) return kcc_parse_if();
+    if (t == TOK_SWITCH) return kcc_parse_switch();
+    if (t == TOK_WHILE) return kcc_parse_while();
+    if (t == TOK_DO) return kcc_parse_do();
+    if (t == TOK_FOR) return kcc_parse_for();
+    if (t == TOK_GOTO) return kcc_parse_goto();
+    if (t == TOK_CONTINUE) {
+        kcc_pp_next();
+        void *n = kcc_ast_alloc(AST_CONTINUE_STMT);
+        kcc_parse_expect(TOK_SEMI);
+        return n;
+    }
+    if (t == TOK_BREAK) {
+        kcc_pp_next();
+        void *n = kcc_ast_alloc(AST_BREAK_STMT);
+        kcc_parse_expect(TOK_SEMI);
+        return n;
+    }
+    if (t == TOK_RETURN) return kcc_parse_return();
+    if (t == TOK_CASE) return kcc_parse_case();
+    if (t == TOK_DEFAULT) return kcc_parse_default();
+    if (t == TOK_ASM) {
+        kcc_pp_next();                         /* consume 'asm' */
+        while (kcc_tok_type != TOK_LPAREN && kcc_tok_type != TOK_EOF)
+            kcc_pp_next();                     /* skip volatile/inline/goto */
+        kcc_parse_expect(TOK_LPAREN);
+        struct StrLit tmpl = kcc_strlit_gather();
+        void *n = kcc_parse_asm_extended((const char *)tmpl.ptr, tmpl.len);
+        kcc_parse_expect(TOK_SEMI);
+        return n;
+    }
+    if (t == TOK_IDENT) {
+        void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+        kcc_pp_next();                         /* consume identifier */
+        if (kcc_tok_type == TOK_COLON) {
+            kcc_pp_next();                     /* consume ':' */
+            void *inner = kcc_parse_stmt();
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_LABEL_STMT);
+            n->f0 = (unsigned long)name;
+            n->f1 = (unsigned long)inner;
+            return n;
+        }
+        struct Node *id = (struct Node *)kcc_ast_alloc(AST_IDENT_EXPR);
+        id->f0 = (unsigned long)name;
+        void *e = kcc_parse_postfix_tail(id);
+        e = kcc_parse_expr_rest(e);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_EXPR_STMT);
+        n->f0 = (unsigned long)e;
+        kcc_parse_expect(TOK_SEMI);
+        return n;
+    }
+    /* Expression statement. */
+    void *e = kcc_parse_expr();
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_EXPR_STMT);
+    n->f0 = (unsigned long)e;
+    kcc_parse_expect(TOK_SEMI);
+    return n;
+}
+@}
+
+\section{Expression Continuation}
+
+When the dispatcher consumed an identifier for label lookahead and found no
+colon, \texttt{kcc\_parse\_expr\_rest} finishes the expression from that
+left-hand side.  An assignment operator takes the whole thing as its left
+operand and then falls straight to the comma check (an assignment is a valid
+comma operand); otherwise it climbs binary operators by precedence, then a
+possible ternary, then the comma operator---the same shape the expression parser
+uses, replayed here because the leading identifier was already consumed.
+
+@l c
+@d Selfhost: statements exprrest @{
+void *kcc_parse_expr_rest(void *lhs) {
+    struct Node *cur = (struct Node *)lhs;
+    unsigned long t = kcc_tok_type;
+    if (t >= TOK_ASSIGN && t <= TOK_OR_ASSIGN) {
+        unsigned long op = t;
+        kcc_pp_next();
+        void *rhs = kcc_parse_assign_expr();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_ASSIGN_EXPR);
+        n->f0 = op;
+        n->f1 = (unsigned long)cur;
+        n->f2 = (unsigned long)rhs;
+        cur = n;
+    } else {
+        for (;;) {
+            unsigned long prec = kcc_prec_lookup(kcc_tok_type);
+            if (prec == 0) break;
+            unsigned long op = kcc_tok_type;
+            kcc_pp_next();
+            void *rhs = kcc_parse_binary_expr(prec + 1);
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_BINARY_EXPR);
+            n->f0 = op;
+            n->f1 = (unsigned long)cur;
+            n->f2 = (unsigned long)rhs;
+            cur = n;
+        }
+        if (kcc_tok_type == TOK_QUESTION) {
+            kcc_pp_next();
+            void *then = kcc_parse_expr();
+            kcc_parse_expect(TOK_COLON);
+            void *els = kcc_parse_cond_expr();
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_COND_EXPR);
+            n->f0 = (unsigned long)cur;
+            n->f1 = (unsigned long)then;
+            n->f2 = (unsigned long)els;
+            cur = n;
+        }
+    }
+    while (kcc_tok_type == TOK_COMMA) {
+        kcc_pp_next();
+        void *r = kcc_parse_assign_expr();
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_COMMA_EXPR);
+        n->f0 = (unsigned long)cur;
+        n->f1 = (unsigned long)r;
+        cur = n;
+    }
+    return cur;
+}
+@}
+
+\section{Inline Assembly}
+
+The extended inline-asm grammar carries, after the template, up to three
+colon-separated operand lists (outputs, inputs, clobbers; a fourth
+\texttt{goto}-label list is consumed but unmodelled).  \texttt{parse\_asm\_opsec}
+reads one list, building an \texttt{AST\_ASM\_OPERAND} per operand---an optional
+\texttt{[name]} skipped, a string constraint, and a parenthesised
+expression---and appending it to the statement's operand chain through
+\texttt{f4}.  \texttt{parse\_asm\_clobbers} consumes the clobber strings, and
+\texttt{parse\_asm\_extended} assembles the \texttt{AST\_ASM\_STMT} and drives
+the colon sections, closing on the right paren.
+
+@l c
+@d Selfhost: statements asm @{
+void kcc_parse_asm_opsec(void *asm_stmt, unsigned long is_output) {
+    struct Node *as = (struct Node *)asm_stmt;
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_COLON || t == TOK_RPAREN || t == TOK_EOF) return;
+        if (t == TOK_LBRACKET) {
+            kcc_pp_next();
+            while (kcc_tok_type != TOK_EOF && kcc_tok_type != TOK_RBRACKET)
+                kcc_pp_next();
+            if (kcc_tok_type == TOK_EOF) return;
+            kcc_pp_next();                      /* consume ']' */
+        }
+        struct StrLit c = kcc_strlit_gather();
+        kcc_parse_expect(TOK_LPAREN);
+        void *expr = kcc_parse_assign_expr();
+        kcc_parse_expect(TOK_RPAREN);
+        struct Node *op = (struct Node *)kcc_ast_alloc(AST_ASM_OPERAND);
+        op->f0 = (unsigned long)c.ptr;
+        op->f1 = c.len;
+        op->f2 = (unsigned long)expr;
+        op->f3 = is_output;
+        if (as->f2 == 0) {
+            as->f2 = (unsigned long)op;
+        } else {
+            struct Node *p = (struct Node *)as->f2;
+            while (p->f4) p = (struct Node *)p->f4;
+            p->f4 = (unsigned long)op;
+        }
+        if (kcc_tok_type != TOK_COMMA) return;
+        kcc_pp_next();
+    }
+}
+
+void kcc_parse_asm_clobbers(void) {
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_COLON || t == TOK_RPAREN || t == TOK_EOF) return;
+        kcc_strlit_gather();                    /* consume one clobber string */
+        if (kcc_tok_type != TOK_COMMA) return;
+        kcc_pp_next();
+    }
+}
+
+void *kcc_parse_asm_extended(const char *tmpl, unsigned long len) {
+    struct Node *a = (struct Node *)kcc_ast_alloc(AST_ASM_STMT);
+    a->f0 = (unsigned long)tmpl;
+    a->f1 = len;
+    if (kcc_tok_type != TOK_COLON) { kcc_parse_expect(TOK_RPAREN); return a; }
+    kcc_pp_next();                              /* ':' before outputs */
+    kcc_parse_asm_opsec(a, 1);
+    if (kcc_tok_type != TOK_COLON) { kcc_parse_expect(TOK_RPAREN); return a; }
+    kcc_pp_next();                              /* ':' before inputs */
+    kcc_parse_asm_opsec(a, 0);
+    if (kcc_tok_type != TOK_COLON) { kcc_parse_expect(TOK_RPAREN); return a; }
+    kcc_pp_next();                              /* ':' before clobbers */
+    kcc_parse_asm_clobbers();
+    if (kcc_tok_type != TOK_COLON) { kcc_parse_expect(TOK_RPAREN); return a; }
+    kcc_pp_next();                              /* ':' before goto labels */
+    while (kcc_tok_type != TOK_RPAREN && kcc_tok_type != TOK_EOF)
+        kcc_pp_next();
+    kcc_parse_expect(TOK_RPAREN);
+    return a;
+}
+@}
+
+\section{Compound Statements and the Control Forms}
+
+A compound statement opens a typedef scope, then reads items until the closing
+brace: an item is a declaration when the leading token is a type or a storage
+class, else a statement, and each item---which may itself be a multi-declarator
+chain---is appended by walking to its \texttt{f4} tail.  The selection and
+iteration forms are the direct grammar: each consumes its keyword and
+parenthesised parts and builds its node.  \texttt{for} accepts a declaration or
+an expression initializer and allows any of its three clauses to be empty.
+
+@l c
+@d Selfhost: statements compound @{
+static int starts_decl(unsigned long t) {
+    return t == TOK_TYPEDEF || t == TOK_EXTERN || t == TOK_STATIC ||
+           t == TOK_AUTO || t == TOK_REGISTER || t == TOK_STATIC_ASSERT;
+}
+
+void *kcc_parse_compound(void) {
+    kcc_parse_expect(TOK_LBRACE);
+    kcc_typedef_push_scope();
+    struct Node *comp = (struct Node *)kcc_ast_alloc(AST_COMPOUND);
+    struct Node *first = 0, *last = 0;
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_RBRACE || t == TOK_EOF) break;
+        void *item;
+        if (kcc_parse_is_type_token() || starts_decl(kcc_tok_type))
+            item = kcc_parse_decl();
+        else
+            item = kcc_parse_stmt();
+        struct Node *head = (struct Node *)item;
+        if (head == 0) continue;               /* error recovery */
+        struct Node *tail = head;
+        while (tail->f4) tail = (struct Node *)tail->f4;
+        if (first == 0) { first = head; last = tail; }
+        else { last->f4 = (unsigned long)head; last = tail; }
+    }
+    kcc_parse_expect(TOK_RBRACE);
+    kcc_typedef_pop_scope();
+    comp->f0 = (unsigned long)first;
+    return comp;
+}
+
+void *kcc_parse_if(void) {
+    kcc_pp_next();
+    kcc_parse_expect(TOK_LPAREN);
+    void *cond = kcc_parse_expr();
+    kcc_parse_expect(TOK_RPAREN);
+    void *then = kcc_parse_stmt();
+    void *els = 0;
+    if (kcc_tok_type == TOK_ELSE) { kcc_pp_next(); els = kcc_parse_stmt(); }
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_IF_STMT);
+    n->f0 = (unsigned long)cond;
+    n->f1 = (unsigned long)then;
+    n->f2 = (unsigned long)els;
+    return n;
+}
+
+void *kcc_parse_switch(void) {
+    kcc_pp_next();
+    kcc_parse_expect(TOK_LPAREN);
+    void *e = kcc_parse_expr();
+    kcc_parse_expect(TOK_RPAREN);
+    void *body = kcc_parse_stmt();
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_SWITCH_STMT);
+    n->f0 = (unsigned long)e;
+    n->f1 = (unsigned long)body;
+    return n;
+}
+
+void *kcc_parse_while(void) {
+    kcc_pp_next();
+    kcc_parse_expect(TOK_LPAREN);
+    void *cond = kcc_parse_expr();
+    kcc_parse_expect(TOK_RPAREN);
+    void *body = kcc_parse_stmt();
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_WHILE_STMT);
+    n->f0 = (unsigned long)cond;
+    n->f1 = (unsigned long)body;
+    return n;
+}
+
+void *kcc_parse_do(void) {
+    kcc_pp_next();
+    void *body = kcc_parse_stmt();
+    kcc_parse_expect(TOK_WHILE);
+    kcc_parse_expect(TOK_LPAREN);
+    void *cond = kcc_parse_expr();
+    kcc_parse_expect(TOK_RPAREN);
+    kcc_parse_expect(TOK_SEMI);
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_DO_STMT);
+    n->f0 = (unsigned long)body;
+    n->f1 = (unsigned long)cond;
+    return n;
+}
+
+void *kcc_parse_for(void) {
+    kcc_pp_next();
+    kcc_parse_expect(TOK_LPAREN);
+    void *init = 0;
+    if (kcc_tok_type == TOK_SEMI) {
+        kcc_pp_next();
+    } else if (kcc_parse_is_type_token() || starts_decl(kcc_tok_type)) {
+        init = kcc_parse_decl();               /* consumes trailing ';' */
+    } else {
+        void *e = kcc_parse_expr();
+        struct Node *es = (struct Node *)kcc_ast_alloc(AST_EXPR_STMT);
+        es->f0 = (unsigned long)e;
+        init = es;
+        kcc_parse_expect(TOK_SEMI);
+    }
+    void *cond = 0;
+    if (kcc_tok_type != TOK_SEMI) cond = kcc_parse_expr();
+    kcc_parse_expect(TOK_SEMI);
+    void *incr = 0;
+    if (kcc_tok_type != TOK_RPAREN) incr = kcc_parse_expr();
+    kcc_parse_expect(TOK_RPAREN);
+    void *body = kcc_parse_stmt();
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_FOR_STMT);
+    n->f0 = (unsigned long)init;
+    n->f1 = (unsigned long)cond;
+    n->f2 = (unsigned long)incr;
+    n->f3 = (unsigned long)body;
+    return n;
+}
+@}
+
+\section{Jumps and Labels}
+
+\texttt{goto} interns its target name for later resolution; \texttt{return}
+carries an optional value; \texttt{case} parses a constant expression before its
+colon and \texttt{default} none, each labeling the statement that follows.
+
+@l c
+@d Selfhost: statements jumps @{
+void *kcc_parse_goto(void) {
+    kcc_pp_next();
+    void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+    kcc_pp_next();                             /* consume identifier */
+    kcc_parse_expect(TOK_SEMI);
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_GOTO_STMT);
+    n->f0 = (unsigned long)name;
+    return n;
+}
+
+void *kcc_parse_return(void) {
+    kcc_pp_next();
+    void *expr = 0;
+    if (kcc_tok_type != TOK_SEMI) expr = kcc_parse_expr();
+    kcc_parse_expect(TOK_SEMI);
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_RETURN_STMT);
+    n->f0 = (unsigned long)expr;
+    return n;
+}
+
+void *kcc_parse_case(void) {
+    kcc_pp_next();
+    void *e = kcc_parse_cond_expr();
+    kcc_parse_expect(TOK_COLON);
+    void *stmt = kcc_parse_stmt();
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_CASE_STMT);
+    n->f0 = (unsigned long)e;
+    n->f1 = (unsigned long)stmt;
+    return n;
+}
+
+void *kcc_parse_default(void) {
+    kcc_pp_next();
+    kcc_parse_expect(TOK_COLON);
+    void *stmt = kcc_parse_stmt();
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_DEFAULT_STMT);
+    n->f0 = (unsigned long)stmt;
+    return n;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: statements @{
+@<Selfhost: statements preamble@>
+@<Selfhost: statements dispatch@>
+@<Selfhost: statements exprrest@>
+@<Selfhost: statements asm@>
+@<Selfhost: statements compound@>
+@<Selfhost: statements jumps@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-statements-verify}
+
+\texttt{make selfhost-statements} runs the drop-in loop.  Because every function
+body the suite compiles is parsed into statements by this file, a green
+code-generation suite means \kcc{} compiled its own statement grammar correctly;
+\texttt{difftest} additionally confirms the resulting programs behave identically
+to \texttt{clang}.
+
+@d Selfhost: statements verify @{
+#!/usr/bin/env bash
+# make selfhost-statements — compile kcc's statement parser in C with kcc,
+# relink, run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/statements.c with kcc"
+tmp/kcc -c "$SH/statements.c" -o "$SH/statements_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_statements (statements.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "statements" ]; then OBJ="$OBJ $SH/statements_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_statements $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted statement parser"
+cp tmp/kcc "$SH/kcc_asm_backup_statements"
+cp tmp/kcc_selfhost_statements tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_statements" tmp/kcc
+exit $status
+@}

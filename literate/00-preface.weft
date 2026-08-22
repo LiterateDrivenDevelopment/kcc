@@ -19,7 +19,7 @@ way of building software that is at once more \emph{certain}, more
 software is built today---and that the result can aspire to be not merely
 correct but beautiful.
 
-\section*{Literate Programming, and its Unpaid Cost}
+\section*{Literate Programming: Narrator and Engineer at Once}
 
 Donald Knuth's literate programming inverted the relationship between a
 program and its explanation.  A literate program is not code with comments;
@@ -29,23 +29,31 @@ something a machine can run.  Knuth's aim was frankly aesthetic: to produce
 ``works of literature,'' programs that could be read for pleasure and
 understood as a whole rather than reverse-engineered a function at a time.
 
-For all its beauty, literate programming stayed a minority practice, and the
-reason was economic.  Writing the narrative is real work.  Keeping it in step
-with the code as the code changes is more work still.  And the discipline it
-demands---explaining a thing clearly \emph{before} implementing it---is
-expensive when a single human bears the whole of that cost.  The method was
-admired and seldom used.
+Literate programming is remembered as expensive, and that memory is a
+misjudgement.  The narrative is real work, but it is not \emph{extra} work.
+A program that is correct was understood before it was written: someone
+decided, in some order, what each part must do and why.  Literate programming
+does not add that thinking; it insists only that the thinking be written down
+in the one place where the code can be checked against it.  What the method
+truly asked was not more labour but a rarer discipline---to explain a thing
+clearly \emph{before} implementing it, and to keep the explanation true as the
+code moved---and that discipline was hard to sustain for a single reason: one
+author had to be narrator and engineer at once, holding both in step by hand,
+with no partner to catch the prose when it drifted from the code.  The barrier
+was never the price of the writing.  It was the loneliness of the writing.  So
+the method was admired, and seldom used.
 
 \section*{Literate Driven Development}
 
-A capable AI collaborator changes that arithmetic.  When the narrative and
+A capable AI collaborator supplies the missing half.  When the narrative and
 the code can be authored, revised, and kept synchronised \emph{together}---the
 prose stating the intent, the code realising it, each continually checked
-against the other and against the world---the cost of the literate discipline
-collapses while its benefits compound.  We call this practice \textbf{Literate
-Driven Development}: literate programming as the medium, an AI as the
-co-author, and the woven document as the single source of truth from which
-both the understanding and the executable follow.  The prose is not
+against the other and against the world---the loneliness that made the
+discipline hard simply lifts, and its benefits, never really bought at a
+premium, compound freely.  We call this practice \textbf{Literate Driven
+Development}: literate programming as the medium, an AI as the co-author, and
+the woven document as the single source of truth from which both the
+understanding and the executable follow.  The prose is not
 documentation bolted onto a finished program; it is the place the program is
 thought, and a change is not finished until the story and the code agree.
 

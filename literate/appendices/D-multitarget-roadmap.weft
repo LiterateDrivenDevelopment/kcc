@@ -538,23 +538,69 @@ x86-64 back end was grown as a separate, self-contained emitter
 and prints x86-64 assembly for the system assembler---the playbook's
 \emph{assembly-emission} strategy.  This proves the seam end to end at every
 step while leaving ARM64 byte-identical (it stays the default; the driver
-branches only under \texttt{-{}-target=x86\_64}).  Four rungs have landed: rung
+branches only under \texttt{-{}-target=x86\_64}).  Five rungs have landed: rung
 one (\texttt{const}\,+\,\texttt{ret}, the whole pipeline proven with
 \texttt{int main(void)\{return N;\}}), rung two (the integer ALU and the memory
 operations---\texttt{alloca}/\texttt{load}/\texttt{store}/\texttt{gep}---via an
 all-spill \texttt{\%rbp} frame), rung three (comparisons, branches, and
-System~V calls, including recursion and stack-passed arguments), and rung four
+System~V calls, including recursion and stack-passed arguments), rung four
 (data emission---mutable file-scope globals and string literals---plus the
 GOT-indirect global reference that lets a program call \texttt{printf} and link
-in one step).  Together they compile the scalar language: a whole program of
-functions, loops, globals, and library calls now compiles, links, and runs
-identically to \texttt{clang}.  What remains for the target is the read-only
-data cases (\texttt{const} globals and \texttt{static} locals that become
-fixed byte images), floating point, and by-value aggregates; and M6
+in one step), and rung five (read-only data: \texttt{const} globals,
+\texttt{static} locals, and struct/array images become fixed byte tables in the
+constant section).  Together they compile the scalar language and more: zlib's
+\texttt{deflate}/\texttt{inflate} core, compiled by \kcc{} for x86-64 and
+linked against the C library, performs a byte-exact round-trip.  What remains
+for the \emph{code generator} is floating point and by-value aggregates; and M6
 proper---refactoring ARM64 to \emph{share} this target's interface rather than
-run beside it---is still the eventual consolidation.  The divergence from the
-``M6 before M7'' order was a judgement that a running, differentially-tested
-skeleton is a better foundation for the interface than a carved-but-empty one.
+run beside it---is still the eventual consolidation.
+
+\subsection{Two Milestones for Linux}
+\label{sec:mt-linux}
+
+The x86-64 emitter answers ``can \kcc{} \emph{write} code for another
+machine?''.  Running on Linux asks two sharper questions, and it helps to name
+them apart, because they are reached by different work and the first is a
+prerequisite for neither more nor less than a useful cross-compiler.
+
+\textbf{Milestone~A --- a program \kcc{} compiles runs natively on x86/Linux.}
+Here \kcc{} is the cross-compiler and the Linux machine merely runs the result.
+Three things differ from macOS, and all three live below the language, in the
+\emph{runtime floor} the program stands on: the system-call mechanism (Linux
+uses the \texttt{syscall} instruction with its own call numbers, not
+\texttt{svc\ \#0x80} with Mach numbers), the process entry point (an ELF
+\texttt{\_start}, not a Mach-O \texttt{\_main}), and the final link (a static
+image with no \texttt{libSystem}).  None of these is the compiler's front or
+middle end; each is a thin, hand-written slab of platform assembly.
+Chapter~\ref{ch:runtime-linux} is exactly that slab for Linux/x86-64---an ELF
+\texttt{\_start} and the \texttt{kcc\_sys\_*} wrappers---and \texttt{make
+meta-a} is its proof: a two-file C program, compiled by \kcc{} under
+\texttt{-{}-target=x86\_64-linux}, linked against that runtime with no C
+library, maps arena memory, calls across a translation unit, prints, and exits
+with the status the harness expects, running on a Linux kernel.  This half of
+Milestone~A is \emph{closed}.
+
+\textbf{Milestone~B --- \kcc{} itself runs, and re-compiles itself, on
+x86/Linux.}  This is the true trophy of the second target, and it is gated not
+on the code generator but on the compiler's own \emph{portability as source}.
+Today \kcc{} is largely ARM64 assembly, which no x86 machine can run.  The
+self-hosting chapters (beginning at Chapter~\ref{ch:self-hosting-arena}) are
+the answer: one subsystem at a time, the assembly is rewritten in C, compiled
+by \kcc{}, and linked back in place of the original object, verified
+byte-for-byte by re-running the whole suite through the swapped-in
+implementation.  Each such port also compiles cleanly for x86-64, so with every
+subsystem the compiler's source grows more target-neutral by construction.
+When the last subsystem is C, the Linux \kcc{} follows for free: its source is
+built---by a stock C compiler, or by \kcc{}'s own x86 back end---and linked
+against the same runtime floor Milestone~A established.  Nothing new is
+invented at that point; the two tracks simply meet.  The north star beyond
+both, compiling the Linux kernel itself, is then a matter of breadth---headers,
+inline assembly, the last dark corners of the language---rather than of any
+missing seam.
+
+The divergence from the ``M6 before M7'' order was a judgement that a running,
+differentially-tested skeleton is a better foundation for the interface than a
+carved-but-empty one.
 
 % ================================================================
 \section{Summary}

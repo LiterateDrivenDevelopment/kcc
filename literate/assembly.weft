@@ -873,6 +873,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: opt verify@>
 @}
 
+\noindent The lexer's keyword and token-name tables, ported to C
+(Chapter~\ref{ch:self-hosting-lexer-tables}), a drop-in replacement:
+
+@o tmp/selfhost/lexer_tables.c @{
+@<Selfhost: lexer-tables@>
+@}
+
+@o tmp/selfhost/lexer_tables_verify.sh @{
+@<Selfhost: lexer-tables verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

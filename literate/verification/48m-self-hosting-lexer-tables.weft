@@ -1,0 +1,157 @@
+% 48m-self-hosting-lexer-tables.weft — Stage 8n: the lexer's keyword and
+% token-name tables, written in C, compiled by kcc itself, and linked back in.
+
+\chapter{Self-Hosting: The Lexer Tables in C}
+\label{ch:self-hosting-lexer-tables}
+
+Chapter~\ref{ch:lexer} split the tokenizer's static tables into their own
+object so they could be ported independently of the scanner's hot loop.  This
+is that port: the keyword registration table and its initializer, and the
+token-name table and its lookup.  It is almost pure data---two tables and two
+short functions over them---so it is the safest kind of drop-in, yet it is
+exercised constantly: \texttt{kcc\_lex\_kw\_init} builds the hash table every
+identifier is checked against, and \texttt{kcc\_lex\_type\_name} supplies the
+token spellings that diagnostics and \texttt{-{}-dump-tokens} print.
+
+\section{Keyword Registration}
+
+\texttt{kcc\_lex\_kw\_init} creates a 128-slot hash table, stores it in the
+lexer's global \texttt{kcc\_kw\_table}, and inserts every keyword---its text,
+its byte length, and its token code.  The 63 entries are the 44 C17 keywords
+plus the GNU spellings the compiler accepts: the \texttt{\_\_x\_\_}/\texttt{\_\_x}
+forms alias the standard token codes (\texttt{\_\_const}$\to$14,
+\texttt{\_\_inline}$\to$26, \dots), while \texttt{\_\_attribute\_\_},
+\texttt{typeof}, \texttt{asm}, and \texttt{\_\_extension\_\_} take their own
+codes 54--57.  The lengths are carried explicitly, exactly as the assembly
+table did, so the hash keys match byte-for-byte.
+
+@l c
+@d Selfhost: lexer-tables kw @{
+struct KwEntry { const char *name; unsigned long len; unsigned long token; };
+
+static struct KwEntry kw_reg[63] = {
+    {"auto", 4, 10}, {"break", 5, 11}, {"case", 4, 12}, {"char", 4, 13},
+    {"const", 5, 14}, {"continue", 8, 15}, {"default", 7, 16}, {"do", 2, 17},
+    {"double", 6, 18}, {"else", 4, 19}, {"enum", 4, 20}, {"extern", 6, 21},
+    {"float", 5, 22}, {"for", 3, 23}, {"goto", 4, 24}, {"if", 2, 25},
+    {"inline", 6, 26}, {"int", 3, 27}, {"long", 4, 28}, {"register", 8, 29},
+    {"restrict", 8, 30}, {"return", 6, 31}, {"short", 5, 32}, {"signed", 6, 33},
+    {"sizeof", 6, 34}, {"static", 6, 35}, {"struct", 6, 36}, {"switch", 6, 37},
+    {"typedef", 7, 38}, {"union", 5, 39}, {"unsigned", 8, 40}, {"void", 4, 41},
+    {"volatile", 8, 42}, {"while", 5, 43}, {"_Alignas", 8, 44},
+    {"_Alignof", 8, 45}, {"_Atomic", 7, 46}, {"_Bool", 5, 47},
+    {"_Complex", 8, 48}, {"_Generic", 8, 49}, {"_Imaginary", 10, 50},
+    {"_Noreturn", 9, 51}, {"_Static_assert", 14, 52}, {"_Thread_local", 13, 53},
+    {"__attribute__", 13, 54}, {"__attribute", 11, 54},
+    {"typeof", 6, 55}, {"__typeof__", 10, 55}, {"__typeof", 8, 55},
+    {"asm", 3, 56}, {"__asm__", 7, 56}, {"__asm", 5, 56},
+    {"__extension__", 13, 57},
+    {"__inline", 8, 26}, {"__inline__", 10, 26},
+    {"__const", 7, 14}, {"__const__", 9, 14},
+    {"__signed", 8, 33}, {"__signed__", 10, 33},
+    {"__volatile", 10, 42}, {"__volatile__", 12, 42},
+    {"__restrict", 10, 30}, {"__restrict__", 12, 30}
+};
+
+void *kcc_ht_init(unsigned long capacity);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen,
+                unsigned long value);
+extern void *kcc_kw_table;
+
+void kcc_lex_kw_init(void) {
+    void *ht = kcc_ht_init(128);
+    kcc_kw_table = ht;
+    for (unsigned long i = 0; i < 63; i++)
+        kcc_ht_put(ht, kw_reg[i].name, kw_reg[i].len, kw_reg[i].token);
+}
+@}
+
+\section{Token Names}
+
+\texttt{kcc\_lex\_type\_name} maps a token code to a readable name through a flat
+108-entry table indexed by the code.  The gaps in the code space---6--9, and
+54--59 between the keywords and the punctuators---are null, and both an
+out-of-range code and a null slot return \texttt{"unknown"}.  The punctuator
+names follow Clang's dump convention (\texttt{l\_paren}, \texttt{semi},
+\texttt{plusplus}, \dots); the entries are listed positionally so the index is
+the token code.
+
+@l c
+@d Selfhost: lexer-tables names @{
+static const char *tok_names[108] = {
+    "eof", "identifier", "number", "char_constant", "string_literal",
+    "unknown",
+    0, 0, 0, 0,                              /* 6-9 reserved */
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if",
+    "inline", "int", "long", "register", "restrict", "return", "short",
+    "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+    "unsigned", "void", "volatile", "while", "_Alignas", "_Alignof",
+    "_Atomic", "_Bool", "_Complex", "_Generic", "_Imaginary", "_Noreturn",
+    "_Static_assert", "_Thread_local",
+    0, 0, 0, 0, 0, 0,                        /* 54-59 reserved */
+    "l_paren", "r_paren", "l_brace", "r_brace", "l_bracket", "r_bracket",
+    "semi", "comma", "dot", "arrow", "plusplus", "minusminus", "amp", "star",
+    "plus", "minus", "tilde", "exclaim", "slash", "percent", "lessless",
+    "greatergreater", "less", "greater", "lessequal", "greaterequal",
+    "equalequal", "exclaimequal", "caret", "pipe", "ampamp", "pipepipe",
+    "question", "colon", "equal", "starequal", "slashequal", "percentequal",
+    "plusequal", "minusequal", "lesslessequal", "greatergreaterequal",
+    "ampequal", "caretequal", "pipeequal", "hash", "hashhash", "ellipsis"
+};
+
+const char *kcc_lex_type_name(unsigned long type) {
+    if (type >= 108) return "unknown";
+    const char *n = tok_names[type];
+    return n ? n : "unknown";
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: lexer-tables @{
+@<Selfhost: lexer-tables kw@>
+@<Selfhost: lexer-tables names@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-lexer-tables-verify}
+
+\texttt{make selfhost-lexer-tables} runs the drop-in loop.  Because every
+identifier the compiler reads is checked against the keyword table this file
+builds, a green code-generation suite means \kcc{} compiled its own keyword
+recognition correctly; the diagnostic suite additionally exercises
+\texttt{kcc\_lex\_type\_name} through the token spellings it prints.
+
+@d Selfhost: lexer-tables verify @{
+#!/usr/bin/env bash
+# make selfhost-lexer-tables — compile kcc's lexer tables in C with kcc,
+# relink, run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/lexer_tables.c with kcc"
+tmp/kcc -c "$SH/lexer_tables.c" -o "$SH/lexer_tables_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_lexer_tables (lexer_tables.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "lexer_tables" ]; then OBJ="$OBJ $SH/lexer_tables_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_lexer_tables $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running codegen + diagtest with the self-hosted lexer tables"
+cp tmp/kcc "$SH/kcc_asm_backup_lexer_tables"
+cp tmp/kcc_selfhost_lexer_tables tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh; s1=$?
+bash tmp/tests/diagtest.sh;      s2=$?
+cp "$SH/kcc_asm_backup_lexer_tables" tmp/kcc
+[ $s1 -eq 0 ] && [ $s2 -eq 0 ]
+@}

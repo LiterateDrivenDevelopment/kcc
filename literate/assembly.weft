@@ -1005,6 +1005,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: emit_x86 verify@>
 @}
 
+\noindent The preprocessor, ported to C
+(Chapter~\ref{ch:self-hosting-preprocessor}), a drop-in replacement:
+
+@o tmp/selfhost/preprocessor.c @{
+@<Selfhost: preprocessor@>
+@}
+
+@o tmp/selfhost/preprocessor_verify.sh @{
+@<Selfhost: preprocessor verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

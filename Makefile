@@ -28,7 +28,7 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
         selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
         selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
         selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema \
-        selfhost-emit-x86 meta-a \
+        selfhost-emit-x86 selfhost-preprocessor meta-a \
         difftest interop e2e diagtest warntest test-codegen doc weave clean \
         run map
 
@@ -189,6 +189,12 @@ selfhost-sema: build
 selfhost-emit-x86: build
 	chmod +x tmp/selfhost/emit_x86_verify.sh
 	tmp/selfhost/emit_x86_verify.sh
+
+# Self-hosting (Stage 8z): compile kcc's preprocessor in C, relink,
+# verify with difftest + diagtest + codegen
+selfhost-preprocessor: build
+	chmod +x tmp/selfhost/preprocessor_verify.sh
+	tmp/selfhost/preprocessor_verify.sh
 
 # Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link against the Linux runtime (no libc), run it natively (Chapter: Runtime).

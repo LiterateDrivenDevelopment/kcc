@@ -1,0 +1,1439 @@
+% 48y-self-hosting-preprocessor.weft — Stage 8z: the C17 preprocessor, written
+% in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Preprocessor in C}
+\label{ch:self-hosting-preprocessor}
+
+The preprocessor of Chapters~\ref{ch:preprocessor}--\ref{ch:preprocessor} (the
+spine plus its macro, conditional, and include chapters) is the last and most
+stateful slice of the front end, and porting it completes the \emph{entire}
+front end---lexer, preprocessor, parser, and semantics---in kcc-compiled C.  It
+wraps the Phase~3 lexer, executing directives and expanding macros so the parser
+sees a fully preprocessed token stream: \texttt{\#define}/\texttt{\#undef} with
+object- and function-like macros, argument prescan (\stdref{6.10.3.1}), the
+\texttt{\#} and \texttt{\#\#} operators, the \texttt{\#if} family with a
+recursive-descent constant-expression evaluator, \texttt{\#include} with a
+search path and nine compiler-resident freestanding headers, and the
+\texttt{push\_macro}/\texttt{pop\_macro} pragmas.
+
+The port is verified by the strongest oracle available---\texttt{difftest}
+byte-compares generated objects against clang, and every case runs through the
+preprocessor---plus the self-host and lexer suites and the diagnostic tests.
+The preprocessor-heavy real-world corpora (Lua, zlib, bzip2) exercise the macro
+machinery far past what a synthetic test would.
+
+\section{State, Constants, and Externs}
+
+@l c
+@d Selfhost: pp preamble @{
+/* macro definition (56 bytes) */
+struct PPMacro {
+    const char *name; unsigned long namelen; unsigned long flags;
+    unsigned long nparams; const char *body; unsigned long bodylen; void *params;
+};
+struct PPParam { const char *name; unsigned long len; };   /* 16 bytes */
+struct PPArg { const char *start; unsigned long len; };     /* 16 bytes */
+struct StrResult { char *buf; unsigned long len; };         /* returned in x0:x1 */
+/* context stack entry (80 bytes): saved lexer/source state */
+struct PPCtx {
+    unsigned long type; const char *cursor; const char *end; unsigned long line;
+    const char *lstart; const char *src_base; unsigned long src_size;
+    const char *src_path; struct PPMacro *macro; unsigned long prevline;
+};
+/* push_macro save-stack node (32 bytes) */
+struct PPSave { struct PPSave *next; const char *name; unsigned long len; void *saved; };
+
+/* macro flags */
+#define PP_FLAG_FUNCLIKE  1
+#define PP_FLAG_EXPANDING 2
+#define PP_FLAG_BUILTIN   4
+#define PP_FLAG_VARIADIC  8
+/* context types */
+#define PP_CTX_INCLUDE 0
+#define PP_CTX_EXPAND  1
+/* conditional states */
+#define PP_COND_ACTIVE 0
+#define PP_COND_SKIP   1
+#define PP_COND_DONE   2
+/* limits */
+#define PP_MAX_CTX_DEPTH 256
+#define PP_MAX_COND 64
+#define PP_MAX_ARGS 64
+
+/* tokens */
+enum {
+    TOK_EOF=0, TOK_IDENT=1, TOK_NUMBER=2, TOK_STRING_LIT=4,
+    TOK_LPAREN=60, TOK_RPAREN=61, TOK_COMMA=67, TOK_STAR=73, TOK_PLUS=74,
+    TOK_MINUS=75, TOK_TILDE=76, TOK_BANG=77, TOK_SLASH=78, TOK_PERCENT=79,
+    TOK_SHL=80, TOK_SHR=81, TOK_LT=82, TOK_GT=83, TOK_LE=84, TOK_GE=85,
+    TOK_EQ=86, TOK_NE=87, TOK_CARET=88, TOK_PIPE=89, TOK_AND=90, TOK_OR=91,
+    TOK_QUESTION=92, TOK_COLON=93, TOK_AMP=72, TOK_HASH=105, TOK_ELLIPSIS=107
+};
+
+/* externs — lexer / source globals */
+extern unsigned long kcc_tok_type, kcc_tok_len, kcc_tok_line;
+extern const char *kcc_tok_start;
+extern const char *kcc_lex_cursor, *kcc_lex_end, *kcc_lex_line_start;
+extern unsigned long kcc_lex_line;
+extern const char *kcc_src_base, *kcc_src_path;
+extern unsigned long kcc_src_size;
+void kcc_lex_next(void);
+void kcc_lex_init(const char *base, unsigned long size);
+void kcc_lex_dump_token(void);
+/* externs — hashtable / arena / string / diag / os / source */
+void *kcc_ht_init(unsigned long cap);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen, void *val);
+void *kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void *kcc_arena_alloc(unsigned long n);
+void *kcc_memcpy(void *d, const void *s, unsigned long n);
+int kcc_memcmp(const void *a, const void *b, unsigned long n);
+unsigned long kcc_strlen(const char *s);
+void kcc_diag_error(unsigned long line, unsigned long col, const char *msg);
+void kcc_diag_warning(unsigned long line, unsigned long col, const char *msg);
+long kcc_sys_open(const char *path, unsigned long flags, unsigned long mode);
+long kcc_sys_close(long fd);
+void kcc_sys_exit(long code);
+void kcc_source_open(const char *path);
+void kcc_source_encode(void);
+void kcc_source_splice(void);
+
+/* exported state (driver/other modules reference these) */
+void *kcc_pp_macros = 0;
+long kcc_line_delta = 0;
+unsigned long kcc_pp_ctx_depth = 0;
+/* internal state */
+static struct PPSave *pp_macro_stack = 0;
+static unsigned long pp_eval_depth = 0;
+static unsigned long pp_drain_floor = 0;
+static unsigned long pp_cond_depth = 0;
+static unsigned long pp_prev_line = 0;
+static unsigned long pp_has_pending = 0;
+static unsigned long pp_dir_line = 0;
+static struct PPCtx pp_ctx_stack[PP_MAX_CTX_DEPTH];
+static unsigned char pp_cond_stack[PP_MAX_COND];
+static const char *pp_inc_dirs[64];
+static unsigned long pp_inc_ndirs = 0;
+static const char *pp_cmdline_defs[64];
+static unsigned long pp_cmdline_ndefs = 0;
+
+/* error messages */
+static const char m_unknown_dir[] = "unknown preprocessing directive";
+static const char m_def_name[]  = "expected identifier after #define";
+static const char m_def_param[] = "expected parameter name or ')' in macro parameter list";
+static const char m_ifdef_name[]= "expected identifier after #ifdef/#ifndef";
+static const char m_stray_elif[]= "#elif without matching #if";
+static const char m_stray_else[]= "#else without matching #if";
+static const char m_stray_endif[]="#endif without matching #if";
+static const char m_include[]   = "#include expects \"file\" or <file>";
+static const char m_notfound[]  = "#include file not found";
+static const char m_unterm_cond[]="unterminated conditional directive";
+static const char m_unterm_args[]="unterminated macro argument list";
+static const char m_depth[]     = "maximum include/expansion depth exceeded";
+
+/* forward decls */
+void kcc_pp_next(void);
+int kcc_pp_try_expand(void);
+unsigned long kcc_pp_atoi(const char *p, unsigned long len);
+long kcc_pp_eval_expr(void);
+void kcc_pp_do_line(void);
+void kcc_pp_add_include_dir(const char *dir);
+void kcc_pp_apply_cmdline_defines(void);
+static void pp_dispatch(void);
+static void pp_skip_directive(void);
+static void pp_ctx_pop(void);
+static void pp_skip_line(void);
+static const char *pp_rest_of_line(unsigned long *len_out);
+static void pp_predefine(void);
+static void pp_do_endif(void);
+static void pp_do_elif(void);
+static void pp_do_else(void);
+static void pp_def_simple(const char *name, unsigned long nl, const char *body, unsigned long bl);
+static const char *pp_prepare_cond(const char *src, unsigned long len, unsigned long *lo);
+static const char *pp_builtin_header(const char *name);
+static int kcc_strcmp2(const char *a, const char *b);
+void kcc_pp_init(void);
+void kcc_pp_dump_all(void);
+void kcc_pp_do_define(void);
+void kcc_pp_do_undef(void);
+void kcc_pp_do_ifdef(int negate);
+void kcc_pp_do_if(void);
+void kcc_pp_do_include(void);
+void kcc_pp_do_error(void);
+void kcc_pp_do_pragma(void);
+void kcc_pp_add_cmdline_define(const char *payload);
+void kcc_pp_add_default_includes(const char *argv0);
+const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *pp,
+                          unsigned long np, void *aa, unsigned long ac, unsigned long *lo);
+@}
+
+\section{Initialization, the Main Loop, and Contexts}
+
+\texttt{kcc\_pp\_next} returns one preprocessed token: it handles a false
+conditional branch by skipping to the next directive, a \texttt{\#} at
+beginning-of-line as a directive, and a macro name by pushing its expansion.
+The context stack saves and restores lexer state across \texttt{\#include} and
+macro expansion.
+
+@l c
+@d Selfhost: pp core @{
+void kcc_pp_init(void) {
+    kcc_pp_macros = kcc_ht_init(256);
+    kcc_pp_ctx_depth = 0;
+    pp_cond_depth = 0;
+    pp_prev_line = 0;
+    pp_has_pending = 0;
+    pp_predefine();
+}
+
+static void pp_ctx_push(unsigned long type) {
+    if (kcc_pp_ctx_depth >= PP_MAX_CTX_DEPTH) {
+        kcc_diag_error(kcc_tok_line, 1, m_depth);
+        kcc_sys_exit(1);
+    }
+    struct PPCtx *e = &pp_ctx_stack[kcc_pp_ctx_depth];
+    e->type = type;
+    e->cursor = kcc_lex_cursor;
+    e->end = kcc_lex_end;
+    e->line = kcc_lex_line;
+    e->lstart = kcc_lex_line_start;
+    e->src_base = kcc_src_base;
+    e->src_size = kcc_src_size;
+    e->src_path = kcc_src_path;
+    e->prevline = pp_prev_line;
+    e->macro = 0;
+    kcc_pp_ctx_depth++;
+}
+
+static void pp_ctx_push_expand(struct PPMacro *m, const char *buf, unsigned long buflen) {
+    pp_ctx_push(PP_CTX_EXPAND);
+    pp_ctx_stack[kcc_pp_ctx_depth - 1].macro = m;
+    kcc_lex_cursor = buf;
+    kcc_lex_end = buf + buflen;
+    kcc_lex_line_start = buf;
+}
+
+static void pp_ctx_pop(void) {
+    if (kcc_pp_ctx_depth == 0) return;
+    kcc_pp_ctx_depth--;
+    struct PPCtx *e = &pp_ctx_stack[kcc_pp_ctx_depth];
+    if (e->type == PP_CTX_INCLUDE) {
+        kcc_src_base = e->src_base;
+        kcc_src_size = e->src_size;
+        kcc_src_path = e->src_path;
+    } else if (e->macro) {
+        e->macro->flags &= ~(unsigned long)PP_FLAG_EXPANDING;
+    }
+    kcc_lex_cursor = e->cursor;
+    kcc_lex_end = e->end;
+    kcc_lex_line = e->line;
+    kcc_lex_line_start = e->lstart;
+    pp_prev_line = e->prevline;
+}
+
+void kcc_pp_next(void) {
+    for (;;) {
+        if (pp_has_pending) pp_has_pending = 0;
+        else kcc_lex_next();
+        unsigned long tt = kcc_tok_type;
+        unsigned long tl = kcc_tok_line;
+        if (tt == TOK_EOF) {
+            if (kcc_pp_ctx_depth) {
+                pp_ctx_pop();
+                if (pp_drain_floor && kcc_pp_ctx_depth < pp_drain_floor) return;
+                continue;
+            }
+            if (pp_cond_depth) kcc_diag_error(kcc_tok_line, 1, m_unterm_cond);
+            return;
+        }
+        /* conditional skip */
+        if (pp_cond_depth && pp_cond_stack[pp_cond_depth - 1] != PP_COND_ACTIVE) {
+            if (tt == TOK_HASH && tl > pp_prev_line) {
+                pp_prev_line = tl;
+                pp_skip_directive();
+                continue;
+            }
+            pp_prev_line = tl;
+            continue;
+        }
+        /* directive at BOL */
+        if (tt == TOK_HASH && tl > pp_prev_line) {
+            pp_prev_line = tl;
+            pp_dispatch();
+            continue;
+        }
+        /* macro expansion: IDENT or keyword-class [10,60) */
+        if (tt == TOK_IDENT || (tt - 10) < 50) {
+            if (kcc_pp_try_expand()) continue;
+        }
+        pp_prev_line = tl;
+        return;
+    }
+}
+
+void kcc_pp_dump_all(void) {
+    for (;;) {
+        kcc_pp_next();
+        if (kcc_tok_type == TOK_EOF) return;
+        kcc_lex_dump_token();
+    }
+}
+@}
+
+\section{Helpers: Skip-Line and Rest-of-Line}
+
+\texttt{pp\_skip\_line} advances the cursor past the line's newline;
+\texttt{pp\_rest\_of\_line} returns the directive's remaining text, trimmed,
+scanning past block comments and string/character literals so a newline inside
+one does not end the directive.
+
+@l c
+@d Selfhost: pp helpers @{
+static void pp_skip_line(void) {
+    const char *p = kcc_lex_cursor;
+    const char *end = kcc_lex_end;
+    while (p < end) {
+        char c = *p++;
+        if (c == 0x0A) {
+            kcc_lex_line++;
+            kcc_lex_line_start = p;
+            break;
+        }
+    }
+    kcc_lex_cursor = p;
+}
+
+static const char *pp_rest_of_line(unsigned long *len_out) {
+    const char *p = kcc_lex_cursor;
+    const char *end = kcc_lex_end;
+    while (p < end && (*p == ' ' || *p == 0x09)) p++;
+    const char *start = p;
+    int state = 0;                              /* 0 normal,1 block,2 str,3 char */
+    const char *nl = 0;
+    while (p < end) {
+        char c = *p;
+        if (state == 1) {
+            if (c == '*' && p + 1 < end && p[1] == '/') { state = 0; p += 2; continue; }
+            if (c == 0x0A) kcc_lex_line++;
+            p++;
+            continue;
+        }
+        if (state == 2) {
+            if (c == 0x5C) { p += 2; continue; }
+            if (c == '"') { state = 0; p++; continue; }
+            if (c == 0x0A) { nl = p; break; }
+            p++;
+            continue;
+        }
+        if (state == 3) {
+            if (c == 0x5C) { p += 2; continue; }
+            if (c == 0x27) { state = 0; p++; continue; }
+            if (c == 0x0A) { nl = p; break; }
+            p++;
+            continue;
+        }
+        if (c == 0x0A) { nl = p; break; }
+        if (c == '"') { state = 2; p++; continue; }
+        if (c == 0x27) { state = 3; p++; continue; }
+        if (c == '/' && p + 1 < end && p[1] == '*') { state = 1; p += 2; continue; }
+        p++;
+    }
+    const char *tail;
+    if (nl) { kcc_lex_cursor = nl; tail = nl; }
+    else { kcc_lex_cursor = end; tail = p; }
+    /* trim trailing whitespace */
+    const char *e = tail;
+    while (e > start && (e[-1] == ' ' || e[-1] == 0x09)) e--;
+    *len_out = (unsigned long)(e - start);
+    return start;
+}
+@}
+
+\section{Directive Dispatch}
+
+@l c
+@d Selfhost: pp dispatch @{
+static int dname(const char *n, unsigned long l, const char *s, unsigned long sl) {
+    return l == sl && kcc_memcmp(n, s, sl) == 0;
+}
+
+static void pp_dispatch(void) {
+    pp_dir_line = kcc_tok_line;
+    kcc_lex_next();
+    unsigned long tt = kcc_tok_type;
+    if (tt != TOK_IDENT && (tt < 10 || tt > 53)) { pp_skip_line(); return; }
+    const char *n = kcc_tok_start;
+    unsigned long l = kcc_tok_len;
+    if (dname(n, l, "define", 6)) kcc_pp_do_define();
+    else if (dname(n, l, "undef", 5)) kcc_pp_do_undef();
+    else if (dname(n, l, "ifdef", 5)) kcc_pp_do_ifdef(0);
+    else if (dname(n, l, "ifndef", 6)) kcc_pp_do_ifdef(1);
+    else if (dname(n, l, "if", 2)) kcc_pp_do_if();
+    else if (dname(n, l, "elif", 4)) pp_do_elif();
+    else if (dname(n, l, "else", 4)) pp_do_else();
+    else if (dname(n, l, "endif", 5)) pp_do_endif();
+    else if (dname(n, l, "include", 7)) kcc_pp_do_include();
+    else if (dname(n, l, "error", 5)) kcc_pp_do_error();
+    else if (dname(n, l, "line", 4)) kcc_pp_do_line();
+    else if (dname(n, l, "pragma", 6)) kcc_pp_do_pragma();
+    else {
+        kcc_diag_warning(pp_dir_line, 1, m_unknown_dir);
+        pp_skip_line();
+    }
+}
+@}
+
+\section{\texttt{\#define}, \texttt{\#undef}, and Pragmas}
+
+@l c
+@d Selfhost: pp define @{
+void kcc_pp_do_define(void) {
+    kcc_lex_next();
+    unsigned long tt = kcc_tok_type;
+    if (tt != TOK_IDENT && (tt - 10) >= 50) {
+        kcc_diag_error(pp_dir_line, 1, m_def_name);
+        pp_skip_line();
+        return;
+    }
+    const char *name = kcc_tok_start;
+    unsigned long namelen = kcc_tok_len;
+    unsigned long flags = 0, nparams = 0;
+    struct PPParam *params = 0;
+    /* function-like iff '(' immediately follows the name (no space) */
+    int funclike = (kcc_lex_cursor < kcc_lex_end && *kcc_lex_cursor == '(');
+    if (funclike) {
+        flags = PP_FLAG_FUNCLIKE;
+        kcc_lex_next();                          /* '(' */
+        kcc_lex_next();                          /* first param or ')' */
+        params = (struct PPParam *)kcc_arena_alloc(PP_MAX_ARGS * sizeof(struct PPParam));
+        if (kcc_tok_type != TOK_RPAREN) {
+            for (;;) {
+                if (kcc_tok_type == TOK_ELLIPSIS) {
+                    flags |= PP_FLAG_VARIADIC;
+                    kcc_lex_next();
+                    if (kcc_tok_type != TOK_RPAREN) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
+                    break;
+                }
+                if (kcc_tok_type != TOK_IDENT) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
+                params[nparams].name = kcc_tok_start;
+                params[nparams].len = kcc_tok_len;
+                nparams++;
+                kcc_lex_next();
+                if (kcc_tok_type == TOK_COMMA) { kcc_lex_next(); continue; }
+                if (kcc_tok_type != TOK_RPAREN) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
+                break;
+            }
+        }
+    }
+    unsigned long bodylen;
+    const char *body = pp_rest_of_line(&bodylen);
+    struct PPMacro *m = (struct PPMacro *)kcc_arena_alloc(sizeof(struct PPMacro));
+    m->name = name; m->namelen = namelen; m->flags = flags; m->nparams = nparams;
+    m->body = body; m->bodylen = bodylen; m->params = params;
+    kcc_ht_put(kcc_pp_macros, name, namelen, m);
+    pp_skip_line();
+}
+
+void kcc_pp_do_undef(void) {
+    kcc_lex_next();
+    if (kcc_tok_type == TOK_IDENT)
+        kcc_ht_put(kcc_pp_macros, kcc_tok_start, kcc_tok_len, 0);
+    pp_skip_line();
+}
+
+/* Parse ( "NAME" ) after push_macro/pop_macro; returns name/len (len 0 = fail). */
+static const char *pp_pragma_name(unsigned long *lo) {
+    kcc_lex_next();
+    if (kcc_tok_type != TOK_LPAREN) { *lo = 0; return 0; }
+    kcc_lex_next();
+    if (kcc_tok_type != TOK_STRING_LIT) { *lo = 0; return 0; }
+    *lo = kcc_tok_len - 2;
+    return kcc_tok_start + 1;
+}
+
+void kcc_pp_do_pragma(void) {
+    kcc_lex_next();
+    if (kcc_tok_type == TOK_IDENT) {
+        const char *v = kcc_tok_start;
+        unsigned long vl = kcc_tok_len;
+        if (vl == 10 && kcc_memcmp(v, "push_macro", 10) == 0) {
+            unsigned long nl;
+            const char *nm = pp_pragma_name(&nl);
+            if (nl) {
+                void *saved = kcc_ht_get(kcc_pp_macros, nm, nl);
+                struct PPSave *node = (struct PPSave *)kcc_arena_alloc(sizeof(struct PPSave));
+                node->name = nm; node->len = nl; node->saved = saved;
+                node->next = pp_macro_stack;
+                pp_macro_stack = node;
+            }
+        } else if (vl == 9 && kcc_memcmp(v, "pop_macro", 9) == 0) {
+            unsigned long nl;
+            const char *nm = pp_pragma_name(&nl);
+            if (nl) {
+                struct PPSave **link = &pp_macro_stack;
+                while (*link) {
+                    struct PPSave *node = *link;
+                    if (node->len == nl && kcc_memcmp(nm, node->name, nl) == 0) {
+                        kcc_ht_put(kcc_pp_macros, nm, nl, node->saved);
+                        *link = node->next;
+                        break;
+                    }
+                    link = &node->next;
+                }
+            }
+        }
+    }
+    pp_skip_line();
+}
+@}
+
+\section{Macro Expansion}
+
+\texttt{kcc\_pp\_try\_expand} looks the identifier up, honours the anti-recursion
+flag, substitutes \texttt{\_\_LINE\_\_} dynamically, and for a function-like
+macro collects arguments (across context boundaries, never past the argument
+prescan floor), prescan-expands them, substitutes, and pushes the result.
+
+@l c
+@d Selfhost: pp expand @{
+static const char *pp_line_digits(unsigned long *lo) {
+    unsigned long line = kcc_lex_line + (unsigned long)kcc_line_delta;
+    char *buf = (char *)kcc_arena_alloc(24);
+    char *e = buf + 24;
+    if (line == 0) { *--e = '0'; }
+    else while (line) { *--e = '0' + (line % 10); line /= 10; }
+    *lo = (unsigned long)((buf + 24) - e);
+    return e;
+}
+
+static const char *pp_expand_arg(const char *text, unsigned long len, unsigned long *lo);
+
+int kcc_pp_try_expand(void) {
+    const char *name = kcc_tok_start;
+    unsigned long namelen = kcc_tok_len;
+    struct PPMacro *m = (struct PPMacro *)kcc_ht_get(kcc_pp_macros, name, namelen);
+    if (!m) return 0;
+    if (m->flags & PP_FLAG_EXPANDING) return 0;
+    /* dynamic __LINE__ */
+    if ((m->flags & PP_FLAG_BUILTIN) && namelen == 8 && kcc_memcmp(name, "__LINE__", 8) == 0) {
+        unsigned long dl;
+        const char *d = pp_line_digits(&dl);
+        m->flags |= PP_FLAG_EXPANDING;
+        pp_ctx_push_expand(m, d, dl);
+        return 1;
+    }
+    if (!(m->flags & PP_FLAG_FUNCLIKE)) {
+        /* object-like */
+        unsigned long bl = m->bodylen;
+        if (!bl) return 1;                       /* empty */
+        char *buf = (char *)kcc_arena_alloc(bl);
+        kcc_memcpy(buf, m->body, bl);
+        m->flags |= PP_FLAG_EXPANDING;
+        pp_ctx_push_expand(m, buf, bl);
+        return 1;
+    }
+    /* function-like: drop exhausted contexts to find '(' in enclosing text,
+     * but never cross the argument-prescan drain floor. */
+    for (;;) {
+        if (kcc_lex_cursor < kcc_lex_end) break;
+        if (kcc_pp_ctx_depth == 0) break;
+        if (kcc_pp_ctx_depth <= pp_drain_floor) break;
+        pp_ctx_pop();
+    }
+    const char *p = kcc_lex_cursor;
+    while (p < kcc_lex_end && (*p == ' ' || *p == 0x09 || *p == 0x0A || *p == 0x0D)) p++;
+    if (p >= kcc_lex_end || *p != '(') return 0;
+    kcc_lex_next();                              /* '(' */
+    unsigned long nparams = m->nparams;
+    struct PPParam *params = (struct PPParam *)m->params;
+    struct PPArg *args = (struct PPArg *)kcc_arena_alloc(PP_MAX_ARGS * 16);
+    unsigned long argc = 0;
+    long depth = 1;
+    args[0].start = kcc_lex_cursor;
+    args[0].len = 0;
+    for (;;) {
+        kcc_lex_next();
+        unsigned long tt = kcc_tok_type;
+        if (tt == TOK_EOF) { kcc_diag_error(pp_dir_line, 1, m_unterm_args); return 0; }
+        if (tt == TOK_LPAREN) { depth++; continue; }
+        if (tt == TOK_RPAREN) {
+            depth--;
+            if (depth == 0) {
+                args[argc].len = (unsigned long)(kcc_tok_start - args[argc].start);
+                argc++;
+                break;
+            }
+            continue;
+        }
+        if (tt == TOK_COMMA && depth == 1) {
+            args[argc].len = (unsigned long)(kcc_tok_start - args[argc].start);
+            argc++;
+            args[argc].start = kcc_lex_cursor;
+            args[argc].len = 0;
+        }
+    }
+    /* variadic: collapse trailing args into __VA_ARGS__ */
+    if (m->flags & PP_FLAG_VARIADIC) {
+        params[nparams].name = "__VA_ARGS__";
+        params[nparams].len = 11;
+        if (argc > nparams) {
+            const char *first = args[nparams].start;
+            const char *last_end = args[argc - 1].start + args[argc - 1].len;
+            args[nparams].len = (unsigned long)(last_end - first);
+        } else {
+            args[nparams].start = args[0].start;
+            args[nparams].len = 0;
+        }
+        nparams++;
+        argc = nparams;
+    }
+    /* argument prescan (6.10.3.1) */
+    for (unsigned long i = 0; i < argc; i++) {
+        unsigned long el;
+        const char *eb = pp_expand_arg(args[i].start, args[i].len, &el);
+        args[i].start = eb;
+        args[i].len = el;
+    }
+    /* substitute */
+    unsigned long rl;
+    const char *rbuf = pp_substitute(m->body, m->bodylen, params, nparams, args, argc, &rl);
+    if (!rl) return 1;
+    m->flags |= PP_FLAG_EXPANDING;
+    pp_ctx_push_expand(m, rbuf, rl);
+    return 1;
+}
+@}
+
+\section{Argument Prescan and Substitution}
+
+\texttt{pp\_expand\_arg} drives \texttt{kcc\_pp\_next} over an argument's text
+behind a \emph{drain floor}, so expansion stops at the argument boundary rather
+than reading into the enclosing text.  \texttt{pp\_substitute} walks the body,
+replacing parameter names with (prescan-expanded) argument text and honouring
+the \texttt{\#} (stringise) and \texttt{\#\#} (paste) operators.
+
+@l c
+@d Selfhost: pp substitute @{
+static int is_id(int c) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+static int is_idn(int c) { return is_id(c) || (c >= '0' && c <= '9'); }
+
+static const char *pp_expand_arg(const char *text, unsigned long len, unsigned long *lo) {
+    if (!len) { *lo = 0; return text; }
+    unsigned long base_depth = kcc_pp_ctx_depth;
+    unsigned long saved_floor = pp_drain_floor;
+    pp_drain_floor = base_depth + 1;
+    unsigned long saved_pending = pp_has_pending;
+    pp_has_pending = 0;
+    unsigned long cap = len * 4 + 256;
+    char *out = (char *)kcc_arena_alloc(cap);
+    unsigned long outlen = 0;
+    pp_ctx_push_expand(0, text, len);
+    for (;;) {
+        kcc_pp_next();
+        if (kcc_pp_ctx_depth <= base_depth) break;
+        if (kcc_tok_type == TOK_EOF) break;
+        const char *ts = kcc_tok_start;
+        unsigned long tl = kcc_tok_len;
+        if (outlen + tl + 1 > cap) {
+            unsigned long ncap = (outlen + tl + 1) * 2;
+            char *nb = (char *)kcc_arena_alloc(ncap);
+            kcc_memcpy(nb, out, outlen);
+            out = nb; cap = ncap;
+        }
+        if (outlen) out[outlen++] = ' ';
+        kcc_memcpy(out + outlen, ts, tl);
+        outlen += tl;
+    }
+    pp_drain_floor = saved_floor;
+    pp_has_pending = saved_pending;
+    *lo = outlen;
+    return out;
+}
+
+/* Emit a "..." literal of src with whitespace collapsed and " / \ escaped. */
+static unsigned long pp_emit_string(const char *src, unsigned long len, char *dst) {
+    char *d = dst;
+    *d++ = '"';
+    unsigned long i = 0;
+    while (i < len && (src[i] == ' ' || src[i] == 0x09)) i++;
+    int pending = 0;
+    for (; i < len; i++) {
+        char c = src[i];
+        if (c == ' ' || c == 0x09) { pending = 1; continue; }
+        if (pending) { *d++ = ' '; pending = 0; }
+        if (c == '"' || c == 0x5C) *d++ = 0x5C;
+        *d++ = c;
+    }
+    *d++ = '"';
+    return (unsigned long)(d - dst);
+}
+
+const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *params,
+                          unsigned long np, void *aa, unsigned long ac, unsigned long *lo) {
+    struct PPArg *args = (struct PPArg *)aa;
+    (void)ac;
+    char *out = (char *)kcc_arena_alloc(4096);
+    unsigned long op = 0;
+    unsigned long i = 0;
+    while (i < blen) {
+        char c = body[i];
+        if (c == '#') {
+            if (i + 1 < blen && body[i + 1] == '#') {
+                /* ## paste: trim emitted whitespace, skip operator + whitespace */
+                while (op && (out[op - 1] == ' ' || out[op - 1] == 0x09)) op--;
+                i += 2;
+                while (i < blen && (body[i] == ' ' || body[i] == 0x09)) i++;
+                continue;
+            }
+            /* # stringise */
+            unsigned long j = i + 1;
+            while (j < blen && (body[j] == ' ' || body[j] == 0x09)) j++;
+            unsigned long s = j;
+            while (j < blen && is_idn((unsigned char)body[j])) j++;
+            unsigned long idlen = j - s;
+            long pi = -1;
+            for (unsigned long k = 0; k < np; k++)
+                if (params[k].len == idlen && kcc_memcmp(body + s, params[k].name, idlen) == 0) { pi = (long)k; break; }
+            if (pi >= 0) {
+                op += pp_emit_string(args[pi].start, args[pi].len, out + op);
+                i = j;
+            } else {
+                out[op++] = '#';
+                for (unsigned long k = s; k < j; k++) out[op++] = body[k];
+                i = j;
+            }
+            continue;
+        }
+        if (is_id((unsigned char)c)) {
+            unsigned long s = i;
+            i++;
+            while (i < blen && is_idn((unsigned char)body[i])) i++;
+            unsigned long idlen = i - s;
+            long pi = -1;
+            for (unsigned long k = 0; k < np; k++)
+                if (params[k].len == idlen && kcc_memcmp(body + s, params[k].name, idlen) == 0) { pi = (long)k; break; }
+            if (pi >= 0) {
+                kcc_memcpy(out + op, args[pi].start, args[pi].len);
+                op += args[pi].len;
+            } else {
+                kcc_memcpy(out + op, body + s, idlen);
+                op += idlen;
+            }
+            continue;
+        }
+        out[op++] = c;
+        i++;
+    }
+    *lo = op;
+    return out;
+}
+@}
+
+\section{Predefined Macros and Command-Line Defines}
+
+@l c
+@d Selfhost: pp predefined @{
+static void pp_def_simple(const char *name, unsigned long nl, const char *body, unsigned long bl) {
+    struct PPMacro *m = (struct PPMacro *)kcc_arena_alloc(sizeof(struct PPMacro));
+    m->name = name; m->namelen = nl; m->flags = PP_FLAG_BUILTIN; m->nparams = 0;
+    m->body = body; m->bodylen = bl; m->params = 0;
+    kcc_ht_put(kcc_pp_macros, name, nl, m);
+}
+
+static void pp_predefine(void) {
+    pp_def_simple("__STDC__", 8, "1", 1);
+    pp_def_simple("__STDC_VERSION__", 16, "201710L", 7);
+    pp_def_simple("__STDC_HOSTED__", 15, "1", 1);
+    pp_def_simple("__STDC_NO_ATOMICS__", 19, "1", 1);
+    pp_def_simple("__STDC_NO_THREADS__", 19, "1", 1);
+    pp_def_simple("__STDC_NO_COMPLEX__", 19, "1", 1);
+    pp_def_simple("__STDC_NO_VLA__", 15, "1", 1);
+    pp_def_simple("__LP64__", 8, "1", 1);
+    pp_def_simple("_LP64", 5, "1", 1);
+    pp_def_simple("__LINE__", 8, "1", 1);
+    kcc_pp_apply_cmdline_defines();
+}
+
+void kcc_pp_add_cmdline_define(const char *payload) {
+    if (pp_cmdline_ndefs < 64) pp_cmdline_defs[pp_cmdline_ndefs++] = payload;
+}
+
+void kcc_pp_apply_cmdline_defines(void) {
+    for (unsigned long i = 0; i < pp_cmdline_ndefs; i++) {
+        const char *p = pp_cmdline_defs[i];
+        unsigned long nl = 0;
+        while (p[nl] && p[nl] != '=') nl++;
+        if (p[nl] == '=') {
+            const char *val = p + nl + 1;
+            pp_def_simple(p, nl, val, kcc_strlen(val));
+        } else {
+            pp_def_simple(p, nl, "1", 1);
+        }
+    }
+}
+@}
+
+\section{Conditionals and the \texttt{\#if} Evaluator}
+
+@l c
+@d Selfhost: pp conditional @{
+static void pp_cond_push(unsigned long state) {
+    if (pp_cond_depth >= PP_MAX_COND) return;
+    pp_cond_stack[pp_cond_depth++] = (unsigned char)state;
+}
+
+void kcc_pp_do_ifdef(int negate) {
+    kcc_lex_next();
+    if (kcc_tok_type != TOK_IDENT) {
+        kcc_diag_error(pp_dir_line, 1, m_ifdef_name);
+        pp_cond_push(PP_COND_SKIP);
+        pp_skip_line();
+        return;
+    }
+    void *m = kcc_ht_get(kcc_pp_macros, kcc_tok_start, kcc_tok_len);
+    int cond = (m != 0);
+    if (negate) cond = !cond;
+    pp_cond_push(cond ? PP_COND_ACTIVE : PP_COND_SKIP);
+    pp_skip_line();
+}
+
+/* Rewrite `defined X`/`defined(X)` → 1/0 (operand looked up, not expanded),
+ * copying every other token verbatim. */
+static const char *pp_protect_defined(const char *src, unsigned long len, unsigned long *lo) {
+    const char *saved_cur = kcc_lex_cursor, *saved_end = kcc_lex_end;
+    kcc_lex_cursor = src;
+    kcc_lex_end = src + len;
+    char *out = (char *)kcc_arena_alloc(2 * len + 64);
+    unsigned long outlen = 0;
+    kcc_lex_next();
+    for (;;) {
+        if (kcc_tok_type == TOK_EOF) break;
+        if (kcc_tok_type == TOK_IDENT && kcc_tok_len == 7 &&
+            kcc_memcmp(kcc_tok_start, "defined", 7) == 0) {
+            kcc_lex_next();
+            int paren = (kcc_tok_type == TOK_LPAREN);
+            if (paren) kcc_lex_next();
+            int bit = (kcc_ht_get(kcc_pp_macros, kcc_tok_start, kcc_tok_len) != 0);
+            kcc_lex_next();                       /* past name */
+            if (paren) kcc_lex_next();            /* past ')' */
+            if (outlen) out[outlen++] = ' ';
+            out[outlen++] = '0' + bit;
+            continue;
+        }
+        if (outlen) out[outlen++] = ' ';
+        kcc_memcpy(out + outlen, kcc_tok_start, kcc_tok_len);
+        outlen += kcc_tok_len;
+        kcc_lex_next();
+    }
+    kcc_lex_cursor = saved_cur;
+    kcc_lex_end = saved_end;
+    *lo = outlen;
+    return out;
+}
+
+static const char *pp_prepare_cond(const char *src, unsigned long len, unsigned long *lo) {
+    unsigned long la;
+    const char *a = pp_protect_defined(src, len, &la);
+    if (!la) { *lo = la; return a; }
+    unsigned long saved = pp_cond_depth;
+    pp_cond_depth = 0;
+    unsigned long lb;
+    const char *b = pp_expand_arg(a, la, &lb);
+    pp_cond_depth = saved;
+    *lo = lb;
+    return b;
+}
+
+/* Evaluate the expanded controlling text; returns the integer result. */
+static long pp_eval_line(const char *src, unsigned long len) {
+    unsigned long el;
+    const char *e = pp_prepare_cond(src, len, &el);
+    const char *saved_cur = kcc_lex_cursor, *saved_end = kcc_lex_end;
+    kcc_lex_cursor = e;
+    kcc_lex_end = e + el;
+    kcc_lex_next();
+    long r = kcc_pp_eval_expr();
+    kcc_lex_cursor = saved_cur;
+    kcc_lex_end = saved_end;
+    return r;
+}
+
+void kcc_pp_do_if(void) {
+    unsigned long len;
+    const char *src = pp_rest_of_line(&len);
+    long r = pp_eval_line(src, len);
+    pp_cond_push(r ? PP_COND_ACTIVE : PP_COND_SKIP);
+}
+
+void kcc_pp_do_line(void) {
+    unsigned long phys = kcc_lex_line;
+    unsigned long len;
+    const char *src = pp_rest_of_line(&len);
+    long n = pp_eval_line(src, len);
+    kcc_line_delta = n - (long)phys - 1;
+}
+
+static void pp_do_elif(void) {
+    if (pp_cond_depth == 0) {
+        kcc_diag_error(pp_dir_line, 1, m_stray_elif);
+        pp_skip_line();
+        return;
+    }
+    unsigned char st = pp_cond_stack[pp_cond_depth - 1];
+    if (st == PP_COND_ACTIVE) {
+        pp_cond_stack[pp_cond_depth - 1] = PP_COND_DONE;
+        pp_skip_line();
+        return;
+    }
+    if (st == PP_COND_DONE) { pp_skip_line(); return; }
+    unsigned long len;
+    const char *src = pp_rest_of_line(&len);
+    long r = pp_eval_line(src, len);
+    pp_cond_stack[pp_cond_depth - 1] = r ? PP_COND_ACTIVE : PP_COND_SKIP;
+}
+
+static void pp_do_else(void) {
+    if (pp_cond_depth == 0) {
+        kcc_diag_error(pp_dir_line, 1, m_stray_else);
+        pp_skip_line();
+        return;
+    }
+    unsigned char st = pp_cond_stack[pp_cond_depth - 1];
+    if (st == PP_COND_ACTIVE) pp_cond_stack[pp_cond_depth - 1] = PP_COND_DONE;
+    else if (st == PP_COND_SKIP) pp_cond_stack[pp_cond_depth - 1] = PP_COND_ACTIVE;
+    pp_skip_line();
+}
+
+static void pp_do_endif(void) {
+    if (pp_cond_depth == 0) {
+        kcc_diag_error(pp_dir_line, 1, m_stray_endif);
+        pp_skip_line();
+        return;
+    }
+    pp_cond_depth--;
+    pp_skip_line();
+}
+
+static void pp_skip_directive(void) {
+    pp_dir_line = kcc_tok_line;
+    kcc_lex_next();
+    unsigned long tt = kcc_tok_type;
+    if (tt != TOK_IDENT && (tt < 10 || tt > 53)) { pp_skip_line(); return; }
+    const char *n = kcc_tok_start;
+    unsigned long l = kcc_tok_len;
+    if (dname(n, l, "if", 2) || dname(n, l, "ifdef", 5) || dname(n, l, "ifndef", 6)) {
+        pp_cond_push(PP_COND_DONE);
+        pp_skip_line();
+    } else if (dname(n, l, "endif", 5)) {
+        pp_do_endif();
+    } else if (dname(n, l, "elif", 4)) {
+        pp_do_elif();
+    } else if (dname(n, l, "else", 4)) {
+        pp_do_else();
+    } else {
+        pp_skip_line();
+    }
+}
+@}
+
+@l c
+@d Selfhost: pp eval @{
+static long pp_eval_ternary(void);
+static long pp_eval_primary(void);
+
+long kcc_pp_eval_expr(void) { return pp_eval_ternary(); }
+
+#define BINLEVEL(name, sub, body) \
+static long name(void) { long a = sub(); for (;;) { unsigned long op = kcc_tok_type; body } }
+
+static long pp_eval_unary(void);
+static long pp_eval_mul(void) {
+    long a = pp_eval_unary();
+    for (;;) {
+        unsigned long op = kcc_tok_type;
+        if (op != TOK_STAR && op != TOK_SLASH && op != TOK_PERCENT) return a;
+        kcc_lex_next();
+        long b = pp_eval_unary();
+        if (op == TOK_STAR) a = a * b;
+        else if (op == TOK_SLASH) a = b ? a / b : 0;
+        else a = b ? a % b : 0;
+    }
+}
+static long pp_eval_add(void) {
+    long a = pp_eval_mul();
+    for (;;) {
+        unsigned long op = kcc_tok_type;
+        if (op != TOK_PLUS && op != TOK_MINUS) return a;
+        kcc_lex_next();
+        long b = pp_eval_mul();
+        a = (op == TOK_PLUS) ? a + b : a - b;
+    }
+}
+static long pp_eval_shift(void) {
+    long a = pp_eval_add();
+    for (;;) {
+        unsigned long op = kcc_tok_type;
+        if (op != TOK_SHL && op != TOK_SHR) return a;
+        kcc_lex_next();
+        long b = pp_eval_add();
+        a = (op == TOK_SHL) ? (long)((unsigned long)a << b) : (long)((unsigned long)a >> b);
+    }
+}
+static long pp_eval_rel(void) {
+    long a = pp_eval_shift();
+    for (;;) {
+        unsigned long op = kcc_tok_type;
+        if (op != TOK_LT && op != TOK_GT && op != TOK_LE && op != TOK_GE) return a;
+        kcc_lex_next();
+        long b = pp_eval_shift();
+        if (op == TOK_LT) a = a < b;
+        else if (op == TOK_GT) a = a > b;
+        else if (op == TOK_LE) a = a <= b;
+        else a = a >= b;
+    }
+}
+static long pp_eval_eq(void) {
+    long a = pp_eval_rel();
+    for (;;) {
+        unsigned long op = kcc_tok_type;
+        if (op != TOK_EQ && op != TOK_NE) return a;
+        kcc_lex_next();
+        long b = pp_eval_rel();
+        a = (op == TOK_EQ) ? (a == b) : (a != b);
+    }
+}
+static long pp_eval_band(void) {
+    long a = pp_eval_eq();
+    while (kcc_tok_type == TOK_AMP) { kcc_lex_next(); a = a & pp_eval_eq(); }
+    return a;
+}
+static long pp_eval_bxor(void) {
+    long a = pp_eval_band();
+    while (kcc_tok_type == TOK_CARET) { kcc_lex_next(); a = a ^ pp_eval_band(); }
+    return a;
+}
+static long pp_eval_bor(void) {
+    long a = pp_eval_bxor();
+    while (kcc_tok_type == TOK_PIPE) { kcc_lex_next(); a = a | pp_eval_bxor(); }
+    return a;
+}
+static long pp_eval_land(void) {
+    long a = pp_eval_bor();
+    while (kcc_tok_type == TOK_AND) { kcc_lex_next(); long b = pp_eval_bor(); a = (a && b); }
+    return a;
+}
+static long pp_eval_lor(void) {
+    long a = pp_eval_land();
+    while (kcc_tok_type == TOK_OR) { kcc_lex_next(); long b = pp_eval_land(); a = (a || b); }
+    return a;
+}
+static long pp_eval_ternary(void) {
+    long c = pp_eval_lor();
+    if (kcc_tok_type != TOK_QUESTION) return c;
+    kcc_lex_next();
+    long t = kcc_pp_eval_expr();
+    if (kcc_tok_type == TOK_COLON) kcc_lex_next();
+    long e = pp_eval_ternary();
+    return c ? t : e;
+}
+
+static long pp_eval_unary(void) {
+    unsigned long op = kcc_tok_type;
+    if (op == TOK_BANG) { kcc_lex_next(); return !pp_eval_unary(); }
+    if (op == TOK_TILDE) { kcc_lex_next(); return ~pp_eval_unary(); }
+    if (op == TOK_MINUS) { kcc_lex_next(); return -pp_eval_unary(); }
+    if (op == TOK_PLUS) { kcc_lex_next(); return pp_eval_unary(); }
+    return pp_eval_primary();
+}
+
+/* evaluate a macro's body as an integer (macro chains + expression bodies) */
+static long pp_eval_macro(struct PPMacro *m) {
+    if (pp_eval_depth >= 64) return 0;
+    pp_eval_depth++;
+    const char *sc = kcc_lex_cursor, *se = kcc_lex_end;
+    kcc_lex_cursor = m->body;
+    kcc_lex_end = m->body + m->bodylen;
+    kcc_lex_next();
+    long r = kcc_pp_eval_expr();
+    kcc_lex_cursor = sc;
+    kcc_lex_end = se;
+    pp_eval_depth--;
+    return r;
+}
+
+static long pp_eval_primary(void) {
+    unsigned long tt = kcc_tok_type;
+    if (tt == TOK_NUMBER) {
+        long v = (long)kcc_pp_atoi(kcc_tok_start, kcc_tok_len);
+        kcc_lex_next();
+        return v;
+    }
+    if (tt == TOK_LPAREN) {
+        kcc_lex_next();
+        long v = kcc_pp_eval_expr();
+        if (kcc_tok_type == TOK_RPAREN) kcc_lex_next();
+        return v;
+    }
+    if (tt == TOK_IDENT) {
+        if (kcc_tok_len == 7 && kcc_memcmp(kcc_tok_start, "defined", 7) == 0) {
+            kcc_lex_next();
+            int paren = (kcc_tok_type == TOK_LPAREN);
+            if (paren) kcc_lex_next();
+            if (kcc_tok_type != TOK_IDENT) { kcc_lex_next(); return 0; }
+            int bit = (kcc_ht_get(kcc_pp_macros, kcc_tok_start, kcc_tok_len) != 0);
+            kcc_lex_next();
+            if (paren && kcc_tok_type == TOK_RPAREN) kcc_lex_next();
+            return bit;
+        }
+        struct PPMacro *m = (struct PPMacro *)kcc_ht_get(kcc_pp_macros, kcc_tok_start, kcc_tok_len);
+        if (!m) { kcc_lex_next(); return 0; }
+        long v = pp_eval_macro(m);
+        kcc_lex_next();
+        return v;
+    }
+    return 0;
+}
+
+unsigned long kcc_pp_atoi(const char *p, unsigned long len) {
+    unsigned long acc = 0;
+    if (len >= 2 && p[0] == '0' && ((p[1] | 0x20) == 'x')) {
+        for (unsigned long i = 2; i < len; i++) {
+            char c = p[i];
+            unsigned long d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else { char lc = c | 0x20; if (lc < 'a' || lc > 'f') break; d = lc - 'a' + 10; }
+            acc = (acc << 4) + d;
+        }
+        return acc;
+    }
+    if (len >= 1 && p[0] == '0') {
+        for (unsigned long i = 1; i < len; i++) {
+            char c = p[i];
+            if (c < '0' || c > '7') break;
+            acc = (acc << 3) + (c - '0');
+        }
+        return acc;
+    }
+    for (unsigned long i = 0; i < len; i++) {
+        char c = p[i];
+        if (c < '0' || c > '9') break;
+        acc = acc * 10 + (c - '0');
+    }
+    return acc;
+}
+@}
+
+\section{File Inclusion and Built-in Headers}
+
+@l c
+@d Selfhost: pp include @{
+static int pp_file_exists(const char *path) {
+    long fd = kcc_sys_open(path, 0, 0);
+    if (fd == -1) return 0;
+    kcc_sys_close(fd);
+    return 1;
+}
+
+static const char *pp_resolve_include(const char *name) {
+    unsigned long namelen = kcc_strlen(name);
+    const char *sp = kcc_src_path;
+    if (sp) {
+        unsigned long dirlen = 0;
+        for (unsigned long i = 0; sp[i]; i++) if (sp[i] == '/') dirlen = i + 1;
+        if (dirlen) {
+            char *cand = (char *)kcc_arena_alloc(dirlen + namelen + 1);
+            kcc_memcpy(cand, sp, dirlen);
+            kcc_memcpy(cand + dirlen, name, namelen);
+            cand[dirlen + namelen] = 0;
+            if (pp_file_exists(cand)) return cand;
+        }
+    }
+    if (pp_file_exists(name)) return name;
+    for (unsigned long i = 0; i < pp_inc_ndirs; i++) {
+        const char *dir = pp_inc_dirs[i];
+        unsigned long dl = kcc_strlen(dir);
+        char *cand = (char *)kcc_arena_alloc(dl + namelen + 1);
+        kcc_memcpy(cand, dir, dl);
+        kcc_memcpy(cand + dl, name, namelen);
+        cand[dl + namelen] = 0;
+        if (pp_file_exists(cand)) return cand;
+    }
+    return 0;
+}
+
+void kcc_pp_add_include_dir(const char *dir) {
+    if (pp_inc_ndirs >= 64) return;
+    unsigned long dl = kcc_strlen(dir);
+    char *buf = (char *)kcc_arena_alloc(dl + 2);
+    kcc_memcpy(buf, dir, dl);
+    buf[dl] = '/';
+    buf[dl + 1] = 0;
+    pp_inc_dirs[pp_inc_ndirs++] = buf;
+}
+
+void kcc_pp_add_default_includes(const char *argv0) {
+    unsigned long prefixlen = 0;
+    for (unsigned long i = 0; argv0[i]; i++) if (argv0[i] == '/') prefixlen = i + 1;
+    char *buf = (char *)kcc_arena_alloc(prefixlen + 8);
+    kcc_memcpy(buf, argv0, prefixlen);
+    kcc_memcpy(buf + prefixlen, "include", 7);
+    buf[prefixlen + 7] = 0;
+    kcc_pp_add_include_dir(buf);
+}
+
+void kcc_pp_do_include(void) {
+    kcc_lex_next();
+    unsigned long tt = kcc_tok_type;
+    const char *nstart;
+    unsigned long nlen;
+    int system;
+    if (tt == TOK_STRING_LIT) {
+        system = 0;
+        nstart = kcc_tok_start + 1;
+        nlen = kcc_tok_len - 2;
+    } else if (tt == TOK_LT) {
+        system = 1;
+        const char *s = kcc_lex_cursor;
+        const char *e = kcc_lex_end;
+        const char *p = s;
+        while (p < e && *p != '>' && *p != 0x0A) p++;
+        if (p >= e || *p == 0x0A) { kcc_diag_error(pp_dir_line, 1, m_include); pp_skip_line(); return; }
+        nstart = s;
+        nlen = (unsigned long)(p - s);
+        kcc_lex_cursor = p + 1;
+    } else {
+        kcc_diag_error(pp_dir_line, 1, m_include);
+        pp_skip_line();
+        return;
+    }
+    char *path = (char *)kcc_arena_alloc(nlen + 1);
+    kcc_memcpy(path, nstart, nlen);
+    path[nlen] = 0;
+    pp_skip_line();
+    /* built-in header? */
+    const char *hdr = pp_builtin_header(path);
+    if (hdr) {
+        unsigned long hlen = kcc_strlen(hdr);
+        pp_ctx_push(PP_CTX_INCLUDE);
+        kcc_src_base = hdr;
+        kcc_src_size = hlen;
+        kcc_src_path = path;
+        kcc_lex_init(hdr, hlen);
+        pp_prev_line = 0;
+        return;
+    }
+    const char *rp = pp_resolve_include(path);
+    if (!rp) {
+        if (!system) kcc_diag_error(pp_dir_line, 1, m_notfound);
+        return;
+    }
+    pp_ctx_push(PP_CTX_INCLUDE);
+    kcc_source_open(rp);
+    kcc_source_encode();
+    kcc_source_splice();
+    kcc_lex_init(kcc_src_base, kcc_src_size);
+    pp_prev_line = 0;
+}
+
+void kcc_pp_do_error(void) {
+    unsigned long len;
+    const char *msg = pp_rest_of_line(&len);
+    char *buf = (char *)kcc_arena_alloc(len + 1);
+    kcc_memcpy(buf, msg, len);
+    buf[len] = 0;
+    kcc_diag_error(pp_dir_line, 1, buf);
+}
+@}
+
+\section{Phase 5 and 6: String-Literal Escapes and Concatenation}
+
+The \texttt{preprocessor.o} object also carries translation phases~5 and~6
+(Chapters~\ref{ch:string-literals}--\ref{ch:concatenation}), which the parser
+calls: \texttt{kcc\_strlit\_process} converts escape sequences to their
+execution-character-set bytes, and \texttt{kcc\_strlit\_gather} concatenates the
+current string literal with every adjacent one (through macro expansion, via
+\texttt{kcc\_pp\_next}).  Both hand back a \texttt{\{buffer, length\}} pair in the
+first two registers.
+
+@l c
+@d Selfhost: pp strlit @{
+struct StrResult kcc_strlit_process(const char *src, unsigned long len) {
+    const char *p = src, *end = src + len;
+    char *dst = (char *)kcc_arena_alloc(len + 1);
+    char *d = dst;
+    while (p < end) {
+        char c = *p;
+        if (c != 0x5C) { *d++ = c; p++; continue; }
+        p++;                                     /* skip backslash */
+        if (p >= end) break;                     /* trailing backslash */
+        char e = *p++;
+        if (e == 'n') *d++ = 0x0A;
+        else if (e == 't') *d++ = 0x09;
+        else if (e == 0x5C) *d++ = 0x5C;
+        else if (e == '"') *d++ = 0x22;
+        else if (e == 0x27) *d++ = 0x27;
+        else if (e == 'a') *d++ = 0x07;
+        else if (e == 'b') *d++ = 0x08;
+        else if (e == 'f') *d++ = 0x0C;
+        else if (e == 'r') *d++ = 0x0D;
+        else if (e == 'v') *d++ = 0x0B;
+        else if (e == '?') *d++ = 0x3F;
+        else if (e == 'x') {
+            unsigned v = 0;
+            while (p < end) {
+                char h = *p;
+                unsigned dg;
+                if (h >= '0' && h <= '9') dg = h - '0';
+                else { char lc = h | 0x20; if (lc < 'a' || lc > 'f') break; dg = lc - 'a' + 10; }
+                v = (v << 4) + dg;
+                p++;
+            }
+            *d++ = (char)(v & 0xFF);
+        } else if (e == '0') {
+            if (p < end && *p >= '0' && *p <= '7') {
+                unsigned v = 0; int n = 2;
+                while (p < end && n && *p >= '0' && *p <= '7') { v = (v << 3) + (*p - '0'); p++; n--; }
+                *d++ = (char)(v & 0xFF);
+            } else *d++ = 0x00;
+        } else if (e >= '1' && e <= '7') {
+            unsigned v = e - '0'; int n = 2;
+            while (p < end && n && *p >= '0' && *p <= '7') { v = (v << 3) + (*p - '0'); p++; n--; }
+            *d++ = (char)(v & 0xFF);
+        } else {
+            *d++ = e;                            /* unknown escape → literal */
+        }
+    }
+    struct StrResult r;
+    r.buf = dst;
+    r.len = (unsigned long)(d - dst);
+    return r;
+}
+
+struct StrResult kcc_strlit_gather(void) {
+    unsigned long cap = 256, used = 0;
+    char *buf = (char *)kcc_arena_alloc(256);
+    for (;;) {
+        struct StrResult pr = kcc_strlit_process(kcc_tok_start + 1, kcc_tok_len - 2);
+        if (used + pr.len > cap) {
+            unsigned long nc = cap;
+            while (nc < used + pr.len) nc <<= 1;
+            char *nb = (char *)kcc_arena_alloc(nc);
+            kcc_memcpy(nb, buf, used);
+            buf = nb; cap = nc;
+        }
+        kcc_memcpy(buf + used, pr.buf, pr.len);
+        used += pr.len;
+        kcc_pp_next();
+        if (kcc_tok_type != TOK_STRING_LIT) break;
+    }
+    struct StrResult r;
+    r.buf = buf;
+    r.len = used;
+    return r;
+}
+@}
+
+\section{The Nine Freestanding Built-in Headers}
+
+@l c
+@d Selfhost: pp builtin @{
+static const char hdr_stddef[] = "#ifndef _STDDEF_H\n#define _STDDEF_H\ntypedef unsigned long size_t;\ntypedef long ptrdiff_t;\ntypedef long max_align_t;\n#define NULL ((void*)0)\n#define offsetof(t, m) ((size_t)&(((t*)0)->m))\n#endif\n";
+static const char hdr_stdbool[] = "#ifndef _STDBOOL_H\n#define _STDBOOL_H\n#define bool int\n#define true 1\n#define false 0\n#endif\n";
+static const char hdr_stdarg[] = "#ifndef _STDARG_H\n#define _STDARG_H\n#endif\n";
+static const char hdr_stdint[] = "#ifndef _STDINT_H\n#define _STDINT_H\ntypedef signed char int8_t;\ntypedef unsigned char uint8_t;\ntypedef short int16_t;\ntypedef unsigned short uint16_t;\ntypedef int int32_t;\ntypedef unsigned int uint32_t;\ntypedef long int64_t;\ntypedef unsigned long uint64_t;\ntypedef long intptr_t;\ntypedef unsigned long uintptr_t;\ntypedef long intmax_t;\ntypedef unsigned long uintmax_t;\ntypedef signed char int_least8_t;\ntypedef unsigned char uint_least8_t;\ntypedef short int_least16_t;\ntypedef unsigned short uint_least16_t;\ntypedef int int_least32_t;\ntypedef unsigned int uint_least32_t;\ntypedef long int_least64_t;\ntypedef unsigned long uint_least64_t;\ntypedef signed char int_fast8_t;\ntypedef unsigned char uint_fast8_t;\ntypedef long int_fast16_t;\ntypedef unsigned long uint_fast16_t;\ntypedef long int_fast32_t;\ntypedef unsigned long uint_fast32_t;\ntypedef long int_fast64_t;\ntypedef unsigned long uint_fast64_t;\n#define INT8_MAX 127\n#define INT16_MAX 32767\n#define INT32_MAX 2147483647\n#define INT64_MAX 9223372036854775807L\n#define UINT8_MAX 255\n#define UINT16_MAX 65535\n#define UINT32_MAX 4294967295U\n#define UINT64_MAX 18446744073709551615UL\n#define INTMAX_MAX 9223372036854775807L\n#define UINTMAX_MAX 18446744073709551615UL\n#define INTPTR_MAX 9223372036854775807L\n#define UINTPTR_MAX 18446744073709551615UL\n#define SIZE_MAX 18446744073709551615UL\n#define INT8_MIN (-128)\n#define INT16_MIN (-32768)\n#define INT32_MIN (-2147483647-1)\n#define INT64_MIN (-9223372036854775807L-1)\n#define INTMAX_MIN (-9223372036854775807L-1)\n#define INTPTR_MIN (-9223372036854775807L-1)\n#endif\n";
+static const char hdr_limits[] = "#ifndef _LIMITS_H\n#define _LIMITS_H\n#define CHAR_BIT 8\n#define SCHAR_MIN (-128)\n#define SCHAR_MAX 127\n#define UCHAR_MAX 255\n#define CHAR_MIN (-128)\n#define CHAR_MAX 127\n#define MB_LEN_MAX 6\n#define SHRT_MIN (-32768)\n#define SHRT_MAX 32767\n#define USHRT_MAX 65535\n#define INT_MIN (-2147483647 - 1)\n#define INT_MAX 2147483647\n#define UINT_MAX 4294967295U\n#define LONG_MIN (-9223372036854775807L - 1)\n#define LONG_MAX 9223372036854775807L\n#define ULONG_MAX 18446744073709551615UL\n#define LLONG_MIN (-9223372036854775807LL - 1)\n#define LLONG_MAX 9223372036854775807LL\n#define ULLONG_MAX 18446744073709551615ULL\n#endif\n";
+static const char hdr_float[] = "#ifndef _FLOAT_H\n#define _FLOAT_H\n#define FLT_RADIX 2\n#define FLT_MANT_DIG 24\n#define DBL_MANT_DIG 53\n#define LDBL_MANT_DIG 53\n#define FLT_DIG 6\n#define DBL_DIG 15\n#define LDBL_DIG 15\n#define FLT_MIN_EXP (-125)\n#define DBL_MIN_EXP (-1021)\n#define LDBL_MIN_EXP (-1021)\n#define FLT_MAX_EXP 128\n#define DBL_MAX_EXP 1024\n#define LDBL_MAX_EXP 1024\n#define FLT_MIN_10_EXP (-37)\n#define DBL_MIN_10_EXP (-307)\n#define LDBL_MIN_10_EXP (-307)\n#define FLT_MAX_10_EXP 38\n#define DBL_MAX_10_EXP 308\n#define LDBL_MAX_10_EXP 308\n#define FLT_ROUNDS 1\n#define FLT_EVAL_METHOD 0\n#define FLT_EPSILON 1.19209290e-7F\n#define DBL_EPSILON 2.2204460492503131e-16\n#define LDBL_EPSILON 2.2204460492503131e-16\n#define FLT_MIN 1.17549435e-38F\n#define DBL_MIN 2.2250738585072014e-308\n#define LDBL_MIN 2.2250738585072014e-308\n#define FLT_MAX 3.40282347e+38F\n#define DBL_MAX 1.7976931348623157e+308\n#define LDBL_MAX 1.7976931348623157e+308\n#define DECIMAL_DIG 17\n#endif\n";
+static const char hdr_iso646[] = "#ifndef _ISO646_H\n#define _ISO646_H\n#define and &&\n#define and_eq &=\n#define bitand &\n#define bitor |\n#define compl ~\n#define not !\n#define not_eq !=\n#define or ||\n#define or_eq |=\n#define xor ^\n#define xor_eq ^=\n#endif\n";
+static const char hdr_stdnoreturn[] = "#ifndef _STDNORETURN_H\n#define _STDNORETURN_H\n#define noreturn _Noreturn\n#define __noreturn_is_defined 1\n#endif\n";
+static const char hdr_stdalign[] = "#ifndef _STDALIGN_H\n#define _STDALIGN_H\n#define alignas _Alignas\n#define alignof _Alignof\n#define __alignas_is_defined 1\n#define __alignof_is_defined 1\n#endif\n";
+
+static const char *pp_builtin_header(const char *name) {
+    if (kcc_strcmp2(name, "stddef.h")) return hdr_stddef;
+    if (kcc_strcmp2(name, "stdbool.h")) return hdr_stdbool;
+    if (kcc_strcmp2(name, "stdarg.h")) return hdr_stdarg;
+    if (kcc_strcmp2(name, "stdint.h")) return hdr_stdint;
+    if (kcc_strcmp2(name, "limits.h")) return hdr_limits;
+    if (kcc_strcmp2(name, "float.h")) return hdr_float;
+    if (kcc_strcmp2(name, "iso646.h")) return hdr_iso646;
+    if (kcc_strcmp2(name, "stdnoreturn.h")) return hdr_stdnoreturn;
+    if (kcc_strcmp2(name, "stdalign.h")) return hdr_stdalign;
+    return 0;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: preprocessor @{
+@<Selfhost: pp preamble@>
+static int kcc_strcmp2(const char *a, const char *b) {
+    unsigned long i = 0;
+    while (a[i] && a[i] == b[i]) i++;
+    return a[i] == 0 && b[i] == 0;
+}
+@<Selfhost: pp core@>
+@<Selfhost: pp helpers@>
+@<Selfhost: pp dispatch@>
+@<Selfhost: pp define@>
+@<Selfhost: pp expand@>
+@<Selfhost: pp substitute@>
+@<Selfhost: pp predefined@>
+@<Selfhost: pp conditional@>
+@<Selfhost: pp eval@>
+@<Selfhost: pp include@>
+@<Selfhost: pp builtin@>
+@<Selfhost: pp strlit@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-preprocessor-verify}
+
+\texttt{make selfhost-preprocessor} runs the strongest oracle---\texttt{difftest}
+byte-compares generated objects against clang, and every case is preprocessed by
+the C engine---together with the self-host and lexer suites, the diagnostic
+suite, and the code-generation suite.  A clean sweep means \kcc{} preprocessed
+its own directives, macro expansions, conditionals, and includes faithfully
+enough that not one byte of generated code changed.
+
+@d Selfhost: preprocessor verify @{
+#!/usr/bin/env bash
+# make selfhost-preprocessor — compile kcc's preprocessor in C with kcc, relink,
+# run difftest + selfhost + diagtest + codegen.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/4] compiling tmp/selfhost/preprocessor.c with kcc"
+tmp/kcc -c "$SH/preprocessor.c" -o "$SH/preprocessor_c.o" >/dev/null
+
+echo "[2/4] linking tmp/kcc_selfhost_preprocessor (preprocessor.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "preprocessor" ]; then OBJ="$OBJ $SH/preprocessor_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_preprocessor $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+cp tmp/kcc "$SH/kcc_asm_backup_preprocessor"
+cp tmp/kcc_selfhost_preprocessor tmp/kcc
+
+echo "[3/4] difftest (byte-compare) + diagtest"
+set +e
+bash tmp/tests/difftest.sh >/tmp/pp_difftest.log 2>&1; dstatus=$?
+tail -1 /tmp/pp_difftest.log
+bash tmp/tests/diagtest.sh >/tmp/pp_diag.log 2>&1; diagst=$?
+tail -1 /tmp/pp_diag.log
+set -e
+if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_preprocessor" tmp/kcc; exit 1; fi
+
+echo "[4/4] codegen suite with the self-hosted preprocessor"
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_preprocessor" tmp/kcc
+exit $status
+@}

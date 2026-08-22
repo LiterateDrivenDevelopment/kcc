@@ -1,0 +1,307 @@
+% 38e-runtime-linux.weft — the Linux/x86-64 OS layer for the second target.
+
+\chapter{The Linux Runtime}
+\label{ch:runtime-linux}
+
+Chapter~\ref{ch:syscalls} gave the compiler its ARM64/macOS floor: thin
+wrappers over \texttt{svc \#0x80} and a Mach-O entry point.  Everything above
+that floor is target-neutral by construction --- the ported subsystems bottom
+out on the same \texttt{kcc\_sys\_*} names --- so bringing \kcc{} to a second
+operating system is a matter of laying a \emph{second} floor with the same
+shape.  This chapter is that floor for Linux on x86-64: the ELF entry point and
+the syscall wrappers, hand-written in the assembly the platform's \texttt{as}
+consumes, so that a translation unit \kcc{} emits with \texttt{--target=x86\_64-linux}
+links into a running executable with no C library at all.
+
+It is a distinct artefact from the compiler's own object files: it is never part
+of the ARM64 \kcc{} binary, and it is assembled on a Linux host (or by a cross
+assembler).  It is the runtime that the compiler's Linux output --- and,
+once every subsystem is C, the Linux \kcc{} itself --- links against.
+
+\section{Calling Convention and Syscall ABI}
+
+The Linux/x86-64 syscall ABI differs from macOS/ARM64 in three ways that the
+wrappers must respect.  The syscall \emph{number} goes in \reg{rax} (not a
+dedicated register), the trap is the \texttt{syscall} instruction (not
+\texttt{svc}), and the fourth argument travels in \reg{r10} --- because the
+System~V C convention puts it in \reg{rcx}, but \texttt{syscall} clobbers
+\reg{rcx} (and \reg{r11}) as part of its operation.  So a wrapper that forwards
+four or more C arguments must copy \reg{rcx} into \reg{r10} first.  The result
+comes back in \reg{rax}, with errors as small negative values.
+
+@d Runtime-linux: constants @{
+# Linux/x86-64 syscall numbers (arch/x86/entry/syscalls/syscall_64.tbl)
+.set SYS_read,     0
+.set SYS_write,    1
+.set SYS_open,     2
+.set SYS_close,    3
+.set SYS_lseek,    8
+.set SYS_mmap,     9
+.set SYS_munmap,  11
+.set SYS_fork,    57
+.set SYS_execve,  59
+.set SYS_exit,    60
+.set SYS_wait4,   61
+.set SYS_unlink,  87
+@}
+
+\section{The ELF Entry Point}
+
+The kernel transfers control to \texttt{\_start} with the stack, not registers,
+carrying the program arguments: \reg{rsp} points at \texttt{argc}, immediately
+followed by the \texttt{argv} pointers, a null terminator, and then the
+\texttt{envp} pointers.  There is no return address and no C runtime to unwind
+into.  The entry code reconstructs the System~V argument registers a C
+\texttt{main} expects --- \texttt{argc} in \reg{rdi}, \texttt{argv} in
+\reg{rsi}, \texttt{envp} in \reg{rdx} --- calls \texttt{main}, and turns its
+return value into an \texttt{exit} syscall.  Since \reg{rsp} is sixteen-byte
+aligned at process entry and the \texttt{call} pushes the eight-byte return
+address, \texttt{main} sees exactly the alignment the ABI promises.
+
+@d Runtime-linux: start @{
+	.text
+	.globl _start
+_start:
+	movq	(%rsp), %rdi           # argc
+	leaq	8(%rsp), %rsi          # argv  = &stack[1]
+	leaq	16(%rsp,%rdi,8), %rdx  # envp  = &argv[argc+1]
+	call	main
+	movq	%rax, %rdi             # exit status = main()'s return value
+	movq	$SYS_exit, %rax
+	syscall
+	hlt                            # unreachable
+@}
+
+\section{Process Control}
+
+\texttt{exit} terminates the process and never returns; \texttt{fork},
+\texttt{execve}, and \texttt{wait4} are the three the driver uses to run the
+assembler and linker as child processes.  Each is a direct forward of its C
+arguments to the syscall, with the \reg{rcx}$\rightarrow$\reg{r10} fix-up where a
+fourth argument is present.
+
+@d Runtime-linux: process @{
+# void kcc_sys_exit(int status)          — %edi = status; does not return.
+	.globl kcc_sys_exit
+kcc_sys_exit:
+	movq	$SYS_exit, %rax
+	syscall
+	hlt
+
+# long kcc_sys_fork(void)
+	.globl kcc_sys_fork
+kcc_sys_fork:
+	movq	$SYS_fork, %rax
+	syscall
+	ret
+
+# long kcc_sys_execve(const char *path, char *const argv[], char *const envp[])
+	.globl kcc_sys_execve
+kcc_sys_execve:
+	movq	$SYS_execve, %rax
+	syscall
+	ret
+
+# long kcc_sys_wait4(long pid, int *status, int options, void *rusage)
+	.globl kcc_sys_wait4
+kcc_sys_wait4:
+	movq	%rcx, %r10             # 4th arg: SysV %rcx -> syscall %r10
+	movq	$SYS_wait4, %rax
+	syscall
+	ret
+@}
+
+\section{File I/O}
+
+The file primitives --- \texttt{read}, \texttt{write}, \texttt{open},
+\texttt{close}, \texttt{lseek}, \texttt{unlink} --- each take at most three
+arguments, so the System~V registers \reg{rdi}, \reg{rsi}, \reg{rdx} already sit
+where \texttt{syscall} wants them; the wrappers only set the number and trap.
+
+@d Runtime-linux: fileio @{
+# long kcc_sys_read(long fd, void *buf, long len)
+	.globl kcc_sys_read
+kcc_sys_read:
+	movq	$SYS_read, %rax
+	syscall
+	ret
+
+# long kcc_sys_write(long fd, const void *buf, long len)
+	.globl kcc_sys_write
+kcc_sys_write:
+	movq	$SYS_write, %rax
+	syscall
+	ret
+
+# long kcc_sys_open(const char *path, long flags, long mode)
+	.globl kcc_sys_open
+kcc_sys_open:
+	movq	$SYS_open, %rax
+	syscall
+	ret
+
+# long kcc_sys_close(long fd)
+	.globl kcc_sys_close
+kcc_sys_close:
+	movq	$SYS_close, %rax
+	syscall
+	ret
+
+# long kcc_sys_lseek(long fd, long off, long whence)
+	.globl kcc_sys_lseek
+kcc_sys_lseek:
+	movq	$SYS_lseek, %rax
+	syscall
+	ret
+
+# long kcc_sys_unlink(const char *path)
+	.globl kcc_sys_unlink
+kcc_sys_unlink:
+	movq	$SYS_unlink, %rax
+	syscall
+	ret
+@}
+
+\section{Memory Mapping}
+
+\texttt{mmap} is where the two operating systems disagree on more than
+registers.  The arena (Chapter~\ref{ch:self-hosting-arena}) requests its chunks
+with \texttt{flags = MAP\_PRIVATE | MAP\_ANON}, but that constant is
+\texttt{0x1002} on macOS and \texttt{0x22} on Linux --- the anonymous bit is
+\texttt{0x1000} there and \texttt{0x20} here.  Rather than fork the arena for
+each target, the OS layer owns the difference: when the incoming flags carry the
+Mach anonymous bit, the wrapper clears it and sets the Linux one, so the arena's
+unmodified \texttt{kcc\_sys\_mmap(0, size, 3, 0x1002, -1, 0)} maps anonymous
+private memory here too.  (A future refactor may replace the raw \texttt{mmap}
+call with a target-neutral ``map anonymous'' primitive; until then this
+translation is the seam.)  Beyond the flags, \texttt{mmap} is a six-argument
+syscall, so the fourth argument still takes the \reg{rcx}$\rightarrow$\reg{r10}
+route.
+
+@d Runtime-linux: mmap @{
+# void *kcc_sys_mmap(void *addr, long len, int prot, int flags, int fd, long off)
+	.globl kcc_sys_mmap
+kcc_sys_mmap:
+	testq	$0x1000, %rcx          # Mach MAP_ANON present?
+	jz	.Lmmap_go
+	btrq	$12, %rcx              # clear Mach MAP_ANON (0x1000)
+	orq	$0x20, %rcx            # set Linux MAP_ANONYMOUS
+.Lmmap_go:
+	movq	%rcx, %r10             # 4th arg: SysV %rcx -> syscall %r10
+	movq	$SYS_mmap, %rax
+	syscall
+	ret
+
+# long kcc_sys_munmap(void *addr, long len)
+	.globl kcc_sys_munmap
+kcc_sys_munmap:
+	movq	$SYS_munmap, %rax
+	syscall
+	ret
+@}
+
+\section{Assembling the Runtime}
+
+The runtime is a single \texttt{.s} file.  Marking the stack non-executable
+keeps the linker from emitting an executable-stack warning or an \texttt{RWX}
+segment.
+
+@d Runtime-linux: file @{
+@<Runtime-linux: constants@>
+@<Runtime-linux: start@>
+@<Runtime-linux: process@>
+@<Runtime-linux: fileio@>
+@<Runtime-linux: mmap@>
+	.section .note.GNU-stack,"",@@progbits
+@}
+
+\section{Verification: A Cross-Compiled, Native Linux Run}
+\label{sec:meta-a-verify}
+
+\texttt{make meta-a} closes the loop the retargeting playbook set out: it takes a
+small \emph{multi-file} C program, compiles each translation unit with this
+compiler under \texttt{--target=x86\_64-linux}, links the results against the
+runtime above --- statically, with no libc --- and runs the executable on Linux.
+The program exercises the three seams the runtime provides: it maps arena memory
+through \texttt{kcc\_sys\_mmap}, calls across a translation-unit boundary, writes
+its result through \texttt{kcc\_sys\_write}, and returns a status the harness
+checks.  A green run means a program \kcc{} compiled runs natively on a
+different operating system and architecture than the one \kcc{} runs on.
+
+\paragraph{The program under test.}  Two translation units, to prove
+cross-object linking: \texttt{demo\_util.c} provides a leaf routine, and
+\texttt{demo\_main.c} drives the arena and I/O.
+
+@d Runtime-linux: demo util @{
+/* demo_util.c — a leaf called across a TU boundary. */
+long demo_sum(const long *a, long n) {
+    long s = 0, i = 0;
+    while (i < n) { s = s + a[i]; i = i + 1; }
+    return s;
+}
+@}
+
+@d Runtime-linux: demo main @{
+/* demo_main.c — arena via mmap, cross-TU call, output, distinctive exit. */
+extern long kcc_sys_write(long fd, const void *buf, long len);
+extern void *kcc_sys_mmap(void *addr, long len, int prot, int flags,
+                          int fd, long off);
+extern long demo_sum(const long *a, long n);
+
+static unsigned long slen(const char *s) {
+    unsigned long n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+int main(void) {
+    /* 0x1002 = the arena's macOS MAP_PRIVATE|MAP_ANON; the runtime translates it. */
+    long *p = (long *)kcc_sys_mmap(0, 1 << 16, 3, 0x1002, -1, 0);
+    if ((long)p == -1 || p == 0) return 1;
+
+    long i = 0;
+    while (i < 6) { p[i] = i + 1; i = i + 1; }   /* 1+2+3+4+5+6 = 21 */
+
+    const char *msg = "kcc cross-compiled to linux/x86-64, running native\n";
+    kcc_sys_write(1, msg, slen(msg));
+
+    long got = demo_sum(p, 6) + demo_sum(p, 6);   /* 21 + 21 = 42 */
+    return (int)got;
+}
+@}
+
+@d Runtime-linux: meta-a verify @{
+#!/usr/bin/env bash
+# make meta-a — cross-compile a multi-TU C program to Linux/x86-64 with kcc,
+# link it against the Linux runtime (no libc), and run it natively.
+#
+# kcc runs on the (ARM64/macOS) build host and emits ELF-flavour .s; the
+# assemble/link/run happens on Linux, here inside a linux/amd64 container.
+# Apple Silicon's Docker uses Rosetta, whose ELF loader rejects a valid
+# non-page-aligned RW segment ("bss_size overflow"); we run under qemu-x86_64,
+# a conforming loader, which is what a real Linux kernel behaves like.
+set -euo pipefail
+
+R=tmp/runtime
+KCC=tmp/kcc
+
+echo "[1/3] kcc compiles the demo TUs -> Linux/x86-64 .s"
+"$KCC" -c "$R/demo_util.c" -o "$R/demo_util.s" --target=x86_64-linux >/dev/null
+"$KCC" -c "$R/demo_main.c" -o "$R/demo_main.s" --target=x86_64-linux >/dev/null
+
+echo "[2/3] assemble + link + run inside linux/amd64 (qemu loader)"
+docker run --rm -v "$PWD/$R":/w -w /w --platform linux/amd64 gcc:latest bash -c '
+  set -e
+  apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq qemu-user >/dev/null 2>&1
+  as --64 os_linux.s   -o os_linux.o
+  as --64 demo_util.s  -o demo_util.o
+  as --64 demo_main.s  -o demo_main.o
+  ld -static -nostdlib -e _start -o demo os_linux.o demo_util.o demo_main.o
+  file demo
+  set +e; qemu-x86_64 ./demo; code=$?; set -e
+  echo "exit=$code (expect 42)"
+  [ "$code" -eq 42 ] && echo "META_A_PASS" || { echo "META_A_FAIL"; exit 1; }
+'
+
+echo "[3/3] done"
+@}

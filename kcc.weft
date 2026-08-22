@@ -512,6 +512,7 @@ source file to \texttt{.o}.
 @i literate/backend/38-emit-arm64.weft
 @i literate/backend/38b-emit-asm.weft
 @i literate/backend/38d-emit-x86.weft
+@i literate/backend/38e-runtime-linux.weft
 \end{multicols}
 \newpage
 

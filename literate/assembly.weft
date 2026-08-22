@@ -862,6 +862,29 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: types verify@>
 @}
 
+% -- The Linux/x86-64 runtime and its cross-compile test --------------
+
+\noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the
+ELF entry point and Linux syscall wrappers, assembled on Linux, that \kcc{}'s
+\texttt{--target=x86\_64-linux} output links against.  It is not part of the
+ARM64 compiler, so it routes to its own directory:
+
+@o tmp/runtime/os_linux.s @{
+@<Runtime-linux: file@>
+@}
+
+@o tmp/runtime/demo_util.c @{
+@<Runtime-linux: demo util@>
+@}
+
+@o tmp/runtime/demo_main.c @{
+@<Runtime-linux: demo main@>
+@}
+
+@o tmp/runtime/meta_a_verify.sh @{
+@<Runtime-linux: meta-a verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

@@ -25,15 +25,15 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 .DEFAULT_GOAL := build
 
 .PHONY: all default tangle assemble build test selfhost selfhost-lexer \
-        selfhost-types difftest interop e2e diagtest warntest test-codegen \
-        doc weave clean run map
+        selfhost-types meta-a difftest interop e2e diagtest warntest \
+        test-codegen doc weave clean run map
 
 # Default: build everything
 all default: build
 
 # Tangle: extract .s files from .weft literate sources
 tangle:
-	mkdir -p tmp/src tmp/tests tmp/docs tmp/selfhost tmp/include
+	mkdir -p tmp/src tmp/tests tmp/docs tmp/selfhost tmp/include tmp/runtime
 	weft kcc.weft
 
 # Assemble: compile each .s to .o
@@ -116,6 +116,12 @@ selfhost-conversions: build
 selfhost-types: build
 	chmod +x tmp/selfhost/types_verify.sh
 	tmp/selfhost/types_verify.sh
+
+# Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
+# link against the Linux runtime (no libc), run it natively (Chapter: Runtime).
+meta-a: build
+	chmod +x tmp/runtime/meta_a_verify.sh
+	tmp/runtime/meta_a_verify.sh
 
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build

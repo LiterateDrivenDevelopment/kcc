@@ -1,0 +1,408 @@
+% 48u-self-hosting-dwarf.weft — Stage 8v: the DWARF debug-info emitter, written
+% in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The DWARF Emitter in C}
+\label{ch:self-hosting-dwarf}
+
+The DWARF emitter of Chapter~\ref{ch:dwarf} is a clean, self-contained slice of
+the back end: it consumes the IR function list and the code-buffer size, and
+produces the three DWARF~v4 sections (\texttt{.debug\_abbrev},
+\texttt{.debug\_info}, \texttt{.debug\_line}) into a scratch blob that the Mach-O
+writer places in a non-loaded \texttt{\_\_DWARF} segment.  Because it is gated
+behind \texttt{-g} and touches no other object except through four exported
+entry points and one flag, it ports to C almost mechanically---the same
+little-endian and LEB128 byte streams, the same abbreviation table, the same
+per-function DIEs and line-number program.
+
+The verification is stronger than the code-generation suite alone can show: that
+suite never passes \texttt{-g}, so beyond confirming no regression we compile a
+translation unit \emph{with} \texttt{-g} under both the assembly and the
+C-compiled emitter and byte-compare the resulting objects---identical debug
+bytes mean the port is faithful.
+
+\section{Buffer State, Constants, and Byte Emitters}
+
+The port owns the scratch buffer and the per-section offset/length words as
+file-internal state, exports only \texttt{kcc\_dwarf\_enabled} (the driver and
+the Mach-O writer read it), and declares the DWARF tag/attribute/form codes and
+the IR-function field offsets it reads.  The byte emitters append little-endian
+integers, unsigned and signed LEB128 values, and NUL-terminated strings, exactly
+as the assembly does---every multi-byte value decomposes through \texttt{dw\_u8}
+so the byte stream is identical.
+
+@l c
+@d Selfhost: dwarf preamble @{
+void *kcc_arena_alloc(unsigned long n);
+void *kcc_vec_get(void *vec, unsigned long index);
+void kcc_macho_write_bytes(const void *ptr, unsigned long len);
+void kcc_macho_write64(unsigned long v);
+void kcc_macho_write32(unsigned long v);
+
+extern char *kcc_src_path;          /* pointer to the source file path */
+extern unsigned long kcc_code_pos;  /* code-buffer write position (= code size) */
+extern void *kcc_ir_funcs;          /* vec of IR function pointers */
+
+/* DWARF v4 codes. */
+enum {
+    DW_TAG_compile_unit = 0x11, DW_TAG_subprogram = 0x2e,
+    DW_CHILDREN_no = 0, DW_CHILDREN_yes = 1,
+    DW_AT_name = 0x03, DW_AT_stmt_list = 0x10, DW_AT_low_pc = 0x11,
+    DW_AT_high_pc = 0x12, DW_AT_language = 0x13, DW_AT_comp_dir = 0x1b,
+    DW_AT_producer = 0x25, DW_AT_decl_line = 0x3b,
+    DW_FORM_addr = 0x01, DW_FORM_data2 = 0x05, DW_FORM_string = 0x08,
+    DW_FORM_udata = 0x0f, DW_FORM_sec_offset = 0x17,
+    DW_LANG_C99 = 0x0c,
+    DW_LNS_copy = 1, DW_LNS_advance_line = 3,
+    DW_LNE_end_sequence = 1, DW_LNE_set_address = 2
+};
+
+#define DWARF_BUF_CAP 262144
+#define LC_SEGMENT_64 0x19
+#define VEC_COUNT     8
+#define IRF_NAME      0
+#define IRF_LINE      56
+#define IRF_LOWPC     64
+
+unsigned long kcc_dwarf_enabled = 0;     /* set by -g (read by driver + macho) */
+
+static void *dwarf_buf = 0;
+static unsigned long dwarf_pos = 0;
+static unsigned long dw_abbrev_off = 0, dw_abbrev_len = 0;
+static unsigned long dw_info_off = 0, dw_info_len = 0;
+static unsigned long dw_line_off = 0, dw_line_len = 0;
+
+static const char dw_producer[] = "kcc";
+static const char dw_compdir[]  = "/";
+static const char dw_segname[16]   = "__DWARF";
+static const char dw_sn_abbrev[16] = "__debug_abbrev";
+static const char dw_sn_info[16]   = "__debug_info";
+static const char dw_sn_line[16]   = "__debug_line";
+
+static unsigned long irf(void *f, unsigned long off) {
+    return *(unsigned long *)((char *)f + off);
+}
+
+static void dw_u8(unsigned long v) {
+    unsigned long p = dwarf_pos;
+    ((unsigned char *)dwarf_buf)[p] = (unsigned char)v;
+    dwarf_pos = p + 1;
+}
+static void dw_u16(unsigned long v) { dw_u8(v & 0xff); dw_u8((v >> 8) & 0xff); }
+static void dw_u32(unsigned long v) {
+    dw_u8(v & 0xff); dw_u8((v >> 8) & 0xff);
+    dw_u8((v >> 16) & 0xff); dw_u8((v >> 24) & 0xff);
+}
+static void dw_u64(unsigned long v) { dw_u32(v & 0xffffffff); dw_u32(v >> 32); }
+
+static void dw_uleb(unsigned long v) {
+    for (;;) {
+        unsigned long byte = v & 0x7f;
+        v >>= 7;
+        if (v == 0) { dw_u8(byte); return; }
+        dw_u8(byte | 0x80);
+    }
+}
+static void dw_sleb(long v) {
+    for (;;) {
+        unsigned long byte = (unsigned long)v & 0x7f;
+        v >>= 7;                               /* arithmetic shift keeps the sign */
+        int sign = byte & 0x40;
+        if ((v == 0 && !sign) || (v == -1 && sign)) { dw_u8(byte); return; }
+        dw_u8(byte | 0x80);
+    }
+}
+static void dw_str(const char *s) {
+    if (s) { while (*s) { dw_u8((unsigned char)*s); s++; } }
+    dw_u8(0);
+}
+static unsigned long dw_pos(void) { return dwarf_pos; }
+static void dw_patch32(unsigned long pos, unsigned long v) {
+    unsigned char *p = (unsigned char *)dwarf_buf + pos;
+    p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
+    p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff;
+}
+@}
+
+\section{The Abbreviation Table}
+
+Two DIE shapes: a \texttt{compile\_unit} with children (producer, language, file
+name, working directory, whole-unit address range, and a pointer to the line
+program) and a leaf \texttt{subprogram} (name, address range, declaration line).
+
+@l c
+@d Selfhost: dwarf abbrev @{
+static void dwarf_build_abbrev(void) {
+    dw_abbrev_off = dw_pos();
+    /* abbrev 1: compile_unit, has children */
+    dw_uleb(1);
+    dw_uleb(DW_TAG_compile_unit);
+    dw_u8(DW_CHILDREN_yes);
+    dw_uleb(DW_AT_producer);  dw_uleb(DW_FORM_string);
+    dw_uleb(DW_AT_language);  dw_uleb(DW_FORM_data2);
+    dw_uleb(DW_AT_name);      dw_uleb(DW_FORM_string);
+    dw_uleb(DW_AT_comp_dir);  dw_uleb(DW_FORM_string);
+    dw_uleb(DW_AT_low_pc);    dw_uleb(DW_FORM_addr);
+    dw_uleb(DW_AT_high_pc);   dw_uleb(DW_FORM_addr);
+    dw_uleb(DW_AT_stmt_list); dw_uleb(DW_FORM_sec_offset);
+    dw_u8(0); dw_u8(0);
+    /* abbrev 2: subprogram, leaf */
+    dw_uleb(2);
+    dw_uleb(DW_TAG_subprogram);
+    dw_u8(DW_CHILDREN_no);
+    dw_uleb(DW_AT_name);      dw_uleb(DW_FORM_string);
+    dw_uleb(DW_AT_low_pc);    dw_uleb(DW_FORM_addr);
+    dw_uleb(DW_AT_high_pc);   dw_uleb(DW_FORM_addr);
+    dw_uleb(DW_AT_decl_line); dw_uleb(DW_FORM_udata);
+    dw_u8(0); dw_u8(0);
+    /* terminator abbrev (code 0) */
+    dw_u8(0);
+    dw_abbrev_len = dw_pos() - dw_abbrev_off;
+}
+@}
+
+\section{The Info Section}
+
+One compile-unit DIE followed by one subprogram DIE per function.  Each
+function's \texttt{high\_pc} is the next function's entry (functions are laid out
+in order) or the total code size for the last.  The unit-length field is reserved
+and back-patched once the section is complete.
+
+@l c
+@d Selfhost: dwarf info @{
+static void dwarf_build_info(void) {
+    dw_info_off = dw_pos();
+    unsigned long len_pos = dw_pos();
+    dw_u32(0);                                 /* unit_length (patched) */
+    dw_u16(4);                                 /* version */
+    dw_u32(0);                                 /* debug_abbrev_offset */
+    dw_u8(8);                                  /* address_size */
+    /* CU DIE (abbrev 1) */
+    dw_uleb(1);
+    dw_str(dw_producer);
+    dw_u16(DW_LANG_C99);
+    dw_str(kcc_src_path);
+    dw_str(dw_compdir);
+    dw_u64(0);                                 /* low_pc = text base */
+    unsigned long code_size = kcc_code_pos;
+    dw_u64(code_size);                         /* high_pc = code size */
+    dw_u32(0);                                 /* stmt_list offset */
+
+    void *funcs = kcc_ir_funcs;
+    if (funcs) {
+        unsigned long count = *(unsigned long *)((char *)funcs + VEC_COUNT);
+        for (unsigned long i = 0; i < count; i++) {
+            void *f = *(void **)kcc_vec_get(funcs, i);
+            if (!f) continue;
+            dw_uleb(2);                        /* abbrev subprogram */
+            dw_str((const char *)irf(f, IRF_NAME));
+            dw_u64(irf(f, IRF_LOWPC));         /* low_pc */
+            unsigned long hi;
+            if (i + 1 < count) {
+                void *nf = *(void **)kcc_vec_get(funcs, i + 1);
+                hi = irf(nf, IRF_LOWPC);
+            } else {
+                hi = code_size;
+            }
+            dw_u64(hi);                        /* high_pc */
+            dw_uleb(irf(f, IRF_LINE));         /* decl_line */
+        }
+    }
+    dw_u8(0);                                  /* null DIE ends CU children */
+    dw_patch32(len_pos, dw_pos() - (len_pos + 4));
+    dw_info_len = dw_pos() - dw_info_off;
+}
+@}
+
+\section{The Line-Number Program}
+
+A standard v4 line-program header (opcode table, empty include-directory list,
+one file entry) followed by, for each function, a \texttt{set\_address} to its
+entry, an \texttt{advance\_line} by the delta from the running line register, and
+a \texttt{copy} to emit a row.  A closing \texttt{set\_address} to the code size
+and an \texttt{end\_sequence} terminate the program.
+
+@l c
+@d Selfhost: dwarf line @{
+static void dwarf_build_line(void) {
+    dw_line_off = dw_pos();
+    unsigned long unit_len_pos = dw_pos();
+    dw_u32(0);                                 /* unit_length (patched) */
+    dw_u16(4);                                 /* version */
+    unsigned long hdr_len_pos = dw_pos();
+    dw_u32(0);                                 /* header_length (patched) */
+    dw_u8(4);                                  /* minimum_instruction_length */
+    dw_u8(1);                                  /* maximum_operations_per_instruction */
+    dw_u8(1);                                  /* default_is_stmt */
+    dw_u8((unsigned long)(-5));                /* line_base (signed) */
+    dw_u8(14);                                 /* line_range */
+    dw_u8(13);                                 /* opcode_base */
+    /* standard_opcode_lengths for opcodes 1..12 */
+    dw_u8(0); dw_u8(1); dw_u8(1); dw_u8(1); dw_u8(1); dw_u8(0);
+    dw_u8(0); dw_u8(0); dw_u8(1); dw_u8(0); dw_u8(0); dw_u8(1);
+    /* include_directories: empty → single terminating 0 */
+    dw_u8(0);
+    /* file_names: one entry for the source file */
+    dw_str(kcc_src_path);
+    dw_uleb(0);                                /* dir index */
+    dw_uleb(0);                                /* mtime */
+    dw_uleb(0);                                /* length */
+    dw_u8(0);                                  /* end of file table */
+    dw_patch32(hdr_len_pos, dw_pos() - (hdr_len_pos + 4));
+
+    /* line-number program */
+    long cur_line = 1;                         /* line register starts at 1 */
+    void *funcs = kcc_ir_funcs;
+    if (funcs) {
+        unsigned long count = *(unsigned long *)((char *)funcs + VEC_COUNT);
+        for (unsigned long i = 0; i < count; i++) {
+            void *f = *(void **)kcc_vec_get(funcs, i);
+            if (!f) continue;
+            /* DW_LNE_set_address low_pc */
+            dw_u8(0); dw_uleb(9); dw_u8(DW_LNE_set_address);
+            dw_u64(irf(f, IRF_LOWPC));
+            /* DW_LNS_advance_line by (target - current) */
+            dw_u8(DW_LNS_advance_line);
+            long target = (long)irf(f, IRF_LINE);
+            dw_sleb(target - cur_line);
+            cur_line = target;
+            /* DW_LNS_copy → emit a row */
+            dw_u8(DW_LNS_copy);
+        }
+    }
+    /* final set_address to code size, then end_sequence */
+    dw_u8(0); dw_uleb(9); dw_u8(DW_LNE_set_address);
+    dw_u64(kcc_code_pos);
+    dw_u8(0); dw_uleb(1); dw_u8(DW_LNE_end_sequence);
+    dw_patch32(unit_len_pos, dw_pos() - (unit_len_pos + 4));
+    dw_line_len = dw_pos() - dw_line_off;
+}
+@}
+
+\section{The Entry Point and Mach-O Emission}
+
+\texttt{kcc\_dwarf\_build} is a no-op unless \texttt{-g}; otherwise it allocates
+the scratch buffer and lays down the three sections.  The three Mach-O helpers
+give the writer a decoupled interface: the section-64 descriptors, the
+\texttt{\_\_DWARF} segment load command, the total blob length (so the writer can
+reserve the file span), and the blob copy itself.
+
+@l c
+@d Selfhost: dwarf build @{
+void kcc_dwarf_build(void) {
+    if (!kcc_dwarf_enabled) return;
+    dwarf_buf = kcc_arena_alloc(DWARF_BUF_CAP);
+    dwarf_pos = 0;
+    dwarf_build_abbrev();
+    dwarf_build_info();
+    dwarf_build_line();
+}
+
+/* Write one 80-byte section_64 in the __DWARF segment. */
+static void dwarf_sect64(const char *name, unsigned long addr,
+                         unsigned long size, unsigned long fileoff) {
+    kcc_macho_write_bytes(name, 16);           /* sectname */
+    kcc_macho_write_bytes(dw_segname, 16);     /* segname __DWARF */
+    kcc_macho_write64(addr);
+    kcc_macho_write64(size);
+    kcc_macho_write32(fileoff);
+    kcc_macho_write32(0);                       /* align */
+    kcc_macho_write32(0);                       /* reloff */
+    kcc_macho_write32(0);                       /* nreloc */
+    kcc_macho_write32(0);                       /* flags */
+    kcc_macho_write32(0);                       /* reserved1 */
+    kcc_macho_write32(0);                       /* reserved2 */
+    kcc_macho_write32(0);                       /* reserved3 */
+}
+
+void kcc_dwarf_emit_macho(unsigned long dwarf_file_base, unsigned long vmaddr) {
+    unsigned long a = dw_abbrev_len, in = dw_info_len, ln = dw_line_len;
+    unsigned long total = a + in + ln;
+    /* LC_SEGMENT_64 (__DWARF) */
+    kcc_macho_write32(LC_SEGMENT_64);
+    kcc_macho_write32(72 + 80 * 3);            /* cmdsize = 312 */
+    kcc_macho_write_bytes(dw_segname, 16);
+    kcc_macho_write64(vmaddr);                 /* vmaddr (past __TEXT) */
+    kcc_macho_write64(total);                  /* vmsize */
+    kcc_macho_write64(dwarf_file_base);        /* fileoff */
+    kcc_macho_write64(total);                  /* filesize */
+    kcc_macho_write32(0);                       /* maxprot (not mapped) */
+    kcc_macho_write32(0);                       /* initprot */
+    kcc_macho_write32(3);                       /* nsects */
+    kcc_macho_write32(0);                       /* flags */
+    dwarf_sect64(dw_sn_abbrev, vmaddr, a, dwarf_file_base);
+    dwarf_sect64(dw_sn_info, vmaddr + a, in, dwarf_file_base + a);
+    dwarf_sect64(dw_sn_line, vmaddr + a + in, ln, dwarf_file_base + a + in);
+}
+
+unsigned long kcc_dwarf_total_len(void) {
+    return dw_abbrev_len + dw_info_len + dw_line_len;
+}
+
+void kcc_dwarf_append_blob(void) {
+    kcc_macho_write_bytes(dwarf_buf, dw_abbrev_len + dw_info_len + dw_line_len);
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: dwarf @{
+@<Selfhost: dwarf preamble@>
+@<Selfhost: dwarf abbrev@>
+@<Selfhost: dwarf info@>
+@<Selfhost: dwarf line@>
+@<Selfhost: dwarf build@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-dwarf-verify}
+
+\texttt{make selfhost-dwarf} runs the code-generation suite with the C emitter
+linked in (proving no symbol or link regression), then compiles a small
+translation unit \emph{with} \texttt{-g} under both the assembly and the C
+emitter and byte-compares the two objects.  Byte-identical \texttt{\_\_DWARF}
+segments confirm the port reproduces the abbreviation table, the DIEs, and the
+line-number program exactly.
+
+@d Selfhost: dwarf verify @{
+#!/usr/bin/env bash
+# make selfhost-dwarf — compile kcc's DWARF emitter in C with kcc, relink,
+# run the codegen suite, and byte-compare a -g object against the asm build.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/4] compiling tmp/selfhost/dwarf.c with kcc"
+tmp/kcc -c "$SH/dwarf.c" -o "$SH/dwarf_c.o" >/dev/null
+
+echo "[2/4] linking tmp/kcc_selfhost_dwarf (dwarf.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "dwarf" ]; then OBJ="$OBJ $SH/dwarf_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_dwarf $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/4] byte-comparing a -g object: asm emitter vs C emitter"
+printf 'int add(int a,int b){return a+b;}\nint main(void){return add(2,3);}\n' > "$SH/dwarf_probe.c"
+tmp/kcc -c -g "$SH/dwarf_probe.c" -o "$SH/dwarf_probe_asm.o" >/dev/null
+cp tmp/kcc "$SH/kcc_asm_backup_dwarf"
+cp tmp/kcc_selfhost_dwarf tmp/kcc
+tmp/kcc -c -g "$SH/dwarf_probe.c" -o "$SH/dwarf_probe_c.o" >/dev/null
+cp "$SH/kcc_asm_backup_dwarf" tmp/kcc
+if ! cmp "$SH/dwarf_probe_asm.o" "$SH/dwarf_probe_c.o"; then
+    echo "FAIL: -g object differs between asm and C DWARF emitter"; exit 1
+fi
+echo "  -g objects byte-identical"
+
+echo "[4/4] running the codegen suite with the self-hosted DWARF emitter"
+cp tmp/kcc_selfhost_dwarf tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_dwarf" tmp/kcc
+exit $status
+@}

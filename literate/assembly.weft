@@ -961,6 +961,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: declarations verify@>
 @}
 
+\noindent The DWARF debug-info emitter, ported to C
+(Chapter~\ref{ch:self-hosting-dwarf}), a drop-in replacement:
+
+@o tmp/selfhost/dwarf.c @{
+@<Selfhost: dwarf@>
+@}
+
+@o tmp/selfhost/dwarf_verify.sh @{
+@<Selfhost: dwarf verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

@@ -27,7 +27,7 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 .PHONY: all default tangle assemble build test selfhost selfhost-lexer \
         selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
         selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
-        selfhost-declarations meta-a \
+        selfhost-declarations selfhost-dwarf meta-a \
         difftest interop e2e diagtest warntest test-codegen doc weave clean \
         run map
 
@@ -164,6 +164,12 @@ selfhost-driver: build
 selfhost-declarations: build
 	chmod +x tmp/selfhost/declarations_verify.sh
 	tmp/selfhost/declarations_verify.sh
+
+# Self-hosting (Stage 8v): compile kcc's DWARF emitter in C, relink,
+# run codegen + a -g byte-compare against the asm build
+selfhost-dwarf: build
+	chmod +x tmp/selfhost/dwarf_verify.sh
+	tmp/selfhost/dwarf_verify.sh
 
 # Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link against the Linux runtime (no libc), run it natively (Chapter: Runtime).

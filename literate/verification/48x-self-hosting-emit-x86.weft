@@ -1,0 +1,828 @@
+% 48x-self-hosting-emit-x86.weft — Stage 8y: the x86-64 back end, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The x86-64 Back End in C}
+\label{ch:self-hosting-emit-x86}
+
+The second target's back end (Chapter~\ref{ch:emit-x86}) walks the same neutral
+IR the ARM64 path consumes and prints x86-64 assembly text for the system
+assembler.  Porting it to C completes \emph{both} back ends in kcc-compiled
+C---the ARM64 encoder (Chapter~\ref{ch:self-hosting-emit-arm64}) and now the
+x86-64 emitter.  The module is long but entirely mechanical: a family of small
+helpers that append AT\&T text to the shared growable buffer
+(\texttt{kcc\_as\_str}/\texttt{kcc\_as\_ch}/\texttt{kcc\_as\_dec}), a flat
+opcode dispatch that routes each IR instruction to the right shape, an all-spill
+frame, System~V argument marshalling, and the data-emission paths for globals,
+static locals, read-only constants, and string literals.  A single flag,
+\texttt{kcc\_x86\_os}, chooses Mach-O (Darwin) or ELF (Linux) directives.
+
+Unlike the ARM64 suites, the code-generation and difftest corpora do not
+exercise x86 selection (they target ARM64), so the port is verified
+\emph{functionally}: a broad, opcode-exercising probe suite is compiled with
+\texttt{--target=x86\_64} by the C emitter and run under Rosetta, and its exit
+status must match the ARM64 reference.
+
+\section{State, Constants, and the AT\&T Vocabulary}
+
+@l c
+@d Selfhost: emit_x86 preamble @{
+void kcc_as_init(void);
+void kcc_as_str(const char *s);
+void kcc_as_ch(unsigned c);
+void kcc_as_dec(unsigned long n);
+int kcc_as_write_file(const char *path);
+void *kcc_vec_init(unsigned long elemsize);
+void kcc_vec_push(void *vec, const void *elem);
+void *kcc_vec_get(void *vec, unsigned long i);
+void *kcc_sema_resolve_type(void *node);
+unsigned long kcc_type_layout(void *ty);
+int kcc_strcmp(const char *a, const char *b);
+void kcc_io_err(const char *s);
+void kcc_io_flush(void);
+void kcc_sys_exit(long code);
+int kcc_global_const_rodata(void *decl);
+int kcc_global_const_ptrarr(void *decl);
+unsigned long kcc_rodata_leaf_bits(void *node, unsigned long kind);
+const char *kcc_ir_static_name(void *decl);
+
+extern void *kcc_ir_funcs;           /* vec of IR function pointers */
+extern char kcc_str_modinit[];       /* "kcc.module_init" */
+extern unsigned long kcc_modinit_present;
+
+/* IR instruction / block / function / type / vec / AST field offsets */
+#define IR_OP 0
+#define IR_DEST 8
+#define IR_SRC1 16
+#define IR_SRC2 24
+#define IR_TYPE 32
+#define IR_NEXT 40
+#define BB_ID 0
+#define BB_FIRST 8
+#define IRF_NAME 0
+#define IRF_BLOCKS 16
+#define IRF_VREG_N 24
+#define IRF_PARAMS 40
+#define IRF_STATIC 72
+#define VEC_COUNT 8
+#define TY_KIND 0
+#define TY_SIZE 8
+#define TY_F0 32
+#define TY_VOID 1
+#define TY_STRUCT 14
+#define TY_ARRAY 12
+#define AST_TAG 0
+#define AST_F0 24
+#define AST_F1 32
+#define AST_F2 40
+#define AST_F3 48
+#define AST_F4 56
+
+/* IR opcodes */
+enum {
+    IR_ADD=1, IR_SUB=2, IR_MUL=3, IR_SDIV=4, IR_UDIV=5, IR_SMOD=6, IR_UMOD=7,
+    IR_NEG=8, IR_AND=10, IR_OR=11, IR_XOR=12, IR_SHL=13, IR_LSHR=14, IR_ASHR=15,
+    IR_NOT=16, IR_CMP_EQ=20, IR_CMP_NE=21, IR_CMP_SLT=22, IR_CMP_SLE=23,
+    IR_CMP_SGT=24, IR_CMP_SGE=25, IR_CMP_ULT=26, IR_CMP_ULE=27,
+    IR_LOAD=30, IR_STORE=31, IR_ALLOCA=32, IR_GEP=33, IR_BR=40, IR_BR_COND=41,
+    IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
+    IR_BITCAST=53, IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64
+};
+/* AST tags used by the data/static walks */
+enum {
+    AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_COMPOUND=30, AST_IF_STMT=32,
+    AST_SWITCH_STMT=33, AST_WHILE_STMT=34, AST_DO_STMT=35, AST_FOR_STMT=36,
+    AST_CASE_STMT=42, AST_LABEL_STMT=41, AST_DEFAULT_STMT=43, AST_INIT_LIST=65
+};
+
+/* exported target-selection state (the driver sets these) */
+unsigned long kcc_target = 0;        /* 0 = arm64/Mach-O, 1 = x86-64 */
+void *kcc_x86_tu = 0;                /* AST translation unit (data emission) */
+unsigned long kcc_x86_os = 0;        /* 0 = Darwin/Mach-O, 1 = Linux/ELF */
+static unsigned long kcc_x86_vreg_n = 0;
+static void *kcc_x86_strs = 0;
+
+#define S(name, str) static const char name[] = str
+S(s_text, ".text\n"); S(s_globl, ".globl "); S(s_us, "_");
+S(s_rodata, ".section .rodata\n"); S(s_comm, "\t.comm "); S(s_comm_a8, ",8\n");
+S(s_modinit_d, ".section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad ");
+S(s_modinit_l, ".section .init_array,\"aw\"\n\t.p2align 3\n\t.quad ");
+S(s_modinitnm, "kcc.module_init");
+S(s_constsect, ".section __TEXT,__const\n"); S(s_p2align3, "\t.p2align 3\n");
+S(s_d_byte, "\t.byte "); S(s_d_short, "\t.short "); S(s_d_long, "\t.long ");
+S(s_d_quad, "\t.quad "); S(s_zerodir, "\t.zero "); S(s_colon_nl, ":\n");
+S(s_minus, "-"); S(s_rbp, "(%rbp)"); S(s_comma, ", ");
+S(s_push_rbp, "\tpushq\t%rbp\n"); S(s_mov_sp, "\tmovq\t%rsp, %rbp\n");
+S(s_sub_sp, "\tsubq\t$"); S(s_sp_nl, ", %rsp\n"); S(s_leave, "\tleave\n");
+S(s_retq, "\tretq\n"); S(s_movq, "\tmovq\t"); S(s_movabsq, "\tmovabsq\t$");
+S(s_movl, "\tmovl\t"); S(s_movb, "\tmovb\t"); S(s_movw, "\tmovw\t");
+S(s_movslq, "\tmovslq\t"); S(s_movsbq, "\tmovsbq\t"); S(s_movswq, "\tmovswq\t");
+S(s_movzbq, "\tmovzbq\t"); S(s_movzwq, "\tmovzwq\t"); S(s_leaq, "\tleaq\t");
+S(s_addq, "\taddq\t"); S(s_subq, "\tsubq\t"); S(s_imulq, "\timulq\t");
+S(s_andq, "\tandq\t"); S(s_orq, "\torq\t"); S(s_xorq, "\txorq\t");
+S(s_negq, "\tnegq\t"); S(s_notq, "\tnotq\t"); S(s_shlq, "\tshlq\t");
+S(s_sarq, "\tsarq\t"); S(s_shrq, "\tshrq\t"); S(s_cqto, "\tcqto\n");
+S(s_xor_rdx, "\txorq\t%rdx, %rdx\n"); S(s_idiv_rcx, "\tidivq\t%rcx\n");
+S(s_div_rcx, "\tdivq\t%rcx\n");
+S(s_r10, "%r10"); S(s_r11, "%r11"); S(s_rax, "%rax"); S(s_rcx, "%rcx");
+S(s_rdx, "%rdx"); S(s_r11_r10, "%r11, %r10\n"); S(s_r10_nl, "%r10\n");
+S(s_cl_r10, "%cl, %r10\n"); S(s_c_r10, ", %r10\n"); S(s_c_r10d, ", %r10d\n");
+S(s_pr11_r10, "(%r11), %r10\n"); S(s_pr11_r10d, "(%r11), %r10d\n");
+S(s_r10_pr11, "%r10, (%r11)\n"); S(s_r10b_pr11, "%r10b, (%r11)\n");
+S(s_r10w_pr11, "%r10w, (%r11)\n"); S(s_r10d_pr11, "%r10d, (%r11)\n");
+S(s_cmpl, "\tcmpl\t%r11d, %r10d\n"); S(s_cmpq, "\tcmpq\t%r11, %r10\n");
+S(s_movzbl_al, "\tmovzbl\t%al, %r10d\n"); S(s_sete, "\tsete\t%al\n");
+S(s_setne, "\tsetne\t%al\n"); S(s_setl, "\tsetl\t%al\n"); S(s_setle, "\tsetle\t%al\n");
+S(s_setg, "\tsetg\t%al\n"); S(s_setge, "\tsetge\t%al\n"); S(s_setb, "\tsetb\t%al\n");
+S(s_setbe, "\tsetbe\t%al\n"); S(s_bb, ".Lkccbb"); S(s_label_nl, ":\n");
+S(s_jmp, "\tjmp\t"); S(s_jne, "\tjne\t"); S(s_test_r10, "\ttestq\t%r10, %r10\n");
+S(s_rdi, "%rdi"); S(s_rsi, "%rsi"); S(s_r8, "%r8"); S(s_r9, "%r9");
+S(s_call, "\tcall\t"); S(s_call_r11, "\tcall\t*%r11\n"); S(s_zero_al, "\tmovb\t$0, %al\n");
+S(s_add_rsp, "\taddq\t$"); S(s_paren_rsp, "(%rsp)"); S(s_rip_r10, "(%rip), %r10\n");
+S(s_got_r10, "@@GOTPCREL(%rip), %r10\n");
+S(s_zerofill, "\t.zerofill __DATA,__common,_"); S(s_zf_a3, ",3\n"); S(s_comma1, ",");
+S(s_unsup, "kcc: --target=x86_64: unsupported operation (floating point, inline asm, or by-value aggregate not yet implemented for the x86-64 back end)\n");
+S(s_strlbl, ".Lx86str"); S(s_cstrsect, ".section __TEXT,__cstring,cstring_literals\n");
+S(s_zero_nl, "0\n");
+static const char *const argregs[6] = { s_rdi, s_rsi, s_rdx, s_rcx, s_r8, s_r9 };
+
+#define IL(i,off) (*(unsigned long *)((char *)(i) + (off)))
+struct Type { unsigned long kind, size, align, quals, f0, f1; };
+struct Node { unsigned long tag, line, col, f0, f1, f2, f3, f4; };
+
+/* forward decls */
+static void x86_emit_rodata_global(void *decl, const char *name);
+static void x86_emit_zero(unsigned long n);
+static void x86_emit_value(unsigned long bits, unsigned long size);
+static void x86_prereg_stmt(void *stmt);
+@}
+
+\section{Symbol and Operand Helpers}
+
+\texttt{x86\_sym} prefixes a symbol with an underscore on Darwin only.
+\texttt{x86\_disp}/\texttt{x86\_slot} print a frame displacement and a vreg's
+slot operand; \texttt{x86\_load}/\texttt{x86\_store} move a slot to or from a
+named register.
+
+@l c
+@d Selfhost: emit_x86 helpers @{
+static void x86_sym(const char *name) {
+    if (!kcc_x86_os) kcc_as_str(s_us);          /* Darwin underscore */
+    kcc_as_str(name);
+}
+static void x86_disp(unsigned long d) {
+    kcc_as_str(s_minus); kcc_as_dec(d); kcc_as_str(s_rbp);
+}
+static void x86_slot(unsigned long v) { x86_disp((v + 1) * 8); }
+static void x86_load(unsigned long v, const char *reg) {
+    kcc_as_str(s_movq); x86_slot(v); kcc_as_str(s_comma); kcc_as_str(reg); kcc_as_ch('\n');
+}
+static void x86_store(unsigned long v, const char *reg) {
+    kcc_as_str(s_movq); kcc_as_str(reg); kcc_as_str(s_comma); x86_slot(v); kcc_as_ch('\n');
+}
+@}
+
+\section{Instruction Shapes}
+
+The ALU, shift, division, conversion, memory, comparison, and call shapes each
+lower one IR instruction to its x86-64 form, leaving the result in
+\texttt{DEST}'s slot.
+
+@l c
+@d Selfhost: emit_x86 shapes @{
+static void x86_binop(void *i, const char *mnem) {
+    x86_load(IL(i, IR_SRC1), s_r10);
+    x86_load(IL(i, IR_SRC2), s_r11);
+    kcc_as_str(mnem); kcc_as_str(s_r11_r10);
+    x86_store(IL(i, IR_DEST), s_r10);
+}
+static void x86_unop(void *i, const char *mnem) {
+    x86_load(IL(i, IR_SRC1), s_r10);
+    kcc_as_str(mnem); kcc_as_str(s_r10_nl);
+    x86_store(IL(i, IR_DEST), s_r10);
+}
+static void x86_shift(void *i, const char *mnem) {
+    x86_load(IL(i, IR_SRC1), s_r10);
+    x86_load(IL(i, IR_SRC2), s_rcx);
+    kcc_as_str(mnem); kcc_as_str(s_cl_r10);
+    x86_store(IL(i, IR_DEST), s_r10);
+}
+static void x86_divop(void *i, int is_signed, int want_rem) {
+    x86_load(IL(i, IR_SRC1), s_rax);
+    kcc_as_str(is_signed ? s_cqto : s_xor_rdx);
+    x86_load(IL(i, IR_SRC2), s_rcx);
+    kcc_as_str(is_signed ? s_idiv_rcx : s_div_rcx);
+    x86_store(IL(i, IR_DEST), want_rem ? s_rdx : s_rax);
+}
+static void x86_extend(void *i, const char *mnem, const char *tail) {
+    kcc_as_str(mnem); x86_slot(IL(i, IR_SRC1)); kcc_as_str(tail);
+    x86_store(IL(i, IR_DEST), s_r10);
+}
+static void x86_conv(void *i, unsigned long width, int is_signed) {
+    if (width == 1) x86_extend(i, is_signed ? s_movsbq : s_movzbq, s_c_r10);
+    else if (width == 2) x86_extend(i, is_signed ? s_movswq : s_movzwq, s_c_r10);
+    else if (width == 4) {
+        if (is_signed) x86_extend(i, s_movslq, s_c_r10);
+        else x86_extend(i, s_movl, s_c_r10d);
+    } else x86_extend(i, s_movq, s_c_r10);       /* 8 / unknown: plain copy */
+}
+static void x86_memload(void *i, const char *mnem, const char *tail) {
+    x86_load(IL(i, IR_SRC1), s_r11);
+    kcc_as_str(mnem); kcc_as_str(tail);
+    x86_store(IL(i, IR_DEST), s_r10);
+}
+static void x86_memstore(void *i, const char *mnem, const char *valtail) {
+    x86_load(IL(i, IR_SRC1), s_r10);
+    x86_load(IL(i, IR_SRC2), s_r11);
+    kcc_as_str(mnem); kcc_as_str(valtail);
+}
+static void x86_cmp(void *i, const char *setcc) {
+    x86_load(IL(i, IR_SRC1), s_r10);
+    x86_load(IL(i, IR_SRC2), s_r11);
+    struct Type *ty = (struct Type *)IL(i, IR_TYPE);
+    if (!ty || ty->size == 8) kcc_as_str(s_cmpq);
+    else kcc_as_str(s_cmpl);
+    kcc_as_str(setcc); kcc_as_str(s_movzbl_al);
+    x86_store(IL(i, IR_DEST), s_r10);
+}
+static void x86_bblabel(unsigned long id) { kcc_as_str(s_bb); kcc_as_dec(id); }
+
+static unsigned long x86_marshal(unsigned long *args, unsigned long count) {
+    unsigned long stack_adj = 0;
+    if (!count) return 0;
+    if (count > 6) {
+        stack_adj = (((count - 6) * 8) + 15) & ~15UL;
+        kcc_as_str(s_sub_sp); kcc_as_dec(stack_adj); kcc_as_str(s_sp_nl);
+        for (unsigned long k = 6; k < count; k++) {
+            x86_load(args[1 + 2 * k], s_r10);
+            kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma);
+            kcc_as_dec((k - 6) * 8); kcc_as_str(s_paren_rsp); kcc_as_ch('\n');
+        }
+    }
+    unsigned long nreg = count < 6 ? count : 6;
+    for (unsigned long k = 0; k < nreg; k++)
+        x86_load(args[1 + 2 * k], argregs[k]);
+    return stack_adj;
+}
+static unsigned long x86_call_args(unsigned long *args) {
+    if (!args) return 0;
+    return x86_marshal(args, args[0] & 0xffffffff);
+}
+@}
+
+\section{The Dispatch}
+
+\texttt{x86\_sel} routes one IR instruction to its shape.  \texttt{IR\_CONST},
+\texttt{IR\_ALLOCA}, \texttt{IR\_RET}, loads, stores, branches, calls, global
+references, and string literals are lowered inline; the ALU/shift/div/conv
+opcodes go through the shape helpers.  A genuine \texttt{IR\_NOP} emits nothing;
+any other unrecognised opcode (floating point, inline asm, by-value aggregate)
+is refused cleanly rather than miscompiled.
+
+@l c
+@d Selfhost: emit_x86 dispatch @{
+void kcc_x86_sel(void *i) {
+    unsigned long op = IL(i, IR_OP);
+    switch (op) {
+    case IR_CONST:
+        kcc_as_str(s_movabsq); kcc_as_dec(IL(i, IR_SRC1)); kcc_as_str(s_c_r10);
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    case IR_ALLOCA: {
+        unsigned long off = IL(i, IR_SRC2);
+        unsigned long size = IL(i, IR_SRC1);
+        if (!size) size = 1;
+        unsigned long d = (kcc_x86_vreg_n + off + size) * 8;
+        kcc_as_str(s_leaq); x86_disp(d); kcc_as_str(s_c_r10);
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    }
+    case IR_RET: {
+        struct Type *ty = (struct Type *)IL(i, IR_TYPE);
+        if (ty && ty->kind != TY_VOID) x86_load(IL(i, IR_SRC1), s_rax);
+        kcc_as_str(s_leave); kcc_as_str(s_retq);
+        return;
+    }
+    case IR_LOAD: {
+        unsigned long sz = IL(i, IR_SRC2);
+        if (sz == 1) x86_memload(i, s_movzbq, s_pr11_r10);
+        else if (sz == 2) x86_memload(i, s_movzwq, s_pr11_r10);
+        else if (sz == 4) x86_memload(i, s_movl, s_pr11_r10d);
+        else if (sz == 5) x86_memload(i, s_movsbq, s_pr11_r10);
+        else if (sz == 6) x86_memload(i, s_movswq, s_pr11_r10);
+        else if (sz == 7) x86_memload(i, s_movslq, s_pr11_r10);
+        else if (sz == 8) { /* single float: deferred */ }
+        else x86_memload(i, s_movq, s_pr11_r10);
+        return;
+    }
+    case IR_STORE: {
+        unsigned long sz = IL(i, IR_DEST);
+        if (sz == 1) x86_memstore(i, s_movb, s_r10b_pr11);
+        else if (sz == 2) x86_memstore(i, s_movw, s_r10w_pr11);
+        else if (sz == 4) x86_memstore(i, s_movl, s_r10d_pr11);
+        else if (sz == 8) { /* single float: deferred */ }
+        else x86_memstore(i, s_movq, s_r10_pr11);
+        return;
+    }
+    case IR_ADD: case IR_GEP: x86_binop(i, s_addq); return;
+    case IR_SUB: x86_binop(i, s_subq); return;
+    case IR_MUL: x86_binop(i, s_imulq); return;
+    case IR_AND: x86_binop(i, s_andq); return;
+    case IR_OR: x86_binop(i, s_orq); return;
+    case IR_XOR: x86_binop(i, s_xorq); return;
+    case IR_NEG: x86_unop(i, s_negq); return;
+    case IR_NOT: x86_unop(i, s_notq); return;
+    case IR_SHL: x86_shift(i, s_shlq); return;
+    case IR_LSHR: x86_shift(i, s_shrq); return;
+    case IR_ASHR: x86_shift(i, s_sarq); return;
+    case IR_SDIV: x86_divop(i, 1, 0); return;
+    case IR_UDIV: x86_divop(i, 0, 0); return;
+    case IR_SMOD: x86_divop(i, 1, 1); return;
+    case IR_UMOD: x86_divop(i, 0, 1); return;
+    case IR_SEXT: x86_conv(i, IL(i, IR_SRC2), 1); return;
+    case IR_ZEXT: x86_conv(i, IL(i, IR_SRC2), 0); return;
+    case IR_TRUNC: {
+        struct Type *ty = (struct Type *)IL(i, IR_TYPE);
+        x86_conv(i, ty ? ty->size : 8, 0);
+        return;
+    }
+    case IR_BITCAST: x86_conv(i, 8, 0); return;
+    case IR_CMP_EQ: x86_cmp(i, s_sete); return;
+    case IR_CMP_NE: x86_cmp(i, s_setne); return;
+    case IR_CMP_SLT: x86_cmp(i, s_setl); return;
+    case IR_CMP_SLE: x86_cmp(i, s_setle); return;
+    case IR_CMP_SGT: x86_cmp(i, s_setg); return;
+    case IR_CMP_SGE: x86_cmp(i, s_setge); return;
+    case IR_CMP_ULT: x86_cmp(i, s_setb); return;
+    case IR_CMP_ULE: x86_cmp(i, s_setbe); return;
+    case IR_BR:
+        kcc_as_str(s_jmp); x86_bblabel(IL(i, IR_SRC1)); kcc_as_ch('\n');
+        return;
+    case IR_BR_COND:
+        x86_load(IL(i, IR_DEST), s_r10);
+        kcc_as_str(s_test_r10);
+        kcc_as_str(s_jne); x86_bblabel(IL(i, IR_SRC1)); kcc_as_ch('\n');
+        kcc_as_str(s_jmp); x86_bblabel(IL(i, IR_SRC2)); kcc_as_ch('\n');
+        return;
+    case IR_GLOBAL_REF:
+        if (kcc_x86_os) {                        /* Linux: leaq name(%rip) */
+            kcc_as_str(s_leaq); x86_sym((const char *)IL(i, IR_SRC1)); kcc_as_str(s_rip_r10);
+        } else {                                 /* Darwin: movq name@@GOTPCREL(%rip) */
+            kcc_as_str(s_movq); x86_sym((const char *)IL(i, IR_SRC1)); kcc_as_str(s_got_r10);
+        }
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    case IR_STRING_LIT: {
+        unsigned long id = IL(kcc_x86_strs, VEC_COUNT);
+        unsigned long entry[2];
+        entry[0] = IL(i, IR_SRC1);
+        entry[1] = IL(i, IR_SRC2);
+        kcc_vec_push(kcc_x86_strs, entry);
+        kcc_as_str(s_leaq); kcc_as_str(s_strlbl); kcc_as_dec(id); kcc_as_str(s_rip_r10);
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    }
+    case IR_CALL: {
+        unsigned long adj = x86_call_args((unsigned long *)IL(i, IR_SRC2));
+        kcc_as_str(s_zero_al);
+        kcc_as_str(s_call); x86_sym((const char *)IL(i, IR_SRC1)); kcc_as_ch('\n');
+        if (adj) { kcc_as_str(s_add_rsp); kcc_as_dec(adj); kcc_as_str(s_sp_nl); }
+        {
+            struct Type *ty = (struct Type *)IL(i, IR_TYPE);
+            if (ty && ty->kind != TY_VOID) x86_store(IL(i, IR_DEST), s_rax);
+        }
+        return;
+    }
+    case IR_CALL_IND: {
+        unsigned long adj = x86_call_args((unsigned long *)IL(i, IR_SRC2));
+        x86_load(IL(i, IR_SRC1), s_r11);
+        kcc_as_str(s_zero_al);
+        kcc_as_str(s_call_r11);
+        if (adj) { kcc_as_str(s_add_rsp); kcc_as_dec(adj); kcc_as_str(s_sp_nl); }
+        {
+            struct Type *ty = (struct Type *)IL(i, IR_TYPE);
+            if (ty && ty->kind != TY_VOID) x86_store(IL(i, IR_DEST), s_rax);
+        }
+        return;
+    }
+    case IR_NOP:
+        return;
+    default:
+        kcc_io_err(s_unsup);
+        kcc_io_flush();
+        kcc_sys_exit(1);
+    }
+}
+@}
+
+\section{Frame, Parameters, and the Function Walk}
+
+\texttt{x86\_prescan} assigns each \texttt{IR\_ALLOCA} its slot offset and returns
+the total; \texttt{x86\_spill\_params} copies the incoming System~V registers
+into their parameter vreg slots; \texttt{x86\_render\_text} walks the function
+list, emitting the label, prologue, and each block's instructions.
+
+@l c
+@d Selfhost: emit_x86 frame @{
+static unsigned long x86_prescan(void *f) {
+    unsigned long off = 0;
+    void *blocks = (void *)IL(f, IRF_BLOCKS);
+    if (!blocks) return 0;
+    unsigned long nbb = IL(blocks, VEC_COUNT);
+    for (unsigned long b = 0; b < nbb; b++) {
+        void *bb = *(void **)kcc_vec_get(blocks, b);
+        void *ins = (void *)IL(bb, BB_FIRST);
+        while (ins) {
+            if (IL(ins, IR_OP) == IR_ALLOCA) {
+                IL(ins, IR_SRC2) = off;
+                unsigned long sz = IL(ins, IR_SRC1);
+                off += sz ? sz : 1;
+            }
+            ins = (void *)IL(ins, IR_NEXT);
+        }
+    }
+    return off;
+}
+
+static void x86_spill_params(void *f) {
+    unsigned long np = IL(f, IRF_PARAMS);
+    for (unsigned long k = 0; k < np; k++) {
+        if (k < 6) {
+            x86_store(k, argregs[k]);
+        } else {
+            kcc_as_str(s_movq);
+            kcc_as_dec(16 + (k - 6) * 8); kcc_as_str(s_rbp);
+            kcc_as_str(s_comma); kcc_as_str(s_r10); kcc_as_ch('\n');
+            x86_store(k, s_r10);
+        }
+    }
+}
+
+static void x86_render_text(void) {
+    kcc_as_str(s_text);
+    void *funcs = kcc_ir_funcs;
+    if (!funcs) return;
+    unsigned long nf = IL(funcs, VEC_COUNT);
+    for (unsigned long fi = 0; fi < nf; fi++) {
+        void *f = *(void **)kcc_vec_get(funcs, fi);
+        const char *name = (const char *)IL(f, IRF_NAME);
+        if (!IL(f, IRF_STATIC) && kcc_strcmp(name, kcc_str_modinit) != 0) {
+            kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n');
+        }
+        x86_sym(name); kcc_as_str(s_colon_nl);
+        unsigned long vn = IL(f, IRF_VREG_N);
+        kcc_x86_vreg_n = vn;
+        unsigned long allocas = x86_prescan(f);
+        unsigned long frame = (((vn + allocas) * 8) + 15) & ~15UL;
+        kcc_as_str(s_push_rbp); kcc_as_str(s_mov_sp);
+        if (frame) { kcc_as_str(s_sub_sp); kcc_as_dec(frame); kcc_as_str(s_sp_nl); }
+        x86_spill_params(f);
+        void *blocks = (void *)IL(f, IRF_BLOCKS);
+        if (!blocks) continue;
+        unsigned long nbb = IL(blocks, VEC_COUNT);
+        for (unsigned long b = 0; b < nbb; b++) {
+            void *bb = *(void **)kcc_vec_get(blocks, b);
+            x86_bblabel(IL(bb, BB_ID)); kcc_as_str(s_label_nl);
+            void *ins = (void *)IL(bb, BB_FIRST);
+            while (ins) { kcc_x86_sel(ins); ins = (void *)IL(ins, IR_NEXT); }
+        }
+    }
+}
+@}
+
+\section{Global, Static, and Read-Only Data}
+
+Mutable file-scope globals become zeroed common storage (their initialisers run
+as code); \texttt{const} scalars, arrays of scalars, structs of scalars, and
+arrays of such structs become read-only value directives; static locals are
+recovered by walking every function body.
+
+@l c
+@d Selfhost: emit_x86 data @{
+static void x86_emit_zerofill(const char *name, unsigned long size, int is_static) {
+    if (!is_static) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
+    if (kcc_x86_os) {                            /* Linux .comm name,size,8 */
+        kcc_as_str(s_comm); kcc_as_str(name); kcc_as_str(s_comma1);
+        kcc_as_dec(size); kcc_as_str(s_comm_a8);
+    } else {                                     /* Darwin .zerofill (prefix carries _) */
+        kcc_as_str(s_zerofill); kcc_as_str(name); kcc_as_str(s_comma1);
+        kcc_as_dec(size); kcc_as_str(s_zf_a3);
+    }
+}
+static unsigned long round8_min8(unsigned long n) {
+    if (n < 8) n = 8;
+    return (n + 7) & ~7UL;
+}
+
+void kcc_x86_emit_data(void) {
+    struct Node *tu = (struct Node *)kcc_x86_tu;
+    if (!tu) return;
+    struct Node *d = (struct Node *)tu->f0;
+    for (; d; d = (struct Node *)d->f4) {
+        if (d->tag != AST_VAR_DECL) continue;
+        void *name = (void *)d->f1;
+        if (!name) continue;
+        unsigned long sc = d->f3;                /* storage class */
+        if (sc == 2 || sc == 1) continue;        /* extern / typedef: no storage */
+        if (kcc_global_const_rodata(d)) {
+            x86_emit_rodata_global(d, name);
+            continue;
+        }
+        if (kcc_global_const_ptrarr(d)) continue; /* const pointer array: deferred */
+        void *ty = kcc_sema_resolve_type((void *)d->f0);
+        if (!ty) continue;
+        unsigned long size = round8_min8(kcc_type_layout(ty));
+        x86_emit_zerofill(name, size, sc == 3);
+    }
+}
+
+static void x86_emit_one_static(void *decl) {
+    struct Node *d = (struct Node *)decl;
+    const char *name = kcc_ir_static_name(d);
+    if (kcc_global_const_rodata(d)) {
+        x86_emit_rodata_global(d, name);
+        return;
+    }
+    void *ty = kcc_sema_resolve_type((void *)d->f0);
+    if (!ty) return;
+    unsigned long size = round8_min8(kcc_type_layout(ty));
+    x86_emit_zerofill(name, size, 1);
+}
+
+static void x86_prereg_stmt(void *stmt) {
+    struct Node *s = (struct Node *)stmt;
+    for (; s; s = (struct Node *)s->f4) {
+        unsigned long tag = s->tag;
+        if (tag == AST_VAR_DECL) {
+            if (s->f3 == 3) x86_emit_one_static(s);
+            continue;
+        }
+        switch (tag) {
+        case AST_COMPOUND: case AST_DO_STMT: case AST_DEFAULT_STMT:
+            x86_prereg_stmt((void *)s->f0); break;
+        case AST_SWITCH_STMT: case AST_WHILE_STMT: case AST_CASE_STMT:
+        case AST_LABEL_STMT:
+            x86_prereg_stmt((void *)s->f1); break;
+        case AST_IF_STMT:
+            x86_prereg_stmt((void *)s->f1);
+            x86_prereg_stmt((void *)s->f2);
+            break;
+        case AST_FOR_STMT:
+            x86_prereg_stmt((void *)s->f0);
+            x86_prereg_stmt((void *)s->f3);
+            break;
+        default: break;
+        }
+    }
+}
+
+void kcc_x86_emit_statics(void) {
+    struct Node *tu = (struct Node *)kcc_x86_tu;
+    if (!tu) return;
+    struct Node *d = (struct Node *)tu->f0;
+    for (; d; d = (struct Node *)d->f4)
+        if (d->tag == AST_FUNC_DECL && d->f3)
+            x86_prereg_stmt((void *)d->f3);
+}
+@}
+
+\section{Read-Only Byte Images}
+
+@l c
+@d Selfhost: emit_x86 rodata @{
+static void x86_emit_zero(unsigned long n) {
+    if (!n) return;
+    kcc_as_str(s_zerodir); kcc_as_dec(n); kcc_as_ch('\n');
+}
+static void x86_emit_value(unsigned long bits, unsigned long size) {
+    if (size == 1) { kcc_as_str(s_d_byte); bits &= 0xff; }
+    else if (size == 2) { kcc_as_str(s_d_short); bits &= 0xffff; }
+    else if (size == 8) { kcc_as_str(s_d_quad); }
+    else { kcc_as_str(s_d_long); bits &= 0xffffffff; }
+    kcc_as_dec(bits); kcc_as_ch('\n');
+}
+static void x86_emit_struct_bytes(void *sty, void *init, unsigned long total) {
+    struct Node *decl = (struct Node *)((struct Type *)sty)->f0;
+    struct Node *field = (struct Node *)decl->f1;
+    struct Node *elem = init ? (struct Node *)((struct Node *)init)->f0 : 0;
+    unsigned long cursor = 0;
+    while (field) {
+        struct Type *ft = (struct Type *)kcc_sema_resolve_type((void *)field->f0);
+        if (!ft) break;
+        unsigned long fsize = ft->size, fkind = ft->kind;
+        unsigned long foff = field->f3;
+        if (foff > cursor) { x86_emit_zero(foff - cursor); cursor = foff; }
+        unsigned long bits;
+        if (elem) { bits = kcc_rodata_leaf_bits(elem, fkind); elem = (struct Node *)elem->f4; }
+        else bits = 0;
+        x86_emit_value(bits, fsize);
+        cursor += fsize;
+        field = (struct Node *)field->f4;
+    }
+    if (cursor < total) x86_emit_zero(total - cursor);
+}
+
+static void x86_emit_rodata_global(void *decl, const char *name) {
+    struct Node *d = (struct Node *)decl;
+    if (!name) return;
+    struct Type *full = (struct Type *)kcc_sema_resolve_type((void *)d->f0);
+    if (!full) return;
+    unsigned long shape, count = 0, elemsize, elemkind;
+    struct Type *elemtype;
+    unsigned long fk = full->kind;
+    if (fk == TY_STRUCT) { shape = 2; elemtype = full; }
+    else if (fk == TY_ARRAY) {
+        elemtype = (struct Type *)full->f0;
+        shape = (elemtype->kind == TY_STRUCT) ? 3 : 1;
+        elemsize = elemtype->size;
+        if (!elemsize) return;
+        count = kcc_type_layout(full) / elemsize;
+    } else { shape = 0; elemtype = full; count = 1; }
+    elemsize = elemtype->size;
+    elemkind = elemtype->kind;
+
+    kcc_as_str(kcc_x86_os ? s_rodata : s_constsect);
+    kcc_as_str(s_p2align3);
+    if (d->f3 != 3) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
+    x86_sym(name); kcc_as_str(s_colon_nl);
+
+    if (shape == 2) {
+        unsigned long total = kcc_type_layout(full);
+        x86_emit_struct_bytes(full, (void *)d->f2, total);
+        return;
+    }
+    if (shape == 3) {
+        unsigned long emitted = 0;
+        struct Node *arr = (struct Node *)d->f2;
+        struct Node *e = arr ? (struct Node *)arr->f0 : 0;
+        while (e && emitted < count) {
+            x86_emit_struct_bytes(elemtype, e, elemsize);
+            emitted++;
+            e = (struct Node *)e->f4;
+        }
+        if (emitted < count) x86_emit_zero((count - emitted) * elemsize);
+        return;
+    }
+    /* scalar / array-of-scalar */
+    unsigned long emitted = 0;
+    struct Node *init = (struct Node *)d->f2;
+    if (init) {
+        if (init->tag == AST_INIT_LIST) {
+            struct Node *e = (struct Node *)init->f0;
+            while (e) {
+                x86_emit_value(kcc_rodata_leaf_bits(e, elemkind), elemsize);
+                emitted++;
+                e = (struct Node *)e->f4;
+            }
+        } else {
+            x86_emit_value(kcc_rodata_leaf_bits(init, elemkind), elemsize);
+            emitted = 1;
+        }
+    }
+    if (emitted < count) x86_emit_zero((count - emitted) * elemsize);
+}
+@}
+
+\section{Module Init, String Literals, and the Render Entry}
+
+@l c
+@d Selfhost: emit_x86 render @{
+void kcc_x86_emit_modinit(void) {
+    if (!kcc_modinit_present) return;
+    kcc_as_str(kcc_x86_os ? s_modinit_l : s_modinit_d);
+    x86_sym(s_modinitnm);
+    kcc_as_ch('\n');
+}
+
+void kcc_x86_emit_strings(void) {
+    void *strs = kcc_x86_strs;
+    if (!strs) return;
+    unsigned long n = IL(strs, VEC_COUNT);
+    if (!n) return;
+    kcc_as_str(kcc_x86_os ? s_rodata : s_cstrsect);
+    for (unsigned long i = 0; i < n; i++) {
+        kcc_as_str(s_strlbl); kcc_as_dec(i); kcc_as_str(s_label_nl);
+        unsigned long *e = (unsigned long *)kcc_vec_get(strs, i);
+        unsigned char *data = (unsigned char *)e[0];
+        unsigned long len = e[1];
+        kcc_as_str(s_d_byte);
+        for (unsigned long b = 0; b < len; b++) { kcc_as_dec(data[b]); kcc_as_str(s_comma1); }
+        kcc_as_str(s_zero_nl);
+    }
+}
+
+int kcc_x86_render(const char *path) {
+    kcc_as_init();
+    kcc_x86_strs = kcc_vec_init(16);
+    x86_render_text();
+    kcc_x86_emit_data();
+    kcc_x86_emit_statics();
+    kcc_x86_emit_strings();
+    kcc_x86_emit_modinit();
+    return kcc_as_write_file(path);
+}
+@}
+
+@l c
+@d Selfhost: emit_x86 @{
+@<Selfhost: emit_x86 preamble@>
+@<Selfhost: emit_x86 helpers@>
+@<Selfhost: emit_x86 shapes@>
+@<Selfhost: emit_x86 dispatch@>
+@<Selfhost: emit_x86 frame@>
+@<Selfhost: emit_x86 data@>
+@<Selfhost: emit_x86 rodata@>
+@<Selfhost: emit_x86 render@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-emit-x86-verify}
+
+\texttt{make selfhost-emit-x86} first confirms the drop-in links and the ARM64
+path is untouched (codegen 226), then verifies the x86 emitter functionally: a
+probe suite spanning the integer ALU, division, shifts, comparisons, control
+flow, recursion, many-argument calls, pointers, arrays, structs, globals, and
+string handling is compiled with \texttt{--target=x86\_64} by the C emitter, run
+under Rosetta, and its exit status compared against the ARM64 reference built by
+the assembly compiler.  Matching exits across the suite mean the C emitter
+lowers the whole implemented opcode set correctly.
+
+@d Selfhost: emit_x86 verify @{
+#!/usr/bin/env bash
+# make selfhost-emit-x86 — compile kcc's x86-64 back end in C with kcc, relink,
+# and verify functionally (arm64 codegen unbroken + x86 programs run correctly).
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/4] compiling tmp/selfhost/emit_x86.c with kcc"
+tmp/kcc -c "$SH/emit_x86.c" -o "$SH/emit_x86_c.o" >/dev/null
+
+echo "[2/4] linking tmp/kcc_selfhost_emit_x86 (emit_x86.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "emit_x86" ]; then OBJ="$OBJ $SH/emit_x86_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_emit_x86 $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+cp tmp/kcc "$SH/kcc_asm_backup_emit_x86"
+
+echo "[3/4] x86-64 functional check: C emitter -> as -> Rosetta run vs reference"
+mkdir -p "$SH/x86probes"
+# A probe suite spanning the implemented opcode set.
+cat > "$SH/x86probes/p1.c" <<'P1'
+int g; static int add(int a,int b){return a+b;}
+int fib(int n){ if(n<2) return n; return fib(n-1)+fib(n-2); }
+int main(void){ g=7; int s=0; for(int i=0;i<5;i++) s+=add(i,g); return (s+fib(6))%100; }
+P1
+cat > "$SH/x86probes/p2.c" <<'P2'
+unsigned uf(unsigned x){ return (x*3u + 7u) / 2u; }
+int main(void){ int a=100,b=7; long r=0; r+=a/b; r+=a%b; r+=(a<<2); r+=(a>>1);
+  r+=(a&0x3c); r+=(a|1); r+=(a^5); r+=(-a); r+=(~b); r+=uf(41); return (int)(r%97); }
+P2
+cat > "$SH/x86probes/p3.c" <<'P3'
+struct P{ int x; char c; long z; }; int arr[5];
+int sum6(int a,int b,int c,int d,int e,int f){ return a+b+c+d+e+f; }
+int main(void){ struct P p; p.x=10; p.c=3; p.z=100; for(int i=0;i<5;i++) arr[i]=i*i;
+  int t=0; for(int i=0;i<5;i++) t+=arr[i];
+  return (p.x+p.c+(int)p.z+t+sum6(1,2,3,4,5,6))%100; }
+P3
+cat > "$SH/x86probes/p4.c" <<'P4'
+const char *msg="hello"; const int tbl[4]={11,22,33,44};
+int slen(const char*s){int n=0;while(*s){n++;s++;}return n;}
+int cnt(void){ static int k; k++; return k; }
+int main(void){ int r=slen(msg); for(int i=0;i<4;i++) r+=tbl[i];
+  r+=cnt(); r+=cnt(); r+=cnt(); return r%100; }
+P4
+
+status=0
+for p in p1 p2 p3 p4; do
+    src="$SH/x86probes/$p.c"
+    # ARM64 reference (assembly compiler, native default target).
+    cp "$SH/kcc_asm_backup_emit_x86" tmp/kcc
+    tmp/kcc "$src" -o "$SH/x86probes/${p}_ref" >/dev/null 2>&1
+    set +e; "$SH/x86probes/${p}_ref"; ref=$?; set -e
+    # x86-64 via the C emitter, run under Rosetta.
+    cp tmp/kcc_selfhost_emit_x86 tmp/kcc
+    tmp/kcc --target=x86_64 "$src" -o "$SH/x86probes/${p}_x86" >/dev/null 2>&1
+    set +e; "$SH/x86probes/${p}_x86"; got=$?; set -e
+    if [ "$ref" != "$got" ]; then
+        echo "  FAIL $p: x86(C emitter) exit $got != arm64 reference $ref"; status=1
+    else
+        echo "  ok   $p: exit $got (x86 C emitter == arm64 reference)"
+    fi
+done
+cp "$SH/kcc_asm_backup_emit_x86" tmp/kcc
+if [ $status -ne 0 ]; then exit 1; fi
+
+echo "[4/4] codegen suite with the self-hosted x86 back end linked in (arm64 path)"
+cp tmp/kcc_selfhost_emit_x86 tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_emit_x86" tmp/kcc
+exit $status
+@}

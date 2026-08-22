@@ -994,6 +994,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: sema verify@>
 @}
 
+\noindent The x86-64 back end, ported to C
+(Chapter~\ref{ch:self-hosting-emit-x86}), a drop-in replacement:
+
+@o tmp/selfhost/emit_x86.c @{
+@<Selfhost: emit_x86@>
+@}
+
+@o tmp/selfhost/emit_x86_verify.sh @{
+@<Selfhost: emit_x86 verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

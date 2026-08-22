@@ -27,7 +27,8 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 .PHONY: all default tangle assemble build test selfhost selfhost-lexer \
         selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
         selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
-        selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema meta-a \
+        selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema \
+        selfhost-emit-x86 meta-a \
         difftest interop e2e diagtest warntest test-codegen doc weave clean \
         run map
 
@@ -182,6 +183,12 @@ selfhost-emit-arm64: build
 selfhost-sema: build
 	chmod +x tmp/selfhost/sema_verify.sh
 	tmp/selfhost/sema_verify.sh
+
+# Self-hosting (Stage 8y): compile kcc's x86-64 back end in C, relink,
+# verify functionally (arm64 codegen + x86 programs run under Rosetta)
+selfhost-emit-x86: build
+	chmod +x tmp/selfhost/emit_x86_verify.sh
+	tmp/selfhost/emit_x86_verify.sh
 
 # Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link against the Linux runtime (no libc), run it natively (Chapter: Runtime).

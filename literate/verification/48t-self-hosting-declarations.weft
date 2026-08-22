@@ -1,0 +1,915 @@
+% 48t-self-hosting-declarations.weft — Stage 8u: the declaration parser, written
+% in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Declaration Parser in C}
+\label{ch:self-hosting-declarations}
+
+The declaration parser of Chapter~\ref{ch:declarations} is the last and most
+intricate slice of the front end to port, and completing it puts the \emph{entire}
+parse---spine, expressions, statements, and now declarations---through
+kcc-compiled C.  It is where C's syntax is hardest: the specifier bitmask that
+folds \texttt{unsigned long long int} into one type, the inside-out declarator
+that turns \texttt{int (*fp)(int)} into a pointer to a function, struct/union
+member lists with bit-fields and anonymous members, enums, abstract declarators
+for casts and \texttt{sizeof}, designated initializers, and the GNU attribute and
+\texttt{typeof} extensions real headers depend on.  The port follows the assembly
+node-build for node-build so every AST it produces is identical.
+
+\section{Nodes, Tokens, and Specifier Bits}
+
+The port declares the 64-byte node, owns the two layout-attribute globals the
+struct parser reads (\texttt{packed} and \texttt{aligned}), and declares the token
+and node-tag constants along with the specifier bits (\texttt{void}~1,
+\texttt{char}~2, \dots\ \texttt{unsigned}~512, \dots) and qualifier bits.
+\texttt{decl\_specs} returns two values---the type node and the storage class---so
+it is declared as a 16-byte struct the ABI hands back in the first two registers.
+
+@l c
+@d Selfhost: declarations preamble @{
+struct Node {
+    unsigned long tag;
+    unsigned long line;
+    unsigned long col;
+    unsigned long f0;
+    unsigned long f1;
+    unsigned long f2;
+    unsigned long f3;
+    unsigned long f4;
+};
+
+struct DeclSpecs { void *type; unsigned long storage; };
+
+extern unsigned long kcc_tok_type;
+extern const char *kcc_tok_start;
+extern unsigned long kcc_tok_len;
+extern unsigned long kcc_tok_line;
+extern unsigned long kcc_tok_col;
+
+void *kcc_ast_alloc(unsigned long tag);
+void kcc_parse_expect(unsigned long tok_type);
+void kcc_pp_next(void);
+void *kcc_parse_expr(void);
+void *kcc_parse_assign_expr(void);
+void *kcc_parse_cond_expr(void);
+void *kcc_parse_compound(void);
+void kcc_parse_sync(void);
+void kcc_diag_error(unsigned long line, unsigned long col, const char *msg);
+int kcc_memcmp(const void *a, const void *b, unsigned long n);
+unsigned long kcc_strlen(const char *s);
+void *kcc_strtab_intern(const void *ptr, unsigned long len);
+unsigned long kcc_pp_atoi(const char *s, unsigned long len);
+void kcc_typedef_add(const char *name, unsigned long len);
+int kcc_typedef_lookup(const char *name, unsigned long len);
+
+unsigned long kcc_attr_packed = 0;
+unsigned long kcc_attr_align = 0;
+
+enum {
+    TOK_EOF = 0, TOK_IDENT = 1, TOK_NUMBER = 2, TOK_AUTO = 10, TOK_CHAR = 13,
+    TOK_CONST = 14, TOK_DOUBLE = 18, TOK_ENUM = 20, TOK_EXTERN = 21,
+    TOK_FLOAT = 22, TOK_INLINE = 26, TOK_INT = 27, TOK_LONG = 28,
+    TOK_REGISTER = 29, TOK_RESTRICT = 30, TOK_SHORT = 32, TOK_SIGNED = 33,
+    TOK_STATIC = 35, TOK_STRUCT = 36, TOK_TYPEDEF = 38, TOK_UNION = 39,
+    TOK_UNSIGNED = 40, TOK_VOID = 41, TOK_VOLATILE = 42,
+    TOK__ALIGNAS = 44, TOK__ATOMIC = 46, TOK__BOOL = 47, TOK__COMPLEX = 48,
+    TOK__IMAGINARY = 50, TOK__NORETURN = 51, TOK__STATIC_ASSERT = 52,
+    TOK__THREAD_LOCAL = 53, TOK_ATTRIBUTE = 54, TOK_TYPEOF = 55,
+    TOK_EXTENSION = 57,
+    TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62, TOK_RBRACE = 63,
+    TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66, TOK_COMMA = 67,
+    TOK_DOT = 68, TOK_STAR = 73, TOK_QUESTION = 92, TOK_COLON = 93,
+    TOK_ASSIGN = 94, TOK_ELLIPSIS = 107
+};
+
+enum {
+    AST_TAG = 0, AST_VAR_DECL = 10, AST_FUNC_DECL = 11, AST_PARAM_DECL = 12,
+    AST_TYPEDEF_DECL = 13, AST_STRUCT_DECL = 14, AST_UNION_DECL = 15,
+    AST_ENUM_DECL = 16, AST_ENUMERATOR = 17, AST_FIELD_DECL = 18,
+    AST_STATIC_ASSERT = 19, AST_TYPE_BUILTIN = 20, AST_TYPE_NAME = 21,
+    AST_TYPE_PTR = 22, AST_TYPE_ARRAY = 23, AST_TYPE_FUNC = 24,
+    AST_TYPE_STRUCT = 25, AST_TYPE_UNION = 26, AST_TYPE_ENUM = 27,
+    AST_TYPE_QUALS = 28, AST_TYPE_TYPEOF = 29, AST_INT_LIT = 51,
+    AST_CHAR_LIT = 53, AST_INIT_LIST = 65, AST_DESIGNATOR = 66,
+    AST_PAREN_EXPR = 68
+};
+
+/* Forward declarations. */
+void *kcc_parse_decl(void);
+void kcc_parse_skip_attributes(void);
+void *kcc_parse_typeof(void);
+struct DeclSpecs kcc_parse_decl_specs(void);
+void *kcc_parse_declarator(void *base);
+void *kcc_parse_direct_declarator(void *type);
+void *kcc_parse_param_decl(void);
+void *kcc_parse_abstract_declarator(void *base);
+void *kcc_parse_struct_or_union(void);
+void *kcc_parse_enum(void);
+void *kcc_parse_type_name(void);
+unsigned long kcc_parse_is_type_token(void);
+void *kcc_parse_initializer(void);
+void *kcc_parse_static_assert(void);
+static void *abst_splice(void *chain, void *old_base, void *new_type);
+static void *parse_designated_element(void);
+static unsigned long parse_const_index(void *e);
+
+#define F0(n) (((struct Node *)(n))->f0)
+#define F1(n) (((struct Node *)(n))->f1)
+#define F2(n) (((struct Node *)(n))->f2)
+#define F3(n) (((struct Node *)(n))->f3)
+#define F4(n) (((struct Node *)(n))->f4)
+#define TAG(n) (((struct Node *)(n))->tag)
+@}
+
+\section{Attributes and \texttt{typeof}}
+
+\texttt{skip\_attributes} consumes GNU \texttt{\_\_attribute\_\_((...))} and
+\texttt{\_\_extension\_\_} runs, discarding all but the two that change layout:
+it records \texttt{packed} and \texttt{aligned(N)} into the module globals, reset
+at entry.  \texttt{typeof} wraps its parenthesised type-name or expression in a
+\texttt{TYPE\_TYPEOF} node.
+
+@l c
+@d Selfhost: declarations attrs @{
+void kcc_parse_skip_attributes(void) {
+    kcc_attr_packed = 0;
+    kcc_attr_align = 0;
+    int want_align = 0;
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_EXTENSION) { kcc_pp_next(); continue; }
+        if (t != TOK_ATTRIBUTE) return;
+        kcc_pp_next();                        /* consume __attribute__ */
+        if (kcc_tok_type != TOK_LPAREN) return;
+        long depth = 0;
+        for (;;) {
+            unsigned long tt = kcc_tok_type;
+            if (tt == TOK_EOF) return;
+            if (tt == TOK_LPAREN) depth++;
+            else if (tt == TOK_RPAREN) depth--;
+            else if (tt == TOK_IDENT) {
+                const char *txt = kcc_tok_start;
+                unsigned long l = kcc_tok_len;
+                if (l == 6 && kcc_memcmp(txt, "packed", 6) == 0) kcc_attr_packed = 1;
+                else if (l == 10 && kcc_memcmp(txt, "__packed__", 10) == 0) kcc_attr_packed = 1;
+                else if (l == 7 && kcc_memcmp(txt, "aligned", 7) == 0) want_align = 1;
+                else if (l == 11 && kcc_memcmp(txt, "__aligned__", 11) == 0) want_align = 1;
+            } else if (tt == TOK_NUMBER) {
+                if (want_align) {
+                    want_align = 0;
+                    kcc_attr_align = kcc_pp_atoi(kcc_tok_start, kcc_tok_len);
+                }
+            }
+            kcc_pp_next();
+            if (depth == 0) break;
+        }
+    }
+}
+
+void *kcc_parse_typeof(void) {
+    kcc_pp_next();                             /* consume typeof */
+    kcc_parse_expect(TOK_LPAREN);
+    void *operand;
+    unsigned long is_type;
+    if (kcc_parse_is_type_token()) { operand = kcc_parse_type_name(); is_type = 1; }
+    else { operand = kcc_parse_expr(); is_type = 0; }
+    kcc_parse_expect(TOK_RPAREN);
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_TYPE_TYPEOF);
+    n->f0 = (unsigned long)operand;
+    n->f1 = is_type;
+    return n;
+}
+@}
+
+\section{Declaration Specifiers}
+
+\texttt{decl\_specs} loops over storage classes, qualifiers, function specifiers,
+\texttt{\_Alignas} (whose parenthesised argument is skipped), builtin type
+keywords (each ORing its specifier bit, with two \texttt{long}s promoting to long
+long), struct/union/enum/typeof sub-parsers, typedef names, and interleaved
+attributes.  When the loop ends it materialises the type: an aggregate or typedef
+already built, else a \texttt{TYPE\_BUILTIN} from the bitmask (defaulting to
+\texttt{int}), then wraps it in \texttt{TYPE\_QUALS} if any qualifiers appeared.
+
+@l c
+@d Selfhost: declarations specs @{
+struct DeclSpecs kcc_parse_decl_specs(void) {
+    unsigned long storage = 0, quals = 0, mask = 0, count = 0;
+    void *type = 0;
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_TYPEDEF) { storage = 1; kcc_pp_next(); continue; }
+        if (t == TOK_EXTERN) { storage = 2; kcc_pp_next(); continue; }
+        if (t == TOK_STATIC) { storage = 3; kcc_pp_next(); continue; }
+        if (t == TOK_AUTO) { storage = 4; kcc_pp_next(); continue; }
+        if (t == TOK_REGISTER) { storage = 5; kcc_pp_next(); continue; }
+        if (t == TOK_CONST) { quals |= 1; kcc_pp_next(); continue; }
+        if (t == TOK_VOLATILE) { quals |= 2; kcc_pp_next(); continue; }
+        if (t == TOK_RESTRICT) { quals |= 4; kcc_pp_next(); continue; }
+        if (t == TOK__ATOMIC) { quals |= 8; kcc_pp_next(); continue; }
+        if (t == TOK_INLINE || t == TOK__NORETURN || t == TOK__THREAD_LOCAL) {
+            kcc_pp_next(); continue;
+        }
+        if (t == TOK__ALIGNAS) {
+            kcc_pp_next();
+            kcc_parse_expect(TOK_LPAREN);
+            long depth = 1;
+            for (;;) {
+                unsigned long tt = kcc_tok_type;
+                if (tt == TOK_EOF) break;
+                if (tt == TOK_LPAREN) depth++;
+                else if (tt == TOK_RPAREN) { depth--; if (depth == 0) { kcc_pp_next(); break; } }
+                kcc_pp_next();
+            }
+            continue;
+        }
+        if (t == TOK_VOID) { mask |= 1; count++; kcc_pp_next(); continue; }
+        if (t == TOK_CHAR) { mask |= 2; count++; kcc_pp_next(); continue; }
+        if (t == TOK_SHORT) { mask |= 4; count++; kcc_pp_next(); continue; }
+        if (t == TOK_INT) { mask |= 8; count++; kcc_pp_next(); continue; }
+        if (t == TOK_LONG) {
+            if (mask & 16) mask |= 32; else mask |= 16;
+            count++; kcc_pp_next(); continue;
+        }
+        if (t == TOK_FLOAT) { mask |= 64; count++; kcc_pp_next(); continue; }
+        if (t == TOK_DOUBLE) { mask |= 128; count++; kcc_pp_next(); continue; }
+        if (t == TOK_SIGNED) { mask |= 256; count++; kcc_pp_next(); continue; }
+        if (t == TOK_UNSIGNED) { mask |= 512; count++; kcc_pp_next(); continue; }
+        if (t == TOK__BOOL) { mask |= 1024; count++; kcc_pp_next(); continue; }
+        if (t == TOK__COMPLEX || t == TOK__IMAGINARY) {
+            kcc_diag_error(kcc_tok_line, kcc_tok_col,
+                "complex types (_Complex/_Imaginary) are not supported");
+            mask |= 2048; count++; kcc_pp_next(); continue;
+        }
+        if (t == TOK_STRUCT || t == TOK_UNION) { type = kcc_parse_struct_or_union(); count++; continue; }
+        if (t == TOK_ENUM) { type = kcc_parse_enum(); count++; continue; }
+        if (t == TOK_TYPEOF) { type = kcc_parse_typeof(); count++; continue; }
+        if (t == TOK_ATTRIBUTE || t == TOK_EXTENSION) { kcc_parse_skip_attributes(); continue; }
+        if (t == TOK_IDENT) {
+            if (count) break;
+            if (!kcc_typedef_lookup(kcc_tok_start, kcc_tok_len)) break;
+            void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+            kcc_pp_next();
+            struct Node *tn = (struct Node *)kcc_ast_alloc(AST_TYPE_NAME);
+            tn->f0 = (unsigned long)name;
+            type = tn; count++;
+            continue;
+        }
+        break;
+    }
+    if (type == 0) {
+        struct Node *bt = (struct Node *)kcc_ast_alloc(AST_TYPE_BUILTIN);
+        bt->f0 = count ? mask : 8;             /* default int */
+        type = bt;
+    }
+    if (quals) {
+        struct Node *q = (struct Node *)kcc_ast_alloc(AST_TYPE_QUALS);
+        q->f0 = (unsigned long)type;
+        q->f1 = quals;
+        type = q;
+    }
+    struct DeclSpecs r;
+    r.type = type;
+    r.storage = storage;
+    return r;
+}
+@}
+
+\section{Declarators}
+
+A declarator wraps the base type in pointer nodes (each with its qualifiers),
+then hands off to the direct declarator, which reads the name (or a grouped
+inner declarator) and the array and function suffixes.  Array dimensions nest
+left-to-right (the first bracket is outermost); a function suffix builds a
+\texttt{TYPE\_FUNC} and a \texttt{FUNC\_DECL}, tagging the variadic flag into bit
+0 of the params pointer.  A grouped declarator such as \texttt{int (*fp)(int)}
+parses the inner \texttt{*fp}, then splices the trailing function or array type in
+place of the base within the inner declarator's type chain---C's inside-out rule.
+
+@l c
+@d Selfhost: declarations declarator @{
+void *kcc_parse_declarator(void *base) {
+    void *type = base;
+    while (kcc_tok_type == TOK_STAR) {
+        kcc_pp_next();
+        unsigned long q = 0;
+        for (;;) {
+            unsigned long t = kcc_tok_type;
+            if (t == TOK_CONST) { q |= 1; kcc_pp_next(); }
+            else if (t == TOK_VOLATILE) { q |= 2; kcc_pp_next(); }
+            else if (t == TOK_RESTRICT) { q |= 4; kcc_pp_next(); }
+            else if (t == TOK__ATOMIC) { q |= 8; kcc_pp_next(); }
+            else break;
+        }
+        struct Node *p = (struct Node *)kcc_ast_alloc(AST_TYPE_PTR);
+        p->f0 = (unsigned long)type;
+        p->f1 = q;
+        type = p;
+    }
+    return kcc_parse_direct_declarator(type);
+}
+
+/* Parse array [ ... ] suffixes into a chain whose element is `base`; returns the
+ * outermost array (or 0 if none), advancing past the brackets. */
+static void *parse_array_suffix(void *base) {
+    void *innermost = 0, *outermost = 0;
+    while (kcc_tok_type == TOK_LBRACKET) {
+        kcc_pp_next();
+        while (kcc_tok_type == TOK_CONST || kcc_tok_type == TOK_VOLATILE ||
+               kcc_tok_type == TOK_RESTRICT || kcc_tok_type == TOK_STATIC)
+            kcc_pp_next();
+        void *size = 0;
+        if (kcc_tok_type == TOK_RBRACKET) {
+            /* empty */
+        } else if (kcc_tok_type == TOK_STAR) {
+            kcc_pp_next();
+        } else {
+            size = kcc_parse_assign_expr();
+        }
+        kcc_parse_expect(TOK_RBRACKET);
+        struct Node *a = (struct Node *)kcc_ast_alloc(AST_TYPE_ARRAY);
+        a->f1 = (unsigned long)size;
+        if (innermost == 0) { a->f0 = (unsigned long)base; innermost = a; outermost = a; }
+        else { a->f0 = F0(innermost); F0(innermost) = (unsigned long)a; innermost = a; }
+    }
+    return outermost;
+}
+
+/* Parse a parameter list (after the '(' is consumed) into fn->f1, setting the
+ * variadic flag in fn->f2. */
+static void parse_param_list(struct Node *fn) {
+    void *first = 0, *last = 0;
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_RPAREN) break;
+        if (t == TOK_ELLIPSIS) { kcc_pp_next(); fn->f2 = 1; break; }
+        void *p = kcc_parse_param_decl();
+        if (first == 0) { first = p; last = p; }
+        else { F4(last) = (unsigned long)p; last = p; }
+        if (kcc_tok_type != TOK_COMMA) break;
+        kcc_pp_next();
+        if (kcc_tok_type == TOK_ELLIPSIS) { kcc_pp_next(); fn->f2 = 1; break; }
+    }
+    fn->f1 = (unsigned long)first;
+}
+@}
+
+@l c
+@d Selfhost: declarations direct @{
+void *kcc_parse_direct_declarator(void *type) {
+    void *name = 0;
+    if (kcc_tok_type == TOK_LPAREN) {
+        /* grouped declarator: ( declarator ) suffix? */
+        kcc_pp_next();
+        struct Node *inner = (struct Node *)kcc_parse_declarator(type);
+        kcc_parse_expect(TOK_RPAREN);
+        if (kcc_tok_type == TOK_LPAREN) {
+            kcc_pp_next();
+            struct Node *ft = (struct Node *)kcc_ast_alloc(AST_TYPE_FUNC);
+            ft->f0 = (unsigned long)type;
+            parse_param_list(ft);
+            kcc_parse_expect(TOK_RPAREN);
+            if (F0(inner) == (unsigned long)type) {
+                /* redundant parens around a function name: retag as FuncDecl */
+                inner->tag = AST_FUNC_DECL;
+                inner->f0 = (unsigned long)type;
+                inner->f2 = ft->f1 | ft->f2;
+            } else {
+                struct Node *w = inner;
+                while (F0(w) != (unsigned long)type) w = (struct Node *)F0(w);
+                F0(w) = (unsigned long)ft;
+            }
+            return inner;
+        }
+        if (kcc_tok_type == TOK_LBRACKET) {
+            void *arr = parse_array_suffix(type);
+            if (arr) {
+                if (F0(inner) == (unsigned long)type) F0(inner) = (unsigned long)arr;
+                else {
+                    struct Node *w = inner;
+                    while (F0(w) != (unsigned long)type) w = (struct Node *)F0(w);
+                    F0(w) = (unsigned long)arr;
+                }
+            }
+            return inner;
+        }
+        return inner;
+    }
+    if (kcc_tok_type == TOK_IDENT) {
+        name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+        kcc_pp_next();
+    }
+    /* suffixes */
+    void *innermost = 0;                       /* innermost array (multi-dim) */
+    for (;;) {
+        if (kcc_tok_type == TOK_LBRACKET) {
+            kcc_pp_next();
+            while (kcc_tok_type == TOK_CONST || kcc_tok_type == TOK_VOLATILE ||
+                   kcc_tok_type == TOK_RESTRICT || kcc_tok_type == TOK_STATIC)
+                kcc_pp_next();
+            void *size = 0;
+            if (kcc_tok_type == TOK_RBRACKET) { /* empty */ }
+            else if (kcc_tok_type == TOK_STAR) { kcc_pp_next(); }
+            else size = kcc_parse_assign_expr();
+            kcc_parse_expect(TOK_RBRACKET);
+            struct Node *a = (struct Node *)kcc_ast_alloc(AST_TYPE_ARRAY);
+            a->f1 = (unsigned long)size;
+            if (innermost == 0) { a->f0 = (unsigned long)type; type = a; innermost = a; }
+            else { a->f0 = F0(innermost); F0(innermost) = (unsigned long)a; innermost = a; }
+            continue;
+        }
+        if (kcc_tok_type == TOK_LPAREN) {
+            innermost = 0;                     /* a function suffix ends an array chain */
+            kcc_pp_next();
+            struct Node *ft = (struct Node *)kcc_ast_alloc(AST_TYPE_FUNC);
+            ft->f0 = (unsigned long)type;
+            if (kcc_tok_type != TOK_RPAREN) parse_param_list(ft);
+            kcc_parse_expect(TOK_RPAREN);
+            struct Node *fd = (struct Node *)kcc_ast_alloc(AST_FUNC_DECL);
+            fd->f0 = ft->f0;                   /* return type */
+            fd->f1 = (unsigned long)name;
+            fd->f2 = ft->f1 | ft->f2;          /* params | variadic */
+            return fd;
+        }
+        break;
+    }
+    struct Node *vd = (struct Node *)kcc_ast_alloc(AST_VAR_DECL);
+    vd->f0 = (unsigned long)type;
+    vd->f1 = (unsigned long)name;
+    return vd;
+}
+
+void *kcc_parse_param_decl(void) {
+    struct DeclSpecs ds = kcc_parse_decl_specs();
+    void *type = ds.type;
+    unsigned long t = kcc_tok_type;
+    if (t == TOK_RPAREN || t == TOK_COMMA || t == TOK_ELLIPSIS) {
+        struct Node *p = (struct Node *)kcc_ast_alloc(AST_PARAM_DECL);
+        p->f0 = (unsigned long)type;
+        return p;
+    }
+    struct Node *d = (struct Node *)kcc_parse_declarator(type);
+    kcc_parse_skip_attributes();
+    struct Node *p = (struct Node *)kcc_ast_alloc(AST_PARAM_DECL);
+    p->f0 = F0(d);
+    p->f1 = F1(d);
+    return p;
+}
+@}
+
+\section{Abstract Declarators}
+
+An abstract declarator (used in casts and \texttt{sizeof(type)}) is a declarator
+without a name.  Besides pointers and array/function suffixes it may group an
+inner \texttt{(*)}, which is handled inside-out with \texttt{abst\_splice}: the
+trailing function or array type replaces the base within the inner chain, so
+\texttt{void (*)(void)} becomes a pointer to a function.
+
+@l c
+@d Selfhost: declarations abstract @{
+static void *abst_splice(void *chain, void *old_base, void *new_type) {
+    if (chain == old_base) return new_type;
+    struct Node *w = (struct Node *)chain;
+    for (;;) {
+        void *nx = (void *)w->f0;
+        if (nx == old_base) { w->f0 = (unsigned long)new_type; return chain; }
+        if (nx == 0) return chain;
+        w = (struct Node *)nx;
+    }
+}
+
+/* Build a TYPE_FUNC over `base` from a parameter list (the '(' already consumed
+ * for the grouped case; here we parse params then ')'). */
+static void *build_func_type(void *base) {
+    struct Node *ft = (struct Node *)kcc_ast_alloc(AST_TYPE_FUNC);
+    ft->f0 = (unsigned long)base;
+    void *first = 0, *last = 0;
+    for (;;) {
+        unsigned long t = kcc_tok_type;
+        if (t == TOK_RPAREN) break;
+        if (t == TOK_ELLIPSIS) { kcc_pp_next(); ft->f2 = 1; break; }
+        void *p = kcc_parse_param_decl();
+        if (first == 0) { first = p; last = p; }
+        else { F4(last) = (unsigned long)p; last = p; }
+        if (kcc_tok_type != TOK_COMMA) break;
+        kcc_pp_next();
+    }
+    ft->f1 = (unsigned long)first;
+    kcc_parse_expect(TOK_RPAREN);
+    return ft;
+}
+
+void *kcc_parse_abstract_declarator(void *base) {
+    void *type = base;
+    if (kcc_tok_type == TOK_LPAREN) {
+        kcc_pp_next();
+        if (kcc_tok_type == TOK_STAR || kcc_tok_type == TOK_LPAREN) {
+            void *inner = kcc_parse_abstract_declarator(type);
+            kcc_parse_expect(TOK_RPAREN);
+            if (kcc_tok_type == TOK_LPAREN) {
+                kcc_pp_next();
+                void *ft = build_func_type(type);
+                return abst_splice(inner, type, ft);
+            }
+            if (kcc_tok_type == TOK_LBRACKET) {
+                kcc_pp_next();
+                void *size = 0;
+                if (kcc_tok_type != TOK_RBRACKET) size = kcc_parse_assign_expr();
+                kcc_parse_expect(TOK_RBRACKET);
+                struct Node *a = (struct Node *)kcc_ast_alloc(AST_TYPE_ARRAY);
+                a->f0 = (unsigned long)type;
+                a->f1 = (unsigned long)size;
+                return abst_splice(inner, type, a);
+            }
+            return inner;
+        }
+        /* '(' opened a parameter list over the base (bare function type). */
+        return build_func_type(type);
+    }
+    while (kcc_tok_type == TOK_STAR) {
+        kcc_pp_next();
+        unsigned long q = 0;
+        for (;;) {
+            unsigned long t = kcc_tok_type;
+            if (t == TOK_CONST) { q |= 1; kcc_pp_next(); }
+            else if (t == TOK_VOLATILE) { q |= 2; kcc_pp_next(); }
+            else if (t == TOK_RESTRICT) { q |= 4; kcc_pp_next(); }
+            else if (t == TOK__ATOMIC) { q |= 8; kcc_pp_next(); }
+            else break;
+        }
+        struct Node *p = (struct Node *)kcc_ast_alloc(AST_TYPE_PTR);
+        p->f0 = (unsigned long)type;
+        p->f1 = q;
+        type = p;
+    }
+    /* trailing array / function suffixes */
+    for (;;) {
+        if (kcc_tok_type == TOK_LBRACKET) {
+            kcc_pp_next();
+            void *size = 0;
+            if (kcc_tok_type != TOK_RBRACKET) size = kcc_parse_assign_expr();
+            kcc_parse_expect(TOK_RBRACKET);
+            struct Node *a = (struct Node *)kcc_ast_alloc(AST_TYPE_ARRAY);
+            a->f0 = (unsigned long)type;
+            a->f1 = (unsigned long)size;
+            type = a;
+            continue;
+        }
+        if (kcc_tok_type == TOK_LPAREN) {
+            kcc_pp_next();
+            type = build_func_type(type);
+            continue;
+        }
+        break;
+    }
+    return type;
+}
+@}
+
+\section{Struct, Union, and Enum}
+
+Struct and union parsing consume the keyword, read an optional tag and an optional
+brace-enclosed member list (each member a specifier-plus-declarator, with optional
+bit-field width and anonymous members), then build the aggregate declaration and
+wrap it in a \texttt{TYPE\_STRUCT}/\texttt{TYPE\_UNION}, folding the layout
+attributes (\texttt{packed}, \texttt{aligned}) from the three sites around it into
+\texttt{f3}.  Enum parsing reads its enumerators with optional values.
+
+@l c
+@d Selfhost: declarations aggregate @{
+void *kcc_parse_struct_or_union(void) {
+    unsigned long packed = 0, align = 0;
+    unsigned long decl_tag = (kcc_tok_type == TOK_STRUCT) ? AST_STRUCT_DECL
+                                                          : AST_UNION_DECL;
+    kcc_pp_next();                             /* consume struct/union */
+    kcc_parse_skip_attributes();
+    if (kcc_attr_packed) packed = 1;
+    if (kcc_attr_align > align) align = kcc_attr_align;
+
+    void *name = 0;
+    if (kcc_tok_type == TOK_IDENT) {
+        name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+        kcc_pp_next();
+        kcc_parse_skip_attributes();
+        if (kcc_attr_packed) packed = 1;
+        if (kcc_attr_align > align) align = kcc_attr_align;
+    }
+
+    if (kcc_tok_type != TOK_LBRACE) {
+        struct Node *d = (struct Node *)kcc_ast_alloc(decl_tag);
+        d->f0 = (unsigned long)name;
+        struct Node *w = (struct Node *)kcc_ast_alloc(
+            decl_tag == AST_STRUCT_DECL ? AST_TYPE_STRUCT : AST_TYPE_UNION);
+        w->f0 = (unsigned long)d;
+        return w;
+    }
+
+    kcc_pp_next();                             /* consume '{' */
+    void *first = 0, *last = 0;
+    while (kcc_tok_type != TOK_RBRACE && kcc_tok_type != TOK_EOF) {
+        struct DeclSpecs ds = kcc_parse_decl_specs();
+        void *ftype = ds.type;
+        if (kcc_tok_type == TOK_SEMI) {        /* anonymous member */
+            struct Node *fd = (struct Node *)kcc_ast_alloc(AST_FIELD_DECL);
+            fd->f0 = (unsigned long)ftype;
+            if (first == 0) { first = fd; last = fd; }
+            else { F4(last) = (unsigned long)fd; last = fd; }
+            kcc_parse_expect(TOK_SEMI);
+            continue;
+        }
+        for (;;) {
+            struct Node *fd = (struct Node *)kcc_parse_declarator(ftype);
+            if (fd == 0) break;
+            fd->tag = AST_FIELD_DECL;
+            fd->f2 = 0;
+            fd->f4 = 0;
+            kcc_parse_skip_attributes();
+            if (kcc_tok_type == TOK_COLON) {
+                kcc_pp_next();
+                fd->f2 = (unsigned long)kcc_parse_cond_expr();
+            }
+            if (first == 0) { first = fd; last = fd; }
+            else { F4(last) = (unsigned long)fd; last = fd; }
+            if (kcc_tok_type != TOK_COMMA) break;
+            kcc_pp_next();
+        }
+        kcc_parse_expect(TOK_SEMI);
+    }
+    kcc_parse_expect(TOK_RBRACE);
+    kcc_parse_skip_attributes();
+    if (kcc_attr_packed) packed = 1;
+    if (kcc_attr_align > align) align = kcc_attr_align;
+
+    struct Node *d = (struct Node *)kcc_ast_alloc(decl_tag);
+    d->f0 = (unsigned long)name;
+    d->f1 = (unsigned long)first;
+    d->f3 = packed | (align << 1);
+    struct Node *w = (struct Node *)kcc_ast_alloc(
+        decl_tag == AST_STRUCT_DECL ? AST_TYPE_STRUCT : AST_TYPE_UNION);
+    w->f0 = (unsigned long)d;
+    return w;
+}
+
+void *kcc_parse_enum(void) {
+    kcc_pp_next();                             /* consume enum */
+    kcc_parse_skip_attributes();
+    void *name = 0;
+    if (kcc_tok_type == TOK_IDENT) {
+        name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+        kcc_pp_next();
+    }
+    if (kcc_tok_type != TOK_LBRACE) {
+        struct Node *d = (struct Node *)kcc_ast_alloc(AST_ENUM_DECL);
+        d->f0 = (unsigned long)name;
+        struct Node *w = (struct Node *)kcc_ast_alloc(AST_TYPE_ENUM);
+        w->f0 = (unsigned long)d;
+        return w;
+    }
+    kcc_pp_next();                             /* consume '{' */
+    void *first = 0, *last = 0;
+    while (kcc_tok_type != TOK_RBRACE) {
+        void *ename = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+        kcc_pp_next();
+        void *value = 0;
+        if (kcc_tok_type == TOK_ASSIGN) { kcc_pp_next(); value = kcc_parse_cond_expr(); }
+        struct Node *e = (struct Node *)kcc_ast_alloc(AST_ENUMERATOR);
+        e->f0 = (unsigned long)ename;
+        e->f1 = (unsigned long)value;
+        if (first == 0) { first = e; last = e; }
+        else { F4(last) = (unsigned long)e; last = e; }
+        if (kcc_tok_type != TOK_COMMA) break;
+        kcc_pp_next();
+        if (kcc_tok_type == TOK_RBRACE) break;
+    }
+    kcc_parse_expect(TOK_RBRACE);
+    struct Node *d = (struct Node *)kcc_ast_alloc(AST_ENUM_DECL);
+    d->f0 = (unsigned long)name;
+    d->f1 = (unsigned long)first;
+    struct Node *w = (struct Node *)kcc_ast_alloc(AST_TYPE_ENUM);
+    w->f0 = (unsigned long)d;
+    return w;
+}
+@}
+
+\section{Type Name, Predicate, Initializer, and Dispatch}
+
+\texttt{type\_name} is specifiers plus an optional abstract declarator;
+\texttt{is\_type\_token} tests whether the current token can begin a type;
+\texttt{initializer} reads an expression or a brace list of possibly-designated
+elements; and \texttt{parse\_decl} ties it together---function definition versus
+prototype, variable and typedef declarations (with multi-declarator chains),
+bare aggregate types, and \texttt{\_Static\_assert}.
+
+@l c
+@d Selfhost: declarations rest @{
+void *kcc_parse_type_name(void) {
+    struct DeclSpecs ds = kcc_parse_decl_specs();
+    void *type = ds.type;
+    unsigned long t = kcc_tok_type;
+    if (t == TOK_STAR || t == TOK_LBRACKET || t == TOK_LPAREN)
+        return kcc_parse_abstract_declarator(type);
+    return type;
+}
+
+unsigned long kcc_parse_is_type_token(void) {
+    unsigned long t = kcc_tok_type;
+    if (t == TOK_VOID || t == TOK_CHAR || t == TOK_SHORT || t == TOK_INT ||
+        t == TOK_LONG || t == TOK_FLOAT || t == TOK_DOUBLE || t == TOK_SIGNED ||
+        t == TOK_UNSIGNED || t == TOK__BOOL || t == TOK__COMPLEX ||
+        t == TOK_STRUCT || t == TOK_UNION || t == TOK_ENUM || t == TOK_TYPEOF ||
+        t == TOK_CONST || t == TOK_VOLATILE || t == TOK_RESTRICT ||
+        t == TOK__ATOMIC || t == TOK__ALIGNAS)
+        return 1;
+    if (t != TOK_IDENT) return 0;
+    return kcc_typedef_lookup(kcc_tok_start, kcc_tok_len) ? 1 : 0;
+}
+
+static unsigned long parse_const_index(void *e) {
+    struct Node *n = (struct Node *)e;
+    while (n && n->tag == AST_PAREN_EXPR) n = (struct Node *)n->f0;
+    if (n == 0) return 0;
+    if (n->tag == AST_INT_LIT || n->tag == AST_CHAR_LIT) return n->f0;
+    return 0;
+}
+
+static void *parse_designated_element(void) {
+    unsigned long t = kcc_tok_type;
+    if (t != TOK_DOT && t != TOK_LBRACKET) return kcc_parse_initializer();
+    struct Node *head = 0, *tail = 0;
+    for (;;) {
+        if (kcc_tok_type == TOK_DOT) {
+            kcc_pp_next();
+            void *nm = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+            kcc_pp_next();
+            struct Node *d = (struct Node *)kcc_ast_alloc(AST_DESIGNATOR);
+            d->f0 = (unsigned long)nm;
+            d->f1 = 1;
+            if (head == 0) { head = d; tail = d; }
+            else { tail->f2 = (unsigned long)d; tail = d; }
+        } else if (kcc_tok_type == TOK_LBRACKET) {
+            kcc_pp_next();
+            void *ie = kcc_parse_assign_expr();
+            unsigned long idx = parse_const_index(ie);
+            kcc_parse_expect(TOK_RBRACKET);
+            struct Node *d = (struct Node *)kcc_ast_alloc(AST_DESIGNATOR);
+            d->f0 = idx;
+            d->f1 = 0;
+            if (head == 0) { head = d; tail = d; }
+            else { tail->f2 = (unsigned long)d; tail = d; }
+        } else break;
+    }
+    kcc_parse_expect(TOK_ASSIGN);
+    head->f3 = (unsigned long)kcc_parse_initializer();
+    return head;
+}
+
+void *kcc_parse_initializer(void) {
+    if (kcc_tok_type != TOK_LBRACE) return kcc_parse_assign_expr();
+    kcc_pp_next();                             /* consume '{' */
+    struct Node *lst = (struct Node *)kcc_ast_alloc(AST_INIT_LIST);
+    void *first = 0, *last = 0;
+    while (kcc_tok_type != TOK_RBRACE) {
+        void *el = parse_designated_element();
+        if (first == 0) { first = el; last = el; }
+        else { F4(last) = (unsigned long)el; last = el; }
+        if (kcc_tok_type != TOK_COMMA) break;
+        kcc_pp_next();
+        if (kcc_tok_type == TOK_RBRACE) break;
+    }
+    kcc_parse_expect(TOK_RBRACE);
+    lst->f0 = (unsigned long)first;
+    return lst;
+}
+
+void *kcc_parse_static_assert(void) {
+    kcc_pp_next();
+    kcc_parse_expect(TOK_LPAREN);
+    void *expr = kcc_parse_cond_expr();
+    kcc_parse_expect(TOK_COMMA);
+    void *msg = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+    kcc_pp_next();
+    kcc_parse_expect(TOK_RPAREN);
+    kcc_parse_expect(TOK_SEMI);
+    struct Node *n = (struct Node *)kcc_ast_alloc(AST_STATIC_ASSERT);
+    n->f0 = (unsigned long)expr;
+    n->f1 = (unsigned long)msg;
+    return n;
+}
+
+void *kcc_parse_decl(void) {
+    if (kcc_tok_type == TOK__STATIC_ASSERT) return kcc_parse_static_assert();
+
+    struct DeclSpecs ds = kcc_parse_decl_specs();
+    void *base = ds.type;
+    unsigned long storage = ds.storage;
+
+    if (kcc_tok_type == TOK_SEMI) { kcc_pp_next(); return base; }
+
+    struct Node *d = (struct Node *)kcc_parse_declarator(base);
+    if (d == 0) { kcc_parse_sync(); return 0; }
+    kcc_parse_skip_attributes();
+
+    if (d->tag == AST_FUNC_DECL) {
+        if (kcc_tok_type == TOK_LBRACE) {
+            d->f3 = (unsigned long)kcc_parse_compound();
+            if (storage == 3) d->f2 |= 2;      /* static function → local linkage */
+            return d;
+        }
+        if (kcc_tok_type != TOK_COMMA) {
+            kcc_parse_expect(TOK_SEMI);
+            return d;
+        }
+        /* fall into the multi-declarator loop below */
+    } else if (storage == 1) {
+        /* typedef: register the name */
+        if (d->f1) {
+            const char *nm = (const char *)d->f1;
+            kcc_typedef_add(nm, kcc_strlen(nm));
+        }
+        d->tag = AST_TYPEDEF_DECL;
+        kcc_parse_expect(TOK_SEMI);
+        return d;
+    } else {
+        d->f3 = storage;
+        if (kcc_tok_type == TOK_ASSIGN) {
+            kcc_pp_next();
+            d->f2 = (unsigned long)kcc_parse_initializer();
+        }
+        if (kcc_tok_type != TOK_COMMA) {
+            kcc_parse_expect(TOK_SEMI);
+            return d;
+        }
+    }
+
+    /* multi-declarator list sharing `base`. */
+    struct Node *first = d, *lastn = d;
+    while (kcc_tok_type == TOK_COMMA) {
+        kcc_pp_next();
+        struct Node *nd = (struct Node *)kcc_parse_declarator(base);
+        if (nd == 0) break;
+        nd->f3 = storage;
+        if (kcc_tok_type == TOK_ASSIGN) {
+            kcc_pp_next();
+            nd->f2 = (unsigned long)kcc_parse_initializer();
+        }
+        lastn->f4 = (unsigned long)nd;
+        lastn = nd;
+    }
+    kcc_parse_expect(TOK_SEMI);
+    return first;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: declarations @{
+@<Selfhost: declarations preamble@>
+@<Selfhost: declarations attrs@>
+@<Selfhost: declarations specs@>
+@<Selfhost: declarations declarator@>
+@<Selfhost: declarations direct@>
+@<Selfhost: declarations abstract@>
+@<Selfhost: declarations aggregate@>
+@<Selfhost: declarations rest@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-declarations-verify}
+
+\texttt{make selfhost-declarations} runs the drop-in loop through the
+code-generation suite (which declares and defines every function, type, and
+variable the tests use) and \texttt{difftest}; a clean sweep means \kcc{}
+compiled its own declaration grammar---specifiers, declarators, aggregates, and
+initializers---so faithfully that the generated code is unchanged.
+
+@d Selfhost: declarations verify @{
+#!/usr/bin/env bash
+# make selfhost-declarations — compile kcc's declaration parser in C with kcc,
+# relink, run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/declarations.c with kcc"
+tmp/kcc -c "$SH/declarations.c" -o "$SH/declarations_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_declarations (declarations.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "declarations" ]; then OBJ="$OBJ $SH/declarations_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_declarations $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted declaration parser"
+cp tmp/kcc "$SH/kcc_asm_backup_declarations"
+cp tmp/kcc_selfhost_declarations tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_declarations" tmp/kcc
+exit $status
+@}

@@ -950,6 +950,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: driver verify@>
 @}
 
+\noindent The declaration parser, ported to C
+(Chapter~\ref{ch:self-hosting-declarations}), a drop-in replacement:
+
+@o tmp/selfhost/declarations.c @{
+@<Selfhost: declarations@>
+@}
+
+@o tmp/selfhost/declarations_verify.sh @{
+@<Selfhost: declarations verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

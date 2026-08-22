@@ -615,6 +615,7 @@ the binaries, and verify that the exit code matches the expected value.
 @i literate/verification/48q-self-hosting-expressions.weft
 @i literate/verification/48r-self-hosting-parser.weft
 @i literate/verification/48s-self-hosting-driver.weft
+@i literate/verification/48t-self-hosting-declarations.weft
 \end{multicols}
 \newpage
 

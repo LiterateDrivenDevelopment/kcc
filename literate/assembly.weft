@@ -884,6 +884,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: lexer-tables verify@>
 @}
 
+\noindent The linker-information tables, ported to C
+(Chapter~\ref{ch:self-hosting-linker}), a drop-in replacement:
+
+@o tmp/selfhost/linker.c @{
+@<Selfhost: linker@>
+@}
+
+@o tmp/selfhost/linker_verify.sh @{
+@<Selfhost: linker verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

@@ -1,0 +1,213 @@
+% 48n-self-hosting-linker.weft — Stage 8o: the linker-information tables,
+% written in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Linker Information in C}
+\label{ch:self-hosting-linker}
+
+The linker-information module of Chapter~\ref{ch:linker-info} is the seam
+between code generation and object emission: the code generator records, as it
+emits, every symbol it defines or references and every place that needs
+relocating, and the Mach-O writer serialises those tables into the object file.
+Porting it puts that bookkeeping---the symbol vector, the relocation vector, and
+the extern-deduplication hash table---through kcc-compiled C, exercised on every
+single compilation the suite runs.
+
+\section{Tables and State}
+
+The module owns four globals: the two vectors, the extern hash table, and the
+running size of the global data section.  A relocation entry is 24 bytes (a code
+offset, a type, a symbol index); a symbol entry is 32 bytes (a name pointer, a
+section number, a value, and Mach-O flags).  The port declares the vector header
+so it can build the vectors exactly as the assembly did---allocating the header
+and its backing store directly rather than through \texttt{vec\_init}, so the
+initial capacity of~32 matches---and a symbol view for the in-place upgrade of an
+extern to a defined global.
+
+@l c
+@d Selfhost: linker preamble @{
+struct Vec {
+    void *data;              /* VEC_DATA,     0  */
+    unsigned long count;     /* VEC_COUNT,    8  */
+    unsigned long cap;       /* VEC_CAP,      16 */
+    unsigned long elem_size; /* VEC_ELEMSIZE, 24 */
+};
+
+struct LinkSym {
+    const char *name;        /* SYM_NAME,    0  */
+    unsigned long section;   /* SYM_SECTION, 8  */
+    unsigned long value;     /* SYM_VALUE,   16 */
+    unsigned long flags;     /* SYM_FLAGS,   24 */
+};
+
+void *kcc_arena_alloc(long size);
+void kcc_vec_push(void *vec, const void *elem);
+void *kcc_ht_init(unsigned long capacity);
+unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen,
+                unsigned long value);
+unsigned long kcc_strlen(const char *s);
+
+void *kcc_linker_relocs = 0;
+void *kcc_linker_syms = 0;
+void *kcc_linker_extern_ht = 0;
+unsigned long kcc_globals_size = 0;
+
+/* Mach-O symbol flags. */
+#define N_EXT  0x01
+#define N_SECT 0x0E
+@}
+
+\section{Initialization}
+
+\texttt{kcc\_linker\_init} builds the relocation vector (24-byte entries), the
+symbol vector (32-byte entries), each with an initial capacity of 32 and its own
+arena-backed store, and a 64-slot extern hash table.  \texttt{vec\_push} grows
+either vector when it fills, so the initial capacity affects only when the first
+growth happens, not the tables' contents.
+
+@l c
+@d Selfhost: linker init @{
+void kcc_linker_init(void) {
+    struct Vec *rv = (struct Vec *)kcc_arena_alloc(32);   /* VEC_SIZE */
+    kcc_linker_relocs = rv;
+    rv->elem_size = 24;
+    rv->cap = 32;
+    rv->count = 0;
+    rv->data = kcc_arena_alloc(768);                       /* 32 * 24 */
+
+    struct Vec *sv = (struct Vec *)kcc_arena_alloc(32);
+    kcc_linker_syms = sv;
+    sv->elem_size = 32;
+    sv->cap = 32;
+    sv->count = 0;
+    sv->data = kcc_arena_alloc(1024);                      /* 32 * 32 */
+
+    kcc_linker_extern_ht = kcc_ht_init(64);
+}
+@}
+
+\section{Adding Symbols and Relocations}
+
+Each adder builds the entry as a small stack array---in the exact field order
+of the record---and pushes it onto its vector.  \texttt{add\_sym} returns the
+new symbol's zero-based index (the vector's count before the push).
+
+@l c
+@d Selfhost: linker add @{
+unsigned long kcc_linker_add_sym(const char *name, unsigned long section,
+                                 unsigned long value, unsigned long flags) {
+    unsigned long entry[4];
+    entry[0] = (unsigned long)name;   /* SYM_NAME */
+    entry[1] = section;               /* SYM_SECTION */
+    entry[2] = value;                 /* SYM_VALUE */
+    entry[3] = flags;                 /* SYM_FLAGS */
+    struct Vec *v = (struct Vec *)kcc_linker_syms;
+    unsigned long idx = v->count;
+    kcc_vec_push(v, entry);
+    return idx;
+}
+
+void kcc_linker_add_reloc(unsigned long offset, unsigned long type,
+                          unsigned long sym_index) {
+    unsigned long entry[3];
+    entry[0] = offset;                /* RELOC_OFFSET */
+    entry[1] = type;                  /* RELOC_TYPE */
+    entry[2] = sym_index;             /* RELOC_SYM */
+    kcc_vec_push(kcc_linker_relocs, entry);
+}
+@}
+
+\section{External and Global Symbols}
+
+\texttt{kcc\_linker\_extern} returns the index of an undefined external symbol,
+adding an \texttt{N\_EXT} entry the first time a name is seen and deduplicating
+through the hash table (whose stored value is the index plus one, so zero can
+mean ``absent'').  \texttt{kcc\_linker\_global\_sym} registers a \emph{defined}
+global in section~2: if the name is already defined it returns the index
+untouched; if it was previously an extern it upgrades the entry in place,
+assigning it the current data-section offset and advancing that offset by the
+requested size; otherwise it adds a fresh defined symbol.  Both dedup through the
+same hash table, so repeated references and pre-registration are safe.
+
+@l c
+@d Selfhost: linker externs @{
+unsigned long kcc_linker_extern(const char *name) {
+    unsigned long len = kcc_strlen(name);
+    unsigned long r = kcc_ht_get(kcc_linker_extern_ht, name, len);
+    if (r) return r - 1;
+    unsigned long idx = kcc_linker_add_sym(name, 0, 0, N_EXT);
+    kcc_ht_put(kcc_linker_extern_ht, name, len, idx + 1);
+    return idx;
+}
+
+unsigned long kcc_linker_global_sym(const char *name, unsigned long size) {
+    unsigned long len = kcc_strlen(name);
+    unsigned long r = kcc_ht_get(kcc_linker_extern_ht, name, len);
+    if (r) {
+        unsigned long idx = r - 1;
+        struct Vec *sv = (struct Vec *)kcc_linker_syms;
+        struct LinkSym *s = (struct LinkSym *)((char *)sv->data + idx * 32);
+        if (s->section != 0) return idx;   /* already defined */
+        s->section = 2;
+        s->value = kcc_globals_size;
+        kcc_globals_size += size;
+        return idx;
+    }
+    unsigned long value = kcc_globals_size;
+    unsigned long idx = kcc_linker_add_sym(name, 2, value, N_SECT | N_EXT);
+    kcc_globals_size += size;
+    kcc_ht_put(kcc_linker_extern_ht, name, len, idx + 1);
+    return idx;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: linker @{
+@<Selfhost: linker preamble@>
+@<Selfhost: linker init@>
+@<Selfhost: linker add@>
+@<Selfhost: linker externs@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-linker-verify}
+
+\texttt{make selfhost-linker} runs the drop-in loop.  Because every compilation
+registers its function and its referenced externs and globals through these
+tables and the Mach-O writer serialises them, a green code-generation suite---%
+each test of which compiles, links, and runs a program---means \kcc{} compiled
+its own symbol and relocation bookkeeping correctly.
+
+@d Selfhost: linker verify @{
+#!/usr/bin/env bash
+# make selfhost-linker — compile kcc's linker info in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/linker.c with kcc"
+tmp/kcc -c "$SH/linker.c" -o "$SH/linker_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_linker (linker.o -> kcc-compiled linker_c.o)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "linker" ]; then OBJ="$OBJ $SH/linker_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_linker $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted linker info"
+cp tmp/kcc "$SH/kcc_asm_backup_linker"
+cp tmp/kcc_selfhost_linker tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_linker" tmp/kcc
+exit $status
+@}

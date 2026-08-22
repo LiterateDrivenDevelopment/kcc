@@ -25,8 +25,9 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 .DEFAULT_GOAL := build
 
 .PHONY: all default tangle assemble build test selfhost selfhost-lexer \
-        selfhost-types selfhost-opt selfhost-lexer-tables meta-a difftest \
-        interop e2e diagtest warntest test-codegen doc weave clean run map
+        selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
+        meta-a difftest interop e2e diagtest warntest test-codegen doc weave \
+        clean run map
 
 # Default: build everything
 all default: build
@@ -126,6 +127,11 @@ selfhost-opt: build
 selfhost-lexer-tables: build
 	chmod +x tmp/selfhost/lexer_tables_verify.sh
 	tmp/selfhost/lexer_tables_verify.sh
+
+# Self-hosting (Stage 8o): compile kcc's linker info in C, relink, run suite
+selfhost-linker: build
+	chmod +x tmp/selfhost/linker_verify.sh
+	tmp/selfhost/linker_verify.sh
 
 # Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link against the Linux runtime (no libc), run it natively (Chapter: Runtime).

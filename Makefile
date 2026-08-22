@@ -107,6 +107,11 @@ selfhost-symtab: build
 	chmod +x tmp/selfhost/symtab_verify.sh
 	tmp/selfhost/symtab_verify.sh
 
+# Self-hosting (Stage 8k): compile kcc's conversions in C, relink, run suite
+selfhost-conversions: build
+	chmod +x tmp/selfhost/conversions_verify.sh
+	tmp/selfhost/conversions_verify.sh
+
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build
 	chmod +x tmp/tests/difftest.sh

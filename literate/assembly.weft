@@ -840,6 +840,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: symtab verify@>
 @}
 
+\noindent\textbf{conversions.c} --- the standard conversions in C
+(Chapter~\ref{ch:self-hosting-conversions}), a drop-in replacement:
+
+@o tmp/selfhost/conversions.c @{
+@<Selfhost: conversions@>
+@}
+
+@o tmp/selfhost/conversions_verify.sh @{
+@<Selfhost: conversions verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

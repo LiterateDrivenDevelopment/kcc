@@ -1,0 +1,190 @@
+% 48j-self-hosting-conversions.weft — Stage 8k: the standard conversions,
+% written in C, compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Standard Conversions in C}
+\label{ch:self-hosting-conversions}
+
+The conversion rules of Chapter~\ref{ch:conversions} are the purest logic ported
+so far: six side-effect-free functions that, given type descriptors, answer the
+questions \stdref{6.3} poses---what does a small integer promote to, what common
+type do two arithmetic operands share, does an array or function decay, and is
+an implicit conversion allowed.  They own no state and touch no I/O; they read a
+type's kind and signedness and call the type constructors and predicates that
+remain in the (still-assembly) type module.  Porting them puts the compiler's
+type arithmetic through kcc-compiled C.
+
+\section{Reading a Type}
+
+Only two fields of a type descriptor are needed here---the kind at offset~0 and
+the field at offset~32, which for an integer holds its signedness (1 signed,
+0 unsigned) and for an array or pointer holds the element or pointee type.  The
+port declares a struct exposing just those, and the four canonical type
+descriptors (\texttt{int}, \texttt{float}, \texttt{double}, \texttt{long
+double}) and four type helpers as \texttt{extern}s.  The kind constants are the
+type module's (bool~2, char~3, short~4, int~5, float~8, double~9, long
+double~10, pointer~11, array~12, function~13, enum~16).
+
+@l c
+@d Selfhost: conversions preamble @{
+struct Type {
+    unsigned long kind;   /* TY_KIND, offset 0 */
+    unsigned long f_size; /* offset 8 */
+    unsigned long f_2;    /* offset 16 */
+    unsigned long f_3;    /* offset 24 */
+    unsigned long f0;     /* TY_F0, offset 32: signedness, or element/pointee type */
+};
+
+void *kcc_type_ptr(void *pointee);
+int kcc_type_is_integer(void *t);
+int kcc_type_is_arithmetic(void *t);
+unsigned long kcc_type_rank(void *t);
+
+extern void *kcc_type_int_s;
+extern void *kcc_type_float;
+extern void *kcc_type_double;
+extern void *kcc_type_ldouble;
+@}
+
+\section{Integer Promotions and Usual Arithmetic}
+
+\texttt{kcc\_conv\_promote} maps a below-\texttt{int}-rank integer (bool, char,
+short, or an enum) to \texttt{int} and leaves anything else alone.
+\texttt{kcc\_conv\_usual} finds the common type of two arithmetic operands: any
+floating operand pulls the result up to the widest float; otherwise both are
+promoted and the C rules pick by rank and signedness---equal rank returns the
+first, equal signedness gives the higher rank, and mixed signedness lets the
+unsigned type win only when its rank is at least the signed one's.
+
+@l c
+@d Selfhost: conversions arith @{
+void *kcc_conv_promote(void *type) {
+    struct Type *t = (struct Type *)type;
+    unsigned long k = t->kind;
+    if (k == 2 || k == 3 || k == 4 || k == 16) return kcc_type_int_s;
+    return type;
+}
+
+void *kcc_conv_usual(void *a, void *b) {
+    struct Type *t1 = (struct Type *)a;
+    struct Type *t2 = (struct Type *)b;
+    if (t1->kind == 10 || t2->kind == 10) return kcc_type_ldouble;
+    if (t1->kind == 9 || t2->kind == 9) return kcc_type_double;
+    if (t1->kind == 8 || t2->kind == 8) return kcc_type_float;
+    void *p1 = kcc_conv_promote(a);
+    void *p2 = kcc_conv_promote(b);
+    if (p1 == p2) return p1;
+    struct Type *u1 = (struct Type *)p1;
+    struct Type *u2 = (struct Type *)p2;
+    if (u1->f0 == u2->f0) {
+        if (kcc_type_rank(p1) >= kcc_type_rank(p2)) return p1;
+        return p2;
+    }
+    if (u1->f0 == 0) {
+        if (kcc_type_rank(p1) >= kcc_type_rank(p2)) return p1;
+        return p2;
+    }
+    if (kcc_type_rank(p2) >= kcc_type_rank(p1)) return p2;
+    return p1;
+}
+@}
+
+\section{Decay and Lvalue}
+
+An array decays to a pointer to its element type, a function designator to a
+pointer to the function, and anything else is returned unchanged.  The lvalue
+conversion is the no-op stub the assembly carried---qualifier stripping is
+handled elsewhere in semantic analysis---so it returns its argument.
+
+@l c
+@d Selfhost: conversions decay @{
+void *kcc_conv_array_decay(void *type) {
+    struct Type *t = (struct Type *)type;
+    if (t->kind == 12) return kcc_type_ptr((void *)t->f0);
+    return type;
+}
+
+void *kcc_conv_func_decay(void *type) {
+    struct Type *t = (struct Type *)type;
+    if (t->kind == 13) return kcc_type_ptr(type);
+    return type;
+}
+
+void *kcc_conv_lvalue(void *type) {
+    return type;
+}
+@}
+
+\section{Implicit Conversion Check}
+
+\texttt{kcc\_conv\_implicit} is intentionally permissive: identical types, the
+same kind, integer-to-integer, arithmetic-to-arithmetic, and pointer-to-pointer
+all pass, as do the integer/pointer cross-conversions---leaving sema to warn
+rather than reject narrowing or sign changes.  The clauses run in the same order
+as the assembly, so a pointer source only reaches the integer-target test after
+pointer-to-pointer has been ruled out.
+
+@l c
+@d Selfhost: conversions implicit @{
+int kcc_conv_implicit(void *from, void *to) {
+    struct Type *f = (struct Type *)from;
+    struct Type *t = (struct Type *)to;
+    if (from == to) return 1;
+    if (f->kind == t->kind) return 1;
+    if (kcc_type_is_integer(from) && kcc_type_is_integer(to)) return 1;
+    if (kcc_type_is_arithmetic(from) && kcc_type_is_arithmetic(to)) return 1;
+    if (f->kind == 11 && t->kind == 11) return 1;
+    if (f->kind == 11) return kcc_type_is_integer(to) ? 1 : 0;
+    if (kcc_type_is_integer(from) && t->kind == 11) return 1;
+    return 0;
+}
+@}
+
+\section{Assembling the Translation Unit}
+
+@l c
+@d Selfhost: conversions @{
+@<Selfhost: conversions preamble@>
+@<Selfhost: conversions arith@>
+@<Selfhost: conversions decay@>
+@<Selfhost: conversions implicit@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-conversions-verify}
+
+\texttt{make selfhost-conversions} runs the drop-in loop.  Because the usual
+arithmetic conversions and the decays fire on nearly every expression the
+compiler type-checks, a green code-generation suite means \kcc{} compiled its
+own type arithmetic correctly.
+
+@d Selfhost: conversions verify @{
+#!/usr/bin/env bash
+# make selfhost-conversions — compile kcc's conversions in C with kcc, relink,
+# run the suite.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/3] compiling tmp/selfhost/conversions.c with kcc"
+tmp/kcc -c "$SH/conversions.c" -o "$SH/conversions_c.o" >/dev/null
+
+echo "[2/3] linking tmp/kcc_selfhost_conversions (conversions.o -> kcc-compiled)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "conversions" ]; then OBJ="$OBJ $SH/conversions_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_conversions $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+echo "[3/3] running the codegen suite with the self-hosted conversions"
+cp tmp/kcc "$SH/kcc_asm_backup_conversions"
+cp tmp/kcc_selfhost_conversions tmp/kcc
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_conversions" tmp/kcc
+exit $status
+@}

@@ -1,0 +1,1411 @@
+% 48w-self-hosting-sema.weft — Stage 8x: the semantic analyzer, written in C,
+% compiled by kcc itself, and linked back into the compiler.
+
+\chapter{Self-Hosting: The Semantic Analyzer in C}
+\label{ch:self-hosting-sema}
+
+The semantic analyzer of Chapters~\ref{ch:sema}--\ref{ch:sema} (the spine plus
+its declaration, statement, and expression chapters) is the compiler's semantic
+core: it walks the AST, resolves every parser type node into a canonical type
+descriptor, populates the symbol table, lays out aggregates byte-accurately,
+annotates each expression with its resolved type, and raises the \texttt{-Wall}
+family of diagnostics.  Porting it completes the front end and the entire
+semantic layer in kcc-compiled C.
+
+The port is verified by the strongest oracle available: \texttt{difftest}
+byte-compares kcc's object output against clang across the whole corpus, and
+every one of those cases runs through semantic analysis---any deviation in type
+resolution, aggregate layout, or the enum-constant rewrite changes the generated
+code and fails the comparison.  The diagnostic and warning suites
+(\texttt{diagtest}, \texttt{warntest}) additionally pin the exact message text.
+
+\section{Nodes, Types, Symbols, and Constants}
+
+The port declares the 64-byte AST node, the 48-byte type descriptor, and the
+symbol/hash-table field offsets, together with the AST-tag, type-kind, token,
+and symbol-kind enumerations the analyzer dispatches on.  The type singletons
+(\texttt{kcc\_type\_int\_s} and kin) are globals holding descriptor pointers;
+\texttt{eval\_const\_int}, \texttt{expr\_is\_ice}, and
+\texttt{ir\_initlist\_count} live in the IR builder and are declared extern.
+
+@l c
+@d Selfhost: sema preamble @{
+struct Node { unsigned long tag, line, col, f0, f1, f2, f3, f4; };
+struct Type { unsigned long kind, size, align, quals, f0, f1; };
+
+#define TY_DESC_SIZE 48
+/* type descriptor field offsets are the struct members above */
+/* symbol entry (semantic symtab) */
+#define SYM_KIND   0
+#define SYM_TYPE   8
+#define SYM_NAME   16
+#define SYM_VALUE  32
+#define SYM_DEPTH  40
+#define SYM_LINE   48
+#define SYM_FLAGS  56
+#define SYM_COL    64
+/* hash table */
+#define HT_ENTRIES 0
+#define HT_CAP     8
+#define HTE_KEY    8
+#define HTE_VALUE  24
+#define HTE_SIZE   32
+
+/* type kinds */
+enum { TY_VOID=1, TY_BOOL=2, TY_CHAR=3, TY_LLONG=7, TY_PTR=11, TY_ARRAY=12,
+       TY_FUNC=13, TY_STRUCT=14, TY_UNION=15, TY_ENUM=16 };
+/* symbol kinds */
+enum { SYM_VAR=1, SYM_FUNC=2, SYM_TYPEDEF=3, SYM_ENUM_CONST=4 };
+
+/* AST tags */
+enum {
+    AST_TRANS_UNIT=1, AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_PARAM_DECL=12,
+    AST_TYPEDEF_DECL=13, AST_STRUCT_DECL=14, AST_UNION_DECL=15, AST_ENUM_DECL=16,
+    AST_ENUMERATOR=17, AST_FIELD_DECL=18, AST_STATIC_ASSERT=19,
+    AST_TYPE_BUILTIN=20, AST_TYPE_NAME=21, AST_TYPE_PTR=22, AST_TYPE_ARRAY=23,
+    AST_TYPE_FUNC=24, AST_TYPE_STRUCT=25, AST_TYPE_UNION=26, AST_TYPE_ENUM=27,
+    AST_TYPE_QUALS=28, AST_TYPE_TYPEOF=29,
+    AST_COMPOUND=30, AST_EXPR_STMT=31, AST_IF_STMT=32, AST_SWITCH_STMT=33,
+    AST_WHILE_STMT=34, AST_DO_STMT=35, AST_FOR_STMT=36, AST_GOTO_STMT=37,
+    AST_CONTINUE_STMT=38, AST_BREAK_STMT=39, AST_RETURN_STMT=40,
+    AST_LABEL_STMT=41, AST_CASE_STMT=42, AST_DEFAULT_STMT=43, AST_NULL_STMT=44,
+    AST_IDENT_EXPR=50, AST_INT_LIT=51, AST_STR_LIT=52, AST_CHAR_LIT=53,
+    AST_BINARY_EXPR=54, AST_UNARY_EXPR=55, AST_ASSIGN_EXPR=56, AST_COND_EXPR=57,
+    AST_CALL_EXPR=58, AST_SUBSCRIPT=59, AST_MEMBER=60, AST_CAST_EXPR=61,
+    AST_SIZEOF_EXPR=62, AST_ALIGNOF_EXPR=63, AST_COMMA_EXPR=64, AST_INIT_LIST=65,
+    AST_DESIGNATOR=66, AST_COMPOUND_LIT=67, AST_PAREN_EXPR=68, AST_GENERIC=69,
+    AST_FLOAT_LIT=71, AST_VA_ARG=72, AST_STMT_EXPR=73, AST_ASM_STMT=74
+};
+
+/* tokens (operators) */
+enum { TOK_INC=70, TOK_DEC=71, TOK_AMP=72, TOK_STAR=73, TOK_PLUS=74,
+       TOK_MINUS=75, TOK_TILDE=76, TOK_BANG=77, TOK_SHL=80, TOK_SHR=81,
+       TOK_LT=82, TOK_GT=83, TOK_LE=84, TOK_GE=85, TOK_EQ=86, TOK_NE=87,
+       TOK_AND=90, TOK_OR=91, TOK_ASSIGN=94 };
+
+/* externs — type system */
+void *kcc_type_ptr(void *pointee);
+void *kcc_type_array(void *elem, unsigned long len);
+void *kcc_type_func(void *ret, void *params);
+void *kcc_type_struct(void *decl);
+void *kcc_type_union(void *decl);
+void *kcc_type_enum(void *decl);
+void *kcc_type_from_specmask(unsigned long mask);
+void *kcc_type_param_adjust(void *ty);
+int kcc_type_compatible(void *a, void *b);
+void kcc_type_dump(void *ty);
+/* conversions */
+void *kcc_conv_func_decay(void *ty);
+void *kcc_conv_array_decay(void *ty);
+void *kcc_conv_usual(void *a, void *b);
+void *kcc_conv_promote(void *ty);
+/* symbol table */
+void *kcc_symtab_lookup(const char *name, unsigned long len);
+void *kcc_symtab_lookup_tag(const char *name, unsigned long len);
+void *kcc_symtab_lookup_current(const char *name, unsigned long len);
+void *kcc_symtab_declare(const char *name, unsigned long len, unsigned long kind, void *type);
+void kcc_symtab_declare_tag(const char *name, unsigned long len, void *type);
+void kcc_symtab_push_scope(void);
+void kcc_symtab_pop_scope(void);
+void *kcc_symtab_current_ht(void);
+void kcc_symtab_label_add(const char *name, unsigned long len);
+void kcc_symtab_label_begin(void);
+void kcc_symtab_label_end(void);
+/* diagnostics + misc */
+void kcc_diag_error(unsigned long line, unsigned long col, const char *msg);
+void kcc_diag_warning(unsigned long line, unsigned long col, const char *msg);
+void *kcc_arena_alloc(unsigned long n);
+void *kcc_memcpy(void *d, const void *s, unsigned long n);
+unsigned long kcc_strlen(const char *s);
+int kcc_strcmp(const char *a, const char *b);
+void kcc_io_puts(const char *s);
+void kcc_io_flush(void);
+void *kcc_ast_alloc(unsigned long tag);
+unsigned long kcc_eval_const_int(void *node);
+int kcc_expr_is_ice(void *node);
+unsigned long kcc_ir_initlist_count(void *node);
+/* extern globals */
+extern void *kcc_type_int_s, *kcc_type_int_u, *kcc_type_long_s, *kcc_type_long_u;
+extern void *kcc_type_llong_s, *kcc_type_llong_u, *kcc_type_char_s;
+extern void *kcc_type_void, *kcc_type_double, *kcc_type_float;
+extern unsigned long kcc_warn_all;
+extern unsigned long kcc_sym_depth;
+
+#define SL(s,off) (*(unsigned long *)((char *)(s) + (off)))
+
+/* module state */
+static void *sema_cur_ret = 0;
+static unsigned long sema_callee_ctx = 0;
+static unsigned long sema_callee_implicit = 0;
+
+/* diagnostic message strings */
+static const char m_undecl[]   = "use of undeclared identifier '";
+static const char m_nomember[] = "no member named '";
+static const char m_redef[]    = "redefinition of '";
+static const char m_implicit[] = "implicit declaration of function '";
+static const char m_unused[]   = "unused variable '";
+static const char m_not_func[] = "called object is not a function";
+static const char m_not_struct[] = "member access on non-struct/union type";
+static const char m_ret_void[]   = "void function should not return a value";
+static const char m_ret_nonvoid[]= "non-void function should return a value";
+static const char m_reach_end[]  = "control reaches end of non-void function";
+static const char m_sign_cmp[]   = "comparison of integers of different signedness";
+static const char m_int2ptr[]    = "incompatible integer to pointer conversion";
+static const char m_ptr2int[]    = "incompatible pointer to integer conversion";
+static const char m_vla[]        = "variable-length arrays are not supported";
+static const char m_generic[]    = "_Generic: no association compatible with the controlling type";
+static const char m_main[]       = "main";
+static const char m_va_list[]    = "va_list";
+static const char *sema_noreturn_tbl[] = {
+    "exit", "_exit", "_Exit", "abort", "longjmp",
+    "__builtin_unreachable", "__builtin_trap", 0
+};
+
+/* forward declarations */
+void *kcc_sema_resolve_type(void *node);
+void *kcc_sema_expr(void *node);
+void kcc_sema_check_stmt(void *node);
+void kcc_sema_check_decl(void *node);
+unsigned long kcc_type_align(void *ty);
+unsigned long kcc_type_layout(void *ty);
+void kcc_sema_err_named(unsigned long line, unsigned long col, const char *name, const char *prefix);
+void kcc_sema_warn_named(unsigned long line, unsigned long col, const char *name, const char *prefix);
+void kcc_sema_check_unused_scope(void);
+void kcc_sema_check_redef(void *decl, const char *name);
+unsigned long kcc_agg_leaf_count(void *ty);
+unsigned long kcc_infer_arr_elems(void *head, void *elem);
+void kcc_sema_infer_array_len(void *decl);
+void kcc_sema_check_return_path(void *func);
+long kcc_sema_int_signedness(void *t);
+void kcc_sema_check_sign_compare(void *expr, void *lt, void *rt);
+void kcc_sema_check_int_ptr(void *loc, void *dst, void *src, void *srcexpr);
+struct FindResult { void *field; unsigned long off; };
+struct FindResult kcc_type_find_member(void *sty, const char *name);
+static void *sema_expr_generic(struct Node *n);
+static void *sema_expr_ident(struct Node *n);
+static void *sema_expr_literal(struct Node *n, unsigned long tag);
+static void *sema_expr_binary(struct Node *n);
+static void *sema_expr_unary(struct Node *n);
+static void *sema_expr_assign(struct Node *n);
+static void *sema_expr_call(struct Node *n);
+static void *sema_expr_member(struct Node *n);
+static void *sema_expr_cast(struct Node *n);
+static void *sema_expr_sizeof(struct Node *n);
+@}
+
+\section{Entry Point and Type Resolution}
+
+\texttt{kcc\_sema\_check} walks the translation unit's declaration list.
+\texttt{kcc\_sema\_resolve\_type} is the dispatcher that turns a parser type node
+into a canonical descriptor: builtins from the specifier bitmask; pointer, array,
+and function types by recursion and construction (an array folds its length as an
+integer constant expression, rejecting VLAs; a variadic function records its
+fixed count in \texttt{TY\_QUALS}); struct/union bodies reused when the tag
+already names this same definition; typedef names by symbol lookup; and a
+\texttt{volatile} qualifier by cloning the descriptor with the volatile bit set.
+
+@l c
+@d Selfhost: sema resolve @{
+void kcc_sema_check(void *tu) {
+    struct Node *d = (struct Node *)((struct Node *)tu)->f0;
+    while (d) { kcc_sema_check_decl(d); d = (struct Node *)d->f4; }
+}
+
+void *kcc_sema_resolve_type(void *node) {
+    if (!node) return kcc_type_int_s;
+    struct Node *n = (struct Node *)node;
+    unsigned long tag = n->tag;
+
+    if (tag == AST_TYPE_TYPEOF) {
+        if (n->f3) return (void *)n->f3;       /* memoised */
+        void *operand = (void *)n->f0;
+        if (!operand) return kcc_type_int_s;
+        void *r;
+        if (n->f1) r = kcc_sema_resolve_type(operand);  /* type-name */
+        else r = kcc_sema_expr(operand);                /* expression */
+        if (!r) return kcc_type_int_s;
+        n->f3 = (unsigned long)r;
+        return r;
+    }
+    if (tag == AST_TYPE_BUILTIN) {
+        void *r = kcc_type_from_specmask(n->f0);
+        return r ? r : kcc_type_int_s;
+    }
+    if (tag == AST_TYPE_PTR) {
+        return kcc_type_ptr(kcc_sema_resolve_type((void *)n->f0));
+    }
+    if (tag == AST_TYPE_ARRAY) {
+        void *elem = kcc_sema_resolve_type((void *)n->f0);
+        unsigned long len;
+        void *size = (void *)n->f1;
+        if (!size) len = 0;                    /* incomplete */
+        else if (kcc_expr_is_ice(size)) len = kcc_eval_const_int(size);
+        else {
+            kcc_diag_error(n->line, n->col, m_vla);
+            len = 0;
+        }
+        return kcc_type_array(elem, len);
+    }
+    if (tag == AST_TYPE_FUNC) {
+        void *ret = kcc_sema_resolve_type((void *)n->f0);
+        void *params = (void *)(n->f1 & ~1UL);
+        struct Type *ft = (struct Type *)kcc_type_func(ret, params);
+        if (n->f2) {                           /* variadic: record nfixed */
+            unsigned long nfixed = 0;
+            struct Node *p = (struct Node *)(n->f1 & ~1UL);
+            while (p) { nfixed++; p = (struct Node *)p->f4; }
+            ft->quals = nfixed;
+        }
+        return ft;
+    }
+    if (tag == AST_TYPE_STRUCT || tag == AST_TYPE_UNION) {
+        struct Node *decl = (struct Node *)n->f0;
+        if (!decl) return kcc_type_int_s;
+        if (!decl->f1) {                       /* no body → forward-ref lookup */
+            void *name = (void *)decl->f0;
+            if (!name) return (tag == AST_TYPE_STRUCT) ? kcc_type_struct(decl)
+                                                       : kcc_type_union(decl);
+            void *sym = kcc_symtab_lookup_tag(name, kcc_strlen(name));
+            if (!sym) return kcc_type_int_s;
+            return (void *)SL(sym, SYM_TYPE);
+        }
+        /* body present: reuse the registered descriptor iff same definition */
+        void *name = (void *)decl->f0;
+        if (name) {
+            void *sym = kcc_symtab_lookup_tag(name, kcc_strlen(name));
+            if (sym) {
+                struct Type *desc = (struct Type *)SL(sym, SYM_TYPE);
+                if (desc && (void *)desc->f0 == decl) return desc;
+            }
+        }
+        return (tag == AST_TYPE_STRUCT) ? kcc_type_struct(decl)
+                                        : kcc_type_union(decl);
+    }
+    if (tag == AST_TYPE_ENUM) {
+        return kcc_type_enum((void *)n->f0);
+    }
+    if (tag == AST_TYPE_NAME) {
+        void *name = (void *)n->f0;
+        if (!name) return kcc_type_int_s;
+        void *sym = kcc_symtab_lookup(name, kcc_strlen(name));
+        if (sym) return (void *)SL(sym, SYM_TYPE);
+        /* built-in typedef va_list → pointer */
+        if (kcc_strcmp(name, m_va_list) == 0) return kcc_type_ptr(kcc_type_int_s);
+        return kcc_type_int_s;
+    }
+    if (tag == AST_TYPE_QUALS) {
+        struct Type *base = (struct Type *)kcc_sema_resolve_type((void *)n->f0);
+        if (!(n->f1 & 2)) return base;         /* only volatile is honoured */
+        struct Type *nt = (struct Type *)kcc_arena_alloc(TY_DESC_SIZE);
+        *nt = *base;
+        nt->quals |= 2;
+        return nt;
+    }
+    return kcc_type_int_s;                      /* unknown / fallback */
+}
+@}
+
+\section{Statement Checking}
+
+The statement checker dispatches on tag, pushing a scope for compound and
+\texttt{for} bodies (and running the unused-variable check before each pop),
+type-checking conditions and recursing into sub-statements, enforcing the
+\texttt{return}-value constraints of \stdref{6.8.6.4}, and forwarding
+declaration nodes to the declaration checker.
+
+@l c
+@d Selfhost: sema statements @{
+void kcc_sema_check_stmt(void *node) {
+    if (!node) return;
+    struct Node *s = (struct Node *)node;
+    unsigned long tag = s->tag;
+    switch (tag) {
+    case AST_COMPOUND: {
+        kcc_symtab_push_scope();
+        struct Node *it = (struct Node *)s->f0;
+        while (it) { kcc_sema_check_stmt(it); it = (struct Node *)it->f4; }
+        kcc_sema_check_unused_scope();
+        kcc_symtab_pop_scope();
+        return;
+    }
+    case AST_EXPR_STMT:
+        if (s->f0) kcc_sema_expr((void *)s->f0);
+        return;
+    case AST_IF_STMT:
+        kcc_sema_expr((void *)s->f0);
+        kcc_sema_check_stmt((void *)s->f1);
+        if (s->f2) kcc_sema_check_stmt((void *)s->f2);
+        return;
+    case AST_WHILE_STMT:
+        kcc_sema_expr((void *)s->f0);
+        kcc_sema_check_stmt((void *)s->f1);
+        return;
+    case AST_DO_STMT:
+        kcc_sema_check_stmt((void *)s->f0);
+        kcc_sema_expr((void *)s->f1);
+        return;
+    case AST_FOR_STMT:
+        kcc_symtab_push_scope();
+        if (s->f0) kcc_sema_check_stmt((void *)s->f0);
+        if (s->f1) kcc_sema_expr((void *)s->f1);
+        if (s->f2) kcc_sema_expr((void *)s->f2);
+        if (s->f3) kcc_sema_check_stmt((void *)s->f3);
+        kcc_sema_check_unused_scope();
+        kcc_symtab_pop_scope();
+        return;
+    case AST_RETURN_STMT:
+        if (s->f0) {
+            void *st = kcc_sema_expr((void *)s->f0);
+            kcc_sema_check_int_ptr(s, sema_cur_ret, st, (void *)s->f0);
+            if (sema_cur_ret && SL(sema_cur_ret, 0) == TY_VOID)
+                kcc_diag_error(s->line, s->col, m_ret_void);
+        } else {
+            if (sema_cur_ret && SL(sema_cur_ret, 0) != TY_VOID)
+                kcc_diag_error(s->line, s->col, m_ret_nonvoid);
+        }
+        return;
+    case AST_SWITCH_STMT:
+        kcc_sema_expr((void *)s->f0);
+        kcc_sema_check_stmt((void *)s->f1);
+        return;
+    case AST_LABEL_STMT:
+        if (s->f0) kcc_symtab_label_add((void *)s->f0, kcc_strlen((void *)s->f0));
+        if (s->f1) kcc_sema_check_stmt((void *)s->f1);
+        return;
+    case AST_CASE_STMT:
+        kcc_sema_expr((void *)s->f0);
+        if (s->f1) kcc_sema_check_stmt((void *)s->f1);
+        return;
+    case AST_DEFAULT_STMT:
+        if (s->f0) kcc_sema_check_stmt((void *)s->f0);
+        return;
+    case AST_ASM_STMT: {
+        struct Node *op = (struct Node *)s->f2;
+        while (op) {
+            if (op->f2) kcc_sema_expr((void *)op->f2);
+            op = (struct Node *)op->f4;
+        }
+        return;
+    }
+    case AST_VAR_DECL: case AST_TYPEDEF_DECL: case AST_STRUCT_DECL:
+    case AST_UNION_DECL: case AST_ENUM_DECL: case AST_TYPE_ENUM:
+    case AST_TYPE_STRUCT: case AST_TYPE_UNION:
+        kcc_sema_check_decl(s);
+        return;
+    default:
+        return;                                /* goto/break/continue/null/static_assert */
+    }
+}
+@}
+
+\section{Declaration Checking and Aggregate Layout}
+
+The declaration checker registers variables, functions, typedefs, and tags,
+pre-registering any struct/union/enum a declared type introduces (peeling
+pointer, array, and qualifier wrappers to reach a bodied definition), inferring
+incomplete-array lengths, and completing a forward-declared tag in place when a
+definition arrives at the same scope depth.  \texttt{kcc\_type\_layout} computes
+byte-accurate size, alignment, and per-field offsets, packing consecutive
+same-type bit-fields into a container from the least-significant bit up.
+
+@l c
+@d Selfhost: sema layout @{
+unsigned long kcc_type_align(void *ty_) {
+    struct Type *ty = (struct Type *)ty_;
+    if (!ty) return 8;
+    if (ty->kind == TY_ARRAY) return kcc_type_align((void *)ty->f0);
+    return ty->align ? ty->align : 8;
+}
+
+unsigned long kcc_type_layout(void *ty_) {
+    struct Type *ty = (struct Type *)ty_;
+    if (!ty) return 0;
+    unsigned long kind = ty->kind;
+    if (kind == TY_ARRAY) {
+        struct Type *elem = (struct Type *)ty->f0;
+        unsigned long len = ty->f1;
+        unsigned long esz = kcc_type_layout(elem);
+        ty->size = esz * len;
+        ty->align = kcc_type_align(elem);
+        return ty->size;
+    }
+    if (kind != TY_STRUCT && kind != TY_UNION) return ty->size;
+    if (ty->size) return ty->size;             /* memoised */
+    int is_union = (kind == TY_UNION);
+    struct Node *decl = (struct Node *)ty->f0;
+    if (!decl) return 0;
+    unsigned long layout_word = decl->f3;      /* (aligned<<1)|packed */
+    struct Node *field = (struct Node *)decl->f1;
+    if (!field) return 0;                       /* opaque */
+    unsigned long cursor = 0, maxalign = 1, maxsize = 0;
+    unsigned long cont_off = 0, cont_bit = 0, cont_size = 0;
+    while (field) {
+        struct Type *ftype = 0;
+        unsigned long fsize, falign;
+        void *fts = (void *)field->f0;
+        if (fts) ftype = (struct Type *)kcc_sema_resolve_type(fts);
+        if (ftype) { fsize = kcc_type_layout(ftype); falign = kcc_type_align(ftype); }
+        else { fsize = 8; falign = 8; }
+        if (layout_word & 1) falign = 1;        /* packed */
+        struct Node *width_expr = (struct Node *)field->f2;
+        if (width_expr) {
+            /* bit-field: unwrap parens, fold width */
+            struct Node *we = width_expr;
+            unsigned long wtag = we->tag;
+            while (wtag == AST_PAREN_EXPR) {
+                we = (struct Node *)we->f0;
+                if (!we) break;
+                wtag = we->tag;
+            }
+            unsigned long width;
+            if (we && (wtag == AST_INT_LIT || wtag == AST_CHAR_LIT)) width = we->f0;
+            else width = 0;
+            if (is_union) {
+                field->f3 = 0;
+                field->f2 = width & 0xffff;
+                if (fsize > maxsize) maxsize = fsize;
+            } else {
+                unsigned long cont_bits = fsize << 3;
+                if (cont_size == fsize && (cont_bit + width) <= cont_bits) {
+                    /* reuse the active container */
+                } else {
+                    cursor = (cursor + falign - 1) & ~(falign - 1);
+                    cont_off = cursor;
+                    cont_size = fsize;
+                    cont_bit = 0;
+                    cursor += fsize;
+                }
+                field->f3 = cont_off;
+                field->f2 = (cont_bit << 16) | width;
+                cont_bit += width;
+            }
+        } else {
+            cont_size = 0;                      /* plain member ends the run */
+            if (is_union) {
+                field->f3 = 0;
+                if (fsize > maxsize) maxsize = fsize;
+            } else {
+                cursor = (cursor + falign - 1) & ~(falign - 1);
+                field->f3 = cursor;
+                cursor += fsize;
+            }
+        }
+        if (falign > maxalign) maxalign = falign;
+        field = (struct Node *)field->f4;
+    }
+    if (is_union) cursor = maxsize;
+    unsigned long req = layout_word >> 1;       /* aligned(N) */
+    if (req > maxalign) maxalign = req;
+    cursor = (cursor + maxalign - 1) & ~(maxalign - 1);
+    ty->size = cursor;
+    ty->align = maxalign;
+    return cursor;
+}
+@}
+
+\paragraph{The declaration dispatcher.}
+
+@l c
+@d Selfhost: sema declarations @{
+/* Peel array/qual (and pointer only toward a bodied struct/union def) wrappers,
+ * registering any struct/union/enum tag a declared type introduces. */
+static void decl_pretag(struct Node *tn) {
+    struct Node *t = tn;
+    for (;;) {
+        if (!t) return;
+        unsigned long tag = t->tag;
+        if (tag == AST_TYPE_ARRAY || tag == AST_TYPE_QUALS) {
+            t = (struct Node *)t->f0;
+            continue;
+        }
+        if (tag == AST_TYPE_PTR) {
+            /* peel toward a bodied struct/union definition only */
+            struct Node *p = (struct Node *)t->f0;
+            while (p) {
+                unsigned long pt = p->tag;
+                if (pt == AST_TYPE_ARRAY || pt == AST_TYPE_QUALS || pt == AST_TYPE_PTR) {
+                    p = (struct Node *)p->f0; continue;
+                }
+                if (pt == AST_TYPE_STRUCT || pt == AST_TYPE_UNION) {
+                    struct Node *sd = (struct Node *)p->f0;
+                    if (sd && sd->f1) kcc_sema_check_decl(p);  /* bodied → register */
+                }
+                return;
+            }
+            return;
+        }
+        if (tag == AST_TYPE_STRUCT || tag == AST_TYPE_UNION || tag == AST_TYPE_ENUM)
+            kcc_sema_check_decl(t);
+        return;
+    }
+}
+
+void kcc_sema_check_decl(void *node) {
+    if (!node) return;
+    struct Node *d = (struct Node *)node;
+    unsigned long tag = d->tag;
+
+    if (tag == AST_VAR_DECL) {
+        if (d->f0) decl_pretag((struct Node *)d->f0);
+        kcc_sema_infer_array_len(d);
+        void *ty = kcc_sema_resolve_type((void *)d->f0);
+        void *name = (void *)d->f1;
+        if (name) {
+            kcc_sema_check_redef(d, name);
+            void *sym = kcc_symtab_declare(name, kcc_strlen(name), SYM_VAR, ty);
+            SL(sym, SYM_LINE) = d->line;
+            SL(sym, SYM_COL) = d->col;
+        }
+        if (d->f2) {
+            void *it = kcc_sema_expr((void *)d->f2);
+            kcc_sema_check_int_ptr(d, ty, it, (void *)d->f2);
+        }
+        return;
+    }
+    if (tag == AST_FUNC_DECL) {
+        void *ret = kcc_sema_resolve_type((void *)d->f0);
+        void *params = (void *)(d->f2 & ~3UL);
+        struct Type *ft = (struct Type *)kcc_type_func(ret, params);
+        if (d->f2 & 1) {                        /* variadic: nfixed → TY_QUALS */
+            unsigned long nfixed = 0;
+            struct Node *p = (struct Node *)(d->f2 & ~3UL);
+            while (p) { nfixed++; p = (struct Node *)p->f4; }
+            ft->quals = nfixed;
+        }
+        void *name = (void *)d->f1;
+        if (name) kcc_symtab_declare(name, kcc_strlen(name), SYM_FUNC, ft);
+        if (!d->f3) return;                      /* prototype */
+        sema_cur_ret = (void *)ft->f0;           /* return type from TY_FUNC */
+        kcc_symtab_push_scope();
+        kcc_symtab_label_begin();
+        struct Node *p = (struct Node *)(d->f2 & ~3UL);
+        while (p) {
+            void *pty = kcc_type_param_adjust(kcc_sema_resolve_type((void *)p->f0));
+            void *pname = (void *)p->f1;
+            if (pname) {
+                kcc_sema_check_redef(p, pname);
+                kcc_symtab_declare(pname, kcc_strlen(pname), SYM_VAR, pty);
+            }
+            p = (struct Node *)p->f4;
+        }
+        kcc_sema_check_stmt((void *)d->f3);
+        kcc_sema_check_return_path(d);
+        kcc_symtab_label_end();
+        kcc_symtab_pop_scope();
+        return;
+    }
+    if (tag == AST_TYPEDEF_DECL) {
+        struct Node *t = (struct Node *)d->f0;
+        if (!t) return;
+        while (t && (t->tag == AST_TYPE_PTR || t->tag == AST_TYPE_ARRAY)) {
+            struct Node *inner = (struct Node *)t->f0;
+            if (!inner) break;
+            t = inner;
+        }
+        if (t && (t->tag == AST_TYPE_STRUCT || t->tag == AST_TYPE_UNION ||
+                  t->tag == AST_TYPE_ENUM))
+            kcc_sema_check_decl(t);
+        void *ty = kcc_sema_resolve_type((void *)d->f0);
+        void *name = (void *)d->f1;
+        if (!name) return;
+        kcc_symtab_declare(name, kcc_strlen(name), SYM_TYPEDEF, ty);
+        return;
+    }
+    if (tag == AST_TYPE_STRUCT || tag == AST_TYPE_UNION) {
+        d = (struct Node *)d->f0;               /* unwrap to inner decl */
+        if (!d) return;
+        tag = d->tag;
+        /* fall through to struct/union decl handling below */
+    }
+    if (tag == AST_STRUCT_DECL || tag == AST_UNION_DECL) {
+        /* register any tagged type a member defines */
+        struct Node *fld = (struct Node *)d->f1;
+        while (fld) {
+            struct Node *ct = (struct Node *)fld->f0;
+            while (ct && (ct->tag == AST_TYPE_PTR || ct->tag == AST_TYPE_ARRAY ||
+                          ct->tag == AST_TYPE_QUALS))
+                ct = (struct Node *)ct->f0;
+            if (ct) {
+                unsigned long ctag = ct->tag;
+                struct Node *inner = 0;
+                if (ctag == AST_TYPE_STRUCT || ctag == AST_TYPE_UNION ||
+                    ctag == AST_TYPE_ENUM) {
+                    inner = (struct Node *)ct->f0;
+                    if (inner && inner->f1) kcc_sema_check_decl(ct);
+                } else if (ctag == AST_STRUCT_DECL || ctag == AST_UNION_DECL ||
+                           ctag == AST_ENUM_DECL) {
+                    if (ct->f1) kcc_sema_check_decl(ct);
+                }
+            }
+            fld = (struct Node *)fld->f4;
+        }
+        void *name = (void *)d->f0;
+        if (!name) return;
+        void *sym = kcc_symtab_lookup_tag(name, kcc_strlen(name));
+        if (sym) {
+            struct Type *desc = (struct Type *)SL(sym, SYM_TYPE);
+            if (desc) {
+                unsigned long tdepth = SL(sym, SYM_DEPTH);
+                if (!d->f1) return;              /* bodyless reference: no-op */
+                if (tdepth == kcc_sym_depth) {   /* complete in place */
+                    desc->f0 = (unsigned long)d;
+                    desc->size = 0;
+                    kcc_type_layout(desc);
+                    return;
+                }
+                /* enclosing-scope tag: this definition shadows → fresh */
+            }
+        }
+        void *desc = (tag == AST_STRUCT_DECL) ? kcc_type_struct(d)
+                                              : kcc_type_union(d);
+        kcc_type_layout(desc);
+        kcc_symtab_declare_tag(name, kcc_strlen(name), desc);
+        return;
+    }
+    if (tag == AST_TYPE_ENUM) {
+        d = (struct Node *)d->f0;
+        if (!d) return;
+        tag = AST_ENUM_DECL;
+    }
+    if (tag == AST_ENUM_DECL) {
+        void *name = (void *)d->f0;
+        if (name) {
+            void *desc = kcc_type_enum(d);
+            kcc_symtab_declare_tag(name, kcc_strlen(name), desc);
+        }
+        struct Node *en = (struct Node *)d->f1;
+        long counter = 0;
+        while (en) {
+            if (en->f1) counter = (long)kcc_eval_const_int((void *)en->f1);
+            void *ename = (void *)en->f0;
+            if (ename) {
+                void *sym = kcc_symtab_declare(ename, kcc_strlen(ename),
+                                               SYM_ENUM_CONST, kcc_type_int_s);
+                SL(sym, SYM_VALUE) = (unsigned long)counter;
+            }
+            counter++;
+            en = (struct Node *)en->f4;
+        }
+        return;
+    }
+}
+@}
+
+\section{Expression Type-Checking}
+
+\texttt{kcc\_sema\_expr} dispatches on tag, storing the resolved type in the
+node's \texttt{AST\_F3}.  Simple forms are inline; identifiers, literals, binary,
+unary, assignment, calls, member access, casts, and \texttt{sizeof} are
+delegated.  \texttt{\_Generic} is resolved here---the controlling expression is
+typed but not evaluated, and the first compatible association (or the default)
+is chosen and stashed for the IR builder.
+
+@l c
+@d Selfhost: sema expr @{
+void *kcc_sema_expr(void *node) {
+    if (!node) return kcc_type_void;
+    struct Node *n = (struct Node *)node;
+    unsigned long tag = n->tag;
+    void *t;
+    switch (tag) {
+    case AST_IDENT_EXPR: t = sema_expr_ident(n); break;
+    case AST_INT_LIT: case AST_FLOAT_LIT: case AST_STR_LIT: case AST_CHAR_LIT:
+        t = sema_expr_literal(n, tag); break;
+    case AST_BINARY_EXPR: t = sema_expr_binary(n); break;
+    case AST_UNARY_EXPR: t = sema_expr_unary(n); break;
+    case AST_ASSIGN_EXPR: t = sema_expr_assign(n); break;
+    case AST_COND_EXPR:
+        kcc_sema_expr((void *)n->f0);
+        t = kcc_sema_expr((void *)n->f1);       /* result = then type */
+        kcc_sema_expr((void *)n->f2);
+        break;
+    case AST_CALL_EXPR: t = sema_expr_call(n); break;
+    case AST_SUBSCRIPT: {
+        struct Type *at = (struct Type *)kcc_sema_expr((void *)n->f0);
+        kcc_sema_expr((void *)n->f1);
+        if (at->kind == TY_PTR || at->kind == TY_ARRAY) t = (void *)at->f0;
+        else t = kcc_type_int_s;
+        break;
+    }
+    case AST_MEMBER: t = sema_expr_member(n); break;
+    case AST_CAST_EXPR: t = sema_expr_cast(n); break;
+    case AST_SIZEOF_EXPR: t = sema_expr_sizeof(n); break;
+    case AST_ALIGNOF_EXPR:
+        kcc_sema_resolve_type((void *)n->f0);
+        t = kcc_type_long_u;
+        break;
+    case AST_COMMA_EXPR:
+        kcc_sema_expr((void *)n->f0);
+        t = kcc_sema_expr((void *)n->f1);
+        break;
+    case AST_PAREN_EXPR:
+        t = kcc_sema_expr((void *)n->f0);
+        break;
+    case AST_GENERIC: t = sema_expr_generic(n); break;
+    case AST_COMPOUND_LIT:
+        if (!n->f0) t = kcc_type_int_s;
+        else t = kcc_sema_resolve_type((void *)n->f0);
+        break;
+    case AST_VA_ARG:
+        if (n->f0) kcc_sema_expr((void *)n->f0);
+        if (!n->f1) t = kcc_type_int_s;
+        else t = kcc_sema_resolve_type((void *)n->f1);
+        break;
+    case AST_INIT_LIST: {
+        struct Node *el = (struct Node *)n->f0;
+        while (el) {
+            if (el->tag == AST_DESIGNATOR) {
+                if (el->f3) kcc_sema_expr((void *)el->f3);
+            } else {
+                kcc_sema_expr(el);
+            }
+            el = (struct Node *)el->f4;
+        }
+        t = kcc_type_int_s;
+        break;
+    }
+    case AST_STMT_EXPR: {
+        struct Node *cmp = (struct Node *)n->f0;
+        if (!cmp) { t = kcc_type_void; break; }
+        kcc_sema_check_stmt(cmp);
+        struct Node *it = (struct Node *)cmp->f0;
+        if (!it) { t = kcc_type_void; break; }
+        while (it->f4) it = (struct Node *)it->f4;   /* last item */
+        if (it->tag != AST_EXPR_STMT || !it->f0) { t = kcc_type_void; break; }
+        void *ft = (void *)((struct Node *)it->f0)->f3;
+        t = ft ? ft : kcc_type_void;
+        break;
+    }
+    default: t = kcc_type_int_s; break;
+    }
+    n->f3 = (unsigned long)t;
+    return t;
+}
+
+static void *sema_expr_generic(struct Node *n) {
+    struct Type *ct = (struct Type *)kcc_sema_expr((void *)n->f0);
+    if (ct && ct->kind == TY_ARRAY) ct = (struct Type *)kcc_type_ptr((void *)ct->f0);
+    struct Node *assoc = (struct Node *)n->f1;
+    void *dflt = 0;
+    void *chosen = 0;
+    while (assoc) {
+        if (!assoc->f0) {                        /* default association */
+            dflt = (void *)assoc->f1;
+        } else {
+            void *aty = kcc_sema_resolve_type((void *)assoc->f0);
+            if (kcc_type_compatible(aty, ct)) { chosen = (void *)assoc->f1; break; }
+        }
+        assoc = (struct Node *)assoc->f4;
+    }
+    if (!chosen) {
+        if (!dflt) {
+            kcc_diag_error(n->line, 0, m_generic);
+            return kcc_type_int_s;
+        }
+        chosen = dflt;
+    }
+    n->f2 = (unsigned long)chosen;               /* for the IR builder */
+    return kcc_sema_expr(chosen);
+}
+@}
+
+\paragraph{Identifiers, literals, and the named-message helpers.}
+
+@l c
+@d Selfhost: sema exprident @{
+static char *sema_build_named(const char *name, const char *prefix) {
+    unsigned long plen = kcc_strlen(prefix);
+    unsigned long nlen = kcc_strlen(name);
+    char *buf = (char *)kcc_arena_alloc(plen + nlen + 2);
+    kcc_memcpy(buf, prefix, plen);
+    kcc_memcpy(buf + plen, name, nlen);
+    buf[plen + nlen] = '\'';
+    buf[plen + nlen + 1] = 0;
+    return buf;
+}
+void kcc_sema_err_named(unsigned long line, unsigned long col, const char *name, const char *prefix) {
+    kcc_diag_error(line, col, sema_build_named(name, prefix));
+}
+void kcc_sema_warn_named(unsigned long line, unsigned long col, const char *name, const char *prefix) {
+    kcc_diag_warning(line, col, sema_build_named(name, prefix));
+}
+
+static void *sema_expr_ident(struct Node *n) {
+    void *name = (void *)n->f0;
+    if (!name) return kcc_type_int_s;
+    void *sym = kcc_symtab_lookup(name, kcc_strlen(name));
+    if (!sym) {
+        if (sema_callee_ctx) {
+            sema_callee_implicit = 1;
+            if (kcc_warn_all)
+                kcc_sema_warn_named(n->line, n->col, name, m_implicit);
+            return kcc_type_int_s;
+        }
+        kcc_sema_err_named(n->line, n->col, name, m_undecl);
+        return kcc_type_int_s;
+    }
+    if (SL(sym, SYM_KIND) == SYM_ENUM_CONST) {
+        n->tag = AST_INT_LIT;                    /* rewrite in place */
+        n->f0 = SL(sym, SYM_VALUE);
+        return kcc_type_int_s;
+    }
+    unsigned *flags = (unsigned *)((char *)sym + SYM_FLAGS);
+    *flags |= 2;                                 /* mark used */
+    void *ty = (void *)SL(sym, SYM_TYPE);
+    ty = kcc_conv_func_decay(ty);
+    ty = kcc_conv_array_decay(ty);
+    return ty;
+}
+
+static void *sema_expr_literal(struct Node *n, unsigned long tag) {
+    if (tag == AST_FLOAT_LIT) return n->f2 ? kcc_type_float : kcc_type_double;
+    if (tag == AST_STR_LIT) return kcc_type_ptr(kcc_type_char_s);
+    /* int / char literal */
+    unsigned long f2 = n->f2;
+    if (!f2) return kcc_type_int_s;
+    unsigned long rank = (f2 >> 1) & 3;
+    unsigned long uns = f2 & 1;
+    if (rank == 0) return kcc_type_int_u;        /* u/U, no l */
+    if (rank == 1) return uns ? kcc_type_long_u : kcc_type_long_s;
+    return uns ? kcc_type_llong_u : kcc_type_llong_s;
+}
+@}
+
+\paragraph{The -Wall semantic checks: unused, redefinition, sign-compare, int/pointer.}
+
+@l c
+@d Selfhost: sema checks @{
+void kcc_sema_check_unused_scope(void) {
+    if (!kcc_warn_all) return;
+    void *ht = kcc_symtab_current_ht();
+    if (!ht) return;
+    char *entries = *(char **)((char *)ht + HT_ENTRIES);
+    unsigned long cap = SL(ht, HT_CAP);
+    for (unsigned long i = 0; i < cap; i++) {
+        char *e = entries + i * HTE_SIZE;
+        if (!*(void **)(e + HTE_KEY)) continue;
+        void *sym = *(void **)(e + HTE_VALUE);
+        if (!sym) continue;
+        if (SL(sym, SYM_KIND) != SYM_VAR) continue;
+        if (*(unsigned *)((char *)sym + SYM_FLAGS) & 2) continue;
+        kcc_sema_warn_named(SL(sym, SYM_LINE), SL(sym, SYM_COL),
+                            (const char *)SL(sym, SYM_NAME), m_unused);
+    }
+}
+
+void kcc_sema_check_redef(void *decl, const char *name) {
+    struct Node *d = (struct Node *)decl;
+    if (kcc_sym_depth < 2) return;               /* block scope only */
+    void *sym = kcc_symtab_lookup_current(name, kcc_strlen(name));
+    if (!sym) return;
+    kcc_sema_err_named(d->line, d->col, name, m_redef);
+}
+
+long kcc_sema_int_signedness(void *t_) {
+    struct Type *t = (struct Type *)t_;
+    if (!t) return -1;
+    unsigned long k = t->kind;
+    if (k == TY_ENUM) return 1;
+    if (k < TY_CHAR || k > TY_LLONG) return -1;
+    return (long)t->f0;                          /* 1 signed, 0 unsigned */
+}
+
+static int sema_is_nonneg_const(void *e_) {
+    struct Node *e = (struct Node *)e_;
+    if (!e) return 0;
+    while (e->tag == AST_PAREN_EXPR) { e = (struct Node *)e->f0; if (!e) return 0; }
+    return (e->tag == AST_INT_LIT || e->tag == AST_CHAR_LIT);
+}
+
+void kcc_sema_check_sign_compare(void *expr, void *lt, void *rt) {
+    struct Node *n = (struct Node *)expr;
+    if (!kcc_warn_all) return;
+    long ls = kcc_sema_int_signedness(lt);
+    if (ls == -1) return;
+    long rs = kcc_sema_int_signedness(rt);
+    if (rs == -1) return;
+    if (ls == rs) return;
+    if (sema_is_nonneg_const((void *)n->f1)) return;
+    if (sema_is_nonneg_const((void *)n->f2)) return;
+    kcc_diag_warning(n->line, n->col, m_sign_cmp);
+}
+
+static int sema_ptr_int_class(void *t_) {
+    struct Type *t = (struct Type *)t_;
+    if (!t) return 0;
+    unsigned long k = t->kind;
+    if (k == TY_PTR) return 1;
+    if (k == TY_ENUM) return 2;
+    if (k < TY_BOOL || k > TY_LLONG) return 0;
+    return 2;
+}
+
+static int sema_is_null_const(void *e_) {
+    struct Node *e = (struct Node *)e_;
+    if (!e) return 0;
+    while (e->tag == AST_PAREN_EXPR) { e = (struct Node *)e->f0; if (!e) return 0; }
+    if (e->tag != AST_INT_LIT) return 0;
+    return e->f0 == 0;
+}
+
+void kcc_sema_check_int_ptr(void *loc, void *dst, void *src, void *srcexpr) {
+    struct Node *n = (struct Node *)loc;
+    if (!kcc_warn_all) return;
+    int dc = sema_ptr_int_class(dst);
+    int sc = sema_ptr_int_class(src);
+    if (dc == 1) {
+        if (sc != 2) return;
+        if (sema_is_null_const(srcexpr)) return;
+        kcc_diag_warning(n->line, n->col, m_int2ptr);
+    } else if (dc == 2) {
+        if (sc != 1) return;
+        kcc_diag_warning(n->line, n->col, m_ptr2int);
+    }
+}
+@}
+
+\paragraph{Binary, unary, and assignment expressions.}
+
+@l c
+@d Selfhost: sema binunasgn @{
+static void *sema_expr_binary(struct Node *n) {
+    struct Type *lt = (struct Type *)kcc_sema_expr((void *)n->f1);
+    struct Type *rt = (struct Type *)kcc_sema_expr((void *)n->f2);
+    unsigned long op = n->f0;
+    switch (op) {
+    case TOK_EQ: case TOK_NE: case TOK_LT: case TOK_GT: case TOK_LE: case TOK_GE:
+        kcc_sema_check_sign_compare(n, lt, rt);
+        return kcc_type_int_s;
+    case TOK_AND: case TOK_OR:
+        return kcc_type_int_s;
+    case TOK_SHL: case TOK_SHR:
+        return kcc_conv_promote(lt);              /* result = promoted left */
+    default: break;
+    }
+    if (lt->kind == TY_PTR) {                     /* pointer arithmetic */
+        if (op == TOK_MINUS) {
+            unsigned long rk = rt->kind;
+            if (rk == TY_PTR || rk == TY_ARRAY) return kcc_type_long_s;  /* ptrdiff */
+        }
+        return lt;
+    }
+    return kcc_conv_usual(lt, rt);
+}
+
+static void *sema_expr_unary(struct Node *n) {
+    struct Type *ot = (struct Type *)kcc_sema_expr((void *)n->f1);
+    unsigned long op = n->f0;
+    switch (op) {
+    case TOK_AMP: return kcc_type_ptr(ot);
+    case TOK_STAR:
+        if (ot->kind != TY_PTR) return kcc_type_int_s;
+        return (void *)ot->f0;
+    case TOK_BANG: return kcc_type_int_s;
+    case TOK_TILDE: case TOK_MINUS: case TOK_PLUS:
+        return kcc_conv_promote(ot);
+    default: return ot;                           /* ++/-- and fallback */
+    }
+}
+
+static void *sema_expr_assign(struct Node *n) {
+    void *lt = kcc_sema_expr((void *)n->f1);
+    void *rt = kcc_sema_expr((void *)n->f2);
+    if (n->f0 == TOK_ASSIGN)
+        kcc_sema_check_int_ptr(n, lt, rt, (void *)n->f2);
+    return lt;
+}
+@}
+
+\paragraph{Calls, member access, casts, and sizeof.}
+
+@l c
+@d Selfhost: sema callmembercast @{
+static void *sema_expr_call(struct Node *n) {
+    sema_callee_implicit = 0;
+    struct Node *callee = (struct Node *)n->f0;
+    sema_callee_ctx = (callee->tag == AST_IDENT_EXPR);
+    struct Type *ct = (struct Type *)kcc_sema_expr(callee);
+    sema_callee_ctx = 0;
+    struct Node *arg = (struct Node *)n->f1;
+    while (arg) { kcc_sema_expr(arg); arg = (struct Node *)arg->f4; }
+    if (ct->kind == TY_FUNC) return (void *)ct->f0;
+    if (ct->kind == TY_PTR) {
+        struct Type *fn = (struct Type *)ct->f0;
+        if (fn->kind != TY_FUNC) return kcc_type_int_s;
+        return (void *)fn->f0;
+    }
+    if (sema_callee_implicit) return kcc_type_int_s;
+    kcc_diag_error(n->line, n->col, m_not_func);
+    return kcc_type_int_s;
+}
+
+struct FindResult kcc_type_find_member(void *sty, const char *name) {
+    struct FindResult r;
+    r.field = 0; r.off = 0;
+    struct Type *ty = (struct Type *)sty;
+    kcc_type_layout(ty);
+    struct Node *decl = (struct Node *)ty->f0;
+    if (!decl) return r;
+    struct Node *field = (struct Node *)decl->f1;
+    while (field) {
+        void *fname = (void *)field->f1;
+        if (!fname) {
+            void *fty = (void *)field->f0;
+            if (fty) {
+                struct Type *ift = (struct Type *)kcc_sema_resolve_type(fty);
+                if (ift && (ift->kind == TY_STRUCT || ift->kind == TY_UNION)) {
+                    struct FindResult inner = kcc_type_find_member(ift, name);
+                    if (inner.field) {
+                        r.field = inner.field;
+                        r.off = inner.off + field->f3;
+                        return r;
+                    }
+                }
+            }
+        } else if (kcc_strcmp(fname, name) == 0) {
+            r.field = field;
+            r.off = field->f3;
+            return r;
+        }
+        field = (struct Node *)field->f4;
+    }
+    return r;
+}
+
+static void *sema_expr_member(struct Node *n) {
+    struct Type *ot = (struct Type *)kcc_sema_expr((void *)n->f0);
+    if (n->f2) {                                  /* arrow: deref pointer */
+        if (ot->kind != TY_PTR) goto fallback;
+        ot = (struct Type *)ot->f0;
+    }
+    if (ot->kind != TY_STRUCT && ot->kind != TY_UNION) goto fallback;
+    {
+        struct Node *fd = (struct Node *)kcc_type_find_member(ot, (void *)n->f1).field;
+        if (!fd) {
+            kcc_sema_err_named(n->line, n->col, (const char *)n->f1, m_nomember);
+            return kcc_type_int_s;
+        }
+        void *fts = (void *)fd->f0;
+        if (!fts) return kcc_type_int_s;
+        struct Type *fty = (struct Type *)kcc_sema_resolve_type(fts);
+        /* bit-field integer promotion (§6.3.1.1) */
+        unsigned long width = fd->f2 & 0xffff;
+        if (!width || !fty) return fty;
+        unsigned long k = fty->kind;
+        if (k - 2 > 5) return fty;                /* not TY_BOOL..TY_LLONG */
+        if (fty->f0) {                            /* signed */
+            if (width > 32) return fty;
+            return kcc_type_int_s;
+        }
+        /* unsigned */
+        if (width <= 31) return kcc_type_int_s;
+        if (width > 32) return fty;
+        return kcc_type_int_u;                    /* width == 32 */
+    }
+fallback:
+    kcc_diag_error(n->line, n->col, m_not_struct);
+    return kcc_type_int_s;
+}
+
+static void *sema_expr_cast(struct Node *n) {
+    void *target = kcc_sema_resolve_type((void *)n->f0);
+    kcc_sema_expr((void *)n->f1);
+    return target;
+}
+
+static void *sema_expr_sizeof(struct Node *n) {
+    if (n->f1) {                                  /* type operand */
+        kcc_sema_resolve_type((void *)n->f0);
+        return kcc_type_long_u;
+    }
+    kcc_sema_expr((void *)n->f0);
+    /* sizeof does not decay arrays (§6.3.2.1): restore the array type */
+    struct Node *operand = (struct Node *)n->f0;
+    struct Node *inner = operand;
+    while (inner && inner->tag == AST_PAREN_EXPR) inner = (struct Node *)inner->f0;
+    if (inner) {
+        if (inner->tag == AST_STR_LIT) {
+            unsigned long len = inner->f1 + 1;
+            void *arr = kcc_type_array(kcc_type_char_s, len);
+            operand->f3 = (unsigned long)arr;
+        } else if (inner->tag == AST_IDENT_EXPR && inner->f0) {
+            void *name = (void *)inner->f0;
+            void *sym = kcc_symtab_lookup(name, kcc_strlen(name));
+            if (sym) {
+                struct Type *st = (struct Type *)SL(sym, SYM_TYPE);
+                if (st && st->kind == TY_ARRAY) operand->f3 = (unsigned long)st;
+            }
+        }
+    }
+    return kcc_type_long_u;
+}
+@}
+
+\paragraph{Array-length inference and the reaching-end (-Wreturn-type) analysis.}
+
+@l c
+@d Selfhost: sema returnpath @{
+unsigned long kcc_agg_leaf_count(void *ty_) {
+    struct Type *ty = (struct Type *)ty_;
+    if (!ty) return 1;
+    if (ty->kind == TY_ARRAY)
+        return kcc_agg_leaf_count((void *)ty->f0) * ty->f1;
+    if (ty->kind == TY_STRUCT) {
+        struct Node *decl = (struct Node *)ty->f0;
+        if (!decl) return 1;
+        struct Node *f = (struct Node *)decl->f1;
+        if (!f) return 1;
+        unsigned long acc = 0;
+        while (f) {
+            acc += kcc_agg_leaf_count(kcc_sema_resolve_type((void *)f->f0));
+            f = (struct Node *)f->f4;
+        }
+        return acc;
+    }
+    if (ty->kind == TY_UNION) {
+        struct Node *decl = (struct Node *)ty->f0;
+        if (!decl) return 1;
+        struct Node *f = (struct Node *)decl->f1;
+        if (!f) return 1;
+        return kcc_agg_leaf_count(kcc_sema_resolve_type((void *)f->f0));
+    }
+    return 1;
+}
+
+unsigned long kcc_infer_arr_elems(void *head, void *elem) {
+    struct Node *it = (struct Node *)head;
+    unsigned long leaves = kcc_agg_leaf_count(elem);
+    unsigned long count = 0;
+    while (it) {
+        unsigned long tg = it->tag;
+        if (tg == AST_INIT_LIST || tg == AST_DESIGNATOR) {
+            it = (struct Node *)it->f4;
+        } else {
+            unsigned long skip = leaves;
+            while (skip && it) { it = (struct Node *)it->f4; skip--; }
+        }
+        count++;
+    }
+    return count;
+}
+
+void kcc_sema_infer_array_len(void *decl) {
+    struct Node *d = (struct Node *)decl;
+    struct Node *tn = (struct Node *)d->f0;
+    if (!tn || tn->tag != AST_TYPE_ARRAY) return;
+    if (tn->f1) return;                           /* already complete */
+    struct Node *init = (struct Node *)d->f2;
+    if (!init) return;
+    unsigned long len;
+    if (init->tag == AST_STR_LIT) {
+        len = init->f1 + 1;
+    } else if (init->tag == AST_INIT_LIST) {
+        struct Type *at = (struct Type *)kcc_sema_resolve_type(tn);
+        struct Type *elem = at ? (struct Type *)at->f0 : 0;
+        if (elem && (elem->kind == TY_STRUCT || elem->kind == TY_UNION ||
+                     elem->kind == TY_ARRAY)) {
+            len = kcc_infer_arr_elems((void *)init->f0, elem);
+        } else {
+            len = kcc_ir_initlist_count(init);
+        }
+    } else {
+        return;
+    }
+    struct Node *lit = (struct Node *)kcc_ast_alloc(AST_INT_LIT);
+    lit->f0 = len;
+    tn->f1 = (unsigned long)lit;
+}
+
+static int sema_const_true(struct Node *e) {
+    if (!e) return 0;
+    while (e->tag == AST_PAREN_EXPR) { e = (struct Node *)e->f0; if (!e) return 0; }
+    if (e->tag != AST_INT_LIT && e->tag != AST_CHAR_LIT) return 0;
+    return e->f0 != 0;
+}
+
+static int sema_has_toplevel_break(struct Node *s) {
+    if (!s) return 0;
+    switch (s->tag) {
+    case AST_BREAK_STMT: return 1;
+    case AST_WHILE_STMT: case AST_FOR_STMT: case AST_DO_STMT:
+    case AST_SWITCH_STMT: return 0;
+    case AST_COMPOUND: {
+        struct Node *it = (struct Node *)s->f0;
+        while (it) {
+            if (sema_has_toplevel_break(it)) return 1;
+            it = (struct Node *)it->f4;
+        }
+        return 0;
+    }
+    case AST_IF_STMT:
+        if (sema_has_toplevel_break((struct Node *)s->f1)) return 1;
+        if (!s->f2) return 0;
+        return sema_has_toplevel_break((struct Node *)s->f2);
+    case AST_LABEL_STMT: case AST_CASE_STMT:
+        return sema_has_toplevel_break((struct Node *)s->f1);
+    case AST_DEFAULT_STMT:
+        return sema_has_toplevel_break((struct Node *)s->f0);
+    default: return 0;
+    }
+}
+
+static int sema_is_noreturn_call(struct Node *e) {
+    if (!e || e->tag != AST_CALL_EXPR) return 0;
+    struct Node *callee = (struct Node *)e->f0;
+    if (!callee || callee->tag != AST_IDENT_EXPR) return 0;
+    const char *name = (const char *)callee->f0;
+    if (!name) return 0;
+    for (int i = 0; sema_noreturn_tbl[i]; i++)
+        if (kcc_strcmp(name, sema_noreturn_tbl[i]) == 0) return 1;
+    return 0;
+}
+
+static int sema_falls_through(struct Node *s) {
+    if (!s) return 1;
+    switch (s->tag) {
+    case AST_RETURN_STMT: case AST_GOTO_STMT: case AST_BREAK_STMT:
+    case AST_CONTINUE_STMT: case AST_SWITCH_STMT:
+        return 0;
+    case AST_COMPOUND: {
+        struct Node *it = (struct Node *)s->f0;
+        while (it) {
+            if (!sema_falls_through(it)) return 0;
+            it = (struct Node *)it->f4;
+        }
+        return 1;
+    }
+    case AST_IF_STMT:
+        if (!s->f2) return 1;                     /* no else → untaken path */
+        if (sema_falls_through((struct Node *)s->f1)) return 1;
+        return sema_falls_through((struct Node *)s->f2);
+    case AST_LABEL_STMT:
+        return sema_falls_through((struct Node *)s->f1);
+    case AST_WHILE_STMT:
+        if (!sema_const_true((struct Node *)s->f0)) return 1;
+        return sema_has_toplevel_break((struct Node *)s->f1);
+    case AST_FOR_STMT:
+        if (s->f1 && !sema_const_true((struct Node *)s->f1)) return 1;
+        return sema_has_toplevel_break((struct Node *)s->f3);
+    case AST_DO_STMT:
+        if (!sema_const_true((struct Node *)s->f1)) return 1;
+        return sema_has_toplevel_break((struct Node *)s->f0);
+    case AST_EXPR_STMT:
+        return !sema_is_noreturn_call((struct Node *)s->f0);
+    default: return 1;
+    }
+}
+
+void kcc_sema_check_return_path(void *func) {
+    struct Node *f = (struct Node *)func;
+    if (!kcc_warn_all) return;
+    if (!sema_cur_ret || SL(sema_cur_ret, 0) == TY_VOID) return;
+    void *name = (void *)f->f1;
+    if (!name) return;
+    if (kcc_strcmp(name, m_main) == 0) return;    /* main is exempt */
+    if (!f->f3) return;                            /* prototype */
+    if (!sema_falls_through((struct Node *)f->f3)) return;
+    kcc_diag_warning(f->line, f->col, m_reach_end);
+}
+@}
+
+\section{Type Dumping and Assembly}
+
+\texttt{kcc\_sema\_dump\_types} implements \texttt{--dump-types}, printing each
+top-level variable, function, and typedef with its resolved type.
+
+@l c
+@d Selfhost: sema dump @{
+void kcc_sema_dump_types(void *tu) {
+    struct Node *d = (struct Node *)((struct Node *)tu)->f0;
+    while (d) {
+        unsigned long tag = d->tag;
+        if (tag == AST_VAR_DECL || tag == AST_FUNC_DECL || tag == AST_TYPEDEF_DECL) {
+            const char *kw = (tag == AST_VAR_DECL) ? "var "
+                           : (tag == AST_FUNC_DECL) ? "func " : "typedef ";
+            kcc_io_puts(kw);
+            if (d->f1) kcc_io_puts((const char *)d->f1);
+            kcc_io_puts(tag == AST_TYPEDEF_DECL ? " = " : ": ");
+            kcc_type_dump(kcc_sema_resolve_type((void *)d->f0));
+            kcc_io_puts("\n");
+        }
+        d = (struct Node *)d->f4;
+    }
+    kcc_io_flush();
+}
+@}
+
+@l c
+@d Selfhost: sema @{
+@<Selfhost: sema preamble@>
+@<Selfhost: sema resolve@>
+@<Selfhost: sema statements@>
+@<Selfhost: sema layout@>
+@<Selfhost: sema declarations@>
+@<Selfhost: sema expr@>
+@<Selfhost: sema exprident@>
+@<Selfhost: sema checks@>
+@<Selfhost: sema binunasgn@>
+@<Selfhost: sema callmembercast@>
+@<Selfhost: sema returnpath@>
+@<Selfhost: sema dump@>
+@}
+
+\section{Verification}
+\label{sec:selfhost-sema-verify}
+
+\texttt{make selfhost-sema} runs the strongest available oracle: the
+code-generation suite plus \texttt{difftest} (byte-comparing every case against
+clang), and the diagnostic/warning suites that pin the exact \texttt{-Wall}
+message text.  A clean sweep means \kcc{} compiled its own semantic core---type
+resolution, aggregate layout, the enum-constant rewrite, and every diagnostic
+path---faithfully enough that not one byte of generated code, nor one character
+of a diagnostic, changed.
+
+@d Selfhost: sema verify @{
+#!/usr/bin/env bash
+# make selfhost-sema — compile kcc's semantic analyzer in C with kcc, relink,
+# run codegen + difftest + diagtest + warntest.
+set -euo pipefail
+
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+
+echo "[1/5] compiling tmp/selfhost/sema.c with kcc"
+tmp/kcc -c "$SH/sema.c" -o "$SH/sema_c.o" >/dev/null
+
+echo "[2/5] linking tmp/kcc_selfhost_sema (sema.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "sema" ]; then OBJ="$OBJ $SH/sema_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_sema $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+
+cp tmp/kcc "$SH/kcc_asm_backup_sema"
+cp tmp/kcc_selfhost_sema tmp/kcc
+
+echo "[3/5] difftest (byte-compare generated objects against clang)"
+set +e
+bash tmp/tests/difftest.sh >/tmp/sema_difftest.log 2>&1
+dstatus=$?
+tail -1 /tmp/sema_difftest.log
+set -e
+if [ $dstatus -ne 0 ]; then cp "$SH/kcc_asm_backup_sema" tmp/kcc; exit $dstatus; fi
+
+echo "[4/5] diagtest + warntest (pin the -Wall message text)"
+set +e
+bash tmp/tests/diagtest.sh >/tmp/sema_diag.log 2>&1; diagst=$?
+bash tmp/tests/warntest.sh >/tmp/sema_warn.log 2>&1; warnst=$?
+tail -1 /tmp/sema_diag.log; tail -1 /tmp/sema_warn.log
+set -e
+if [ $diagst -ne 0 ] || [ $warnst -ne 0 ]; then cp "$SH/kcc_asm_backup_sema" tmp/kcc; exit 1; fi
+
+echo "[5/5] codegen suite with the self-hosted semantic analyzer"
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_sema" tmp/kcc
+exit $status
+@}

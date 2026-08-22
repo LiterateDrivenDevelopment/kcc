@@ -983,6 +983,17 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: emit_arm64 verify@>
 @}
 
+\noindent The semantic analyzer, ported to C
+(Chapter~\ref{ch:self-hosting-sema}), a drop-in replacement:
+
+@o tmp/selfhost/sema.c @{
+@<Selfhost: sema@>
+@}
+
+@o tmp/selfhost/sema_verify.sh @{
+@<Selfhost: sema verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

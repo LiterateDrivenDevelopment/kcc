@@ -153,9 +153,22 @@ kcc_sys_write:
 	ret
 
 # long kcc_sys_open(const char *path, long flags, long mode)
+# kcc hard-codes the macOS open() flag values (O_CREAT=0x200, O_TRUNC=0x400),
+# so when it runs on Linux those bits mean something else and an output file is
+# never created.  Translate the two flag words kcc actually emits --- 0 (read)
+# and 0x601 (write|create|trunc) --- into the Linux convention (O_CREAT=0x40,
+# O_TRUNC=0x200) before the syscall; the access mode (low two bits) is identical.
 	.globl kcc_sys_open
 kcc_sys_open:
-	movq	$SYS_open, %rax
+	movq	%rsi, %r11             # macOS-convention flags
+	andq	$3, %rsi               # keep access mode (RDONLY/WRONLY/RDWR)
+	testq	$0x200, %r11           # macOS O_CREAT
+	jz	1f
+	orq	$0x40, %rsi            # Linux O_CREAT
+1:	testq	$0x400, %r11           # macOS O_TRUNC
+	jz	2f
+	orq	$0x200, %rsi           # Linux O_TRUNC
+2:	movq	$SYS_open, %rax
 	syscall
 	ret
 

@@ -107,6 +107,7 @@ static void *kcc_x86_strs = 0;
 #define S(name, str) static const char name[] = str
 S(s_text, ".text\n"); S(s_globl, ".globl "); S(s_us, "_");
 S(s_rodata, ".section .rodata\n"); S(s_comm, "\t.comm "); S(s_comm_a8, ",8\n");
+S(s_local, "\t.local ");
 S(s_modinit_d, ".section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad ");
 S(s_modinit_l, ".section .init_array,\"aw\"\n\t.p2align 3\n\t.quad ");
 S(s_modinitnm, "kcc.module_init");
@@ -569,11 +570,20 @@ as code); \texttt{const} scalars, arrays of scalars, structs of scalars, and
 arrays of such structs become read-only value directives; static locals are
 recovered by walking every function body.
 
+A common symbol emitted with \verb|.comm| has \emph{external} linkage: the
+linker coalesces same-named commons from different objects into one.  A
+file-scope \texttt{static} has \emph{internal} linkage and must stay private to
+its translation unit, so for a static we first mark the name \verb|.local|.
+Without it two units that each name a static the same---say both back ends'
+\texttt{s\_globl}---would share one storage cell and their initialisers would
+overwrite each other.
+
 @l c
 @d Selfhost: emit_x86 data @{
 static void x86_emit_zerofill(const char *name, unsigned long size, int is_static) {
     if (!is_static) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
     if (kcc_x86_os) {                            /* Linux .comm name,size,8 */
+        if (is_static) { kcc_as_str(s_local); kcc_as_str(name); kcc_as_ch('\n'); }
         kcc_as_str(s_comm); kcc_as_str(name); kcc_as_str(s_comma1);
         kcc_as_dec(size); kcc_as_str(s_comm_a8);
     } else {                                     /* Darwin .zerofill (prefix carries _) */

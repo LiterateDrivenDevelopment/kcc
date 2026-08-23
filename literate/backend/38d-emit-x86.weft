@@ -133,6 +133,7 @@ _kcc_x86_s_us:       .asciz "_"
 _kcc_x86_s_rodata:   .asciz ".section .rodata\n"
 _kcc_x86_s_comm:     .asciz "\t.comm "
 _kcc_x86_s_comm_a8:  .asciz ",8\n"          // ",<size>,8\n" .comm alignment tail
+_kcc_x86_s_local:    .asciz "\t.local "     // marks a static common as ELF-local
 
 // Module-init pointer: the section header, then ".quad <name>\n" registers the
 // synthesised kcc.module_init so it runs before main.  Darwin: __mod_init_func;
@@ -2193,7 +2194,11 @@ the declared type's size (floored at eight bytes and rounded to a whole
 eight-byte slot, matching the ARM64 pre-registration).  An external global
 (\texttt{extern}) is a declaration, not a definition, and is skipped; a
 \texttt{static} file-scope global gets no \texttt{.globl} (internal linkage);
-everything else is exported so other units can link against it.
+everything else is exported so other units can link against it.  On ELF a bare
+\verb|.comm| is an \emph{external} common that the linker coalesces with
+same-named commons from other objects, which would silently fuse two units'
+distinct statics into one cell; so a static common is first marked \verb|.local|
+to keep it private to its translation unit.
 
 A \texttt{const} global whose initialiser is a fixed byte image takes a
 different path.  \kcc{} realises those as read-only data with their actual
@@ -2250,6 +2255,17 @@ _kcc_x86_emit_zerofill:
     bl _kcc_as_str
     b .Lx86zf_done
 .Lx86zf_comm:
+    // static → .local <name>  (internal linkage; keeps the linker from
+    // coalescing same-named commons from different objects into one cell)
+    cbz x21, .Lx86zf_comm_dir
+    adrp x0, _kcc_x86_s_local@@PAGE
+    add  x0, x0, _kcc_x86_s_local@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_as_str
+    mov x0, #10
+    bl _kcc_as_ch
+.Lx86zf_comm_dir:
     // Linux .comm <name>,<size>,8
     adrp x0, _kcc_x86_s_comm@@PAGE
     add  x0, x0, _kcc_x86_s_comm@@PAGEOFF

@@ -365,21 +365,30 @@ to its true code.  Crucially, \texttt{kcc\_linux} and \texttt{kcc\_linux2} emit
 reproduces itself.  That is the fixed point that distinguishes a self-hosting
 compiler from one that merely runs.
 
-Reaching the fixed point surfaced one genuine bug and one cosmetic one, both
-invisible until the whole compiler was \kcc{}-compiled \emph{for} \texttt{x86-64}
-rather than \texttt{arm64}.  The genuine bug was a small-struct return-ABI
-mismatch in the character-literal path (\S on primary expressions): a two-word
-\texttt{struct} received through a \texttt{void~*} declaration, which reads the
-first return register.  On \texttt{arm64} that register holds the first field;
-the \texttt{x86-64} back end returns such a struct as a pointer to it, so the
+Reaching the fixed point surfaced two bugs, both invisible until the whole
+compiler was \kcc{}-compiled \emph{for} \texttt{x86-64} rather than
+\texttt{arm64}.  The first was a small-struct return-ABI mismatch in the
+character-literal path (\S on primary expressions): a two-word \texttt{struct}
+received through a \texttt{void~*} declaration, which reads the first return
+register.  On \texttt{arm64} that register holds the first field; the
+\texttt{x86-64} back end returns such a struct as a pointer to it, so the
 character's value became the low byte of an address.  Receiving the real struct
-fixes it under either convention.  The cosmetic one: a stray space byte lands in
-the \texttt{s\_globl} directive string at runtime, so the self-compiled compiler
-writes \texttt{.globl}~with two spaces before each name.  The assembler accepts
-it and the output assembles, links and runs --- and because the quirk is
-deterministic it reproduces exactly in both generations, so the fixed point
-still holds --- but it is a real miscompiled address computation left for a
-later pass.
+fixes it under either convention.
+
+The second was subtler and only bit once \emph{two} \kcc{}-compiled objects were
+linked together: the self-compiled compiler wrote \texttt{.globl} with two
+spaces before each name.  The cause was a linkage error, not a codegen one.  A
+file-scope \texttt{static} array was reserved with a bare \verb|.comm|, which on
+ELF is an \emph{external} common: the linker coalesces same-named commons from
+different objects into a single cell.  Both back ends happen to name a directive
+string \texttt{s\_globl} (one \texttt{".globl~"}, the other \texttt{"\\t.globl~"}),
+so the two distinct statics fused into one, and their initialisers---run as code
+from \verb|.init_array|---overwrote each other, leaving the survivor without its
+terminating \texttt{NUL}.  The fix belongs to the data emitter (\S on global
+data): a \texttt{static} common is marked \verb|.local| first, restoring the
+internal linkage the language requires.  With both fixed, the self-compiled
+compiler's output is \emph{byte-identical} to the cross-compiler's for every
+module---the strongest form of the fixed point.
 
 Because the bootstrap needs an \texttt{x86-64} Linux toolchain and a conforming
 ELF loader --- a \texttt{linux/amd64} container plus \texttt{qemu-x86\_64} on an

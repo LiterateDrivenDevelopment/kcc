@@ -293,6 +293,46 @@ _kcc_x86_argregs:
     .quad _kcc_x86_s_r9
 @}
 
+\subsection{Vocabulary for Floating Point (Rung 4)}
+\label{sec:x86-data-fp}
+
+Floating point is the fourth rung, and the one \kcc{} needs to compile itself
+(its float-literal parser and its \texttt{const}-float narrowing both do real
+FP).  The all-spill model carries a floating value in the same 8-byte slot an
+integer uses---holding the IEEE-754 \emph{double} bit pattern, exactly as the
+ARM64 back end does---so the only new machinery is the SSE instructions that
+move a slot into an \texttt{\%xmm} register, operate, and write it back.
+Two scratch SSE registers, \verb|%xmm0| and \verb|%xmm1|, mirror the integer
+\verb|%r10|/\verb|%r11| pair.  A \texttt{float} in memory is the single-precision
+narrowing of that double, so a width-code-8 load widens with \texttt{cvtss2sd}
+and a width-code-8 store narrows with \texttt{cvtsd2ss}; every value the
+selection carries between slots stays a double.
+
+@d X86: data @{
+.section __TEXT,__cstring,cstring_literals
+// SSE moves and the scratch xmm operands.
+_kcc_x86_s_movsd:    .asciz "\tmovsd\t"
+_kcc_x86_s_movss:    .asciz "\tmovss\t"
+_kcc_x86_s_cx0_nl:   .asciz ", %xmm0\n"
+_kcc_x86_s_cx1_nl:   .asciz ", %xmm1\n"
+_kcc_x86_s_x0_c:     .asciz "%xmm0, "
+_kcc_x86_s_nl:       .asciz "\n"
+// FP binary ops: dst(%xmm0) = %xmm0 OP %xmm1.
+_kcc_x86_s_addsd:    .asciz "\taddsd\t"
+_kcc_x86_s_subsd:    .asciz "\tsubsd\t"
+_kcc_x86_s_mulsd:    .asciz "\tmulsd\t"
+_kcc_x86_s_divsd:    .asciz "\tdivsd\t"
+_kcc_x86_s_x1_x0:    .asciz "%xmm1, %xmm0\n"
+// Conversions between the integer file, xmm, and single/double precision.
+_kcc_x86_s_cvtsi2sd: .asciz "\tcvtsi2sdq\t%r10, %xmm0\n"
+_kcc_x86_s_cvttsd2si:.asciz "\tcvttsd2si\t%xmm0, %r10\n"
+_kcc_x86_s_cvtsd2ss: .asciz "\tcvtsd2ss\t%xmm0, %xmm0\n"
+_kcc_x86_s_cvtss2sd: .asciz "\tcvtss2sd\t%xmm0, %xmm0\n"
+// Single-precision memory operands (float load/store through %r11).
+_kcc_x86_s_px11_x0:  .asciz "(%r11), %xmm0\n"
+_kcc_x86_s_x0_px11:  .asciz "%xmm0, (%r11)\n"
+@}
+
 \section{Two Object-Format Flavours: Darwin and Linux}
 \label{sec:x86-flavour}
 
@@ -533,6 +573,76 @@ _kcc_x86_shift:
     adrp x1, _kcc_x86_s_r10@@PAGE
     add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
     bl _kcc_x86_store
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_fpload(uint64_t v, const char *xmm_tail) — "movsd slot(v)<tail>".
+//    xmm_tail is ", %xmm0\n" or ", %xmm1\n".
+.p2align 2
+_kcc_x86_fpload:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // v
+    mov x20, x1                     // tail
+    adrp x0, _kcc_x86_s_movsd@@PAGE
+    add  x0, x0, _kcc_x86_s_movsd@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_x86_slot
+    mov x0, x20
+    bl _kcc_as_str
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_fpstore(uint64_t v) — "movsd %xmm0, slot(v)".
+.p2align 2
+_kcc_x86_fpstore:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                     // v
+    adrp x0, _kcc_x86_s_movsd@@PAGE
+    add  x0, x0, _kcc_x86_s_movsd@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_x0_c@@PAGE
+    add  x0, x0, _kcc_x86_s_x0_c@@PAGEOFF
+    bl _kcc_as_str
+    mov x0, x19
+    bl _kcc_x86_slot
+    adrp x0, _kcc_x86_s_nl@@PAGE
+    add  x0, x0, _kcc_x86_s_nl@@PAGEOFF
+    bl _kcc_as_str
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_x86_fpbinop(ir_instr *i, const char *mnem) — %xmm0 = src1 OP src2.
+//    Loads both operands into %xmm0/%xmm1, applies the SSE op, stores %xmm0.
+.p2align 2
+_kcc_x86_fpbinop:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     // instr
+    mov x20, x1                     // mnemonic
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_cx0_nl@@PAGE
+    add  x1, x1, _kcc_x86_s_cx0_nl@@PAGEOFF
+    bl _kcc_x86_fpload
+    ldr x0, [x19, #IR_SRC2]
+    adrp x1, _kcc_x86_s_cx1_nl@@PAGE
+    add  x1, x1, _kcc_x86_s_cx1_nl@@PAGEOFF
+    bl _kcc_x86_fpload
+    mov x0, x20
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_x1_x0@@PAGE
+    add  x0, x0, _kcc_x86_s_x1_x0@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    bl _kcc_x86_fpstore
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
@@ -1087,6 +1197,17 @@ _kcc_x86_sel:
     cmp x22, #IR_BITCAST
     b.eq .Lx86sel_bitcast
 
+    // Floating-point conversions (rung 4).  UITOFP shares the signed cvtsi2sd
+    // path: kcc's own source only ever converts signed integers to floating.
+    cmp x22, #IR_SITOFP
+    b.eq .Lx86sel_sitofp
+    cmp x22, #IR_UITOFP
+    b.eq .Lx86sel_sitofp
+    cmp x22, #IR_FPTOSI
+    b.eq .Lx86sel_fptosi
+    cmp x22, #IR_FPROUND
+    b.eq .Lx86sel_fpround
+
     // Comparisons (rung 3): cmp + set<cc> + movzbl.
     cmp x22, #IR_CMP_EQ
     b.eq .Lx86sel_cmpeq
@@ -1213,7 +1334,7 @@ _kcc_x86_sel:
     cmp x20, #7
     b.eq .Lx86sel_load_s32
     cmp x20, #8
-    b.eq .Lx86sel_done              // single-precision float: deferred
+    b.eq .Lx86sel_load_f32          // single-precision float: movss + widen
     // Default: 64-bit movq.
     mov x0, x19
     adrp x1, _kcc_x86_s_movq@@PAGE
@@ -1281,7 +1402,7 @@ _kcc_x86_sel:
     cmp x20, #4
     b.eq .Lx86sel_store_32
     cmp x20, #8
-    b.eq .Lx86sel_done              // single-precision float: deferred
+    b.eq .Lx86sel_store_f32         // single-precision float: narrow + movss
     // Default: 64-bit movq.
     mov x0, x19
     adrp x1, _kcc_x86_s_movq@@PAGE
@@ -1314,21 +1435,91 @@ _kcc_x86_sel:
     add  x2, x2, _kcc_x86_s_r10d_pr11@@PAGEOFF
     bl _kcc_x86_memstore
     b .Lx86sel_done
+.Lx86sel_load_f32:
+    // float in memory → double in the slot: load ptr into %r11, movss the
+    // single, widen with cvtss2sd, store the double.
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_r11@@PAGE
+    add  x1, x1, _kcc_x86_s_r11@@PAGEOFF
+    bl _kcc_x86_load
+    adrp x0, _kcc_x86_s_movss@@PAGE
+    add  x0, x0, _kcc_x86_s_movss@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_px11_x0@@PAGE
+    add  x0, x0, _kcc_x86_s_px11_x0@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_cvtss2sd@@PAGE
+    add  x0, x0, _kcc_x86_s_cvtss2sd@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    bl _kcc_x86_fpstore
+    b .Lx86sel_done
+.Lx86sel_store_f32:
+    // double in the slot → float in memory: load the double into %xmm0, narrow
+    // with cvtsd2ss, load the address into %r11, movss the single.
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_cx0_nl@@PAGE
+    add  x1, x1, _kcc_x86_s_cx0_nl@@PAGEOFF
+    bl _kcc_x86_fpload
+    adrp x0, _kcc_x86_s_cvtsd2ss@@PAGE
+    add  x0, x0, _kcc_x86_s_cvtsd2ss@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_SRC2]
+    adrp x1, _kcc_x86_s_r11@@PAGE
+    add  x1, x1, _kcc_x86_s_r11@@PAGEOFF
+    bl _kcc_x86_load
+    adrp x0, _kcc_x86_s_movss@@PAGE
+    add  x0, x0, _kcc_x86_s_movss@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_x0_px11@@PAGE
+    add  x0, x0, _kcc_x86_s_x0_px11@@PAGEOFF
+    bl _kcc_as_str
+    b .Lx86sel_done
 
 // ---- Two-operand ALU tails: load mnemonic, call the binop shape. ----
 .Lx86sel_add:
+    // A floating ADD/SUB/MUL/DIV (typed float/double) uses the SSE unit; the
+    // shared IR_GEP that also lands here is integer address arithmetic, so its
+    // int type keeps it on the integer path.
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_type_is_fp
+    cbz x0, .Lx86sel_add_i
+    mov x0, x19
+    adrp x1, _kcc_x86_s_addsd@@PAGE
+    add  x1, x1, _kcc_x86_s_addsd@@PAGEOFF
+    bl _kcc_x86_fpbinop
+    b .Lx86sel_done
+.Lx86sel_add_i:
     mov x0, x19
     adrp x1, _kcc_x86_s_addq@@PAGE
     add  x1, x1, _kcc_x86_s_addq@@PAGEOFF
     bl _kcc_x86_binop
     b .Lx86sel_done
 .Lx86sel_sub:
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_type_is_fp
+    cbz x0, .Lx86sel_sub_i
+    mov x0, x19
+    adrp x1, _kcc_x86_s_subsd@@PAGE
+    add  x1, x1, _kcc_x86_s_subsd@@PAGEOFF
+    bl _kcc_x86_fpbinop
+    b .Lx86sel_done
+.Lx86sel_sub_i:
     mov x0, x19
     adrp x1, _kcc_x86_s_subq@@PAGE
     add  x1, x1, _kcc_x86_s_subq@@PAGEOFF
     bl _kcc_x86_binop
     b .Lx86sel_done
 .Lx86sel_mul:
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_type_is_fp
+    cbz x0, .Lx86sel_mul_i
+    mov x0, x19
+    adrp x1, _kcc_x86_s_mulsd@@PAGE
+    add  x1, x1, _kcc_x86_s_mulsd@@PAGEOFF
+    bl _kcc_x86_fpbinop
+    b .Lx86sel_done
+.Lx86sel_mul_i:
     mov x0, x19
     adrp x1, _kcc_x86_s_imulq@@PAGE
     add  x1, x1, _kcc_x86_s_imulq@@PAGEOFF
@@ -1383,10 +1574,63 @@ _kcc_x86_sel:
     bl _kcc_x86_shift
     b .Lx86sel_done
 .Lx86sel_sdiv:
+    ldr x0, [x19, #IR_TYPE]
+    bl _kcc_ir_type_is_fp
+    cbz x0, .Lx86sel_sdiv_i
+    mov x0, x19
+    adrp x1, _kcc_x86_s_divsd@@PAGE
+    add  x1, x1, _kcc_x86_s_divsd@@PAGEOFF
+    bl _kcc_x86_fpbinop
+    b .Lx86sel_done
+.Lx86sel_sdiv_i:
     mov x0, x19
     mov x1, #1                      // signed
     mov x2, #0                      // quotient
     bl _kcc_x86_divop
+    b .Lx86sel_done
+
+// ---- Floating-point conversions (rung 4). ----
+.Lx86sel_sitofp:
+    // int slot → double: cvtsi2sdq %r10, %xmm0 ; movsd %xmm0, slot(dest).
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_load
+    adrp x0, _kcc_x86_s_cvtsi2sd@@PAGE
+    add  x0, x0, _kcc_x86_s_cvtsi2sd@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    bl _kcc_x86_fpstore
+    b .Lx86sel_done
+.Lx86sel_fptosi:
+    // double slot → int: movsd slot(src),%xmm0 ; cvttsd2si %xmm0,%r10 ; store.
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_cx0_nl@@PAGE
+    add  x1, x1, _kcc_x86_s_cx0_nl@@PAGEOFF
+    bl _kcc_x86_fpload
+    adrp x0, _kcc_x86_s_cvttsd2si@@PAGE
+    add  x0, x0, _kcc_x86_s_cvttsd2si@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    adrp x1, _kcc_x86_s_r10@@PAGE
+    add  x1, x1, _kcc_x86_s_r10@@PAGEOFF
+    bl _kcc_x86_store
+    b .Lx86sel_done
+.Lx86sel_fpround:
+    // round a double to single precision, keeping it in double format:
+    // movsd slot(src),%xmm0 ; cvtsd2ss ; cvtss2sd ; movsd %xmm0, slot(dest).
+    ldr x0, [x19, #IR_SRC1]
+    adrp x1, _kcc_x86_s_cx0_nl@@PAGE
+    add  x1, x1, _kcc_x86_s_cx0_nl@@PAGEOFF
+    bl _kcc_x86_fpload
+    adrp x0, _kcc_x86_s_cvtsd2ss@@PAGE
+    add  x0, x0, _kcc_x86_s_cvtsd2ss@@PAGEOFF
+    bl _kcc_as_str
+    adrp x0, _kcc_x86_s_cvtss2sd@@PAGE
+    add  x0, x0, _kcc_x86_s_cvtss2sd@@PAGEOFF
+    bl _kcc_as_str
+    ldr x0, [x19, #IR_DEST]
+    bl _kcc_x86_fpstore
     b .Lx86sel_done
 .Lx86sel_udiv:
     mov x0, x19

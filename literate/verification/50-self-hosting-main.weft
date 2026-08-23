@@ -1,0 +1,227 @@
+% 50-self-hosting-main.weft — Stage 8-final: the entry point and CLI dispatch,
+% written in C, compiled by kcc itself.  With this the whole compiler but for the
+% raw-syscall wrappers is C, and the same source is the entry on both targets.
+
+\chapter{Self-Hosting: The Entry Point in C}
+\label{ch:self-hosting-main}
+
+The driver's \texttt{\_main} (Chapter~\ref{ch:driver}) was the last piece of the
+compiler still written in assembly other than the raw-syscall wrappers.  It is
+pure control flow---initialise the subsystems, compare \texttt{argv[1]} against
+each mode flag, run the corresponding prefix of the pipeline---so porting it to C
+costs nothing in fidelity and buys two things at once.  First, it finishes the
+self-hosting effort: every line of the compiler that is not a \texttt{svc}/%
+\texttt{syscall} instruction is now C that kcc compiles.  Second, it is exactly
+the entry point the second target needs.  A C function \texttt{main} becomes the
+symbol \texttt{\_main} that Darwin's \texttt{libSystem} start calls, and it is
+also the \texttt{main} that the Linux runtime's \texttt{\_start}
+(Chapter~\ref{ch:runtime-linux}) calls after laying out \texttt{argc}/%
+\texttt{argv}/\texttt{envp} from the stack---so one C source is the entry on both
+platforms.  The environment pointer, which the driver hands to the linker
+through \texttt{execve}, is recovered the same way the assembly did: it sits
+immediately past \texttt{argv}'s terminating null, at \texttt{argv + argc + 1}.
+
+Because \texttt{main} drives the entire compiler, the port is verified
+functionally: swap the kcc-compiled \texttt{main.o} in for the assembly one and
+the whole test corpus---\texttt{difftest}'s byte-exact comparison against clang,
+the code-generation suite, and the diagnostic suite---must still pass, which it
+can only do if the dispatch is faithful.
+
+\section{Entry Point and Mode Dispatch}
+
+@l c
+@d Selfhost: main @{
+/* subsystem init, front-end phases, sema, IR, driver, syscalls */
+void kcc_arena_init(void);
+void kcc_lex_kw_init(void);
+void kcc_pp_add_default_includes(const char *path);
+void kcc_io_puts(const char *);
+void kcc_io_err(const char *);
+void kcc_io_flush(void);
+int kcc_strcmp(const char *, const char *);
+void kcc_sys_exit(int);
+void kcc_source_open(const char *);
+void kcc_source_encode(void);
+void kcc_source_splice(void);
+void kcc_lex_init(void *base, unsigned long size);
+void kcc_lex_dump_all(void);
+unsigned long kcc_diag_had_errors(void);
+void kcc_pp_init(void);
+void kcc_pp_dump_all(void);
+void kcc_strtab_init(void);
+void kcc_typedef_init(void);
+void *kcc_parse(void);
+void kcc_ast_dump(void);
+void kcc_types_init(void);
+void kcc_symtab_init(void);
+void kcc_sema_check(void *tu);
+void kcc_sema_dump_types(void *tu);
+void kcc_ir_init(void);
+void kcc_ir_build(void *tu);
+void kcc_opt_run(void);
+void kcc_ir_dump(void);
+void kcc_driver_compile_all(int argc, char **argv);
+void kcc_driver_link_all(int argc, char **argv);
+extern void *kcc_src_base;
+extern unsigned long kcc_src_size;
+extern char **kcc_envp;                          /* defined by the driver */
+
+/* Terminal paths, mirroring the assembly's .Lmain_exit / _error_exit / usage. */
+static void exit_ok(void)          { kcc_io_flush(); kcc_sys_exit(0); }
+static void die_usage(const char *m){ kcc_io_err(m); kcc_sys_exit(1); }
+static void finish(void) {
+    if (kcc_diag_had_errors()) { kcc_io_flush(); kcc_sys_exit(1); }
+    kcc_io_flush(); kcc_sys_exit(0);
+}
+
+/* Translation phases 1-2 then lexer init on the source at argv[2]. */
+static void open_lex(char **argv) {
+    kcc_source_open(argv[2]);
+    kcc_source_encode();                          /* phase 1: trigraphs */
+    kcc_source_splice();                          /* phase 2: line splicing */
+    kcc_lex_init(kcc_src_base, kcc_src_size);
+}
+
+int main(int argc, char **argv) {
+    /* envp sits past argv's terminating NULL, exactly as the assembly computes
+       it; the driver passes it on to the linker via execve. */
+    kcc_envp = argv + argc + 1;
+
+    kcc_arena_init();
+    kcc_lex_kw_init();
+    /* register dirname(argv[0])+"include" once, before any file, so the shipped
+       hosted headers resolve with no -I. */
+    kcc_pp_add_default_includes(argv[0]);
+    kcc_io_puts("kcc v0.1.0 - a formal C17 compiler for ARM64\n");
+
+    if (argc < 2) {
+        kcc_io_puts("usage: kcc [--dump-tokens|-E|--dump-ast|--dump-types|--check|--dump-ir|-c <src> -o <out>] <source.c>\n");
+        exit_ok();
+    }
+
+    const char *a1 = argv[1];
+
+    if (kcc_strcmp(a1, "--dump-tokens") == 0) {
+        if (argc < 3) die_usage("kcc: error: --dump-tokens requires a source file\n");
+        open_lex(argv);
+        kcc_lex_dump_all();
+        finish();
+    }
+    if (kcc_strcmp(a1, "-E") == 0) {
+        if (argc < 3) die_usage("kcc: error: -E requires a source file\n");
+        open_lex(argv);
+        kcc_pp_init();
+        kcc_pp_dump_all();
+        finish();
+    }
+    if (kcc_strcmp(a1, "--dump-ast") == 0) {
+        if (argc < 3) die_usage("kcc: error: --dump-ast requires a source file\n");
+        open_lex(argv);
+        kcc_pp_init();
+        kcc_strtab_init();
+        kcc_typedef_init();
+        kcc_parse();
+        kcc_ast_dump();
+        finish();
+    }
+    if (kcc_strcmp(a1, "--dump-types") == 0) {
+        if (argc < 3) die_usage("kcc: error: --dump-types requires a source file\n");
+        open_lex(argv);
+        kcc_pp_init();
+        kcc_strtab_init();
+        kcc_typedef_init();
+        void *tu = kcc_parse();
+        kcc_types_init();
+        kcc_symtab_init();
+        kcc_sema_check(tu);
+        kcc_sema_dump_types(tu);
+        finish();
+    }
+    if (kcc_strcmp(a1, "--check") == 0) {
+        if (argc < 3) die_usage("kcc: error: --check requires a source file\n");
+        open_lex(argv);
+        kcc_pp_init();
+        kcc_strtab_init();
+        kcc_typedef_init();
+        void *tu = kcc_parse();
+        kcc_types_init();
+        kcc_symtab_init();
+        kcc_sema_check(tu);
+        kcc_io_flush();
+        if (kcc_diag_had_errors()) kcc_sys_exit(1);
+        kcc_io_puts("semantic check passed\n");
+        exit_ok();
+    }
+    if (kcc_strcmp(a1, "--dump-ir") == 0) {
+        if (argc < 3) die_usage("kcc: error: --dump-ir requires a source file\n");
+        open_lex(argv);
+        kcc_pp_init();
+        kcc_strtab_init();
+        kcc_typedef_init();
+        void *tu = kcc_parse();
+        kcc_types_init();
+        kcc_symtab_init();
+        kcc_sema_check(tu);
+        if (kcc_diag_had_errors()) { kcc_io_flush(); kcc_sys_exit(1); }
+        kcc_ir_init();
+        kcc_ir_build(tu);
+        kcc_opt_run();
+        kcc_ir_dump();
+        finish();
+    }
+    if (kcc_strcmp(a1, "-c") == 0) {
+        if (argc < 3) die_usage("kcc: error: usage: kcc -c <source.c>... [-o <output.o>]\n");
+        kcc_driver_compile_all(argc, argv);       /* one object per source */
+        exit_ok();
+    }
+
+    /* Not a flag: the argument is a source file.  Compile every source and link
+       the resulting objects into an executable (the default mode). */
+    kcc_driver_link_all(argc, argv);
+    exit_ok();
+    return 0;                                     /* unreachable */
+}
+@}
+
+\section{Composition and Verification}
+
+@d Selfhost: main file @{
+@<Selfhost: main@>
+@}
+
+@d Selfhost: main verify @{
+#!/usr/bin/env bash
+# make selfhost-main — compile kcc's entry point in C with kcc, relink in place
+# of the assembly main.o, and run difftest + diagtest + codegen.  Because main
+# drives the whole compiler, a clean sweep proves the dispatch is faithful.
+set -euo pipefail
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+echo "[1/4] compiling tmp/selfhost/main.c with kcc"
+tmp/kcc -c "$SH/main.c" -o "$SH/main_c.o" >/dev/null
+echo "[2/4] linking tmp/kcc_selfhost_main (main.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "main" ]; then OBJ="$OBJ $SH/main_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_main $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+cp tmp/kcc "$SH/kcc_asm_backup_main"
+cp tmp/kcc_selfhost_main tmp/kcc
+echo "[3/4] difftest + diagtest"
+set +e
+bash tmp/tests/difftest.sh >/tmp/main_difftest.log 2>&1; dstatus=$?
+tail -1 /tmp/main_difftest.log
+bash tmp/tests/diagtest.sh >/tmp/main_diag.log 2>&1; diagst=$?
+tail -1 /tmp/main_diag.log
+set -e
+if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_main" tmp/kcc; exit 1; fi
+echo "[4/4] codegen suite with the self-hosted entry point"
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_main" tmp/kcc
+exit $status
+@}

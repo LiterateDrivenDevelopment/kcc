@@ -1039,6 +1039,18 @@ subsystem to leave assembly:
 @<Selfhost: ir verify@>
 @}
 
+\noindent The entry point and CLI dispatch, ported to C
+(Chapter~\ref{ch:self-hosting-main}) --- the last compiler code to leave
+assembly, and the shared entry for both targets:
+
+@o tmp/selfhost/main.c @{
+@<Selfhost: main@>
+@}
+
+@o tmp/selfhost/main_verify.sh @{
+@<Selfhost: main verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

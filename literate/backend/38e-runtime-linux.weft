@@ -337,3 +337,51 @@ docker run --rm -v "$PWD/$R":/w -w /w --platform linux/amd64 gcc:latest bash -c 
 
 echo "[3/3] done"
 @}
+
+\section{kcc Self-Hosts on Linux}
+\label{sec:meta-c}
+
+The runtime above lets a program \kcc{} compiled run on Linux; the natural
+question is whether \emph{\kcc{} itself} is such a program.  It is.  The
+milestone ladder has three rungs, each strictly stronger than the last.
+\emph{Meta-A} (\S\ref{sec:meta-a-verify}) shows \kcc{}'s \emph{output} runs on
+Linux.  \emph{Meta-B} shows \kcc{} \emph{runs} on Linux: cross-compile every
+one of \kcc{}'s now-all-C subsystems under \texttt{--target=x86\_64-linux},
+assemble and statically link them with the runtime and no libc, and the
+resulting ELF lexes, parses, checks and compiles C under \texttt{qemu-x86\_64}.
+\emph{Meta-C}, this section, shows \kcc{} \emph{self-hosts} on Linux: that Linux
+binary, call it \texttt{kcc\_linux}, compiles \kcc{}'s own source into a
+second-generation compiler that is itself correct.
+
+The bootstrap is deliberately simple.  \texttt{kcc\_linux} compiles each of its
+twenty-nine C modules (the lexer slot is the compiler's real lexer, not the
+standalone tokenizer) under \texttt{--target=x86\_64-linux}; the host
+\texttt{as} and \texttt{ld} assemble and link them, again static and libc-free,
+into \texttt{kcc\_linux2}.  The second generation compiles \texttt{hello.c} to
+exit~42, a floating-point program to its expected value --- exercising the SSE
+rung the \texttt{x86-64} back end now carries in C --- and a character constant
+to its true code.  Crucially, \texttt{kcc\_linux} and \texttt{kcc\_linux2} emit
+\emph{byte-identical} assembly for every module: the compiler compiled by itself
+reproduces itself.  That is the fixed point that distinguishes a self-hosting
+compiler from one that merely runs.
+
+Reaching the fixed point surfaced one genuine bug and one cosmetic one, both
+invisible until the whole compiler was \kcc{}-compiled \emph{for} \texttt{x86-64}
+rather than \texttt{arm64}.  The genuine bug was a small-struct return-ABI
+mismatch in the character-literal path (\S on primary expressions): a two-word
+\texttt{struct} received through a \texttt{void~*} declaration, which reads the
+first return register.  On \texttt{arm64} that register holds the first field;
+the \texttt{x86-64} back end returns such a struct as a pointer to it, so the
+character's value became the low byte of an address.  Receiving the real struct
+fixes it under either convention.  The cosmetic one: a stray space byte lands in
+the \texttt{s\_globl} directive string at runtime, so the self-compiled compiler
+writes \texttt{.globl}~with two spaces before each name.  The assembler accepts
+it and the output assembles, links and runs --- and because the quirk is
+deterministic it reproduces exactly in both generations, so the fixed point
+still holds --- but it is a real miscompiled address computation left for a
+later pass.
+
+Because the bootstrap needs an \texttt{x86-64} Linux toolchain and a conforming
+ELF loader --- a \texttt{linux/amd64} container plus \texttt{qemu-x86\_64} on an
+Apple-Silicon host --- it runs as a manual procedure rather than a \texttt{make}
+target, in the spirit of the Meta-A verifier above but one rung higher.

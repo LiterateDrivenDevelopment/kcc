@@ -1,0 +1,400 @@
+% 51-self-hosting-lexer.weft — the lexer runtime in C.  The earlier lexer
+% self-host (Chapter on tables) verified a standalone tokenizer against clang;
+% this is the drop-in for the compiler's own lexer module, the piece a full-C
+% build (and the second target) needs.
+
+\chapter{Self-Hosting: The Lexer in C}
+\label{ch:self-hosting-lexer}
+
+The compiler's lexer (Chapter~\ref{ch:lexer}) was, until now, the one
+runtime module still only in assembly: the earlier ``lexer self-host'' verified
+a \emph{standalone} tokenizer against clang, not a drop-in for the module whose
+\texttt{kcc\_lex\_next} the preprocessor and every parser stage call.  Porting
+it to C closes that gap.  The lexer is a byte scanner---skip whitespace and
+comments while counting newlines, classify the first character, and hand off to
+the identifier, number, string, character, or punctuator scanner---so the port
+is mechanical, and it is verified the strongest way: because the token stream
+determines every downstream byte, swapping the kcc-compiled \texttt{lexer.o} in
+and getting \texttt{difftest}'s byte-exact comparison against clang proves the
+scan is faithful token-for-token.
+
+The lexer keeps its state in globals---the cursor, the buffer end, the line
+number and line start, and the current token's type, text, and location---all
+carried at their assembly displacements so the other modules see the same
+symbols.  A keyword identifier is recognised by looking its text up in the
+keyword table (populated by \texttt{lexer\_tables}); every other scan sets the
+token type directly.
+
+\section{State, Init, and the Scanners}
+
+@l c
+@d Selfhost: lexcore @{
+/* token type codes the lexer itself emits (keyword codes 10-59 come from the
+   keyword table's stored value, so they are not needed here). */
+enum {
+    TOK_EOF=0, TOK_IDENT=1, TOK_NUMBER=2, TOK_CHAR_LIT=3, TOK_STRING_LIT=4,
+    TOK_UNKNOWN=5,
+    TOK_LPAREN=60, TOK_RPAREN=61, TOK_LBRACE=62, TOK_RBRACE=63, TOK_LBRACKET=64,
+    TOK_RBRACKET=65, TOK_SEMI=66, TOK_COMMA=67, TOK_DOT=68, TOK_ARROW=69,
+    TOK_INC=70, TOK_DEC=71, TOK_AMP=72, TOK_STAR=73, TOK_PLUS=74, TOK_MINUS=75,
+    TOK_TILDE=76, TOK_BANG=77, TOK_SLASH=78, TOK_PERCENT=79, TOK_SHL=80,
+    TOK_SHR=81, TOK_LT=82, TOK_GT=83, TOK_LE=84, TOK_GE=85, TOK_EQ=86, TOK_NE=87,
+    TOK_CARET=88, TOK_PIPE=89, TOK_AND=90, TOK_OR=91, TOK_QUESTION=92,
+    TOK_COLON=93, TOK_ASSIGN=94, TOK_MUL_ASSIGN=95, TOK_DIV_ASSIGN=96,
+    TOK_MOD_ASSIGN=97, TOK_ADD_ASSIGN=98, TOK_SUB_ASSIGN=99, TOK_SHL_ASSIGN=100,
+    TOK_SHR_ASSIGN=101, TOK_AND_ASSIGN=102, TOK_XOR_ASSIGN=103, TOK_OR_ASSIGN=104,
+    TOK_HASH=105, TOK_DHASH=106, TOK_ELLIPSIS=107
+};
+
+/* other modules */
+void *kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void kcc_diag_error(unsigned long line, unsigned long col, const char *msg);
+const char *kcc_lex_type_name(unsigned long type);
+void kcc_io_putu(unsigned long);
+void kcc_io_putc(unsigned long);
+void kcc_io_puts(const char *);
+void kcc_io_write(const void *, unsigned long);
+
+/* lexer state (this module is its definition site) */
+char *kcc_lex_cursor = 0;
+char *kcc_lex_end = 0;
+unsigned long kcc_lex_line = 1;
+char *kcc_lex_line_start = 0;
+unsigned long kcc_tok_type = 0;
+char *kcc_tok_start = 0;
+unsigned long kcc_tok_len = 0;
+unsigned long kcc_tok_line = 0;
+unsigned long kcc_tok_col = 0;
+void *kcc_kw_table = 0;                           /* filled by lexer_tables */
+
+static int is_id_start(unsigned c) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+static int is_id_cont(unsigned c) {
+    return is_id_start(c) || (c >= '0' && c <= '9');
+}
+
+void kcc_lex_init(char *base, unsigned long size) {
+    kcc_lex_cursor = base;
+    kcc_lex_end = base + size;
+    kcc_lex_line = 1;
+    kcc_lex_line_start = base;
+}
+
+/* tok_line = current line; tok_col = cursor - line_start + 1 */
+static void kcc_lex_record_loc(void) {
+    kcc_tok_line = kcc_lex_line;
+    kcc_tok_col = (unsigned long)(kcc_lex_cursor - kcc_lex_line_start) + 1;
+}
+
+static void kcc_lex_scan_ident(void) {
+    char *p = kcc_lex_cursor;
+    char *end = kcc_lex_end;
+    char *start = p;
+    for (;;) {
+        p++;
+        if (p >= end) break;
+        if (!is_id_cont((unsigned char)*p)) break;
+    }
+    kcc_lex_cursor = p;
+    kcc_tok_start = start;
+    kcc_tok_len = (unsigned long)(p - start);
+    kcc_tok_type = TOK_IDENT;
+    if (kcc_kw_table) {
+        void *r = kcc_ht_get(kcc_kw_table, start, (unsigned long)(p - start));
+        if (r) kcc_tok_type = (unsigned long)r;    /* a keyword: its stored code */
+    }
+}
+
+static void kcc_lex_scan_number(void) {
+    char *p = kcc_lex_cursor;
+    char *end = kcc_lex_end;
+    char *start = p;
+    for (;;) {
+        p++;
+        if (p >= end) break;
+        unsigned char c = (unsigned char)*p;
+        if (c >= '0' && c <= '9') continue;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            if (c == 'e' || c == 'E' || c == 'p' || c == 'P') {   /* exponent sign */
+                if (p + 1 < end) {
+                    unsigned char n = (unsigned char)p[1];
+                    if (n == '+' || n == '-') { p++; continue; }
+                }
+            }
+            continue;
+        }
+        if (c == '.' || c == '_') continue;
+        break;
+    }
+    kcc_lex_cursor = p;
+    kcc_tok_start = start;
+    kcc_tok_len = (unsigned long)(p - start);
+    kcc_tok_type = TOK_NUMBER;
+}
+
+static void kcc_lex_scan_string(void) {
+    char *p = kcc_lex_cursor;
+    char *end = kcc_lex_end;
+    char *start = p;
+    int unterm = 0;
+    p++;                                           /* skip opening " */
+    for (;;) {
+        if (p >= end) { unterm = 1; break; }
+        unsigned char c = (unsigned char)*p;
+        if (c == '"') { p++; break; }
+        if (c == '\\') { p += 2; continue; }       /* escape: skip 2 */
+        if (c == '\n') { unterm = 1; break; }
+        p++;
+    }
+    kcc_lex_cursor = p;
+    if (unterm) kcc_diag_error(kcc_tok_line, kcc_tok_col, "unterminated string literal");
+    kcc_tok_start = start;
+    kcc_tok_len = (unsigned long)(p - start);
+    kcc_tok_type = TOK_STRING_LIT;
+}
+
+static void kcc_lex_scan_char(void) {
+    char *p = kcc_lex_cursor;
+    char *end = kcc_lex_end;
+    char *start = p;
+    int unterm = 0;
+    p++;                                           /* skip opening ' */
+    for (;;) {
+        if (p >= end) { unterm = 1; break; }
+        unsigned char c = (unsigned char)*p;
+        if (c == '\'') { p++; break; }
+        if (c == '\\') { p += 2; continue; }
+        if (c == '\n') { unterm = 1; break; }
+        p++;
+    }
+    kcc_lex_cursor = p;
+    if (unterm) kcc_diag_error(kcc_tok_line, kcc_tok_col, "unterminated character constant");
+    kcc_tok_start = start;
+    kcc_tok_len = (unsigned long)(p - start);
+    kcc_tok_type = TOK_CHAR_LIT;
+}
+
+/* longest-match punctuator scan (\stdref{6.4.6}) */
+static void kcc_lex_scan_punct(void) {
+    char *p = kcc_lex_cursor;
+    char *end = kcc_lex_end;
+    char *start = p;
+    unsigned char c = (unsigned char)*p;
+    unsigned char c2 = (p + 1 < end) ? (unsigned char)p[1] : 0;
+    unsigned long type;
+    unsigned long n = 1;
+    if (c == '(') type = TOK_LPAREN;
+    else if (c == ')') type = TOK_RPAREN;
+    else if (c == '{') type = TOK_LBRACE;
+    else if (c == '}') type = TOK_RBRACE;
+    else if (c == '[') type = TOK_LBRACKET;
+    else if (c == ']') type = TOK_RBRACKET;
+    else if (c == ';') type = TOK_SEMI;
+    else if (c == ',') type = TOK_COMMA;
+    else if (c == '~') type = TOK_TILDE;
+    else if (c == '?') type = TOK_QUESTION;
+    else if (c == ':') type = TOK_COLON;
+    else if (c == '+') {
+        type = TOK_PLUS;
+        if (c2 == '+') { type = TOK_INC; n = 2; }
+        else if (c2 == '=') { type = TOK_ADD_ASSIGN; n = 2; }
+    } else if (c == '-') {
+        type = TOK_MINUS;
+        if (c2 == '-') { type = TOK_DEC; n = 2; }
+        else if (c2 == '=') { type = TOK_SUB_ASSIGN; n = 2; }
+        else if (c2 == '>') { type = TOK_ARROW; n = 2; }
+    } else if (c == '*') {
+        type = TOK_STAR;
+        if (c2 == '=') { type = TOK_MUL_ASSIGN; n = 2; }
+    } else if (c == '/') {
+        type = TOK_SLASH;
+        if (c2 == '=') { type = TOK_DIV_ASSIGN; n = 2; }
+    } else if (c == '%') {
+        type = TOK_PERCENT;
+        if (c2 == '=') { type = TOK_MOD_ASSIGN; n = 2; }
+    } else if (c == '<') {
+        type = TOK_LT;
+        if (c2 == '<') {
+            type = TOK_SHL; n = 2;
+            if (p + 2 < end && (unsigned char)p[2] == '=') { type = TOK_SHL_ASSIGN; n = 3; }
+        } else if (c2 == '=') { type = TOK_LE; n = 2; }
+    } else if (c == '>') {
+        type = TOK_GT;
+        if (c2 == '>') {
+            type = TOK_SHR; n = 2;
+            if (p + 2 < end && (unsigned char)p[2] == '=') { type = TOK_SHR_ASSIGN; n = 3; }
+        } else if (c2 == '=') { type = TOK_GE; n = 2; }
+    } else if (c == '=') {
+        type = TOK_ASSIGN;
+        if (c2 == '=') { type = TOK_EQ; n = 2; }
+    } else if (c == '!') {
+        type = TOK_BANG;
+        if (c2 == '=') { type = TOK_NE; n = 2; }
+    } else if (c == '&') {
+        type = TOK_AMP;
+        if (c2 == '&') { type = TOK_AND; n = 2; }
+        else if (c2 == '=') { type = TOK_AND_ASSIGN; n = 2; }
+    } else if (c == '|') {
+        type = TOK_PIPE;
+        if (c2 == '|') { type = TOK_OR; n = 2; }
+        else if (c2 == '=') { type = TOK_OR_ASSIGN; n = 2; }
+    } else if (c == '^') {
+        type = TOK_CARET;
+        if (c2 == '=') { type = TOK_XOR_ASSIGN; n = 2; }
+    } else if (c == '#') {
+        type = TOK_HASH;
+        if (c2 == '#') { type = TOK_DHASH; n = 2; }
+    } else if (c == '.') {
+        type = TOK_DOT;
+        if (c2 == '.' && p + 2 < end && (unsigned char)p[2] == '.') { type = TOK_ELLIPSIS; n = 3; }
+    } else {
+        type = TOK_UNKNOWN;                        /* unrecognized character */
+    }
+    kcc_lex_cursor = p + n;
+    kcc_tok_type = type;
+    kcc_tok_start = start;
+    kcc_tok_len = n;
+}
+
+void kcc_lex_next(void) {
+    char *p = kcc_lex_cursor;
+    char *end = kcc_lex_end;
+    for (;;) {
+        if (p >= end) {                            /* EOF (cursor pinned to end) */
+            kcc_lex_record_loc();
+            kcc_tok_type = TOK_EOF;
+            kcc_lex_cursor = end;
+            kcc_tok_start = p;
+            kcc_tok_len = 0;
+            return;
+        }
+        unsigned char c = (unsigned char)*p;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f') { p++; continue; }
+        if (c == '\n') { p++; kcc_lex_line++; kcc_lex_line_start = p; continue; }
+        if (c == '/') {
+            if (p + 1 < end) {
+                unsigned char c2 = (unsigned char)p[1];
+                if (c2 == '/') {                   /* line comment */
+                    p += 2;
+                    while (p < end && *p != '\n') p++;
+                    continue;
+                }
+                if (c2 == '*') {                   /* block comment */
+                    p += 2;
+                    int unterm = 0;
+                    for (;;) {
+                        if (p >= end) { unterm = 1; break; }
+                        unsigned char cc = (unsigned char)*p;
+                        if (cc == '\n') { p++; kcc_lex_line++; kcc_lex_line_start = p; continue; }
+                        if (cc == '*') {
+                            if (p + 1 < end && (unsigned char)p[1] == '/') { p += 2; break; }
+                            p++;
+                            continue;
+                        }
+                        p++;
+                    }
+                    if (unterm) {
+                        kcc_diag_error(kcc_lex_line, 1, "unterminated block comment");
+                        kcc_lex_record_loc();
+                        kcc_tok_type = TOK_EOF;
+                        kcc_lex_cursor = end;
+                        kcc_tok_start = p;
+                        kcc_tok_len = 0;
+                        return;
+                    }
+                    continue;
+                }
+            }
+            break;                                 /* a lone '/' → punctuator */
+        }
+        break;                                     /* significant character */
+    }
+    /* dispatch: publish cursor, record location, classify */
+    kcc_lex_cursor = p;
+    kcc_lex_record_loc();
+    unsigned char c = (unsigned char)*p;
+    if (is_id_start(c)) {
+        /* L'x' / u'x' / U'x' prefixed character constant: drop the prefix */
+        if ((c == 'L' || c == 'u' || c == 'U') && p + 1 < end && (unsigned char)p[1] == '\'') {
+            kcc_lex_cursor = p + 1;
+            kcc_lex_scan_char();
+            return;
+        }
+        kcc_lex_scan_ident();
+        return;
+    }
+    if (c >= '0' && c <= '9') { kcc_lex_scan_number(); return; }
+    if (c == '"') { kcc_lex_scan_string(); return; }
+    if (c == '\'') { kcc_lex_scan_char(); return; }
+    if (c == '.') {
+        if (p + 1 < end) {
+            unsigned char c2 = (unsigned char)p[1];
+            if (c2 >= '0' && c2 <= '9') { kcc_lex_scan_number(); return; }
+        }
+        kcc_lex_scan_punct();
+        return;
+    }
+    kcc_lex_scan_punct();
+}
+
+void kcc_lex_dump_token(void) {
+    kcc_io_putu(kcc_tok_line);
+    kcc_io_putc(':');
+    kcc_io_putu(kcc_tok_col);
+    kcc_io_putc(' ');
+    kcc_io_puts(kcc_lex_type_name(kcc_tok_type));
+    kcc_io_putc(' ');
+    kcc_io_putc('\'');
+    kcc_io_write(kcc_tok_start, kcc_tok_len);
+    kcc_io_putc('\'');
+    kcc_io_putc('\n');
+}
+
+void kcc_lex_dump_all(void) {
+    for (;;) {
+        kcc_lex_next();
+        if (kcc_tok_type == TOK_EOF) break;
+        kcc_lex_dump_token();
+    }
+}
+@}
+
+\section{Verification}
+
+@d Selfhost: lexcore verify @{
+#!/usr/bin/env bash
+# make selfhost-lexer-core — compile the compiler's lexer in C with kcc, relink
+# in place of the assembly lexer.o, and run difftest + diagtest + codegen.  The
+# token stream drives everything, so a byte-exact difftest proves the scan.
+set -euo pipefail
+SDK=$(xcrun --show-sdk-path)
+SH=tmp/selfhost
+sources="main syscalls arena strings io hashtab vec strtab source lexer \
+lexer_tables diag preprocessor parser expressions statements declarations \
+types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
+echo "[1/4] compiling tmp/selfhost/lexer_core.c with kcc"
+tmp/kcc -c "$SH/lexer_core.c" -o "$SH/lexer_core_c.o" >/dev/null
+echo "[2/4] linking tmp/kcc_selfhost_lexer (lexer.o -> C)"
+OBJ=""
+for f in $sources; do
+    if [ "$f" = "lexer" ]; then OBJ="$OBJ $SH/lexer_core_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+done
+ld -o tmp/kcc_selfhost_lexer $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+cp tmp/kcc "$SH/kcc_asm_backup_lexer"
+cp tmp/kcc_selfhost_lexer tmp/kcc
+echo "[3/4] difftest + diagtest"
+set +e
+bash tmp/tests/difftest.sh >/tmp/lexer_difftest.log 2>&1; dstatus=$?
+tail -1 /tmp/lexer_difftest.log
+bash tmp/tests/diagtest.sh >/tmp/lexer_diag.log 2>&1; diagst=$?
+tail -1 /tmp/lexer_diag.log
+set -e
+if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_lexer" tmp/kcc; exit 1; fi
+echo "[4/4] codegen suite with the self-hosted lexer"
+set +e
+bash tmp/tests/test_codegen.sh
+status=$?
+cp "$SH/kcc_asm_backup_lexer" tmp/kcc
+exit $status
+@}

@@ -1051,6 +1051,18 @@ assembly, and the shared entry for both targets:
 @<Selfhost: main verify@>
 @}
 
+\noindent The compiler's lexer, ported to C
+(Chapter~\ref{ch:self-hosting-lexer}) --- a drop-in for the module whose token
+stream the whole front end consumes:
+
+@o tmp/selfhost/lexer_core.c @{
+@<Selfhost: lexcore@>
+@}
+
+@o tmp/selfhost/lexer_core_verify.sh @{
+@<Selfhost: lexcore verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

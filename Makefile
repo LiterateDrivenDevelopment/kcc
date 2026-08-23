@@ -28,7 +28,7 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
         selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
         selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
         selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema \
-        selfhost-emit-x86 selfhost-preprocessor selfhost-codegen selfhost-ir selfhost-main meta-a \
+        selfhost-emit-x86 selfhost-preprocessor selfhost-codegen selfhost-ir selfhost-main selfhost-lexer-core meta-a \
         difftest interop e2e diagtest warntest test-codegen doc weave clean \
         run map
 
@@ -210,6 +210,11 @@ selfhost-ir: build
 selfhost-main: build
 	chmod +x tmp/selfhost/main_verify.sh
 	tmp/selfhost/main_verify.sh
+
+# Self-hosting: compile the compiler's lexer in C, relink in place of lexer.o, verify
+selfhost-lexer-core: build
+	chmod +x tmp/selfhost/lexer_core_verify.sh
+	tmp/selfhost/lexer_core_verify.sh
 
 # Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link against the Linux runtime (no libc), run it natively (Chapter: Runtime).

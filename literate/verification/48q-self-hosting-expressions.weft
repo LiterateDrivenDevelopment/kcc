@@ -56,7 +56,7 @@ void *kcc_parse_compound(void);
 void *kcc_parse_initializer(void);
 int kcc_strcmp(const char *a, const char *b);
 struct StrLit kcc_strlit_gather(void);
-void *kcc_strlit_process(const char *ptr, unsigned long len);
+struct StrLit kcc_strlit_process(const char *ptr, unsigned long len);
 void *kcc_strtab_intern(const void *ptr, unsigned long len);
 
 enum {
@@ -367,6 +367,18 @@ constant's suffix and magnitude set its type flags per \stdref{6.4.4.1}: the
 suffix fixes a floor, then the value climbs the suffix- and base-dependent list to
 the first type that can hold it.
 
+A character constant's value is the first byte of the escape-processed body, which
+\texttt{kcc\_strlit\_process} returns as a \texttt{struct StrLit} (pointer and
+length).  We must receive that \emph{as the struct} and read \texttt{s.ptr[0]}---
+exactly as the string-literal case receives \texttt{kcc\_strlit\_gather}'s result.
+An earlier shortcut declared the callee as \texttt{void~*} and read the returned
+register as the pointer directly; that relied on the ARM64 convention of returning
+a two-word struct in \texttt{x0:x1} (buffer in \texttt{x0}).  The \texttt{x86-64}
+back end returns such a struct as a pointer to it, so grabbing the first return
+register yields the \emph{address} of the pair, not the buffer, and the character's
+value would be the low byte of that address.  Consuming the real struct is correct
+under either return convention.
+
 @l c
 @d Selfhost: expressions primary @{
 /* Value-directed integer type (§6.4.4.1): flags bit0=unsigned, bits1-2=rank. */
@@ -447,8 +459,8 @@ void *kcc_parse_primary_expr(void) {
         return n;
     }
     if (t == TOK_CHAR_LIT) {
-        unsigned char *p = (unsigned char *)kcc_strlit_process(start + 1, len - 2);
-        unsigned long value = p[0];
+        struct StrLit s = kcc_strlit_process(start + 1, len - 2);
+        unsigned long value = (unsigned char)((char *)s.ptr)[0];
         kcc_pp_next();
         struct Node *n = (struct Node *)kcc_ast_alloc(AST_CHAR_LIT);
         n->f0 = value;

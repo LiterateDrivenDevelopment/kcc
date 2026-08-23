@@ -62,6 +62,25 @@ address, \texttt{main} sees exactly the alignment the ABI promises.
 	.text
 	.globl _start
 _start:
+	# Run the module initializers before main.  kcc lowers a non-main
+	# translation unit's file-scope initializers into a synthesised
+	# `kcc.module_init` and registers its address in .init_array (the ELF form
+	# of a Mach-O __mod_init_func); a normal C runtime runs those before main,
+	# but a -nostdlib static executable has none, so the entry does it here.
+	# Without this, every non-main TU's initialised global keeps its zero image
+	# --- e.g. io's `kcc_io_fd = 1` stays 0, so buffered output goes to fd 0.
+	# The linker provides __init_array_start/_end around the section; %rbx and
+	# %rbp are callee-saved, so they survive each initializer call, and the
+	# balanced call/ret keeps %rsp (hence argc at (%rsp)) unchanged.
+	leaq	__init_array_start(%rip), %rbx
+	leaq	__init_array_end(%rip), %rbp
+.Linit_loop:
+	cmpq	%rbp, %rbx
+	jae	.Linit_done
+	call	*(%rbx)
+	addq	$8, %rbx
+	jmp	.Linit_loop
+.Linit_done:
 	movq	(%rsp), %rdi           # argc
 	leaq	8(%rsp), %rsi          # argv  = &stack[1]
 	leaq	16(%rsp,%rdi,8), %rdx  # envp  = &argv[argc+1]

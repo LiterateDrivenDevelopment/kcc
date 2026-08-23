@@ -70,6 +70,8 @@ extern unsigned long kcc_modinit_present;
 #define TY_VOID 1
 #define TY_STRUCT 14
 #define TY_ARRAY 12
+#define TY_FLOAT 8
+#define TY_DOUBLE 9
 #define AST_TAG 0
 #define AST_F0 24
 #define AST_F1 32
@@ -85,7 +87,8 @@ enum {
     IR_CMP_SGT=24, IR_CMP_SGE=25, IR_CMP_ULT=26, IR_CMP_ULE=27,
     IR_LOAD=30, IR_STORE=31, IR_ALLOCA=32, IR_GEP=33, IR_BR=40, IR_BR_COND=41,
     IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
-    IR_BITCAST=53, IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64
+    IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_FPROUND=57, IR_UITOFP=58,
+    IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64
 };
 /* AST tags used by the data/static walks */
 enum {
@@ -143,6 +146,16 @@ S(s_zerofill, "\t.zerofill __DATA,__common,_"); S(s_zf_a3, ",3\n"); S(s_comma1, 
 S(s_unsup, "kcc: --target=x86_64: unsupported operation (floating point, inline asm, or by-value aggregate not yet implemented for the x86-64 back end)\n");
 S(s_strlbl, ".Lx86str"); S(s_cstrsect, ".section __TEXT,__cstring,cstring_literals\n");
 S(s_zero_nl, "0\n");
+/* Floating point (rung 4): SSE moves, arithmetic, and conversions.  A value
+   lives in the same 8-byte slot as an integer (the IEEE double bit pattern);
+   %xmm0/%xmm1 are the scratch pair, single precision only at the memory edge. */
+S(s_movsd, "\tmovsd\t"); S(s_movss, "\tmovss\t");
+S(s_cx0_nl, ", %xmm0\n"); S(s_cx1_nl, ", %xmm1\n"); S(s_x0_c, "%xmm0, "); S(s_nl, "\n");
+S(s_addsd, "\taddsd\t"); S(s_subsd, "\tsubsd\t"); S(s_mulsd, "\tmulsd\t");
+S(s_divsd, "\tdivsd\t"); S(s_x1_x0, "%xmm1, %xmm0\n");
+S(s_cvtsi2sd, "\tcvtsi2sdq\t%r10, %xmm0\n"); S(s_cvttsd2si, "\tcvttsd2si\t%xmm0, %r10\n");
+S(s_cvtsd2ss, "\tcvtsd2ss\t%xmm0, %xmm0\n"); S(s_cvtss2sd, "\tcvtss2sd\t%xmm0, %xmm0\n");
+S(s_px11_x0, "(%r11), %xmm0\n"); S(s_x0_px11, "%xmm0, (%r11)\n");
 static const char *const argregs[6] = { s_rdi, s_rsi, s_rdx, s_rcx, s_r8, s_r9 };
 
 #define IL(i,off) (*(unsigned long *)((char *)(i) + (off)))
@@ -244,6 +257,23 @@ static void x86_cmp(void *i, const char *setcc) {
     kcc_as_str(setcc); kcc_as_str(s_movzbl_al);
     x86_store(IL(i, IR_DEST), s_r10);
 }
+static int is_fp_type(void *ty) {
+    if (!ty) return 0;
+    unsigned long k = IL(ty, TY_KIND);
+    return k == TY_FLOAT || k == TY_DOUBLE;
+}
+static void x86_fpload(unsigned long v, const char *tail) {
+    kcc_as_str(s_movsd); x86_slot(v); kcc_as_str(tail);
+}
+static void x86_fpstore(unsigned long v) {
+    kcc_as_str(s_movsd); kcc_as_str(s_x0_c); x86_slot(v); kcc_as_str(s_nl);
+}
+static void x86_fpbinop(void *i, const char *mnem) {
+    x86_fpload(IL(i, IR_SRC1), s_cx0_nl);
+    x86_fpload(IL(i, IR_SRC2), s_cx1_nl);
+    kcc_as_str(mnem); kcc_as_str(s_x1_x0);
+    x86_fpstore(IL(i, IR_DEST));
+}
 static void x86_bblabel(unsigned long id) { kcc_as_str(s_bb); kcc_as_dec(id); }
 
 static unsigned long x86_marshal(unsigned long *args, unsigned long count) {
@@ -310,7 +340,12 @@ void kcc_x86_sel(void *i) {
         else if (sz == 5) x86_memload(i, s_movsbq, s_pr11_r10);
         else if (sz == 6) x86_memload(i, s_movswq, s_pr11_r10);
         else if (sz == 7) x86_memload(i, s_movslq, s_pr11_r10);
-        else if (sz == 8) { /* single float: deferred */ }
+        else if (sz == 8) {                      /* single float: movss + widen */
+            x86_load(IL(i, IR_SRC1), s_r11);
+            kcc_as_str(s_movss); kcc_as_str(s_px11_x0);
+            kcc_as_str(s_cvtss2sd);
+            x86_fpstore(IL(i, IR_DEST));
+        }
         else x86_memload(i, s_movq, s_pr11_r10);
         return;
     }
@@ -319,13 +354,30 @@ void kcc_x86_sel(void *i) {
         if (sz == 1) x86_memstore(i, s_movb, s_r10b_pr11);
         else if (sz == 2) x86_memstore(i, s_movw, s_r10w_pr11);
         else if (sz == 4) x86_memstore(i, s_movl, s_r10d_pr11);
-        else if (sz == 8) { /* single float: deferred */ }
+        else if (sz == 8) {                      /* single float: narrow + movss */
+            x86_fpload(IL(i, IR_SRC1), s_cx0_nl);
+            kcc_as_str(s_cvtsd2ss);
+            x86_load(IL(i, IR_SRC2), s_r11);
+            kcc_as_str(s_movss); kcc_as_str(s_x0_px11);
+        }
         else x86_memstore(i, s_movq, s_r10_pr11);
         return;
     }
-    case IR_ADD: case IR_GEP: x86_binop(i, s_addq); return;
-    case IR_SUB: x86_binop(i, s_subq); return;
-    case IR_MUL: x86_binop(i, s_imulq); return;
+    /* A floating ADD/SUB/MUL/DIV (typed float/double) uses SSE; the shared
+       IR_GEP that also lands on IR_ADD is integer address arithmetic. */
+    case IR_ADD:
+        if (is_fp_type((void *)IL(i, IR_TYPE))) x86_fpbinop(i, s_addsd);
+        else x86_binop(i, s_addq);
+        return;
+    case IR_GEP: x86_binop(i, s_addq); return;
+    case IR_SUB:
+        if (is_fp_type((void *)IL(i, IR_TYPE))) x86_fpbinop(i, s_subsd);
+        else x86_binop(i, s_subq);
+        return;
+    case IR_MUL:
+        if (is_fp_type((void *)IL(i, IR_TYPE))) x86_fpbinop(i, s_mulsd);
+        else x86_binop(i, s_imulq);
+        return;
     case IR_AND: x86_binop(i, s_andq); return;
     case IR_OR: x86_binop(i, s_orq); return;
     case IR_XOR: x86_binop(i, s_xorq); return;
@@ -334,7 +386,28 @@ void kcc_x86_sel(void *i) {
     case IR_SHL: x86_shift(i, s_shlq); return;
     case IR_LSHR: x86_shift(i, s_shrq); return;
     case IR_ASHR: x86_shift(i, s_sarq); return;
-    case IR_SDIV: x86_divop(i, 1, 0); return;
+    case IR_SDIV:
+        if (is_fp_type((void *)IL(i, IR_TYPE))) x86_fpbinop(i, s_divsd);
+        else x86_divop(i, 1, 0);
+        return;
+    /* Floating-point conversions (rung 4); UITOFP shares the signed cvtsi2sd,
+       as kcc's own source only converts signed integers to floating. */
+    case IR_SITOFP: case IR_UITOFP:
+        x86_load(IL(i, IR_SRC1), s_r10);
+        kcc_as_str(s_cvtsi2sd);
+        x86_fpstore(IL(i, IR_DEST));
+        return;
+    case IR_FPTOSI:
+        x86_fpload(IL(i, IR_SRC1), s_cx0_nl);
+        kcc_as_str(s_cvttsd2si);
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    case IR_FPROUND:
+        x86_fpload(IL(i, IR_SRC1), s_cx0_nl);
+        kcc_as_str(s_cvtsd2ss);
+        kcc_as_str(s_cvtss2sd);
+        x86_fpstore(IL(i, IR_DEST));
+        return;
     case IR_UDIV: x86_divop(i, 0, 0); return;
     case IR_SMOD: x86_divop(i, 1, 1); return;
     case IR_UMOD: x86_divop(i, 0, 1); return;

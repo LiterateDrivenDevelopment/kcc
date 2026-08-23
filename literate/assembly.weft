@@ -1027,6 +1027,18 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 @<Selfhost: codegen verify@>
 @}
 
+\noindent The middle-end IR builder, ported to C
+(Chapter~\ref{ch:self-hosting-ir}), a drop-in replacement --- the last
+subsystem to leave assembly:
+
+@o tmp/selfhost/ir.c @{
+@<Selfhost: ir@>
+@}
+
+@o tmp/selfhost/ir_verify.sh @{
+@<Selfhost: ir verify@>
+@}
+
 % -- The Linux/x86-64 runtime and its cross-compile test --------------
 
 \noindent The second target's OS layer (Chapter~\ref{ch:runtime-linux}): the

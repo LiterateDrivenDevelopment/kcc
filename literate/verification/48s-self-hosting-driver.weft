@@ -70,6 +70,7 @@ long kcc_sys_execve(const char *path, char *const argv[], char *const envp[]);
 long kcc_sys_wait4(long pid, int *status, long options, void *rusage);
 long kcc_sys_open(const char *path, long flags, long mode);
 long kcc_sys_close(long fd);
+long kcc_sys_write(long fd, const void *buf, long len);
 long kcc_sys_unlink(const char *path);
 void kcc_sys_exit(int status);
 
@@ -83,6 +84,7 @@ extern unsigned long kcc_dwarf_enabled;
 
 void *kcc_envp = 0;
 unsigned long kcc_emit_asm = 0;
+unsigned long kcc_host_linux = 0;    /* set to 1 by the Linux _start (os_linux) */
 
 static const char OPT_O[] = "-o";
 static const char OPT_WALL[] = "-Wall";
@@ -102,6 +104,11 @@ static const char STR_SYSLIBROOT[] = "-syslibroot";
 static const char STR_ARM64[] = "arm64";
 static const char STR_DASH_E[] = "-e";
 static const char STR_UMAIN[] = "_main";
+static const char STR_AS_64[] = "--64";          /* ELF: assemble 64-bit */
+static const char STR_STATIC[] = "-static";       /* ELF: static, no dynamic loader */
+static const char STR_NOSTDLIB[] = "-nostdlib";   /* ELF: no libc; kcc supplies the runtime */
+static const char STR_USTART[] = "_start";        /* ELF entry point */
+static const char STR_DOT_O[] = ".o";
 static const char STR_AOUT[] = "a.out";
 static const char STR_SDKROOT_ENV[] = "SDKROOT";
 static const char STR_SDK_CLT[] =
@@ -109,6 +116,45 @@ static const char STR_SDK_CLT[] =
 static const char STR_SDK_XCODE[] =
     "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
 static const char ERR_NOINPUT[] = "kcc: error: no input files\n";
+
+/* The Linux runtime kcc emits and assembles at link time so that a -nostdlib
+   static executable has an entry point and syscall stubs.  It mirrors the
+   hand-written os_linux.s that kcc itself is built from --- the same syscall
+   numbers and the same macOS-to-Linux flag/argument translations --- minus the
+   kcc-internal kcc_host_linux hook, so it links against any freestanding TU. */
+static const char STR_RT_S[] = "kcc_rt.s";
+static const char STR_RT_O[] = "kcc_rt.o";
+static const char STR_RUNTIME[] =
+    ".set SYS_read,0\n.set SYS_write,1\n.set SYS_open,2\n.set SYS_close,3\n"
+    ".set SYS_lseek,8\n.set SYS_mmap,9\n.set SYS_munmap,11\n.set SYS_fork,57\n"
+    ".set SYS_execve,59\n.set SYS_exit,60\n.set SYS_wait4,61\n.set SYS_unlink,87\n"
+    "\t.comm kcc_host_linux,8,8\n"    /* merges with the kcc that links us, if any */
+    "\t.text\n\t.globl _start\n_start:\n"
+    "\tleaq __init_array_start(%rip), %rbx\n"
+    "\tleaq __init_array_end(%rip), %rbp\n"
+    ".Linit_loop:\n\tcmpq %rbp, %rbx\n\tjae .Linit_done\n"
+    "\tcall *(%rbx)\n\taddq $8, %rbx\n\tjmp .Linit_loop\n.Linit_done:\n"
+    "\tmovq $1, kcc_host_linux(%rip)\n"   /* a kcc we build can itself drive as/ld */
+    "\tmovq (%rsp), %rdi\n\tleaq 8(%rsp), %rsi\n\tleaq 16(%rsp,%rdi,8), %rdx\n"
+    "\tcall main\n\tmovq %rax, %rdi\n\tmovq $SYS_exit, %rax\n\tsyscall\n\thlt\n"
+    "\t.globl kcc_sys_exit\nkcc_sys_exit:\n\tmovq $SYS_exit, %rax\n\tsyscall\n\thlt\n"
+    "\t.globl kcc_sys_fork\nkcc_sys_fork:\n\tmovq $SYS_fork, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_execve\nkcc_sys_execve:\n\tmovq $SYS_execve, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_wait4\nkcc_sys_wait4:\n\tmovq %rcx, %r10\n\tmovq $SYS_wait4, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_read\nkcc_sys_read:\n\tmovq $SYS_read, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_write\nkcc_sys_write:\n\tmovq $SYS_write, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_open\nkcc_sys_open:\n\tmovq %rsi, %r11\n\tandq $3, %rsi\n"
+    "\ttestq $0x200, %r11\n\tjz 1f\n\torq $0x40, %rsi\n"
+    "1:\ttestq $0x400, %r11\n\tjz 2f\n\torq $0x200, %rsi\n"
+    "2:\tmovq $SYS_open, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_close\nkcc_sys_close:\n\tmovq $SYS_close, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_lseek\nkcc_sys_lseek:\n\tmovq $SYS_lseek, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_unlink\nkcc_sys_unlink:\n\tmovq $SYS_unlink, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_mmap\nkcc_sys_mmap:\n\ttestq $0x1000, %rcx\n\tjz .Lmmap_go\n"
+    "\tbtrq $12, %rcx\n\torq $0x20, %rcx\n.Lmmap_go:\n\tmovq %rcx, %r10\n"
+    "\tmovq $SYS_mmap, %rax\n\tsyscall\n\tret\n"
+    "\t.globl kcc_sys_munmap\nkcc_sys_munmap:\n\tmovq $SYS_munmap, %rax\n\tsyscall\n\tret\n"
+    "\t.section .note.GNU-stack,\"\",@@progbits\n";
 
 char *kcc_getenv(const char *name, unsigned long namelen);
 int kcc_driver_x86_object(const char *out);
@@ -175,7 +221,7 @@ int kcc_driver_emit_asm_object(const char *out) {
 }
 
 int kcc_driver_x86_object(const char *out) {
-    if (kcc_x86_os) {                     /* Linux/ELF: render .s to out, stop. */
+    if (kcc_x86_os && !kcc_host_linux) {  /* macOS host, Linux target: can only emit .s */
         kcc_x86_render(out);
         return 0;
     }
@@ -185,13 +231,18 @@ int kcc_driver_x86_object(const char *out) {
     kcc_memcpy(outs + len, STR_DOT_S, 3);
     if (kcc_x86_render(outs)) return 1;
     char *av[7];
-    av[0] = (char *)STR_AS_ARGV0;
-    av[1] = (char *)STR_ARCH;
-    av[2] = (char *)STR_X86_64;
-    av[3] = (char *)OPT_O;
-    av[4] = (char *)out;
-    av[5] = outs;
-    av[6] = 0;
+    long k = 0;
+    av[k++] = (char *)STR_AS_ARGV0;
+    if (kcc_host_linux) {                 /* ELF assembler: as --64 */
+        av[k++] = (char *)STR_AS_64;
+    } else {                              /* Darwin assembler: as -arch x86_64 */
+        av[k++] = (char *)STR_ARCH;
+        av[k++] = (char *)STR_X86_64;
+    }
+    av[k++] = (char *)OPT_O;
+    av[k++] = (char *)out;
+    av[k++] = outs;
+    av[k] = 0;
     if (kcc_driver_spawn(STR_AS_PATH, av)) return 1;
     return 0;
 }
@@ -355,12 +406,25 @@ int kcc_driver_spawn(const char *path, char *const argv[]) {
 it scans the arguments building the linker command line---compiling each
 \texttt{.c} to a temporary object (tracked for removal), forwarding an unknown
 \texttt{-flag} verbatim, and handing any other file (a \texttt{.o}, an archive)
-straight to \texttt{ld}.  It appends the freestanding link line
-(\texttt{-o out -lSystem -syslibroot <sdk> -arch <arch> -e \_main}), runs
-\texttt{ld}, removes the temporary objects, and exits with the linker's status.
+straight to \texttt{ld}.  On a Darwin host it appends the system link line
+(\texttt{-o out -lSystem -syslibroot <sdk> -arch <arch> -e \_main}).  On a Linux
+host (\texttt{kcc\_host\_linux}, set by \texttt{os\_linux}'s \texttt{\_start}) it
+instead emits and assembles the embedded runtime to a temporary object and links
+statically with no libc (\texttt{-static -nostdlib -o out <objs> kcc\_rt.o -e
+\_start}); this is what lets \kcc{} produce a running executable from source in a
+single command on Linux.  It then runs \texttt{ld}, removes the temporary
+objects, and exits with the linker's status.
 
 @l c
 @d Selfhost: driver link @{
+static int kcc_driver_write_runtime(const char *path) {
+    long fd = kcc_sys_open(path, 0x601, 0x1a4);   /* O_WRONLY|O_CREAT|O_TRUNC, 0644 */
+    if (fd < 0) return 1;
+    long n = (long)kcc_strlen(STR_RUNTIME);
+    int ok = (kcc_sys_write(fd, STR_RUNTIME, n) == n);
+    kcc_sys_close(fd);
+    return ok ? 0 : 1;
+}
 void kcc_driver_link_all(long argc, char **argv) {
     /* Pass 1: honour flags wherever they appear. */
     for (long i = 1; i < argc; ) {
@@ -368,6 +432,7 @@ void kcc_driver_link_all(long argc, char **argv) {
         if (kcc_strcmp(a, OPT_WALL) == 0) { kcc_warn_all = 1; i++; continue; }
         if (kcc_strcmp(a, OPT_EMITASM) == 0) { kcc_emit_asm = 1; i++; continue; }
         if (kcc_strcmp(a, OPT_TARGET_X86) == 0) { kcc_target = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_TARGET_LINUX) == 0) { kcc_target = 1; kcc_x86_os = 1; i++; continue; }
         if (kcc_strcmp(a, OPT_G) == 0) { kcc_dwarf_enabled = 1; i++; continue; }
         const char *next = (i + 1 < argc) ? argv[i + 1] : 0;
         unsigned long n = kcc_driver_I(a, next, 1);
@@ -396,7 +461,8 @@ void kcc_driver_link_all(long argc, char **argv) {
         }
         if (kcc_strcmp(a, OPT_WALL) == 0 || kcc_strcmp(a, OPT_G) == 0 ||
             kcc_strcmp(a, OPT_EMITASM) == 0 ||
-            kcc_strcmp(a, OPT_TARGET_X86) == 0) { i++; continue; }
+            kcc_strcmp(a, OPT_TARGET_X86) == 0 ||
+            kcc_strcmp(a, OPT_TARGET_LINUX) == 0) { i++; continue; }
         unsigned long n = kcc_driver_I(a, 0, 0);
         if (n) { i += (long)n; continue; }
         n = kcc_driver_D(a, 0, 0);
@@ -422,20 +488,36 @@ void kcc_driver_link_all(long argc, char **argv) {
     if (inputs == 0) { kcc_io_err(ERR_NOINPUT); kcc_sys_exit(1); }
 
     if (out == 0) out = STR_AOUT;
-    larg[k++] = (char *)OPT_O;
-    larg[k++] = (char *)out;
-    larg[k++] = (char *)STR_LSYSTEM;
-    larg[k++] = (char *)STR_SYSLIBROOT;
-    larg[k++] = kcc_driver_sdkroot();
-    larg[k++] = (char *)STR_ARCH;
-    larg[k++] = kcc_target ? (char *)STR_X86_64 : (char *)STR_ARM64;
-    larg[k++] = (char *)STR_DASH_E;
-    larg[k++] = (char *)STR_UMAIN;
+    if (kcc_x86_os && kcc_host_linux) {   /* Linux host: static, no libc, embedded runtime */
+        if (kcc_driver_write_runtime(STR_RT_S)) { kcc_io_flush(); kcc_sys_exit(1); }
+        char *rav[6];
+        rav[0] = (char *)STR_AS_ARGV0; rav[1] = (char *)STR_AS_64;
+        rav[2] = (char *)OPT_O; rav[3] = (char *)STR_RT_O; rav[4] = (char *)STR_RT_S; rav[5] = 0;
+        if (kcc_driver_spawn(STR_AS_PATH, rav)) { kcc_io_flush(); kcc_sys_exit(1); }
+        larg[k++] = (char *)STR_RT_O;     /* runtime object as a link input */
+        larg[k++] = (char *)OPT_O;
+        larg[k++] = (char *)out;
+        larg[k++] = (char *)STR_STATIC;
+        larg[k++] = (char *)STR_NOSTDLIB;
+        larg[k++] = (char *)STR_DASH_E;
+        larg[k++] = (char *)STR_USTART;
+    } else {                              /* Darwin host: link against libSystem */
+        larg[k++] = (char *)OPT_O;
+        larg[k++] = (char *)out;
+        larg[k++] = (char *)STR_LSYSTEM;
+        larg[k++] = (char *)STR_SYSLIBROOT;
+        larg[k++] = kcc_driver_sdkroot();
+        larg[k++] = (char *)STR_ARCH;
+        larg[k++] = kcc_target ? (char *)STR_X86_64 : (char *)STR_ARM64;
+        larg[k++] = (char *)STR_DASH_E;
+        larg[k++] = (char *)STR_UMAIN;
+    }
     larg[k] = 0;
 
     kcc_io_flush();
     int status = kcc_driver_spawn(STR_LD_PATH, larg);
 
+    if (kcc_x86_os && kcc_host_linux) { kcc_sys_unlink(STR_RT_S); kcc_sys_unlink(STR_RT_O); }
     for (long i = 0; i < tmpcount; i++) kcc_sys_unlink(tmpobj[i]);
 
     kcc_io_flush();

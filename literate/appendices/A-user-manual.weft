@@ -72,6 +72,20 @@ There is nothing to configure: \kcc{} has no configuration file and no
 environment variables to set.  Its entire behaviour is controlled by the
 command-line options described in \S\ref{sec:um-commands}.
 
+To run the complete verification suite in one step:
+
+\begin{verbatim}
+make ci
+\end{verbatim}
+
+This runs the fast native checks first --- the unit tests, the differential
+tests against \texttt{clang}, ABI interop, end-to-end compile-and-run,
+diagnostics, warnings, and the code-generation suite --- and finishes with the
+self-host milestones \texttt{meta-a} and \texttt{meta-c}.  The last two
+cross-compile \kcc{} to Linux and run it there, so they need Docker and
+\texttt{qemu-user}; the individual targets (for example \texttt{make difftest})
+can be run on their own when that toolchain is not available.
+
 \section{Your First Program}
 \label{sec:um-first}
 

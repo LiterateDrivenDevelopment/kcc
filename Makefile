@@ -24,7 +24,7 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 
 .DEFAULT_GOAL := build
 
-.PHONY: all default tangle assemble build test selfhost selfhost-lexer \
+.PHONY: all default ci tangle assemble build test selfhost selfhost-lexer \
         selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
         selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
         selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema \
@@ -34,6 +34,12 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
 
 # Default: build everything
 all default: build
+
+# CI: the complete verification suite, in one entry point. Fast native checks
+# run first (fail fast); the meta-* self-host milestones run last and need
+# Docker + qemu-user. Prerequisites share `build`, so it is assembled once.
+ci: build test difftest interop e2e diagtest warntest test-codegen meta-a meta-c
+	echo "=== ci: all suites passed ==="
 
 # Tangle: extract .s files from .weft literate sources
 tangle:

@@ -28,7 +28,7 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
         selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
         selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
         selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema \
-        selfhost-emit-x86 selfhost-preprocessor selfhost-codegen selfhost-ir selfhost-main selfhost-lexer-core meta-a \
+        selfhost-emit-x86 selfhost-preprocessor selfhost-codegen selfhost-ir selfhost-main selfhost-lexer-core meta-a meta-c \
         difftest interop e2e diagtest warntest test-codegen doc weave clean \
         run map
 
@@ -221,6 +221,12 @@ selfhost-lexer-core: build
 meta-a: build
 	chmod +x tmp/runtime/meta_a_verify.sh
 	tmp/runtime/meta_a_verify.sh
+
+# Milestone C: cross-compile kcc's own source to Linux, link it, and prove the
+# Linux-native compiler self-hosts (and re-hosts itself) in a single command.
+meta-c: build
+	chmod +x tmp/runtime/meta_c_verify.sh
+	tmp/runtime/meta_c_verify.sh
 
 # Differential tests: compile each program with kcc AND clang, compare
 difftest: build

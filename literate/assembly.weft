@@ -1086,6 +1086,10 @@ ARM64 compiler, so it routes to its own directory:
 @<Runtime-linux: meta-a verify@>
 @}
 
+@o tmp/runtime/meta_c_verify.sh @{
+@<Runtime-linux: meta-c verify@>
+@}
+
 % -- Differential testing against clang -------------------------------
 
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and

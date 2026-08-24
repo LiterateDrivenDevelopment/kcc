@@ -408,3 +408,83 @@ runtime it embeds carries the same \texttt{kcc\_host\_linux} hook, so a \kcc{}
 that \kcc{} builds is itself a one-command Linux self-host.  The whole ladder
 therefore closes on itself: after the one-time cross-compile, the compiler
 reproduces and re-hosts itself on Linux unaided.
+
+\section{Verification: The Automated Self-Host}
+\label{sec:meta-c-verify}
+
+\texttt{make meta-c} performs the whole loop end to end.  It cross-compiles every
+one of \kcc{}'s own C modules to Linux assembly on the build host, then, inside a
+\texttt{linux/amd64} container under \texttt{qemu-x86\_64}, assembles and links
+them into a native \texttt{kcc\_linux}.  It then exercises the one-command driver:
+\texttt{kcc\_linux} turns a source file into a running executable in a single
+step (checked by its exit status), builds a \emph{second} compiler from all
+twenty-nine modules in one command, and finally has \emph{that} compiler build
+and run a program --- proving the self-host is recursive.  A green run prints
+\texttt{META\_C\_PASS}.  Like the Meta-A verifier it needs Docker and
+\texttt{qemu-user}, so it is a milestone check rather than part of the default
+suite.
+
+@d Runtime-linux: meta-c verify @{
+#!/usr/bin/env bash
+# make meta-c — cross-compile kcc's own source to Linux, link it, and prove the
+# Linux-native compiler self-hosts (and re-hosts itself) in a single command.
+set -euo pipefail
+
+KCC=tmp/kcc
+S=tmp/selfhost
+M=tmp/metac
+mkdir -p "$M"
+
+mods="arena strings io hashtab vec strtab source lexer_tables diag preprocessor \
+parser expressions statements declarations types symtab conversions sema ir opt \
+emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
+
+echo "[1/3] cross-compile kcc's own source -> Linux/x86-64 .s (+ stage .c)"
+for m in $mods; do
+  "$KCC" -c "$S/$m.c" --target=x86_64-linux -o "$M/$m.s" >/dev/null
+  cp "$S/$m.c" "$M/$m.c"
+done
+"$KCC" -c "$S/lexer_core.c" --target=x86_64-linux -o "$M/lexer.s" >/dev/null
+cp "$S/lexer_core.c" "$M/lexer.c"
+cp tmp/runtime/os_linux.s "$M/os_linux.s"
+printf 'int main(void){return 42;}\n' > "$M/hello.c"
+
+echo "[2/3] link kcc_linux and self-host inside linux/amd64 (qemu loader)"
+docker run --rm -v "$PWD/$M":/w -w /w --platform linux/amd64 gcc:latest bash -c '
+  set -e
+  for i in 1 2 3; do
+    apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq qemu-user >/dev/null 2>&1 && break
+    sleep 2
+  done
+  ALL="os_linux arena strings io hashtab vec strtab source lexer lexer_tables diag \
+preprocessor parser expressions statements declarations types symtab conversions \
+sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
+  for m in $ALL; do as --64 -o "$m.o" "$m.s"; done
+  OBJ="main.o arena.o strings.o io.o hashtab.o vec.o strtab.o source.o lexer.o \
+lexer_tables.o diag.o preprocessor.o parser.o expressions.o statements.o \
+declarations.o types.o symtab.o conversions.o sema.o ir.o opt.o emit_arm64.o \
+emit_x86.o linker.o codegen.o emit_macho.o dwarf.o driver.o"
+  ld -static -nostdlib -e _start -o kcc_linux os_linux.o $OBJ
+  echo "  built $(file kcc_linux | cut -d, -f1-2)"
+
+  echo "  one command: kcc_linux hello.c -o hello"
+  qemu-x86_64 ./kcc_linux hello.c --target=x86_64-linux -o hello
+  set +e; qemu-x86_64 ./hello; c=$?; set -e
+  [ "$c" -eq 42 ] || { echo "META_C_FAIL: hello=$c (want 42)"; exit 1; }
+
+  echo "  capstone: kcc_linux builds kcc_linux3 (29 modules) in one command"
+  SRC="main.c arena.c strings.c io.c hashtab.c vec.c strtab.c source.c lexer.c \
+lexer_tables.c diag.c preprocessor.c parser.c expressions.c statements.c \
+declarations.c types.c symtab.c conversions.c sema.c ir.c opt.c emit_arm64.c \
+emit_x86.c linker.c codegen.c emit_macho.c dwarf.c driver.c"
+  qemu-x86_64 ./kcc_linux $SRC --target=x86_64-linux -o kcc_linux3
+
+  echo "  recursive: kcc_linux3 builds and runs hello in one command"
+  qemu-x86_64 ./kcc_linux3 hello.c --target=x86_64-linux -o hello3
+  set +e; qemu-x86_64 ./hello3; c=$?; set -e
+  [ "$c" -eq 42 ] || { echo "META_C_FAIL: recursive hello3=$c (want 42)"; exit 1; }
+
+  echo "META_C_PASS"
+'
+echo "[3/3] done"
+@}

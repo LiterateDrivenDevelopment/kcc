@@ -71,6 +71,7 @@ enum {
 };
 
 /* externs — lexer / source globals */
+extern unsigned long kcc_x86_os;     /* 1 when the target is Linux/x86-64 */
 extern unsigned long kcc_tok_type, kcc_tok_len, kcc_tok_line;
 extern const char *kcc_tok_start;
 extern const char *kcc_lex_cursor, *kcc_lex_end, *kcc_lex_line_start;
@@ -752,6 +753,10 @@ static void pp_predefine(void) {
     pp_def_simple("__LP64__", 8, "1", 1);
     pp_def_simple("_LP64", 5, "1", 1);
     pp_def_simple("__LINE__", 8, "1", 1);
+    if (kcc_x86_os) {                     /* Linux/x86-64 target: let headers pick glibc bindings */
+        pp_def_simple("__linux__", 9, "1", 1);
+        pp_def_simple("__x86_64__", 10, "1", 1);
+    }
     kcc_pp_apply_cmdline_defines();
 }
 
@@ -1130,7 +1135,7 @@ unsigned long kcc_pp_atoi(const char *p, unsigned long len) {
 @d Selfhost: pp include @{
 static int pp_file_exists(const char *path) {
     long fd = kcc_sys_open(path, 0, 0);
-    if (fd == -1) return 0;
+    if (fd < 0) return 0;    /* open failed (macOS returns -1; Linux returns -errno) */
     kcc_sys_close(fd);
     return 1;
 }

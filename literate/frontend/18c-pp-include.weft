@@ -48,8 +48,8 @@ _kcc_pp_file_exists:
     mov x1, #0                   // O_RDONLY
     mov x2, #0
     bl _kcc_sys_open
-    cmn x0, #1                   // x0 == -1 ?
-    b.eq .Lfe_no
+    cmp x0, #0                   // fd < 0 → open failed (macOS: -1; Linux: -errno)
+    b.lt .Lfe_no
     bl _kcc_sys_close            // opened: close the probe fd
     mov x0, #1
     ldp x29, x30, [sp], #16
@@ -662,12 +662,18 @@ dylib-imported datum through the global offset table, so
 #endif
 typedef unsigned long size_t;
 typedef void FILE;
+#ifdef __linux__
+extern FILE *stdin;
+extern FILE *stdout;
+extern FILE *stderr;
+#else
 extern FILE *__stdinp;
 extern FILE *__stdoutp;
 extern FILE *__stderrp;
 #define stdin  __stdinp
 #define stdout __stdoutp
 #define stderr __stderrp
+#endif
 #define EOF (-1)
 #define BUFSIZ 1024
 #define FOPEN_MAX 20
@@ -853,11 +859,16 @@ double nan(const char *tag);
 @}
 
 The last two bridges show how cheap a new hosted header now is---each is a file
-and nothing else.  \verb|<errno.h>| is the interesting case on this platform:
-\texttt{errno} is not a global but a thread-local accessed through a function,
-so the macro expands to \verb|(*__error())| and the bridge declares
-\texttt{\_\_error} returning \texttt{int *}, exactly as \texttt{libSystem}
-provides it; the \texttt{E*} constants carry the BSD values macOS uses.
+and nothing else.  \verb|<errno.h>| is the interesting case: \texttt{errno} is
+not a global but a thread-local accessed through a function, and the two
+platforms name that function differently.  When the target is Linux/x86-64 (the
+compiler predefines \texttt{\_\_linux\_\_}) the macro expands to
+\verb|(*__errno_location())|, the accessor glibc provides; otherwise it expands
+to \verb|(*__error())|, exactly as \texttt{libSystem} provides it.  The same
+\texttt{\_\_linux\_\_} switch picks the standard streams in \verb|<stdio.h>|:
+\texttt{stderr} and friends are direct \texttt{extern FILE *} globals under glibc,
+but the underscored \texttt{\_\_stderrp} accessors under \texttt{libSystem}.  The
+\texttt{E*} constants carry the BSD values, which Linux shares for this subset.
 \verb|<time.h>| gives \texttt{time\_t} (a \texttt{long}) and a \texttt{struct
 tm} laid out to match the platform's, including the \texttt{tm\_gmtoff} and
 \texttt{tm\_zone} tail fields so a program that reads them sees the real thing.
@@ -896,8 +907,13 @@ unsigned long strftime(char *s, unsigned long max, char *fmt, struct tm *tm);
 @d Header: errno @{
 #ifndef _ERRNO_H
 #define _ERRNO_H
+#ifdef __linux__
+int *__errno_location(void);
+#define errno (*__errno_location())
+#else
 int *__error(void);
 #define errno (*__error())
+#endif
 #define EPERM 1
 #define ENOENT 2
 #define ESRCH 3

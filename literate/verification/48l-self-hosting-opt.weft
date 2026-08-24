@@ -603,7 +603,8 @@ unsigned long kcc_opt_dce(void *fn) {
             unsigned long op = in->op;
             if (op == IR_STORE || op == IR_BR || op == IR_BR_COND ||
                 op == IR_RET || op == IR_CALL || op == IR_CALL_IND ||
-                op == IR_NOP || op == IR_ALLOCA)
+                op == IR_NOP || op == IR_ALLOCA ||
+                op == IR_VA_START || op == IR_ASM)
                 continue;
             if (op == IR_LOAD) {
                 struct Type *t = (struct Type *)in->type;

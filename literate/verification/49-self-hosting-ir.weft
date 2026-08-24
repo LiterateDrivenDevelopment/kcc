@@ -166,6 +166,7 @@ struct kcc_member_res kcc_type_find_member(void *sty, const char *name);
 /* type singletons (pointers to descriptors) defined by the types module */
 extern void *kcc_type_int_s, *kcc_type_long_s, *kcc_type_long_u,
             *kcc_type_double, *kcc_type_float, *kcc_type_void;
+extern unsigned long kcc_target;     /* 1 when compiling for x86-64 (System V va_list) */
 
 /* -- IR builder global state (this module is its definition site) -- */
 void *kcc_ir_cur_func = 0;
@@ -3445,6 +3446,19 @@ for AAPCS64, reserves a hidden result buffer for an aggregate return, and
 dispatches direct or indirect.  The cast builder delegates FP conversions to
 \texttt{convert} and re-canonicalises integer width and signedness.
 
+Variadic access has two lowerings.  On ARM64 a \texttt{va\_list} is a bare
+pointer that walks the homogeneous save area, so \texttt{va\_start} records the
+frame base and \texttt{va\_arg} bumps the cursor by eight.  On x86-64 the System~V
+ABI splits arguments across the integer and vector banks, so \texttt{va\_start}
+materialises the four-field \texttt{va\_list} struct (\texttt{gp\_offset},
+\texttt{fp\_offset}, overflow pointer, register-save pointer) and \texttt{va\_arg}
+selects register-versus-overflow \emph{branchlessly}
+(\texttt{addr = overflow + c\,(reg\_addr - overflow)}, where \texttt{c} is the
+in-range predicate) and advances the matching counter.  Because the requested
+type governs which bank to read, \texttt{va\_arg} resolves the unresolved
+type-name node to a \texttt{Type} first, so a \texttt{double} takes the
+vector-bank path rather than being misread from the integer save area.
+
 @l c
 @d Selfhost: ir assigncall @{
 unsigned long kcc_ir_build_assign(void *e) {
@@ -3737,8 +3751,87 @@ unsigned long kcc_ir_ident_alloca(void *ident) {
     return rv;
 }
 
+/* small IR emitters for the x86-64 System V va_list lowering */
+static unsigned long ir_vc(unsigned long v) {
+    void *n = kcc_ir_alloc_instr(IR_CONST);
+    IL(n, IR_TYPE) = (unsigned long)kcc_type_long_s;
+    IL(n, IR_SRC1) = v;
+    unsigned long d = kcc_ir_next_vreg(); IL(n, IR_DEST) = d; kcc_ir_emit(n);
+    return d;
+}
+static unsigned long ir_v2(unsigned long op, unsigned long a, unsigned long b) {
+    void *n = kcc_ir_alloc_instr(op);
+    IL(n, IR_TYPE) = (unsigned long)kcc_type_long_s;
+    IL(n, IR_SRC1) = a; IL(n, IR_SRC2) = b;
+    unsigned long d = kcc_ir_next_vreg(); IL(n, IR_DEST) = d; kcc_ir_emit(n);
+    return d;
+}
+static unsigned long ir_vload(unsigned long addr, void *ty) {
+    void *n = kcc_ir_alloc_instr(IR_LOAD);
+    IL(n, IR_TYPE) = (unsigned long)ty;
+    IL(n, IR_SRC1) = addr;
+    unsigned long d = kcc_ir_next_vreg(); IL(n, IR_DEST) = d; kcc_ir_emit(n);
+    return d;
+}
+static void ir_vstore(unsigned long val, unsigned long addr, void *ty) {
+    void *n = kcc_ir_alloc_instr(IR_STORE);
+    IL(n, IR_TYPE) = (unsigned long)ty;
+    IL(n, IR_SRC1) = val; IL(n, IR_SRC2) = addr;
+    kcc_ir_emit(n);
+}
+
+/* Branchless System V va_arg: the register-save area (rdi-r9 at +0, xmm0-7 at
+   +48) and the stack overflow area are picked without a jump ---
+   addr = overflow + c*(reg_addr - overflow), c = (offset < limit). */
+static unsigned long ir_va_arg_sysv(unsigned long ap, int fp) {
+    unsigned long off_field = fp ? 8 : 0;
+    unsigned long base_off  = fp ? 48 : 0;
+    unsigned long limit     = fp ? 128 : 48;
+    unsigned long reg_adv   = fp ? 16 : 8;
+    unsigned long S      = ir_vload(ap, kcc_type_long_s);              /* &va_list */
+    unsigned long S_off  = ir_v2(IR_ADD, S, ir_vc(off_field));
+    unsigned long off    = ir_vload(S_off, kcc_type_long_s);
+    unsigned long c      = ir_v2(IR_CMP_ULT, off, ir_vc(limit));       /* 0/1 */
+    unsigned long rs     = ir_vload(ir_v2(IR_ADD, S, ir_vc(24)), kcc_type_long_s);
+    unsigned long ra     = ir_v2(IR_ADD, ir_v2(IR_ADD, rs, ir_vc(base_off)), off);
+    unsigned long S_ov   = ir_v2(IR_ADD, S, ir_vc(16));
+    unsigned long ov     = ir_vload(S_ov, kcc_type_long_s);
+    unsigned long diff   = ir_v2(IR_SUB, ra, ov);
+    unsigned long addr   = ir_v2(IR_ADD, ov, ir_v2(IR_MUL, c, diff));
+    unsigned long val    = ir_vload(addr, fp ? kcc_type_double : kcc_type_long_s);
+    ir_vstore(ir_v2(IR_ADD, off, ir_v2(IR_MUL, c, ir_vc(reg_adv))), S_off, kcc_type_long_s);
+    ir_vstore(ir_v2(IR_ADD, ov, ir_v2(IR_MUL, ir_v2(IR_SUB, ir_vc(1), c), ir_vc(8))), S_ov, kcc_type_long_s);
+    return val;
+}
+
 unsigned long kcc_ir_build_va_start(void *call) {
     unsigned long ap = kcc_ir_ident_alloca((void *)IL(call, AST_F1));
+    if (kcc_target) {                    /* x86-64: build the System V va_list struct */
+        unsigned long np = IL(kcc_ir_cur_func, IRF_PARAMS);
+        void *cls = (void *)IL(kcc_ir_cur_func, IRF_PARAM_CLS);
+        unsigned long ngp = 0, nfp = 0;
+        for (unsigned long p = 0; p < np; p++) {
+            unsigned long cl = cls ? ((unsigned long *)cls)[p] : 0;
+            if (cl == 1) nfp++; else ngp++;
+        }
+        if (ngp > 6) ngp = 6;
+        if (nfp > 8) nfp = 8;
+        void *a = kcc_ir_alloc_instr(IR_ALLOCA);       /* 32-byte struct (4 slots) */
+        IL(a, IR_TYPE) = (unsigned long)kcc_type_long_s;
+        IL(a, IR_SRC1) = 4;
+        unsigned long S = kcc_ir_next_vreg();
+        IL(a, IR_DEST) = S;
+        kcc_ir_emit(a);
+        void *vs = kcc_ir_alloc_instr(IR_VA_START);
+        IL(vs, IR_TYPE) = (unsigned long)kcc_type_int_s;
+        IL(vs, IR_SRC1) = S;
+        IL(vs, IR_SRC2) = (nfp << 8) | ngp;
+        unsigned long d = kcc_ir_next_vreg();
+        IL(vs, IR_DEST) = d;
+        kcc_ir_emit(vs);
+        ir_vstore(S, ap, kcc_type_long_s);
+        return S;
+    }
     unsigned long F = IL(kcc_ir_cur_func, IRF_PARAMS);
     void *vs = kcc_ir_alloc_instr(IR_VA_START);
     IL(vs, IR_TYPE) = (unsigned long)kcc_type_int_s;
@@ -3756,6 +3849,13 @@ unsigned long kcc_ir_build_va_start(void *call) {
 
 unsigned long kcc_ir_build_va_arg(void *va) {
     unsigned long ap = kcc_ir_ident_alloca((void *)IL(va, AST_F0));
+    if (kcc_target) {                    /* x86-64 System V */
+        /* AST_F1 is the unresolved type-name node; resolve it to a Type before
+           reading its kind, so float/double arguments take the %xmm path. */
+        void *ty = kcc_sema_resolve_type((void *)IL(va, AST_F1));
+        int fp = ty && (IL(ty, TY_KIND) >= TY_FLOAT && IL(ty, TY_KIND) <= TY_LDOUBLE);
+        return ir_va_arg_sysv(ap, fp);
+    }
     void *ld1 = kcc_ir_alloc_instr(IR_LOAD);
     IL(ld1, IR_TYPE) = (unsigned long)kcc_type_int_s;
     IL(ld1, IR_SRC1) = ap;

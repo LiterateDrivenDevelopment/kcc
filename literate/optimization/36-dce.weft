@@ -233,7 +233,11 @@ is not marked as used---and that has no side effects---is replaced with
 \texttt{IR\_NOP}.  Side-effecting instructions (\texttt{IR\_STORE},
 \texttt{IR\_BR}, \texttt{IR\_BR\_COND}, \texttt{IR\_RET},
 \texttt{IR\_CALL}) and stack allocations (\texttt{IR\_ALLOCA}) are
-unconditionally preserved.  The function returns the total number of
+unconditionally preserved.  So are \texttt{IR\_VA\_START}, which writes the
+\texttt{va\_list} structure to memory (its destination vreg may go unused on a
+target that keeps the register-save pointer in the structure rather than in the
+result), and \texttt{IR\_ASM}, whose inline assembly may have arbitrary effects.
+The function returns the total number of
 eliminations so the pass manager can detect whether another round of
 optimization is warranted.
 
@@ -274,6 +278,10 @@ optimization is warranted.
     b.eq .Ldce_sweep_skip
     cmp x1, #IR_ALLOCA
     b.eq .Ldce_sweep_skip       // keep allocas
+    cmp x1, #IR_VA_START
+    b.eq .Ldce_sweep_skip       // va_start writes the va_list struct in memory
+    cmp x1, #IR_ASM
+    b.eq .Ldce_sweep_skip       // inline asm has arbitrary side effects
 
     // A volatile load is a side effect: the read must occur even if its value
     // is unused, so it is never dead.

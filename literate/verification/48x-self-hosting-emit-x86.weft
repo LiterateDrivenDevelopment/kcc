@@ -62,7 +62,9 @@ extern unsigned long kcc_modinit_present;
 #define IRF_BLOCKS 16
 #define IRF_VREG_N 24
 #define IRF_PARAMS 40
+#define IRF_PARAM_CLS 48
 #define IRF_STATIC 72
+#define IRF_VARIADIC 88
 #define VEC_COUNT 8
 #define TY_KIND 0
 #define TY_SIZE 8
@@ -70,6 +72,7 @@ extern unsigned long kcc_modinit_present;
 #define TY_VOID 1
 #define TY_STRUCT 14
 #define TY_ARRAY 12
+#define TY_PTR 11
 #define TY_FLOAT 8
 #define TY_DOUBLE 9
 #define AST_TAG 0
@@ -87,12 +90,12 @@ enum {
     IR_CMP_SGT=24, IR_CMP_SGE=25, IR_CMP_ULT=26, IR_CMP_ULE=27,
     IR_LOAD=30, IR_STORE=31, IR_ALLOCA=32, IR_GEP=33, IR_BR=40, IR_BR_COND=41,
     IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
-    IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_FPROUND=57, IR_UITOFP=58,
+    IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_VA_START=56, IR_FPROUND=57, IR_UITOFP=58,
     IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64
 };
 /* AST tags used by the data/static walks */
 enum {
-    AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_COMPOUND=30, AST_IF_STMT=32,
+    AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_STR_LIT=52, AST_COMPOUND=30, AST_IF_STMT=32,
     AST_SWITCH_STMT=33, AST_WHILE_STMT=34, AST_DO_STMT=35, AST_FOR_STMT=36,
     AST_CASE_STMT=42, AST_LABEL_STMT=41, AST_DEFAULT_STMT=43, AST_INIT_LIST=65
 };
@@ -103,6 +106,7 @@ void *kcc_x86_tu = 0;                /* AST translation unit (data emission) */
 unsigned long kcc_x86_os = 0;        /* 0 = Darwin/Mach-O, 1 = Linux/ELF */
 static unsigned long kcc_x86_vreg_n = 0;
 static void *kcc_x86_strs = 0;
+static unsigned long kcc_x86_rsa_top = 0;   /* rbp-relative top of the variadic register-save area */
 
 #define S(name, str) static const char name[] = str
 S(s_text, ".text\n"); S(s_globl, ".globl "); S(s_us, "_");
@@ -131,6 +135,7 @@ S(s_r10, "%r10"); S(s_r11, "%r11"); S(s_rax, "%rax"); S(s_rcx, "%rcx");
 S(s_rdx, "%rdx"); S(s_r11_r10, "%r11, %r10\n"); S(s_r10_nl, "%r10\n");
 S(s_cl_r10, "%cl, %r10\n"); S(s_c_r10, ", %r10\n"); S(s_c_r10d, ", %r10d\n");
 S(s_pr11_r10, "(%r11), %r10\n"); S(s_pr11_r10d, "(%r11), %r10d\n");
+S(s_pr11, "(%r11)");
 S(s_r10_pr11, "%r10, (%r11)\n"); S(s_r10b_pr11, "%r10b, (%r11)\n");
 S(s_r10w_pr11, "%r10w, (%r11)\n"); S(s_r10d_pr11, "%r10d, (%r11)\n");
 S(s_cmpl, "\tcmpl\t%r11d, %r10d\n"); S(s_cmpq, "\tcmpq\t%r11, %r10\n");
@@ -141,6 +146,7 @@ S(s_setbe, "\tsetbe\t%al\n"); S(s_bb, ".Lkccbb"); S(s_label_nl, ":\n");
 S(s_jmp, "\tjmp\t"); S(s_jne, "\tjne\t"); S(s_test_r10, "\ttestq\t%r10, %r10\n");
 S(s_rdi, "%rdi"); S(s_rsi, "%rsi"); S(s_r8, "%r8"); S(s_r9, "%r9");
 S(s_call, "\tcall\t"); S(s_call_r11, "\tcall\t*%r11\n"); S(s_zero_al, "\tmovb\t$0, %al\n");
+S(s_movb_d, "\tmovb\t$"); S(s_al_nl, ", %al\n");
 S(s_add_rsp, "\taddq\t$"); S(s_paren_rsp, "(%rsp)"); S(s_rip_r10, "(%rip), %r10\n");
 S(s_got_r10, "@@GOTPCREL(%rip), %r10\n");
 S(s_zerofill, "\t.zerofill __DATA,__common,_"); S(s_zf_a3, ",3\n"); S(s_comma1, ",");
@@ -158,6 +164,9 @@ S(s_cvtsi2sd, "\tcvtsi2sdq\t%r10, %xmm0\n"); S(s_cvttsd2si, "\tcvttsd2si\t%xmm0,
 S(s_cvtsd2ss, "\tcvtsd2ss\t%xmm0, %xmm0\n"); S(s_cvtss2sd, "\tcvtss2sd\t%xmm0, %xmm0\n");
 S(s_px11_x0, "(%r11), %xmm0\n"); S(s_x0_px11, "%xmm0, (%r11)\n");
 static const char *const argregs[6] = { s_rdi, s_rsi, s_rdx, s_rcx, s_r8, s_r9 };
+S(s_xmm0, "%xmm0"); S(s_xmm1, "%xmm1"); S(s_xmm2, "%xmm2"); S(s_xmm3, "%xmm3");
+S(s_xmm4, "%xmm4"); S(s_xmm5, "%xmm5"); S(s_xmm6, "%xmm6"); S(s_xmm7, "%xmm7");
+static const char *const xmmregs[8] = { s_xmm0, s_xmm1, s_xmm2, s_xmm3, s_xmm4, s_xmm5, s_xmm6, s_xmm7 };
 
 #define IL(i,off) (*(unsigned long *)((char *)(i) + (off)))
 struct Type { unsigned long kind, size, align, quals, f0, f1; };
@@ -165,6 +174,7 @@ struct Node { unsigned long tag, line, col, f0, f1, f2, f3, f4; };
 
 /* forward decls */
 static void x86_emit_rodata_global(void *decl, const char *name);
+static void x86_emit_rodata_ptrarr(void *decl, const char *name);
 static void x86_emit_zero(unsigned long n);
 static void x86_emit_value(unsigned long bits, unsigned long size);
 static void x86_prereg_stmt(void *stmt);
@@ -277,22 +287,52 @@ static void x86_fpbinop(void *i, const char *mnem) {
 }
 static void x86_bblabel(unsigned long id) { kcc_as_str(s_bb); kcc_as_dec(id); }
 
+static unsigned long kcc_x86_call_nfp = 0;
 static unsigned long x86_marshal(unsigned long *args, unsigned long count) {
-    unsigned long stack_adj = 0;
+    kcc_x86_call_nfp = 0;
     if (!count) return 0;
-    if (count > 6) {
-        stack_adj = (((count - 6) * 8) + 15) & ~15UL;
+    /* System~V argument classification: class~1 arguments (float/double) travel
+       in %xmm0-7, everything else in %rdi..%r9; whatever overflows either bank
+       is copied to the outgoing stack area in argument order. */
+    unsigned long ngp = 0, nfp = 0, nstk = 0;
+    for (unsigned long k = 0; k < count; k++) {
+        if (args[2 + 2 * k] == 1) { if (nfp < 8) nfp++; else nstk++; }
+        else                      { if (ngp < 6) ngp++; else nstk++; }
+    }
+    unsigned long stack_adj = 0;
+    if (nstk) {
+        stack_adj = ((nstk * 8) + 15) & ~15UL;
         kcc_as_str(s_sub_sp); kcc_as_dec(stack_adj); kcc_as_str(s_sp_nl);
-        for (unsigned long k = 6; k < count; k++) {
-            x86_load(args[1 + 2 * k], s_r10);
-            kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma);
-            kcc_as_dec((k - 6) * 8); kcc_as_str(s_paren_rsp); kcc_as_ch('\n');
+    }
+    kcc_x86_call_nfp = nfp;
+    ngp = 0; nfp = 0;
+    unsigned long soff = 0;
+    for (unsigned long k = 0; k < count; k++) {
+        unsigned long v = args[1 + 2 * k];
+        if (args[2 + 2 * k] == 1) {
+            if (nfp < 8) {
+                kcc_as_str(s_movsd); x86_slot(v); kcc_as_str(s_comma);
+                kcc_as_str(xmmregs[nfp]); kcc_as_ch('\n'); nfp++;
+            } else {
+                x86_load(v, s_r10);
+                kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma);
+                kcc_as_dec(soff); kcc_as_str(s_paren_rsp); kcc_as_ch('\n'); soff += 8;
+            }
+        } else {
+            if (ngp < 6) { x86_load(v, argregs[ngp]); ngp++; }
+            else {
+                x86_load(v, s_r10);
+                kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma);
+                kcc_as_dec(soff); kcc_as_str(s_paren_rsp); kcc_as_ch('\n'); soff += 8;
+            }
         }
     }
-    unsigned long nreg = count < 6 ? count : 6;
-    for (unsigned long k = 0; k < nreg; k++)
-        x86_load(args[1 + 2 * k], argregs[k]);
     return stack_adj;
+}
+/* System~V requires %al to hold the number of vector registers used when
+   calling a variadic (or unprototyped) function; benign for the rest. */
+static void x86_set_al(void) {
+    kcc_as_str(s_movb_d); kcc_as_dec(kcc_x86_call_nfp); kcc_as_str(s_al_nl);
 }
 static unsigned long x86_call_args(unsigned long *args) {
     if (!args) return 0;
@@ -304,10 +344,20 @@ static unsigned long x86_call_args(unsigned long *args) {
 
 \texttt{x86\_sel} routes one IR instruction to its shape.  \texttt{IR\_CONST},
 \texttt{IR\_ALLOCA}, \texttt{IR\_RET}, loads, stores, branches, calls, global
-references, and string literals are lowered inline; the ALU/shift/div/conv
-opcodes go through the shape helpers.  A genuine \texttt{IR\_NOP} emits nothing;
-any other unrecognised opcode (floating point, inline asm, by-value aggregate)
-is refused cleanly rather than miscompiled.
+references, and string literals are lowered inline; the ALU/shift/div/conv and
+floating-point opcodes go through the shape helpers.  A genuine \texttt{IR\_NOP}
+emits nothing; an unrecognised opcode (inline asm, by-value aggregate) is refused
+cleanly rather than miscompiled.
+
+Floating point is a first-class citizen of both the call boundary and the return
+path.  \texttt{x86\_marshal} classifies each outgoing argument the System~V
+way---class-1 (\texttt{float}/\texttt{double}) values into \texttt{\%xmm0-7},
+everything else into \texttt{\%rdi..\%r9}, and the overflow of either bank onto
+the outgoing stack in argument order---and records the vector-register count so
+the call site can load \texttt{\%al} (mandatory when the callee is variadic).
+\texttt{x86\_spill\_params} mirrors that classification on entry, and both
+\texttt{IR\_RET} and the call-result store route a floating-point value through
+\texttt{\%xmm0} rather than \texttt{\%rax}.
 
 @l c
 @d Selfhost: emit_x86 dispatch @{
@@ -329,7 +379,8 @@ void kcc_x86_sel(void *i) {
     }
     case IR_RET: {
         struct Type *ty = (struct Type *)IL(i, IR_TYPE);
-        if (ty && ty->kind != TY_VOID) x86_load(IL(i, IR_SRC1), s_rax);
+        if (ty && is_fp_type(ty)) x86_fpload(IL(i, IR_SRC1), s_cx0_nl);
+        else if (ty && ty->kind != TY_VOID) x86_load(IL(i, IR_SRC1), s_rax);
         kcc_as_str(s_leave); kcc_as_str(s_retq);
         return;
     }
@@ -457,25 +508,45 @@ void kcc_x86_sel(void *i) {
     }
     case IR_CALL: {
         unsigned long adj = x86_call_args((unsigned long *)IL(i, IR_SRC2));
-        kcc_as_str(s_zero_al);
+        x86_set_al();
         kcc_as_str(s_call); x86_sym((const char *)IL(i, IR_SRC1)); kcc_as_ch('\n');
         if (adj) { kcc_as_str(s_add_rsp); kcc_as_dec(adj); kcc_as_str(s_sp_nl); }
         {
             struct Type *ty = (struct Type *)IL(i, IR_TYPE);
-            if (ty && ty->kind != TY_VOID) x86_store(IL(i, IR_DEST), s_rax);
+            if (ty && is_fp_type(ty)) x86_fpstore(IL(i, IR_DEST));
+            else if (ty && ty->kind != TY_VOID) x86_store(IL(i, IR_DEST), s_rax);
         }
         return;
     }
     case IR_CALL_IND: {
         unsigned long adj = x86_call_args((unsigned long *)IL(i, IR_SRC2));
         x86_load(IL(i, IR_SRC1), s_r11);
-        kcc_as_str(s_zero_al);
+        x86_set_al();
         kcc_as_str(s_call_r11);
         if (adj) { kcc_as_str(s_add_rsp); kcc_as_dec(adj); kcc_as_str(s_sp_nl); }
         {
             struct Type *ty = (struct Type *)IL(i, IR_TYPE);
-            if (ty && ty->kind != TY_VOID) x86_store(IL(i, IR_DEST), s_rax);
+            if (ty && is_fp_type(ty)) x86_fpstore(IL(i, IR_DEST));
+            else if (ty && ty->kind != TY_VOID) x86_store(IL(i, IR_DEST), s_rax);
         }
+        return;
+    }
+    case IR_VA_START: {
+        /* Build the System V va_list at SRC1 (its address).  SRC2 packs the
+           named-argument counts: (named_fp << 8) | named_gp.  Layout (kcc-
+           internal, 8-byte fields): [0] gp_offset, [8] fp_offset, [16]
+           overflow_arg_area, [24] reg_save_area. */
+        unsigned long named = IL(i, IR_SRC2);
+        unsigned long ngp = named & 0xff, nfp = (named >> 8) & 0xff;
+        x86_load(IL(i, IR_SRC1), s_r11);                  /* r11 = &va_list */
+        kcc_as_str(s_movabsq); kcc_as_dec(ngp * 8); kcc_as_str(s_c_r10);
+        kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma); kcc_as_dec(0); kcc_as_str(s_pr11); kcc_as_ch('\n');
+        kcc_as_str(s_movabsq); kcc_as_dec(nfp * 16); kcc_as_str(s_c_r10);
+        kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma); kcc_as_dec(8); kcc_as_str(s_pr11); kcc_as_ch('\n');
+        kcc_as_str(s_leaq); kcc_as_dec(16); kcc_as_str(s_rbp); kcc_as_str(s_c_r10);   /* overflow = rbp+16 */
+        kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma); kcc_as_dec(16); kcc_as_str(s_pr11); kcc_as_ch('\n');
+        kcc_as_str(s_leaq); x86_disp(kcc_x86_rsa_top); kcc_as_str(s_c_r10);           /* reg_save = rbp-rsa_top */
+        kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma); kcc_as_dec(24); kcc_as_str(s_pr11); kcc_as_ch('\n');
         return;
     }
     case IR_NOP:
@@ -519,14 +590,28 @@ static unsigned long x86_prescan(void *f) {
 
 static void x86_spill_params(void *f) {
     unsigned long np = IL(f, IRF_PARAMS);
+    void *cls = (void *)IL(f, IRF_PARAM_CLS);
+    /* Mirror the caller's System~V classification: float/double parameters
+       arrive in %xmm0-7, the rest in %rdi..%r9, and any overflow sits above the
+       return address at 16(%rbp), 24(%rbp), ... in parameter order. */
+    unsigned long ngp = 0, nfp = 0, soff = 16;
     for (unsigned long k = 0; k < np; k++) {
-        if (k < 6) {
-            x86_store(k, argregs[k]);
+        unsigned long cl = cls ? ((unsigned long *)cls)[k] : 0;
+        if (cl == 1) {
+            if (nfp < 8) {
+                kcc_as_str(s_movsd); kcc_as_str(xmmregs[nfp]); kcc_as_str(s_comma);
+                x86_slot(k); kcc_as_ch('\n'); nfp++;
+            } else {
+                kcc_as_str(s_movq); kcc_as_dec(soff); kcc_as_str(s_rbp);
+                kcc_as_str(s_comma); kcc_as_str(s_r10); kcc_as_ch('\n');
+                x86_store(k, s_r10); soff += 8;
+            }
+        } else if (ngp < 6) {
+            x86_store(k, argregs[ngp]); ngp++;
         } else {
-            kcc_as_str(s_movq);
-            kcc_as_dec(16 + (k - 6) * 8); kcc_as_str(s_rbp);
+            kcc_as_str(s_movq); kcc_as_dec(soff); kcc_as_str(s_rbp);
             kcc_as_str(s_comma); kcc_as_str(s_r10); kcc_as_ch('\n');
-            x86_store(k, s_r10);
+            x86_store(k, s_r10); soff += 8;
         }
     }
 }
@@ -546,10 +631,27 @@ static void x86_render_text(void) {
         unsigned long vn = IL(f, IRF_VREG_N);
         kcc_x86_vreg_n = vn;
         unsigned long allocas = x86_prescan(f);
-        unsigned long frame = (((vn + allocas) * 8) + 15) & ~15UL;
+        unsigned long save_base = (vn + allocas) * 8;
+        unsigned long variadic = IL(f, IRF_VARIADIC);
+        kcc_x86_rsa_top = 0;
+        if (variadic) {              /* reserve a System V register-save area: 6 GP + 8 XMM */
+            save_base += 176;
+            kcc_x86_rsa_top = save_base;
+        }
+        unsigned long frame = ((save_base) + 15) & ~15UL;
         kcc_as_str(s_push_rbp); kcc_as_str(s_mov_sp);
         if (frame) { kcc_as_str(s_sub_sp); kcc_as_dec(frame); kcc_as_str(s_sp_nl); }
         x86_spill_params(f);
+        if (variadic) {              /* spill the incoming argument registers for va_arg */
+            for (unsigned long k = 0; k < 6; k++) {
+                kcc_as_str(s_movq); kcc_as_str(argregs[k]); kcc_as_str(s_comma);
+                x86_disp(kcc_x86_rsa_top - k * 8); kcc_as_ch('\n');
+            }
+            for (unsigned long k = 0; k < 8; k++) {
+                kcc_as_str(s_movsd); kcc_as_str(xmmregs[k]); kcc_as_str(s_comma);
+                x86_disp(kcc_x86_rsa_top - 48 - k * 16); kcc_as_ch('\n');
+            }
+        }
         void *blocks = (void *)IL(f, IRF_BLOCKS);
         if (!blocks) continue;
         unsigned long nbb = IL(blocks, VEC_COUNT);
@@ -610,7 +712,7 @@ void kcc_x86_emit_data(void) {
             x86_emit_rodata_global(d, name);
             continue;
         }
-        if (kcc_global_const_ptrarr(d)) continue; /* const pointer array: deferred */
+        if (kcc_global_const_ptrarr(d)) { x86_emit_rodata_ptrarr(d, name); continue; }
         void *ty = kcc_sema_resolve_type((void *)d->f0);
         if (!ty) continue;
         unsigned long size = round8_min8(kcc_type_layout(ty));
@@ -625,6 +727,7 @@ static void x86_emit_one_static(void *decl) {
         x86_emit_rodata_global(d, name);
         return;
     }
+    if (kcc_global_const_ptrarr(d)) { x86_emit_rodata_ptrarr(d, name); return; }
     void *ty = kcc_sema_resolve_type((void *)d->f0);
     if (!ty) return;
     unsigned long size = round8_min8(kcc_type_layout(ty));
@@ -762,6 +865,37 @@ static void x86_emit_rodata_global(void *decl, const char *name) {
         }
     }
     if (emitted < count) x86_emit_zero((count - emitted) * elemsize);
+}
+
+/* A const array of pointers whose initialisers are string literals: emit one
+   `.quad .Lx86str<id>` per element, registering each string so the render
+   entry lays it down with a matching label.  (Not emitting `.globl` for a
+   static leaves the symbol local to the translation unit.) */
+static void x86_emit_rodata_ptrarr(void *decl, const char *name) {
+    struct Node *d = (struct Node *)decl;
+    if (!name) return;
+    struct Type *full = (struct Type *)kcc_sema_resolve_type((void *)d->f0);
+    if (!full) return;
+    unsigned long total = kcc_type_layout(full);
+    kcc_as_str(kcc_x86_os ? s_rodata : s_constsect);
+    kcc_as_str(s_p2align3);
+    if (d->f3 != 3) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
+    x86_sym(name); kcc_as_str(s_colon_nl);
+    struct Node *init = (struct Node *)d->f2;
+    struct Node *e = init ? (struct Node *)init->f0 : 0;
+    unsigned long emitted = 0;
+    for (; e; e = (struct Node *)e->f4) {
+        if (e->tag == AST_STR_LIT) {
+            unsigned long id = IL(kcc_x86_strs, VEC_COUNT);
+            unsigned long entry[2]; entry[0] = e->f0; entry[1] = e->f1;
+            kcc_vec_push(kcc_x86_strs, entry);
+            kcc_as_str(s_d_quad); kcc_as_str(s_strlbl); kcc_as_dec(id); kcc_as_ch('\n');
+        } else {
+            kcc_as_str(s_d_quad); kcc_as_dec(kcc_rodata_leaf_bits(e, TY_PTR)); kcc_as_ch('\n');
+        }
+        emitted++;
+    }
+    if (emitted * 8 < total) x86_emit_zero(total - emitted * 8);
 }
 @}
 

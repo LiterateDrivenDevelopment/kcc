@@ -44,6 +44,10 @@ int kcc_global_const_rodata(void *decl);
 int kcc_global_const_ptrarr(void *decl);
 unsigned long kcc_rodata_leaf_bits(void *node, unsigned long kind);
 const char *kcc_ir_static_name(void *decl);
+void *kcc_ht_init(unsigned long capacity);
+unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen, unsigned long value);
+unsigned long kcc_strlen(const char *s);
 
 extern void *kcc_ir_funcs;           /* vec of IR function pointers */
 extern char kcc_str_modinit[];       /* "kcc.module_init" */
@@ -682,7 +686,19 @@ overwrite each other.
 
 @l c
 @d Selfhost: emit_x86 data @{
+/* A single file-scope object may be spelled by both a tentative declaration
+   (\verb|u32 x;|) and a defining one (\verb|u32 x = 0;|); C makes that one
+   object, but each reaches the emitter separately.  Emitting the zero-storage
+   cell twice is harmless as a Mach-O common (the linker coalesces them) yet a
+   hard error for a GNU-assembler \verb|.local .comm| pair, so the set of names
+   already given storage is remembered and re-emission is skipped. */
+static void *kcc_x86_emitted = 0;
 static void x86_emit_zerofill(const char *name, unsigned long size, int is_static) {
+    if (kcc_x86_emitted && name) {
+        unsigned long kl = kcc_strlen(name);
+        if (kcc_ht_get(kcc_x86_emitted, name, kl)) return;
+        kcc_ht_put(kcc_x86_emitted, name, kl, 1);
+    }
     if (!is_static) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
     if (kcc_x86_os) {                            /* Linux .comm name,size,8 */
         if (is_static) { kcc_as_str(s_local); kcc_as_str(name); kcc_as_ch('\n'); }
@@ -701,6 +717,7 @@ static unsigned long round8_min8(unsigned long n) {
 void kcc_x86_emit_data(void) {
     struct Node *tu = (struct Node *)kcc_x86_tu;
     if (!tu) return;
+    kcc_x86_emitted = kcc_ht_init(256);    /* fresh per translation unit */
     struct Node *d = (struct Node *)tu->f0;
     for (; d; d = (struct Node *)d->f4) {
         if (d->tag != AST_VAR_DECL) continue;

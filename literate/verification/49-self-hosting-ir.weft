@@ -311,6 +311,8 @@ void kcc_ir_sw_scan(void *stmt);
 void kcc_ir_sw_disp(void *stmt);
 unsigned long kcc_eval_const_int(void *n);
 unsigned long kcc_expr_is_ice(void *n);
+unsigned long kcc_eval_addr(void *n);
+unsigned long kcc_addr_is_iconst(void *n);
 unsigned long kcc_rodata_binop_ok(unsigned long op);
 unsigned long kcc_rodata_const_intexpr(void *n);
 unsigned long kcc_rodata_is_lit(void *n, unsigned long isfloat);
@@ -3141,7 +3143,12 @@ Each control-flow builder allocates fresh blocks and wires them with
 terminator so nothing is appended past a branch.  \texttt{switch} scans its body
 twice (allocate label blocks, emit the dispatch chain) then builds the body once
 so \texttt{case}/\texttt{default} labels place themselves.  The constant
-evaluator folds integer constant expressions for case values and array bounds.
+evaluator folds integer constant expressions for case values and array bounds,
+including \texttt{offsetof}-style null-based address constants: \texttt{is\_ice}
+accepts \verb|&(((T*)0)->m)| and \texttt{eval\_const\_int} reduces it to the
+member's byte offset (via \texttt{eval\_addr}), so a bound such as
+\verb|char b[sizeof(P)-offsetof(P,tail)]| lays out at its true size rather than
+being rejected as a variable-length array.
 
 @l c
 @d Selfhost: ir control @{
@@ -3265,6 +3272,7 @@ unsigned long kcc_eval_const_int(void *n) {
     }
     if (tag == AST_UNARY_EXPR) {
         unsigned long op = IL(n, AST_F0);
+        if (op == TOK_AMP) return kcc_eval_addr((void *)IL(n, AST_F1));  /* offsetof */
         long v = (long)kcc_eval_const_int((void *)IL(n, AST_F1));
         if (op == TOK_MINUS) return (unsigned long)(-v);
         if (op == TOK_TILDE) return (unsigned long)(~v);
@@ -3290,14 +3298,61 @@ unsigned long kcc_eval_const_int(void *n) {
     return 0;
 }
 
+/* The integer value of the address of an lvalue whose base is a compile-time
+   integer (an `offsetof`-style null-based address constant).  For `p->m` the
+   base pointer's value is added to the member's byte offset; for `s.m` the
+   address of `s` is; `&*p` collapses to the value of `p`. */
+unsigned long kcc_eval_addr(void *n) {
+    if (!n) return 0;
+    unsigned long tag = IL(n, AST_TAG);
+    if (tag == AST_PAREN_EXPR) return kcc_eval_addr((void *)IL(n, AST_F0));
+    if (tag == AST_MEMBER) {
+        void *obj = (void *)IL(n, AST_F0);
+        unsigned long base = IL(n, AST_F2) ? kcc_eval_const_int(obj)  /* p->m */
+                                           : kcc_eval_addr(obj);       /* s.m  */
+        void *st = (void *)IL(obj, AST_F3);
+        if (!st) st = kcc_sema_expr(obj);  /* base may be untyped during array-bound eval */
+        if (st && IL(st, TY_KIND) == TY_PTR) st = (void *)IL(st, TY_F0);
+        unsigned long off = 0;
+        if (st && (IL(st, TY_KIND) == TY_STRUCT || IL(st, TY_KIND) == TY_UNION)) {
+            kcc_type_layout(st);
+            struct kcc_member_res mr = kcc_type_find_member(st, (const char *)IL(n, AST_F1));
+            if (mr.field) off = mr.off;
+        }
+        return base + off;
+    }
+    if (tag == AST_UNARY_EXPR && IL(n, AST_F0) == TOK_STAR)
+        return kcc_eval_const_int((void *)IL(n, AST_F1));
+    return 0;
+}
+
+/* Whether the address of an lvalue reduces to an integer constant expression:
+   its ultimate base must be a constant pointer, as in `&(((T*)0)->m)`. */
+unsigned long kcc_addr_is_iconst(void *n) {
+    if (!n) return 0;
+    unsigned long tag = IL(n, AST_TAG);
+    if (tag == AST_PAREN_EXPR) return kcc_addr_is_iconst((void *)IL(n, AST_F0));
+    if (tag == AST_MEMBER)
+        return IL(n, AST_F2) ? kcc_expr_is_ice((void *)IL(n, AST_F0))    /* p->m */
+                             : kcc_addr_is_iconst((void *)IL(n, AST_F0)); /* s.m  */
+    if (tag == AST_UNARY_EXPR && IL(n, AST_F0) == TOK_STAR)
+        return kcc_expr_is_ice((void *)IL(n, AST_F1));
+    return 0;
+}
+
 unsigned long kcc_expr_is_ice(void *n) {
     if (!n) return 1;
     unsigned long tag = IL(n, AST_TAG);
     if (tag == AST_INT_LIT || tag == AST_CHAR_LIT ||
         tag == AST_SIZEOF_EXPR || tag == AST_ALIGNOF_EXPR) return 1;
     if (tag == AST_PAREN_EXPR) return kcc_expr_is_ice((void *)IL(n, AST_F0));
-    if (tag == AST_CAST_EXPR || tag == AST_UNARY_EXPR)
+    if (tag == AST_CAST_EXPR) return kcc_expr_is_ice((void *)IL(n, AST_F1));
+    if (tag == AST_UNARY_EXPR) {
+        unsigned long op = IL(n, AST_F0);
+        if (op == TOK_AMP) return kcc_addr_is_iconst((void *)IL(n, AST_F1));  /* offsetof */
+        if (op == TOK_STAR) return 0;                                        /* deref */
         return kcc_expr_is_ice((void *)IL(n, AST_F1));
+    }
     if (tag == AST_BINARY_EXPR) {
         if (!kcc_expr_is_ice((void *)IL(n, AST_F1))) return 0;
         return kcc_expr_is_ice((void *)IL(n, AST_F2));

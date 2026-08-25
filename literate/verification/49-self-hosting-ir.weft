@@ -3501,6 +3501,21 @@ for AAPCS64, reserves a hidden result buffer for an aggregate return, and
 dispatches direct or indirect.  The cast builder delegates FP conversions to
 \texttt{convert} and re-canonicalises integer width and signedness.
 
+Before any of that, \texttt{build\_call} intercepts the GNU builtins the kernel
+relies on.  \texttt{\_\_builtin\_expect} is a branch hint that reduces to its
+value; \texttt{\_\_builtin\_constant\_p} is a compile-time predicate;
+\texttt{\_\_builtin\_unreachable} annotates a dead point and---since kcc does not
+exploit undefined behaviour---collapses to a harmless dummy value.  The
+\texttt{\_\_builtin\_bswap16/32/64} family reverses byte order through a
+portable IR gather (\texttt{kcc\_ir\_bswap}), so no new opcode or per-target
+support is needed and the low $n$ bytes carry the answer.  The rest are names
+with an exact library counterpart---\texttt{\_\_builtin\_trap} to \texttt{abort},
+and \texttt{\_\_builtin\_abs/labs/llabs} and \texttt{\_\_builtin\_ffs/ffsl/ffsll}
+to their unprefixed forms---which is correct while the milestone links against a
+C library; a freestanding target would instead need bit-scan intrinsics
+(\texttt{clz}/\texttt{ctz}/\texttt{popcount}), which are left for a later rung as
+they require a new IR opcode in both back ends.
+
 Variadic access has two lowerings.  On ARM64 a \texttt{va\_list} is a bare
 pointer that walks the homogeneous save area, so \texttt{va\_start} records the
 frame base and \texttt{va\_arg} bumps the cursor by eight.  On x86-64 the System~V
@@ -3659,6 +3674,33 @@ unsigned long kcc_ir_build_assign(void *e) {
     return value;
 }
 
+/* __builtin_bswapN reverses the byte order of an n-byte value.  It lowers to a
+   target-independent gather: byte i of the input (isolated with a shift and an
+   AND) is deposited at position n-1-i, and the n terms are OR-ed together.  The
+   result occupies the low n bytes with zero above, so a narrower result type
+   truncates correctly without extra work. */
+static unsigned long kcc_ir_bswap(unsigned long val, unsigned long nbytes) {
+    unsigned long result = 0;
+    unsigned long have = 0;
+    for (unsigned long i = 0; i < nbytes; i++) {
+        unsigned long term = val;
+        if (i) {
+            unsigned long sh = kcc_ir_emit_const(i * 8);
+            term = kcc_ir_emit_binop(IR_LSHR, term, sh);
+        }
+        unsigned long m = kcc_ir_emit_const(0xff);
+        term = kcc_ir_emit_binop(IR_AND, term, m);
+        unsigned long outpos = (nbytes - 1 - i) * 8;
+        if (outpos) {
+            unsigned long sh2 = kcc_ir_emit_const(outpos);
+            term = kcc_ir_emit_binop(IR_SHL, term, sh2);
+        }
+        if (!have) { result = term; have = 1; }
+        else result = kcc_ir_emit_binop(IR_OR, result, term);
+    }
+    return result;
+}
+
 unsigned long kcc_ir_build_call(void *e) {
     void *callee = (void *)IL(e, AST_F0);
     if (!callee) return 0;
@@ -3675,7 +3717,29 @@ unsigned long kcc_ir_build_call(void *e) {
             return kcc_ir_build_expr((void *)IL(e, AST_F1));
         if (kcc_strcmp(name, "__builtin_constant_p") == 0)
             return kcc_ir_emit_const(kcc_expr_is_ice((void *)IL(e, AST_F1)) ? 1 : 0);
-        if (kcc_strcmp(name, "__builtin_memcpy") == 0) name = "memcpy";
+        /* __builtin_bswapN: reverse byte order with a portable IR gather. */
+        if (kcc_strcmp(name, "__builtin_bswap16") == 0)
+            return kcc_ir_bswap(kcc_ir_build_expr((void *)IL(e, AST_F1)), 2);
+        if (kcc_strcmp(name, "__builtin_bswap32") == 0)
+            return kcc_ir_bswap(kcc_ir_build_expr((void *)IL(e, AST_F1)), 4);
+        if (kcc_strcmp(name, "__builtin_bswap64") == 0)
+            return kcc_ir_bswap(kcc_ir_build_expr((void *)IL(e, AST_F1)), 8);
+        /* __builtin_unreachable() marks a point control never reaches; with no
+           undefined-behaviour exploitation a plain fall-through is safe, so it
+           yields a dummy value and emits nothing. */
+        if (kcc_strcmp(name, "__builtin_unreachable") == 0)
+            return kcc_ir_emit_const(0);
+        /* __builtin_trap() must terminate; lower it to a call to abort. */
+        if (kcc_strcmp(name, "__builtin_trap") == 0) name = "abort";
+        /* Remaining builtins with an exact libc counterpart are the libc entry
+           points (valid while the milestone links against a C library). */
+        else if (kcc_strcmp(name, "__builtin_abs") == 0) name = "abs";
+        else if (kcc_strcmp(name, "__builtin_labs") == 0) name = "labs";
+        else if (kcc_strcmp(name, "__builtin_llabs") == 0) name = "llabs";
+        else if (kcc_strcmp(name, "__builtin_ffs") == 0) name = "ffs";
+        else if (kcc_strcmp(name, "__builtin_ffsl") == 0) name = "ffsl";
+        else if (kcc_strcmp(name, "__builtin_ffsll") == 0) name = "ffsll";
+        else if (kcc_strcmp(name, "__builtin_memcpy") == 0) name = "memcpy";
         else if (kcc_strcmp(name, "__builtin_memmove") == 0) name = "memmove";
         else if (kcc_strcmp(name, "__builtin_memset") == 0) name = "memset";
         else if (kcc_strcmp(name, "__builtin_strlen") == 0) name = "strlen";

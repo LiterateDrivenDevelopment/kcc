@@ -292,16 +292,30 @@ static void x86_fpbinop(void *i, const char *mnem) {
 static void x86_bblabel(unsigned long id) { kcc_as_str(s_bb); kcc_as_dec(id); }
 
 static unsigned long kcc_x86_call_nfp = 0;
+/* `movq %r10, off(%rsp)` — copy a scratch word to the outgoing stack area. */
+static void x86_push_r10(unsigned long off) {
+    kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma);
+    kcc_as_dec(off); kcc_as_str(s_paren_rsp); kcc_as_ch('\n');
+}
+/* `movq disp(%r11), dst` — load one word of a by-value aggregate (r11 = its
+   address) into a GP argument register or scratch. */
+static void x86_load_word(unsigned long disp, const char *dst) {
+    kcc_as_str(s_movq); kcc_as_dec(disp); kcc_as_str(s_pr11);
+    kcc_as_str(s_comma); kcc_as_str(dst); kcc_as_ch('\n');
+}
 static unsigned long x86_marshal(unsigned long *args, unsigned long count) {
     kcc_x86_call_nfp = 0;
     if (!count) return 0;
-    /* System~V argument classification: class~1 arguments (float/double) travel
-       in %xmm0-7, everything else in %rdi..%r9; whatever overflows either bank
-       is copied to the outgoing stack area in argument order. */
+    /* System~V argument classification: class~1 (float/double) → %xmm0-7;
+       class~2/3 aggregates travel by VALUE in one/two GP registers loaded from
+       their address vreg; everything else in %rdi..%r9.  Whatever overflows a
+       bank is copied to the outgoing stack in argument order. */
     unsigned long ngp = 0, nfp = 0, nstk = 0;
     for (unsigned long k = 0; k < count; k++) {
-        if (args[2 + 2 * k] == 1) { if (nfp < 8) nfp++; else nstk++; }
-        else                      { if (ngp < 6) ngp++; else nstk++; }
+        unsigned long c = args[2 + 2 * k];
+        if (c == 1)      { if (nfp < 8) nfp++; else nstk++; }
+        else if (c == 3) { if (ngp + 1 < 6) ngp += 2; else nstk += 2; }
+        else             { if (ngp < 6) ngp++; else nstk++; }
     }
     unsigned long stack_adj = 0;
     if (nstk) {
@@ -313,22 +327,28 @@ static unsigned long x86_marshal(unsigned long *args, unsigned long count) {
     unsigned long soff = 0;
     for (unsigned long k = 0; k < count; k++) {
         unsigned long v = args[1 + 2 * k];
-        if (args[2 + 2 * k] == 1) {
+        unsigned long c = args[2 + 2 * k];
+        if (c == 1) {
             if (nfp < 8) {
                 kcc_as_str(s_movsd); x86_slot(v); kcc_as_str(s_comma);
                 kcc_as_str(xmmregs[nfp]); kcc_as_ch('\n'); nfp++;
+            } else { x86_load(v, s_r10); x86_push_r10(soff); soff += 8; }
+        } else if (c == 3) {
+            if (ngp + 1 < 6) {
+                x86_load(v, s_r11);
+                x86_load_word(0, argregs[ngp]); x86_load_word(8, argregs[ngp + 1]);
+                ngp += 2;
             } else {
-                x86_load(v, s_r10);
-                kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma);
-                kcc_as_dec(soff); kcc_as_str(s_paren_rsp); kcc_as_ch('\n'); soff += 8;
+                x86_load(v, s_r11);
+                x86_load_word(0, s_r10); x86_push_r10(soff); soff += 8;
+                x86_load_word(8, s_r10); x86_push_r10(soff); soff += 8;
             }
+        } else if (c == 2) {
+            if (ngp < 6) { x86_load(v, s_r11); x86_load_word(0, argregs[ngp]); ngp++; }
+            else { x86_load(v, s_r11); x86_load_word(0, s_r10); x86_push_r10(soff); soff += 8; }
         } else {
             if (ngp < 6) { x86_load(v, argregs[ngp]); ngp++; }
-            else {
-                x86_load(v, s_r10);
-                kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma);
-                kcc_as_dec(soff); kcc_as_str(s_paren_rsp); kcc_as_ch('\n'); soff += 8;
-            }
+            else { x86_load(v, s_r10); x86_push_r10(soff); soff += 8; }
         }
     }
     return stack_adj;
@@ -355,12 +375,19 @@ cleanly rather than miscompiled.
 
 Floating point is a first-class citizen of both the call boundary and the return
 path.  \texttt{x86\_marshal} classifies each outgoing argument the System~V
-way---class-1 (\texttt{float}/\texttt{double}) values into \texttt{\%xmm0-7},
-everything else into \texttt{\%rdi..\%r9}, and the overflow of either bank onto
+way---class-1 (\texttt{float}/\texttt{double}) values into \texttt{\%xmm0-7};
+a small aggregate travelling by value into one (class~2, $\le$8~bytes) or two
+(class~3, 9--16~bytes) integer registers, its words loaded from the address
+vreg; everything else into \texttt{\%rdi..\%r9}; and the overflow of a bank onto
 the outgoing stack in argument order---and records the vector-register count so
 the call site can load \texttt{\%al} (mandatory when the callee is variadic).
-\texttt{x86\_spill\_params} mirrors that classification on entry, and both
-\texttt{IR\_RET} and the call-result store route a floating-point value through
+Because a class-3 aggregate occupies two parameter vregs (matching the IR
+builder's width count), \texttt{x86\_spill\_params} advances a separate
+\texttt{base} vreg cursor and spills two registers for it---getting this wrong
+dropped the sixth register of SQLite's \texttt{yy\_reduce} (its trailing
+\texttt{Parse~*} after a 16-byte \texttt{Token} argument), leaving a garbage
+pointer.  Both \texttt{IR\_RET} and the call-result store route a
+floating-point value through
 \texttt{\%xmm0} rather than \texttt{\%rax}.
 
 @l c
@@ -595,27 +622,35 @@ static unsigned long x86_prescan(void *f) {
 static void x86_spill_params(void *f) {
     unsigned long np = IL(f, IRF_PARAMS);
     void *cls = (void *)IL(f, IRF_PARAM_CLS);
-    /* Mirror the caller's System~V classification: float/double parameters
-       arrive in %xmm0-7, the rest in %rdi..%r9, and any overflow sits above the
-       return address at 16(%rbp), 24(%rbp), ... in parameter order. */
-    unsigned long ngp = 0, nfp = 0, soff = 16;
+    /* Mirror the caller's System~V classification into the parameter vreg slots.
+       `base` is the vreg index (a class-3 aggregate occupies TWO consecutive
+       vregs, matching the IR builder's width count); `ngp`/`nfp` track the
+       register banks; overflow sits above the return address at 16(%rbp),
+       24(%rbp), ... in parameter order. */
+    unsigned long ngp = 0, nfp = 0, base = 0, soff = 16;
     for (unsigned long k = 0; k < np; k++) {
         unsigned long cl = cls ? ((unsigned long *)cls)[k] : 0;
-        if (cl == 1) {
+        if (cl == 1) {                                  /* float/double → %xmm */
             if (nfp < 8) {
                 kcc_as_str(s_movsd); kcc_as_str(xmmregs[nfp]); kcc_as_str(s_comma);
-                x86_slot(k); kcc_as_ch('\n'); nfp++;
-            } else {
-                kcc_as_str(s_movq); kcc_as_dec(soff); kcc_as_str(s_rbp);
-                kcc_as_str(s_comma); kcc_as_str(s_r10); kcc_as_ch('\n');
-                x86_store(k, s_r10); soff += 8;
+                x86_slot(base); kcc_as_ch('\n'); nfp++; base++; continue;
             }
-        } else if (ngp < 6) {
-            x86_store(k, argregs[ngp]); ngp++;
-        } else {
+        } else if (cl == 3) {                           /* 9-16B aggregate → 2 GP */
+            if (ngp + 1 < 6) {
+                x86_store(base, argregs[ngp]); x86_store(base + 1, argregs[ngp + 1]);
+                ngp += 2; base += 2; continue;
+            }
+        } else if (ngp < 6) {                           /* GP / ptr / ≤8B aggregate */
+            x86_store(base, argregs[ngp]); ngp++; base++; continue;
+        }
+        /* overflow: read from the caller's stack image */
+        kcc_as_str(s_movq); kcc_as_dec(soff); kcc_as_str(s_rbp);
+        kcc_as_str(s_comma); kcc_as_str(s_r10); kcc_as_ch('\n');
+        x86_store(base, s_r10); soff += 8; base++;
+        if (cl == 3) {
             kcc_as_str(s_movq); kcc_as_dec(soff); kcc_as_str(s_rbp);
             kcc_as_str(s_comma); kcc_as_str(s_r10); kcc_as_ch('\n');
-            x86_store(k, s_r10); soff += 8;
+            x86_store(base, s_r10); soff += 8; base++;
         }
     }
 }

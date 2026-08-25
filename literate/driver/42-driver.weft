@@ -494,6 +494,82 @@ _kcc_driver_D:
 @| _kcc_driver_D
 @}
 
+The kernel is compiled with two code-generation flags that every argument pass
+must recognise: \texttt{-mno-red-zone} and \texttt{-mcmodel=kernel}.  Both are
+already satisfied by \kcc's x86-64 output.  The red zone---the 128 bytes below
+\texttt{\%rsp} that a leaf function may use without adjusting the stack---is
+never touched, because every function allocates its whole frame with an explicit
+\texttt{subq}; and the code model is immaterial because symbol references are
+RIP-relative (\texttt{leaq sym(\%rip)}, direct \texttt{call sym}) and large
+immediates are \texttt{movabsq}, all of which resolve identically whether the
+image sits in the low or the top two gigabytes.  So \texttt{kcc\_driver\_mflag}
+accepts these flags as no-ops---\texttt{-mcmodel=small} and \texttt{kernel} and
+either red-zone spelling---and refuses \texttt{-mcmodel=large}/\texttt{medium}
+cleanly, since \kcc's direct calls and RIP-relative data cannot span the
+four-gigabyte reach those models allow.  It returns 1 for a flag to skip and 0
+for anything else, leaving unrelated arguments to the caller.
+
+@d Driver: compile @{
+// -- kcc_driver_mflag ---------------------------------------------------------
+// uint64_t kcc_driver_mflag(const char *arg)
+//   Recognise the x86 code-model / red-zone flags.  Returns 1 if arg is one
+//   kcc honours (skip it), 0 if it is not an -m flag we handle.  An -mcmodel=
+//   with an unsupported model is refused here (message + exit).
+.text
+.p2align 2
+.globl _kcc_driver_mflag
+_kcc_driver_mflag:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                    // arg
+    mov x0, x19
+    adrp x1, _kcc_opt_mnoredzone@@PAGE
+    add  x1, x1, _kcc_opt_mnoredzone@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmf_yes
+    mov x0, x19
+    adrp x1, _kcc_opt_mredzone@@PAGE
+    add  x1, x1, _kcc_opt_mredzone@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmf_yes
+    mov x0, x19
+    adrp x1, _kcc_opt_mcmodel@@PAGE
+    add  x1, x1, _kcc_opt_mcmodel@@PAGEOFF
+    mov  x2, #9                    // strlen("-mcmodel=")
+    bl _kcc_memcmp
+    cbnz x0, .Lmf_no               // not a -mcmodel= flag
+    add x19, x19, #9               // suffix after "-mcmodel="
+    mov x0, x19
+    adrp x1, _kcc_str_cm_small@@PAGE
+    add  x1, x1, _kcc_str_cm_small@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmf_yes
+    mov x0, x19
+    adrp x1, _kcc_str_cm_kernel@@PAGE
+    add  x1, x1, _kcc_str_cm_kernel@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lmf_yes
+    // unsupported model: refuse cleanly
+    adrp x0, _kcc_driver_err_cmodel@@PAGE
+    add  x0, x0, _kcc_driver_err_cmodel@@PAGEOFF
+    bl _kcc_io_err
+    bl _kcc_io_flush
+    mov x0, #1
+    bl _kcc_sys_exit
+.Lmf_yes:
+    mov x0, #1
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Lmf_no:
+    mov x0, #0
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_driver_mflag
+@}
+
 @d Driver: compile @{
 // -- kcc_driver_obj_name ------------------------------------------------------
 // char *kcc_driver_obj_name(const char *src)
@@ -640,8 +716,15 @@ _kcc_driver_compile_all:
 .Lca_scan_D_call:
     mov x2, #1                     // register the macro
     bl _kcc_driver_D
-    cbz x0, .Lca_scan_src
+    cbz x0, .Lca_scan_m
     add x23, x23, x0
+    b .Lca_scan
+.Lca_scan_m:
+    // -mcmodel= / -m(no-)red-zone: code-model flag, not a source
+    ldr x0, [x20, x23, lsl #3]
+    bl _kcc_driver_mflag
+    cbz x0, .Lca_scan_src
+    add x23, x23, #1
     b .Lca_scan
 .Lca_scan_src:
     add x22, x22, #1               // a source
@@ -752,8 +835,15 @@ _kcc_driver_compile_all:
     mov x1, #0
     mov x2, #0
     bl _kcc_driver_D
-    cbz x0, .Lca_compile_src
+    cbz x0, .Lca_loop_m
     add x23, x23, x0
+    b .Lca_loop
+.Lca_loop_m:
+    // -mcmodel= / -m(no-)red-zone: honoured in pass 1, skip here
+    mov x0, x25
+    bl _kcc_driver_mflag
+    cbz x0, .Lca_compile_src
+    add x23, x23, #1
     b .Lca_loop
 .Lca_compile_src:
 
@@ -1060,8 +1150,15 @@ _kcc_driver_link_all:
 .Lla_pre_D_call:
     mov x2, #1
     bl _kcc_driver_D
-    cbz x0, .Lla_pre_next
+    cbz x0, .Lla_pre_m
     add x21, x21, x0
+    b .Lla_pre
+.Lla_pre_m:
+    // -mcmodel= / -m(no-)red-zone: code-model flag, honoured as a no-op
+    ldr x0, [x20, x21, lsl #3]
+    bl _kcc_driver_mflag
+    cbz x0, .Lla_pre_next
+    add x21, x21, #1
     b .Lla_pre
 .Lla_pre_next:
     add x21, x21, #1
@@ -1164,8 +1261,15 @@ _kcc_driver_link_all:
     mov x1, #0
     mov x2, #0
     bl _kcc_driver_D
-    cbz x0, .Lla_src
+    cbz x0, .Lla_m
     add x24, x24, x0
+    b .Lla_loop
+.Lla_m:
+    // -mcmodel= / -m(no-)red-zone: consumed here so it is not forwarded to ld
+    mov x0, x27
+    bl _kcc_driver_mflag
+    cbz x0, .Lla_src
+    add x24, x24, #1
     b .Lla_loop
 .Lla_src:
     // Classify a non-option argument.  A leading '-' is an unrecognised linker
@@ -1339,6 +1443,18 @@ _kcc_opt_target_x86:
     .asciz "--target=x86_64"
 _kcc_opt_target_linux:
     .asciz "--target=x86_64-linux"
+_kcc_opt_mcmodel:
+    .asciz "-mcmodel="
+_kcc_opt_mnoredzone:
+    .asciz "-mno-red-zone"
+_kcc_opt_mredzone:
+    .asciz "-mred-zone"
+_kcc_str_cm_small:
+    .asciz "small"
+_kcc_str_cm_kernel:
+    .asciz "kernel"
+_kcc_driver_err_cmodel:
+    .asciz "kcc: error: unsupported -mcmodel (only 'small' and 'kernel')\n"
 _kcc_str_x86_64:
     .asciz "x86_64"
 _kcc_str_as_argv0:

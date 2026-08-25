@@ -102,7 +102,7 @@ enum {
     IR_LOAD=30, IR_STORE=31, IR_ALLOCA=32, IR_GEP=33, IR_BR=40, IR_BR_COND=41,
     IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
     IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_VA_START=56, IR_FPROUND=57, IR_UITOFP=58,
-    IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64
+    IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64, IR_ASM=65
 };
 /* AST tags used by the data/static walks */
 enum {
@@ -377,10 +377,30 @@ static unsigned long x86_call_args(unsigned long *args) {
 
 \texttt{x86\_sel} routes one IR instruction to its shape.  \texttt{IR\_CONST},
 \texttt{IR\_ALLOCA}, \texttt{IR\_RET}, loads, stores, branches, calls, global
-references, and string literals are lowered inline; the ALU/shift/div/conv and
-floating-point opcodes go through the shape helpers.  A genuine \texttt{IR\_NOP}
-emits nothing; an unrecognised opcode (inline asm, by-value aggregate) is refused
-cleanly rather than miscompiled.
+references, string literals, and extended inline asm are lowered inline; the
+ALU/shift/div/conv and floating-point opcodes go through the shape helpers.  A
+genuine \texttt{IR\_NOP} emits nothing; an unrecognised opcode (a by-value
+aggregate the marshaller cannot classify) is refused cleanly rather than
+miscompiled.
+
+Extended inline asm (\texttt{IR\_ASM}) is where the kernel's word-at-a-time and
+atomic idioms live, so \texttt{x86\_emit\_asm} renders it directly.  Only
+register constraints (\verb|"r"|, \verb|"=r"|, \verb|"+r"|) are honoured and at
+most three operands, which covers the kernel sites reached so far; anything else
+is refused rather than silently mis-substituted.  Operand $k$ is placed in
+\texttt{\%r8+k}---all three caller-saved, so the surrounding all-spill code
+survives the asm untouched---with \texttt{\%r11} reserved as the scratch that
+carries an output operand's address.  Each input value is loaded into its
+operand register first; then the template is pasted verbatim except that
+\verb|%%| collapses to a literal \texttt{\%} and \verb|%N| (optionally
+size-prefixed \verb|%bN/%wN/%kN/%qN|) expands to operand $N$'s register at the
+operand's own byte width, so an \texttt{int} operand emits \texttt{\%r8d} while a
+\texttt{long} emits \texttt{\%r8}; finally each output register is stored back
+through \texttt{\%r11} to the operand's address at that width.  Because those
+operand registers live in the AST node's operand list rather than in the IR
+instruction's source fields, the optimiser must renumber and mark them
+explicitly (see the optimiser's CSE and dead-code passes)---otherwise
+store-to-load forwarding would leave an input reading a swept load's slot.
 
 Floating point is a first-class citizen of both the call boundary and the return
 path.  \texttt{x86\_marshal} classifies each outgoing argument the System~V
@@ -401,6 +421,76 @@ floating-point value through
 
 @l c
 @d Selfhost: emit_x86 dispatch @{
+/* Extended inline asm: operand k is materialised in %r8+k (all caller-saved);
+   %r11 stays free as the scratch that carries an output operand's address. The
+   supported subset is `r`/`=r`/`+r` operands, up to three of them. */
+static const char *const asmregs[3] = { s_r8, s_r9, s_r10 };
+/* Emit operand k's register at the requested byte width: %r8 / %r8d / %r8w /
+   %r8b for 8 / 4 / 2 / 1. */
+static void x86_asm_wreg(unsigned long k, unsigned long size) {
+    kcc_as_ch('%'); kcc_as_ch('r'); kcc_as_dec(8 + k);
+    if (size == 4) kcc_as_ch('d');
+    else if (size == 2) kcc_as_ch('w');
+    else if (size == 1) kcc_as_ch('b');
+}
+static unsigned long x86_asm_opsize(void *node, unsigned long num) {
+    void *op = (void *)IL(node, AST_F2);
+    for (unsigned long j = 0; op && j < num; j++) op = (void *)IL(op, AST_F4);
+    if (!op) return 8;
+    unsigned long e = IL(op, AST_F2) ? IL(op, AST_F2) : IL(op, AST_F3);
+    unsigned long sz = e >> 32;
+    return sz ? sz : 8;
+}
+static void x86_emit_asm(void *i) {
+    void *node = (void *)IL(i, IR_TYPE);         /* the AST_ASM_STMT */
+    unsigned long nop = 0;
+    for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4)) {
+        const char *c = (const char *)IL(op, AST_F0);
+        char ch = c[0]; if (ch == '=' || ch == '+') ch = c[1];
+        if (ch != 'r') { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
+        nop++;
+    }
+    if (nop > 3) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
+    /* load each input value into its %r8+k */
+    unsigned long k = 0;
+    for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        unsigned long v = IL(op, AST_F2) & 0xffffffff;
+        if (v) x86_load(v - 1, asmregs[k]);
+    }
+    /* paste the template, rewriting %% -> % and %[bwkq]N -> operand register */
+    const char *t = (const char *)IL(i, IR_SRC1);
+    unsigned long len = IL(i, IR_SRC2);
+    kcc_as_ch('\t');
+    for (unsigned long p = 0; p < len; p++) {
+        char c = t[p];
+        if (c != '%') { kcc_as_ch(c); continue; }
+        if (p + 1 >= len) { kcc_as_ch('%'); break; }
+        char nx = t[p + 1];
+        if (nx == '%') { kcc_as_ch('%'); p++; continue; }
+        unsigned long sz = 0;                    /* 0 = the operand's own size */
+        if (nx == 'b') { sz = 1; p++; nx = t[p + 1]; }
+        else if (nx == 'w') { sz = 2; p++; nx = t[p + 1]; }
+        else if (nx == 'k') { sz = 4; p++; nx = t[p + 1]; }
+        else if (nx == 'q') { sz = 8; p++; nx = t[p + 1]; }
+        if (nx >= '0' && nx <= '9') {
+            unsigned long num = 0;
+            while (p + 1 < len && t[p + 1] >= '0' && t[p + 1] <= '9') { num = num * 10 + (t[p + 1] - '0'); p++; }
+            x86_asm_wreg(num, sz ? sz : x86_asm_opsize(node, num));
+        } else { kcc_as_ch('%'); }
+    }
+    kcc_as_ch('\n');
+    /* store each output register back through its address */
+    k = 0;
+    for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        unsigned long ah = IL(op, AST_F3);
+        unsigned long a = ah & 0xffffffff;
+        if (!a) continue;
+        x86_load(a - 1, s_r11);                  /* r11 = &output */
+        unsigned long sz = ah >> 32; if (!sz) sz = 8;
+        kcc_as_str(sz == 1 ? s_movb : sz == 2 ? s_movw : sz == 4 ? s_movl : s_movq);
+        x86_asm_wreg(k, sz); kcc_as_str(s_comma); kcc_as_str(s_pr11); kcc_as_ch('\n');
+    }
+}
 void kcc_x86_sel(void *i) {
     unsigned long op = IL(i, IR_OP);
     switch (op) {
@@ -589,6 +679,9 @@ void kcc_x86_sel(void *i) {
         kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma); kcc_as_dec(24); kcc_as_str(s_pr11); kcc_as_ch('\n');
         return;
     }
+    case IR_ASM:
+        x86_emit_asm(i);
+        return;
     case IR_NOP:
         return;
     default:

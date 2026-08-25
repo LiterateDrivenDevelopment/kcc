@@ -77,6 +77,16 @@ void *kcc_ir_alloc_instr(long op);
 extern void *kcc_ir_funcs;
 extern void *kcc_type_int_s;
 
+/* An IR_ASM instruction carries its operand list off in the AST node reached
+   through the type field; each operand encodes a register in the low 32 bits
+   (register+1, or 0 for none) and a byte width in the high 32.  The optimiser
+   reaches those encoded registers with a byte accessor so it can renumber and
+   mark them alongside the ordinary source fields. */
+#define OPT_AST_F2 40
+#define OPT_AST_F3 48
+#define OPT_AST_F4 56
+#define OPTL(p,off) (*(unsigned long *)((char *)(p) + (off)))
+
 /* IR opcodes (Chapter: IR design). */
 enum {
     IR_ADD = 1, IR_SUB = 2, IR_MUL = 3, IR_SDIV = 4, IR_UDIV = 5,
@@ -366,7 +376,13 @@ and every instruction's operands are first rewritten through it, so a later use
 reads the surviving register; dead-code elimination then removes the instruction
 left with no users.  The canonicaliser rewrites exactly the fields that hold a
 register---skipping immediates, widths, block ids, and symbols---and a volatile
-load acts as a barrier that is neither reused nor recorded.
+load acts as a barrier that is neither reused nor recorded.  An \texttt{IR\_ASM}
+is a special case: its input values and output addresses are not in the source
+fields at all but encoded (register+1 in the low half, byte width in the high)
+in the operand list hung off the AST node, so the canonicaliser walks that list
+and renumbers each encoded register in place.  Without it, store-to-load
+forwarding would map an asm input's load to the stored value yet leave the asm
+still naming the swept load---reading an uninitialised slot at run time.
 
 @l c
 @d Selfhost: opt cse @{
@@ -374,6 +390,22 @@ static unsigned long opt_canon(unsigned long vreg, unsigned long n,
                                unsigned long *map) {
     if (vreg >= n) return vreg;
     return map[vreg];
+}
+
+static void opt_asm_canon(void *node, unsigned long n, unsigned long *map) {
+    for (void *op = (void *)OPTL(node, OPT_AST_F2); op;
+         op = (void *)OPTL(op, OPT_AST_F4)) {
+        unsigned long v = OPTL(op, OPT_AST_F2);
+        if (v & 0xffffffffUL)
+            OPTL(op, OPT_AST_F2) =
+                ((opt_canon((v & 0xffffffffUL) - 1, n, map) + 1) |
+                 (v & 0xffffffff00000000UL));
+        unsigned long a = OPTL(op, OPT_AST_F3);
+        if (a & 0xffffffffUL)
+            OPTL(op, OPT_AST_F3) =
+                ((opt_canon((a & 0xffffffffUL) - 1, n, map) + 1) |
+                 (a & 0xffffffff00000000UL));
+    }
 }
 
 static void opt_canon_ops(struct Instr *in, unsigned long n, unsigned long *map) {
@@ -391,6 +423,9 @@ static void opt_canon_ops(struct Instr *in, unsigned long n, unsigned long *map)
 
     if (op == IR_BR_COND)
         in->dest = opt_canon(in->dest, n, map);
+
+    if (op == IR_ASM)
+        opt_asm_canon(in->type, n, map);
 }
 
 unsigned long kcc_opt_cse(void *fn) {
@@ -527,9 +562,12 @@ Dead-code elimination is mark-and-sweep.  The mark pass records every vreg that
 appears as a source operand---taking care that a folded \texttt{IR\_CONST}'s
 immediate, a call's name and argument array, and a branch's block ids are not
 mistaken for registers, and that an \texttt{IR\_NOP} left by an earlier sweep
-references nothing.  The sweep pass then turns into a \texttt{NOP} any
-instruction whose destination was never marked and that has no side effect;
-stores, branches, returns, calls, allocas, and volatile loads are always kept.
+references nothing.  An \texttt{IR\_ASM} likewise marks the registers encoded in
+its operand list, so a load feeding an asm input---whose only consumer is the
+asm and thus invisible to the field walk---survives the sweep.  The sweep pass
+then turns into a \texttt{NOP} any instruction whose destination was never
+marked and that has no side effect; stores, branches, returns, calls, allocas,
+inline asm, and volatile loads are always kept.
 
 @l c
 @d Selfhost: opt dce @{
@@ -592,6 +630,17 @@ unsigned long kcc_opt_dce(void *fn) {
                 unsigned long s1 = in->src1, s2 = in->src2;
                 if (s1 < n) used[s1] = 1;
                 if (s2 < n) used[s2] = 1;
+            } else if (op == IR_ASM) {
+                /* the input values and output addresses live in the operand
+                   list off the AST node, invisible to the ordinary field
+                   walk---mark them so an asm-only load survives the sweep */
+                for (void *o = (void *)OPTL(in->type, OPT_AST_F2); o;
+                     o = (void *)OPTL(o, OPT_AST_F4)) {
+                    unsigned long v = OPTL(o, OPT_AST_F2) & 0xffffffffUL;
+                    if (v && v - 1 < n) used[v - 1] = 1;
+                    unsigned long a = OPTL(o, OPT_AST_F3) & 0xffffffffUL;
+                    if (a && a - 1 < n) used[a - 1] = 1;
+                }
             }
         }
     }

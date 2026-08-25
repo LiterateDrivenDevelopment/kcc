@@ -1175,16 +1175,29 @@ unsigned long kcc_ir_build_stmt_expr(void *se) {
     void *comp = (void *)IL(se, AST_F0);
     if (!comp) return 0;
     kcc_ir_scope_enter();
+    /* Register the block's labels: the function-level prescan does not descend
+       into a statement expression, so a goto inside it (the kernel FIND_*_BIT
+       macros jump to `out:') would otherwise not resolve to the label's block. */
+    kcc_ir_prescan_labels(comp);
     void *it = (void *)IL(comp, AST_F0);
     unsigned long val = 0;
     if (!it) { kcc_ir_scope_leave(); return 0; }
     while (it) {
         void *next = (void *)IL(it, AST_F4);
         if (!next) {
-            /* final item: value-producing if an expression statement */
-            if (IL(it, AST_TAG) == AST_EXPR_STMT)
+            /* The final item carries the statement-expression's value.  Peel
+               off any labels first---emitting each label's block so a goto can
+               still reach it---so a `label: expr;' tail (as the `out:' target
+               inside the kernel's FIND_*_BIT macros) yields its expression's
+               value rather than being discarded. */
+            while (it && IL(it, AST_TAG) == AST_LABEL_STMT) {
+                void *bb = kcc_ir_label_bb((const char *)IL(it, AST_F0));
+                if (bb) { kcc_ir_branch_to(bb); kcc_ir_set_bb(bb); }
+                it = (void *)IL(it, AST_F1);
+            }
+            if (it && IL(it, AST_TAG) == AST_EXPR_STMT)
                 val = kcc_ir_build_expr((void *)IL(it, AST_F0));
-            else
+            else if (it)
                 kcc_ir_build_stmt(it);
             break;
         }
@@ -1994,7 +2007,12 @@ than loading.  Binary operators scale pointer arithmetic, remap signed opcodes
 to unsigned by the operands' common type, take an FP path when any operand is
 floating, and short-circuit \texttt{\&\&}/\texttt{||} through fresh blocks.
 Unary handles negation, complement, logical-not, address-of (dispatched by
-operand shape), and dereference.
+operand shape), and dereference.  Logical-not lowers to a compare against zero
+typed at the operand's own width---\texttt{double} for a floating operand, a
+64-bit compare for a \texttt{long} or pointer, else 32-bit---so that
+\texttt{!x} on a wide value whose low 32 bits happen to be zero (the kernel's
+\texttt{find\_bit} loop tests exactly such a masked word) still reports true only
+when the whole word is zero.
 
 @l c
 @d Selfhost: ir exprs @{
@@ -2502,7 +2520,11 @@ unsigned long kcc_ir_build_unary(void *e) {
             void *ot = (void *)IL(operand, AST_F3);
             if (ot) {
                 unsigned long k = IL(ot, TY_KIND);
+                /* Compare against zero at the operand's own width: a 64-bit
+                   value (long or pointer) whose low 32 bits happen to be zero
+                   must still test true only when the whole word is zero. */
                 if (k >= TY_FLOAT && k <= TY_LDOUBLE) cty = kcc_type_double;
+                else if (IL(ot, TY_SIZE) > 4) cty = kcc_type_long_s;
             }
         }
         void *c = kcc_ir_alloc_instr(IR_CONST);

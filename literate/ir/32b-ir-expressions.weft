@@ -233,10 +233,16 @@ expression-statement.  We build every item in order --- the same walk that
 declarations do not leak --- but treat the \emph{last} item specially: when it
 is an expression-statement its expression is built directly with
 \texttt{\_kcc\_ir\_build\_expr} so its result vreg becomes the value of the
-whole construct.  If the block is empty, or ends in a declaration or a
-control-flow statement, the construct is \texttt{void} and we return the
-null vreg.  Because SSA vregs are function-global, the returned vreg remains
-valid after the block's names go out of scope.
+whole construct.  A label on that tail is peeled first---its block emitted so a
+\texttt{goto} can reach it---so a \texttt{label:\ expr;} tail still yields
+\texttt{expr}; this is exactly the shape the kernel's \texttt{FIND\_*\_BIT}
+macros take, ending \texttt{out:\ sz;} after an early \texttt{goto out}.  For the
+same reason the block's labels are pre-registered on entry, since the
+function-level label prescan does not descend into a statement expression.  If
+the block is empty, or ends in a declaration or a control-flow statement, the
+construct is \texttt{void} and we return the null vreg.  Because SSA vregs are
+function-global, the returned vreg remains valid after the block's names go out
+of scope.
 
 @d IR: build expression @{
 // -- kcc_ir_build_stmt_expr -----------------------------------------------
@@ -257,6 +263,11 @@ _kcc_ir_build_stmt_expr:
     cbz x20, .Libse_done
 
     bl _kcc_ir_scope_enter
+    // Register the block's labels: the function-level prescan does not descend
+    // into a statement expression, so a goto inside it (the kernel FIND_*_BIT
+    // macros jump to `out:') would otherwise not resolve to the label's block.
+    mov x0, x20
+    bl _kcc_ir_prescan_labels
     ldr x21, [x20, #AST_F0]      // first item in the block
     cbz x21, .Libse_leave        // empty block → void
 
@@ -269,6 +280,25 @@ _kcc_ir_build_stmt_expr:
     b .Libse_loop
 
 .Libse_last:
+    // Peel off any labels on the tail---emitting each label's block so a goto
+    // can still reach it---so a `label: expr;' tail yields its expression.
+.Libse_peel:
+    ldr x0, [x21, #AST_TAG]
+    cmp x0, #AST_LABEL_STMT
+    b.ne .Libse_last_check
+    ldr x0, [x21, #AST_F0]       // label name
+    bl _kcc_ir_label_bb
+    mov x19, x0                  // the label's block
+    cbz x19, .Libse_peel_next
+    mov x0, x19
+    bl _kcc_ir_branch_to
+    mov x0, x19
+    bl _kcc_ir_set_bb
+.Libse_peel_next:
+    ldr x21, [x21, #AST_F1]      // descend to the labeled statement
+    cbz x21, .Libse_leave        // empty labeled body → void
+    b .Libse_peel
+.Libse_last_check:
     ldr x0, [x21, #AST_TAG]
     cmp x0, #AST_EXPR_STMT
     b.ne .Libse_last_stmt
@@ -4781,12 +4811,23 @@ _kcc_ir_build_unary:
     cbz x9, .Libu_lnot_int_ty
     ldr x10, [x9, #TY_KIND]
     cmp x10, #TY_FLOAT           // 8
-    b.lo .Libu_lnot_int_ty
+    b.lo .Libu_lnot_int_width
     cmp x10, #TY_LDOUBLE         // 10
-    b.hi .Libu_lnot_int_ty       // not floating → int compare
+    b.hi .Libu_lnot_int_width    // not floating → integer compare (pick width)
     adrp x19, _kcc_type_double@@PAGE
     add  x19, x19, _kcc_type_double@@PAGEOFF
     ldr x19, [x19]               // floating operand → compare in double
+    b .Libu_lnot_emit
+.Libu_lnot_int_width:
+    // Compare against zero at the operand's own width: a 64-bit value (long or
+    // pointer) whose low 32 bits are zero must still test true only when the
+    // whole word is zero.  x9 is the operand type here.
+    ldr x10, [x9, #TY_SIZE]
+    cmp x10, #4
+    b.ls .Libu_lnot_int_ty       // <=4 bytes → int_s
+    adrp x19, _kcc_type_long_s@@PAGE
+    add  x19, x19, _kcc_type_long_s@@PAGEOFF
+    ldr x19, [x19]               // >4 bytes → long_s (64-bit compare)
     b .Libu_lnot_emit
 .Libu_lnot_int_ty:
     adrp x19, _kcc_type_int_s@@PAGE

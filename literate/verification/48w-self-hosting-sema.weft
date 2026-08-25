@@ -357,7 +357,10 @@ void kcc_sema_check_stmt(void *node) {
         if (s->f0) {
             void *st = kcc_sema_expr((void *)s->f0);
             kcc_sema_check_int_ptr(s, sema_cur_ret, st, (void *)s->f0);
-            if (sema_cur_ret && SL(sema_cur_ret, 0) == TY_VOID)
+            /* `return <void-expr>;` from a void function is legal C
+               (\S6.8.6.4): only a value-typed expression is the error. */
+            if (sema_cur_ret && SL(sema_cur_ret, 0) == TY_VOID &&
+                !(st && SL(st, 0) == TY_VOID))
                 kcc_diag_error(s->line, s->col, m_ret_void);
         } else {
             if (sema_cur_ret && SL(sema_cur_ret, 0) != TY_VOID)

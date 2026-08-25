@@ -3668,6 +3668,19 @@ unsigned long kcc_ir_build_call(void *e) {
         name = (const char *)IL(callee, AST_F0);
         if (kcc_strcmp(name, "va_start") == 0) return kcc_ir_build_va_start(e);
         if (kcc_strcmp(name, "va_end") == 0) return 0;
+        /* Common GNU builtins the kernel leans on pervasively:
+           __builtin_expect(x,c) is a branch hint -> just x; constant_p is a
+           compile-time predicate; the mem* builtins are the libc entry points. */
+        if (kcc_strcmp(name, "__builtin_expect") == 0)
+            return kcc_ir_build_expr((void *)IL(e, AST_F1));
+        if (kcc_strcmp(name, "__builtin_constant_p") == 0)
+            return kcc_ir_emit_const(kcc_expr_is_ice((void *)IL(e, AST_F1)) ? 1 : 0);
+        if (kcc_strcmp(name, "__builtin_memcpy") == 0) name = "memcpy";
+        else if (kcc_strcmp(name, "__builtin_memmove") == 0) name = "memmove";
+        else if (kcc_strcmp(name, "__builtin_memset") == 0) name = "memset";
+        else if (kcc_strcmp(name, "__builtin_strlen") == 0) name = "strlen";
+        else if (kcc_strcmp(name, "__builtin_strcpy") == 0) name = "strcpy";
+        else if (kcc_strcmp(name, "__builtin_strcmp") == 0) name = "strcmp";
         unsigned long v = (unsigned long)kcc_ht_get(kcc_ir_locals, name, kcc_strlen(name));
         if (v) indirect = 1;
         else {

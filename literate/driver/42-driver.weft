@@ -570,6 +570,118 @@ _kcc_driver_mflag:
 @| _kcc_driver_mflag
 @}
 
+A real Kbuild command line carries dozens of code-generation, tuning, warning,
+and optimisation flags---\texttt{-O2}, \texttt{-fno-strict-aliasing},
+\texttt{-fno-stack-protector}, \texttt{-mno-sse}, \texttt{-mtune=generic},
+\texttt{-Wno-sign-compare}, \texttt{-std=gnu11}, \texttt{-nostdinc}, and many
+more.  None of them change the code \kcc{} generates for the freestanding
+integer subset the kernel is written in: \kcc{} has a single fixed optimisation
+pipeline, never emits vector registers except for actual floating point (which
+kernel C avoids), and has no strict-aliasing or stack-protector passes to turn
+off.  So \texttt{kcc\_driver\_xflag} accepts the whole family as no-ops by
+prefix---anything beginning \texttt{-O}, \texttt{-f}, \texttt{-W} (past the
+\texttt{-Wall} handled earlier), \texttt{-m} (past the code-model flags),
+\texttt{-std=}, \texttt{-pipe}, or \texttt{-nostdinc}.  This is a deliberate
+simplification, not full support: the flags are ignored, not implemented.
+\texttt{kcc\_driver\_skipopt} chains the code-model recogniser and this one, so a
+single call at each argument scan consumes any tuning flag wherever it appears.
+
+@d Driver: compile @{
+// -- kcc_driver_xflag ---------------------------------------------------------
+// uint64_t kcc_driver_xflag(const char *arg)
+//   1 if arg is a single-slot tuning/warning/optimisation flag kcc tolerates as
+//   a no-op, matched by prefix; 0 otherwise.
+.text
+.p2align 2
+_kcc_driver_xflag:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                    // arg
+    mov x0, x19
+    adrp x1, _kcc_xf_dO@@PAGE
+    add  x1, x1, _kcc_xf_dO@@PAGEOFF
+    mov  x2, #2
+    bl _kcc_memcmp
+    cbz x0, .Lxf_yes
+    mov x0, x19
+    adrp x1, _kcc_xf_df@@PAGE
+    add  x1, x1, _kcc_xf_df@@PAGEOFF
+    mov  x2, #2
+    bl _kcc_memcmp
+    cbz x0, .Lxf_yes
+    mov x0, x19
+    adrp x1, _kcc_xf_dW@@PAGE
+    add  x1, x1, _kcc_xf_dW@@PAGEOFF
+    mov  x2, #2
+    bl _kcc_memcmp
+    cbz x0, .Lxf_yes
+    mov x0, x19
+    adrp x1, _kcc_xf_dm@@PAGE
+    add  x1, x1, _kcc_xf_dm@@PAGEOFF
+    mov  x2, #2
+    bl _kcc_memcmp
+    cbz x0, .Lxf_yes
+    mov x0, x19
+    adrp x1, _kcc_xf_std@@PAGE
+    add  x1, x1, _kcc_xf_std@@PAGEOFF
+    mov  x2, #5                    // "-std="
+    bl _kcc_memcmp
+    cbz x0, .Lxf_yes
+    mov x0, x19
+    adrp x1, _kcc_xf_pipe@@PAGE
+    add  x1, x1, _kcc_xf_pipe@@PAGEOFF
+    mov  x2, #5                    // "-pipe"
+    bl _kcc_memcmp
+    cbz x0, .Lxf_yes
+    mov x0, x19
+    adrp x1, _kcc_xf_nostdinc@@PAGE
+    add  x1, x1, _kcc_xf_nostdinc@@PAGEOFF
+    mov  x2, #9                    // "-nostdinc"
+    bl _kcc_memcmp
+    cbz x0, .Lxf_yes
+    mov x0, #0
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Lxf_yes:
+    mov x0, #1
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_driver_xflag
+@}
+
+@d Driver: compile @{
+// -- kcc_driver_skipopt -------------------------------------------------------
+// uint64_t kcc_driver_skipopt(const char *arg)
+//   1 if arg is a code-model / red-zone / tuning flag to skip as a non-source
+//   option (mflag may exit for an unsupported code model); 0 otherwise.
+.text
+.p2align 2
+.globl _kcc_driver_skipopt
+_kcc_driver_skipopt:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0
+    bl _kcc_driver_mflag
+    cbnz x0, .Lso_yes
+    mov x0, x19
+    bl _kcc_driver_xflag
+    cbnz x0, .Lso_yes
+    mov x0, #0
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Lso_yes:
+    mov x0, #1
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+@| _kcc_driver_skipopt
+@}
+
 @d Driver: compile @{
 // -- kcc_driver_obj_name ------------------------------------------------------
 // char *kcc_driver_obj_name(const char *src)
@@ -720,9 +832,9 @@ _kcc_driver_compile_all:
     add x23, x23, x0
     b .Lca_scan
 .Lca_scan_m:
-    // -mcmodel= / -m(no-)red-zone: code-model flag, not a source
+    // code-model / red-zone / tuning flag (-mcmodel=, -O2, -f*, ...): not a source
     ldr x0, [x20, x23, lsl #3]
-    bl _kcc_driver_mflag
+    bl _kcc_driver_skipopt
     cbz x0, .Lca_scan_src
     add x23, x23, #1
     b .Lca_scan
@@ -839,9 +951,9 @@ _kcc_driver_compile_all:
     add x23, x23, x0
     b .Lca_loop
 .Lca_loop_m:
-    // -mcmodel= / -m(no-)red-zone: honoured in pass 1, skip here
+    // code-model / red-zone / tuning flag: honoured in pass 1, skip here
     mov x0, x25
-    bl _kcc_driver_mflag
+    bl _kcc_driver_skipopt
     cbz x0, .Lca_compile_src
     add x23, x23, #1
     b .Lca_loop
@@ -1154,9 +1266,9 @@ _kcc_driver_link_all:
     add x21, x21, x0
     b .Lla_pre
 .Lla_pre_m:
-    // -mcmodel= / -m(no-)red-zone: code-model flag, honoured as a no-op
+    // code-model / red-zone / tuning flag: honoured as a no-op
     ldr x0, [x20, x21, lsl #3]
-    bl _kcc_driver_mflag
+    bl _kcc_driver_skipopt
     cbz x0, .Lla_pre_next
     add x21, x21, #1
     b .Lla_pre
@@ -1265,9 +1377,9 @@ _kcc_driver_link_all:
     add x24, x24, x0
     b .Lla_loop
 .Lla_m:
-    // -mcmodel= / -m(no-)red-zone: consumed here so it is not forwarded to ld
+    // code-model / red-zone / tuning flag: consumed so it is not forwarded to ld
     mov x0, x27
-    bl _kcc_driver_mflag
+    bl _kcc_driver_skipopt
     cbz x0, .Lla_src
     add x24, x24, #1
     b .Lla_loop
@@ -1455,6 +1567,20 @@ _kcc_str_cm_kernel:
     .asciz "kernel"
 _kcc_driver_err_cmodel:
     .asciz "kcc: error: unsupported -mcmodel (only 'small' and 'kernel')\n"
+_kcc_xf_dO:
+    .asciz "-O"
+_kcc_xf_df:
+    .asciz "-f"
+_kcc_xf_dW:
+    .asciz "-W"
+_kcc_xf_dm:
+    .asciz "-m"
+_kcc_xf_std:
+    .asciz "-std="
+_kcc_xf_pipe:
+    .asciz "-pipe"
+_kcc_xf_nostdinc:
+    .asciz "-nostdinc"
 _kcc_str_x86_64:
     .asciz "x86_64"
 _kcc_str_as_argv0:

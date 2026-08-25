@@ -99,7 +99,7 @@ enum {
 };
 /* AST tags used by the data/static walks */
 enum {
-    AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_STR_LIT=52, AST_COMPOUND=30, AST_IF_STMT=32,
+    AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_STR_LIT=52, AST_ASM_STMT=74, AST_COMPOUND=30, AST_IF_STMT=32,
     AST_SWITCH_STMT=33, AST_WHILE_STMT=34, AST_DO_STMT=35, AST_FOR_STMT=36,
     AST_CASE_STMT=42, AST_LABEL_STMT=41, AST_DEFAULT_STMT=43, AST_INIT_LIST=65
 };
@@ -979,10 +979,25 @@ void kcc_x86_emit_strings(void) {
     }
 }
 
+/* A file-scope \verb|asm("...")| (e.g. every \texttt{EXPORT_SYMBOL}) carries a
+   raw assembler template with its own \verb|.section|/\verb|.previous|
+   directives; paste each one verbatim into the text stream. */
+static void kcc_x86_emit_toplevel_asm(void) {
+    struct Node *tu = (struct Node *)kcc_x86_tu;
+    if (!tu) return;
+    for (struct Node *d = (struct Node *)tu->f0; d; d = (struct Node *)d->f4) {
+        if (d->tag != AST_ASM_STMT) continue;
+        const char *t = (const char *)d->f0;
+        unsigned long n = d->f1;
+        for (unsigned long i = 0; i < n; i++) kcc_as_ch((unsigned char)t[i]);
+        kcc_as_ch('\n');
+    }
+}
 int kcc_x86_render(const char *path) {
     kcc_as_init();
     kcc_x86_strs = kcc_vec_init(16);
     x86_render_text();
+    kcc_x86_emit_toplevel_asm();
     kcc_x86_emit_data();
     kcc_x86_emit_statics();
     kcc_x86_emit_strings();

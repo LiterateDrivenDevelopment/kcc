@@ -61,6 +61,9 @@ void kcc_io_putc(unsigned long c);
 void kcc_io_putu(unsigned long n);
 void kcc_io_write(const void *buf, unsigned long len);
 void *kcc_parse_decl(void);
+struct StrLit { void *ptr; unsigned long len; };
+struct StrLit kcc_strlit_gather(void);
+void *kcc_parse_asm_extended(const char *tmpl, unsigned long len);
 
 extern unsigned long kcc_tok_type;
 extern unsigned long kcc_tok_line;
@@ -73,7 +76,7 @@ unsigned long kcc_ast_indent = 0;
 enum {
     TOK_EOF = 0, TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62,
     TOK_RBRACE = 63, TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66,
-    TOK_COMMA = 67, TOK_COLON = 93
+    TOK_COMMA = 67, TOK_COLON = 93, TOK_ASM = 56
 };
 
 enum {
@@ -223,12 +226,29 @@ int kcc_typedef_lookup(const char *name, unsigned long len) {
     return 0;
 }
 
+/* A file-scope \texttt{asm("...")} declaration (a GNU top-level asm, which is
+   what \texttt{EXPORT_SYMBOL} expands to): parse it like the statement form and
+   hand back the \texttt{AST\_ASM\_STMT} so the translation unit carries it to the
+   emitter, which pastes the template verbatim into the output. */
+void *kcc_parse_toplevel_asm(void) {
+    kcc_pp_next();                             /* consume 'asm' */
+    while (kcc_tok_type != TOK_LPAREN && kcc_tok_type != TOK_EOF)
+        kcc_pp_next();                         /* skip volatile/goto */
+    kcc_parse_expect(TOK_LPAREN);
+    struct StrLit tmpl = kcc_strlit_gather();
+    void *n = kcc_parse_asm_extended((const char *)tmpl.ptr, tmpl.len);
+    kcc_parse_expect(TOK_SEMI);
+    return n;
+}
 void *kcc_parse(void) {
     kcc_pp_next();
     struct Node *tu = (struct Node *)kcc_ast_alloc(AST_TRANS_UNIT);
     struct Node *first = 0, *last = 0;
     while (kcc_tok_type != TOK_EOF) {
-        struct Node *d = (struct Node *)kcc_parse_decl();
+        if (kcc_tok_type == TOK_SEMI) { kcc_pp_next(); continue; }  /* stray ';' */
+        struct Node *d;
+        if (kcc_tok_type == TOK_ASM) d = (struct Node *)kcc_parse_toplevel_asm();
+        else d = (struct Node *)kcc_parse_decl();
         if (d == 0) continue;
         struct Node *tail = d;
         while (tail->f4) tail = (struct Node *)tail->f4;

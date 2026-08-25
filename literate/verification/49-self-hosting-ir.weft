@@ -3508,13 +3508,18 @@ value; \texttt{\_\_builtin\_constant\_p} is a compile-time predicate;
 exploit undefined behaviour---collapses to a harmless dummy value.  The
 \texttt{\_\_builtin\_bswap16/32/64} family reverses byte order through a
 portable IR gather (\texttt{kcc\_ir\_bswap}), so no new opcode or per-target
-support is needed and the low $n$ bytes carry the answer.  The rest are names
-with an exact library counterpart---\texttt{\_\_builtin\_trap} to \texttt{abort},
-and \texttt{\_\_builtin\_abs/labs/llabs} and \texttt{\_\_builtin\_ffs/ffsl/ffsll}
-to their unprefixed forms---which is correct while the milestone links against a
-C library; a freestanding target would instead need bit-scan intrinsics
-(\texttt{clz}/\texttt{ctz}/\texttt{popcount}), which are left for a later rung as
-they require a new IR opcode in both back ends.
+support is needed and the low $n$ bytes carry the answer.  The bit-scan family---\texttt{\_\_builtin\_clz}, \texttt{ctz}, \texttt{popcount},
+and \texttt{ffs} (each with 32-bit and 64-bit \texttt{l}/\texttt{ll} widths)---
+also lowers to portable bit-twiddling rather than a per-target intrinsic, so it
+stays freestanding-correct with no new opcode.  Population count is the classic
+SWAR fold; trailing zeros is the population count of the mask below the lowest
+set bit ($x \,\&\, -x$, minus one); leading zeros smears the top set bit
+downward and subtracts its population count from the width; and \texttt{ffs} is
+one past the trailing-zero count, multiplied by a nonzero predicate so a zero
+input yields zero without a branch.  The remaining names have an exact library
+counterpart---\texttt{\_\_builtin\_trap} to \texttt{abort} and
+\texttt{\_\_builtin\_abs/labs/llabs} to their unprefixed forms---which is
+correct while the milestone links against a C library.
 
 Variadic access has two lowerings.  On ARM64 a \texttt{va\_list} is a bare
 pointer that walks the homogeneous save area, so \texttt{va\_start} records the
@@ -3701,6 +3706,91 @@ static unsigned long kcc_ir_bswap(unsigned long val, unsigned long nbytes) {
     return result;
 }
 
+/* Population count of the low nbits of a value, SWAR-style: pairwise sums fold
+   up through 1/2/4-bit fields, then a multiply by 0x01..01 broadcasts the byte
+   sums into the top byte, which a final shift brings down.  Everything is a
+   plain binop, so it needs no new opcode and lowers identically on every
+   target.  The width mask keeps a 32-bit count from seeing stray high bits. */
+static unsigned long kcc_ir_popcount(unsigned long val, unsigned long nbits) {
+    unsigned long full = (nbits >= 64) ? 0xffffffffffffffffUL
+                                       : ((1UL << nbits) - 1);
+    if (nbits < 64) {
+        unsigned long fm = kcc_ir_emit_const(full);
+        val = kcc_ir_emit_binop(IR_AND, val, fm);
+    }
+    unsigned long m1 = kcc_ir_emit_const(0x5555555555555555UL & full);
+    unsigned long m2 = kcc_ir_emit_const(0x3333333333333333UL & full);
+    unsigned long m4 = kcc_ir_emit_const(0x0f0f0f0f0f0f0f0fUL & full);
+    unsigned long h01 = kcc_ir_emit_const(0x0101010101010101UL & full);
+    unsigned long c1 = kcc_ir_emit_const(1);
+    unsigned long t = kcc_ir_emit_binop(IR_LSHR, val, c1);
+    t = kcc_ir_emit_binop(IR_AND, t, m1);
+    val = kcc_ir_emit_binop(IR_SUB, val, t);
+    unsigned long a = kcc_ir_emit_binop(IR_AND, val, m2);
+    unsigned long c2 = kcc_ir_emit_const(2);
+    unsigned long b = kcc_ir_emit_binop(IR_LSHR, val, c2);
+    b = kcc_ir_emit_binop(IR_AND, b, m2);
+    val = kcc_ir_emit_binop(IR_ADD, a, b);
+    unsigned long c4 = kcc_ir_emit_const(4);
+    unsigned long s = kcc_ir_emit_binop(IR_LSHR, val, c4);
+    val = kcc_ir_emit_binop(IR_ADD, val, s);
+    val = kcc_ir_emit_binop(IR_AND, val, m4);
+    val = kcc_ir_emit_binop(IR_MUL, val, h01);
+    unsigned long sh = kcc_ir_emit_const(nbits - 8);
+    val = kcc_ir_emit_binop(IR_LSHR, val, sh);
+    unsigned long ff = kcc_ir_emit_const(0xff);
+    return kcc_ir_emit_binop(IR_AND, val, ff);
+}
+
+/* Count trailing zeros = popcount of the mask below the lowest set bit.
+   val & -val isolates that bit; subtracting one turns the zeros beneath it into
+   ones.  Undefined at zero (as the builtin is), where it yields nbits. */
+static unsigned long kcc_ir_ctz(unsigned long val, unsigned long nbits) {
+    if (nbits < 64) {
+        unsigned long fm = kcc_ir_emit_const((1UL << nbits) - 1);
+        val = kcc_ir_emit_binop(IR_AND, val, fm);
+    }
+    unsigned long zero = kcc_ir_emit_const(0);
+    unsigned long neg = kcc_ir_emit_binop(IR_SUB, zero, val);
+    unsigned long low = kcc_ir_emit_binop(IR_AND, val, neg);
+    unsigned long one = kcc_ir_emit_const(1);
+    unsigned long m = kcc_ir_emit_binop(IR_SUB, low, one);
+    return kcc_ir_popcount(m, nbits);
+}
+
+/* Count leading zeros: smear the highest set bit down to fill every lower bit,
+   so popcount then gives one past the top bit's index; nbits minus that is the
+   leading-zero count.  Undefined at zero, where it yields nbits. */
+static unsigned long kcc_ir_clz(unsigned long val, unsigned long nbits) {
+    if (nbits < 64) {
+        unsigned long fm = kcc_ir_emit_const((1UL << nbits) - 1);
+        val = kcc_ir_emit_binop(IR_AND, val, fm);
+    }
+    for (unsigned long s = 1; s < nbits; s <<= 1) {
+        unsigned long sh = kcc_ir_emit_const(s);
+        unsigned long r = kcc_ir_emit_binop(IR_LSHR, val, sh);
+        val = kcc_ir_emit_binop(IR_OR, val, r);
+    }
+    unsigned long pc = kcc_ir_popcount(val, nbits);
+    unsigned long nb = kcc_ir_emit_const(nbits);
+    return kcc_ir_emit_binop(IR_SUB, nb, pc);
+}
+
+/* Find first set = one past the trailing-zero count, or zero for a zero input.
+   Multiplying by the (nonzero?) predicate folds the zero case in branchlessly. */
+static unsigned long kcc_ir_ffs(unsigned long val, unsigned long nbits) {
+    if (nbits < 64) {
+        unsigned long fm = kcc_ir_emit_const((1UL << nbits) - 1);
+        val = kcc_ir_emit_binop(IR_AND, val, fm);
+    }
+    unsigned long t = kcc_ir_ctz(val, nbits);
+    unsigned long one = kcc_ir_emit_const(1);
+    unsigned long tp1 = kcc_ir_emit_binop(IR_ADD, t, one);
+    unsigned long zero = kcc_ir_emit_const(0);
+    unsigned long nz = kcc_ir_emit_binop(IR_CMP_NE, val, zero);
+    return kcc_ir_emit_binop(IR_MUL, tp1, nz);
+}
+
 unsigned long kcc_ir_build_call(void *e) {
     void *callee = (void *)IL(e, AST_F0);
     if (!callee) return 0;
@@ -3729,16 +3819,36 @@ unsigned long kcc_ir_build_call(void *e) {
            yields a dummy value and emits nothing. */
         if (kcc_strcmp(name, "__builtin_unreachable") == 0)
             return kcc_ir_emit_const(0);
+        /* Bit-scan builtins lower to portable bit-twiddling (like bswap), so
+           they stay freestanding-correct without a new opcode. clz/ctz on the
+           `l`/`ll` widths operate on 64 bits, the plain form on 32. */
+        if (kcc_strcmp(name, "__builtin_clz") == 0)
+            return kcc_ir_clz(kcc_ir_build_expr((void *)IL(e, AST_F1)), 32);
+        if (kcc_strcmp(name, "__builtin_clzl") == 0 ||
+            kcc_strcmp(name, "__builtin_clzll") == 0)
+            return kcc_ir_clz(kcc_ir_build_expr((void *)IL(e, AST_F1)), 64);
+        if (kcc_strcmp(name, "__builtin_ctz") == 0)
+            return kcc_ir_ctz(kcc_ir_build_expr((void *)IL(e, AST_F1)), 32);
+        if (kcc_strcmp(name, "__builtin_ctzl") == 0 ||
+            kcc_strcmp(name, "__builtin_ctzll") == 0)
+            return kcc_ir_ctz(kcc_ir_build_expr((void *)IL(e, AST_F1)), 64);
+        if (kcc_strcmp(name, "__builtin_popcount") == 0)
+            return kcc_ir_popcount(kcc_ir_build_expr((void *)IL(e, AST_F1)), 32);
+        if (kcc_strcmp(name, "__builtin_popcountl") == 0 ||
+            kcc_strcmp(name, "__builtin_popcountll") == 0)
+            return kcc_ir_popcount(kcc_ir_build_expr((void *)IL(e, AST_F1)), 64);
+        if (kcc_strcmp(name, "__builtin_ffs") == 0)
+            return kcc_ir_ffs(kcc_ir_build_expr((void *)IL(e, AST_F1)), 32);
+        if (kcc_strcmp(name, "__builtin_ffsl") == 0 ||
+            kcc_strcmp(name, "__builtin_ffsll") == 0)
+            return kcc_ir_ffs(kcc_ir_build_expr((void *)IL(e, AST_F1)), 64);
         /* __builtin_trap() must terminate; lower it to a call to abort. */
         if (kcc_strcmp(name, "__builtin_trap") == 0) name = "abort";
-        /* Remaining builtins with an exact libc counterpart are the libc entry
-           points (valid while the milestone links against a C library). */
+        /* abs family has an exact libc counterpart (valid while the milestone
+           links against a C library). */
         else if (kcc_strcmp(name, "__builtin_abs") == 0) name = "abs";
         else if (kcc_strcmp(name, "__builtin_labs") == 0) name = "labs";
         else if (kcc_strcmp(name, "__builtin_llabs") == 0) name = "llabs";
-        else if (kcc_strcmp(name, "__builtin_ffs") == 0) name = "ffs";
-        else if (kcc_strcmp(name, "__builtin_ffsl") == 0) name = "ffsl";
-        else if (kcc_strcmp(name, "__builtin_ffsll") == 0) name = "ffsll";
         else if (kcc_strcmp(name, "__builtin_memcpy") == 0) name = "memcpy";
         else if (kcc_strcmp(name, "__builtin_memmove") == 0) name = "memmove";
         else if (kcc_strcmp(name, "__builtin_memset") == 0) name = "memset";

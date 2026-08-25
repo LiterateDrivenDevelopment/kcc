@@ -319,6 +319,8 @@ refinement is deferred.
 _kcc_attr_packed:  .quad 0      // set to 1 when the last attribute run named `packed`
 .globl _kcc_attr_align
 _kcc_attr_align:   .quad 0      // set to N when it named `aligned(N)` (0 = none)
+.globl _kcc_attr_ht
+_kcc_attr_ht:      .quad 0      // linkage-attribute side table (weak/section/alias); C-port only
 .section __TEXT,__cstring,cstring_literals
 _kcc_attr_s_packed:   .asciz "packed"
 _kcc_attr_s_packed2:  .asciz "__packed__"

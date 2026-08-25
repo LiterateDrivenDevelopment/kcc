@@ -48,6 +48,13 @@ void *kcc_ht_init(unsigned long capacity);
 unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
 void kcc_ht_put(void *ht, const void *key, unsigned long keylen, unsigned long value);
 unsigned long kcc_strlen(const char *s);
+/* Linkage-attribute side table populated by the parser (48t). */
+struct AttrRec { unsigned long weak; const char *section; const char *alias; };
+extern void *kcc_attr_ht;
+static struct AttrRec *x86_attr(const char *name) {
+    if (!kcc_attr_ht || !name) return 0;
+    return (struct AttrRec *)kcc_ht_get(kcc_attr_ht, name, kcc_strlen(name));
+}
 
 extern void *kcc_ir_funcs;           /* vec of IR function pointers */
 extern char kcc_str_modinit[];       /* "kcc.module_init" */
@@ -114,6 +121,8 @@ static unsigned long kcc_x86_rsa_top = 0;   /* rbp-relative top of the variadic 
 
 #define S(name, str) static const char name[] = str
 S(s_text, ".text\n"); S(s_globl, ".globl "); S(s_us, "_");
+S(s_weak, ".weak "); S(s_section, ".section "); S(s_set, "\t.set "); S(s_prev, "\t.previous\n");
+S(s_bss, ".bss\n"); S(s_ax, ",\"ax\",@@progbits\n");
 S(s_rodata, ".section .rodata\n"); S(s_comm, "\t.comm "); S(s_comm_a8, ",8\n");
 S(s_local, "\t.local ");
 S(s_modinit_d, ".section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad ");
@@ -597,6 +606,17 @@ the total; \texttt{x86\_spill\_params} copies the incoming System~V registers
 into their parameter vreg slots; \texttt{x86\_render\_text} walks the function
 list, emitting the label, prologue, and each block's instructions.
 
+The GNU linkage attributes the parser stashed in \texttt{kcc\_attr\_ht}
+(Chapter~\ref{ch:self-hosting-declarations}) are honoured here.
+\texttt{x86\_attr} looks a symbol up by name; a function so annotated is wrapped
+in \verb|.section name,"ax",@@progbits| … \verb|.text| for
+\texttt{\_\_attribute\_\_((section))} and headed by \verb|.weak| instead of
+\verb|.globl| for \texttt{\_\_weak}.  A \texttt{\_\_weak} global takes a real
+\texttt{.bss} definition rather than a \verb|.comm| (a common symbol may not
+also be weak), and an \texttt{alias} target---whose declaration is bodiless and
+so never reaches the IR---is emitted as a \verb|.set| by a separate walk of the
+translation unit.
+
 @l c
 @d Selfhost: emit_x86 frame @{
 static unsigned long x86_prescan(void *f) {
@@ -663,8 +683,13 @@ static void x86_render_text(void) {
     for (unsigned long fi = 0; fi < nf; fi++) {
         void *f = *(void **)kcc_vec_get(funcs, fi);
         const char *name = (const char *)IL(f, IRF_NAME);
+        struct AttrRec *ar = x86_attr(name);
+        if (ar && ar->section) {                 /* __attribute__((section("..."))): code section */
+            kcc_as_str(s_section); kcc_as_str(ar->section); kcc_as_str(s_ax);
+        }
         if (!IL(f, IRF_STATIC) && kcc_strcmp(name, kcc_str_modinit) != 0) {
-            kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n');
+            kcc_as_str(ar && ar->weak ? s_weak : s_globl);   /* __weak → .weak */
+            x86_sym(name); kcc_as_ch('\n');
         }
         x86_sym(name); kcc_as_str(s_colon_nl);
         unsigned long vn = IL(f, IRF_VREG_N);
@@ -692,14 +717,16 @@ static void x86_render_text(void) {
             }
         }
         void *blocks = (void *)IL(f, IRF_BLOCKS);
-        if (!blocks) continue;
-        unsigned long nbb = IL(blocks, VEC_COUNT);
-        for (unsigned long b = 0; b < nbb; b++) {
-            void *bb = *(void **)kcc_vec_get(blocks, b);
-            x86_bblabel(IL(bb, BB_ID)); kcc_as_str(s_label_nl);
-            void *ins = (void *)IL(bb, BB_FIRST);
-            while (ins) { kcc_x86_sel(ins); ins = (void *)IL(ins, IR_NEXT); }
+        if (blocks) {
+            unsigned long nbb = IL(blocks, VEC_COUNT);
+            for (unsigned long b = 0; b < nbb; b++) {
+                void *bb = *(void **)kcc_vec_get(blocks, b);
+                x86_bblabel(IL(bb, BB_ID)); kcc_as_str(s_label_nl);
+                void *ins = (void *)IL(bb, BB_FIRST);
+                while (ins) { kcc_x86_sel(ins); ins = (void *)IL(ins, IR_NEXT); }
+            }
         }
+        if (ar && ar->section) kcc_as_str(s_text);  /* leave the custom section */
     }
 }
 @}
@@ -734,8 +761,17 @@ static void x86_emit_zerofill(const char *name, unsigned long size, int is_stati
         if (kcc_ht_get(kcc_x86_emitted, name, kl)) return;
         kcc_ht_put(kcc_x86_emitted, name, kl, 1);
     }
-    if (!is_static) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
-    if (kcc_x86_os) {                            /* Linux .comm name,size,8 */
+    struct AttrRec *ar = x86_attr(name);
+    int weak = !is_static && ar && ar->weak;     /* __weak global */
+    if (!is_static) { kcc_as_str(weak ? s_weak : s_globl); x86_sym(name); kcc_as_ch('\n'); }
+    if (weak && kcc_x86_os) {
+        /* a common symbol cannot also be weak; give it a real weak definition
+           in .bss instead of a `.comm`. */
+        kcc_as_str(s_bss); kcc_as_str(s_p2align3);
+        x86_sym(name); kcc_as_str(s_colon_nl);
+        kcc_as_str(s_zerodir); kcc_as_dec(size); kcc_as_ch('\n');
+        kcc_as_str(s_text);
+    } else if (kcc_x86_os) {                     /* Linux .comm name,size,8 */
         if (is_static) { kcc_as_str(s_local); kcc_as_str(name); kcc_as_ch('\n'); }
         kcc_as_str(s_comm); kcc_as_str(name); kcc_as_str(s_comma1);
         kcc_as_dec(size); kcc_as_str(s_comm_a8);
@@ -993,11 +1029,28 @@ static void kcc_x86_emit_toplevel_asm(void) {
         kcc_as_ch('\n');
     }
 }
+/* `int foo(void) __attribute__((alias("bar")));` is a bodiless declaration, so
+   it never reaches the IR function list; walk the translation unit and emit a
+   `.set` for each name the parser recorded an alias target for. */
+static void kcc_x86_emit_aliases(void) {
+    struct Node *tu = (struct Node *)kcc_x86_tu;
+    if (!tu) return;
+    for (struct Node *d = (struct Node *)tu->f0; d; d = (struct Node *)d->f4) {
+        if (d->tag != AST_FUNC_DECL && d->tag != AST_VAR_DECL) continue;
+        const char *name = (const char *)d->f1;
+        struct AttrRec *ar = x86_attr(name);
+        if (!ar || !ar->alias) continue;
+        kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n');
+        kcc_as_str(s_set); x86_sym(name); kcc_as_str(s_comma);
+        x86_sym(ar->alias); kcc_as_ch('\n');
+    }
+}
 int kcc_x86_render(const char *path) {
     kcc_as_init();
     kcc_x86_strs = kcc_vec_init(16);
     x86_render_text();
     kcc_x86_emit_toplevel_asm();
+    kcc_x86_emit_aliases();
     kcc_x86_emit_data();
     kcc_x86_emit_statics();
     kcc_x86_emit_strings();

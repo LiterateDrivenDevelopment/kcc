@@ -60,12 +60,30 @@ void *kcc_strtab_intern(const void *ptr, unsigned long len);
 unsigned long kcc_pp_atoi(const char *s, unsigned long len);
 void kcc_typedef_add(const char *name, unsigned long len);
 int kcc_typedef_lookup(const char *name, unsigned long len);
+void *kcc_ht_init(unsigned long capacity);
+unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
+void kcc_ht_put(void *ht, const void *key, unsigned long keylen, unsigned long value);
+void *kcc_arena_alloc(unsigned long n);
 
 unsigned long kcc_attr_packed = 0;
 unsigned long kcc_attr_align = 0;
+/* Side table of the linkage attributes that cannot ride on the fixed-field AST
+   node: `__attribute__((weak))`, `((section("name")))`, `((alias("target")))`.
+   Keyed by symbol name; consumed by the code emitter. */
+struct AttrRec { unsigned long weak; const char *section; const char *alias; };
+unsigned long kcc_attr_weak = 0;
+const char *kcc_attr_section = 0;
+const char *kcc_attr_alias = 0;
+void *kcc_attr_ht = 0;
+void kcc_attr_record(const char *name) {
+    if (!kcc_attr_ht) kcc_attr_ht = kcc_ht_init(64);
+    struct AttrRec *r = (struct AttrRec *)kcc_arena_alloc(sizeof(struct AttrRec));
+    r->weak = kcc_attr_weak; r->section = kcc_attr_section; r->alias = kcc_attr_alias;
+    kcc_ht_put(kcc_attr_ht, name, kcc_strlen(name), (unsigned long)r);
+}
 
 enum {
-    TOK_EOF = 0, TOK_IDENT = 1, TOK_NUMBER = 2, TOK_AUTO = 10, TOK_CHAR = 13,
+    TOK_EOF = 0, TOK_IDENT = 1, TOK_NUMBER = 2, TOK_STRING_LIT = 4, TOK_AUTO = 10, TOK_CHAR = 13,
     TOK_CONST = 14, TOK_DOUBLE = 18, TOK_ENUM = 20, TOK_EXTERN = 21,
     TOK_FLOAT = 22, TOK_INLINE = 26, TOK_INT = 27, TOK_LONG = 28,
     TOK_REGISTER = 29, TOK_RESTRICT = 30, TOK_SHORT = 32, TOK_SIGNED = 33,
@@ -123,17 +141,27 @@ static unsigned long parse_const_index(void *e);
 \section{Attributes and \texttt{typeof}}
 
 \texttt{skip\_attributes} consumes GNU \texttt{\_\_attribute\_\_((...))} and
-\texttt{\_\_extension\_\_} runs, discarding all but the two that change layout:
-it records \texttt{packed} and \texttt{aligned(N)} into the module globals, reset
-at entry.  \texttt{typeof} wraps its parenthesised type-name or expression in a
-\texttt{TYPE\_TYPEOF} node.
+\texttt{\_\_extension\_\_} runs, discarding all but the ones that change layout or
+linkage: it records \texttt{packed} and \texttt{aligned(N)} into the per-declarator
+globals (reset at entry), and \texttt{weak}, \texttt{section("name")}, and
+\texttt{alias("target")} into globals that \emph{accumulate} across a
+declaration's leading and trailing attribute lists.  When the top-level parser
+finishes a declaration and knows its name, \texttt{kcc\_attr\_record} copies those
+three into the \texttt{kcc\_attr\_ht} side table (keyed by symbol name), then
+clears them---the AST node has no free field to carry linkage on, and the code
+emitter reads the table back when it lays each symbol down.  \texttt{typeof}
+wraps its parenthesised type-name or expression in a \texttt{TYPE\_TYPEOF} node.
 
 @l c
 @d Selfhost: declarations attrs @{
 void kcc_parse_skip_attributes(void) {
+    /* packed/align are per-declarator (reset each call); weak/section/alias are
+       linkage properties that accumulate across a declaration's leading and
+       trailing attribute lists and are cleared once kcc_attr_record consumes
+       them. */
     kcc_attr_packed = 0;
     kcc_attr_align = 0;
-    int want_align = 0;
+    int want_align = 0, want_section = 0, want_alias = 0;
     for (;;) {
         unsigned long t = kcc_tok_type;
         if (t == TOK_EXTENSION) { kcc_pp_next(); continue; }
@@ -153,11 +181,23 @@ void kcc_parse_skip_attributes(void) {
                 else if (l == 10 && kcc_memcmp(txt, "__packed__", 10) == 0) kcc_attr_packed = 1;
                 else if (l == 7 && kcc_memcmp(txt, "aligned", 7) == 0) want_align = 1;
                 else if (l == 11 && kcc_memcmp(txt, "__aligned__", 11) == 0) want_align = 1;
+                else if ((l == 4 && kcc_memcmp(txt, "weak", 4) == 0) ||
+                         (l == 8 && kcc_memcmp(txt, "__weak__", 8) == 0)) kcc_attr_weak = 1;
+                else if ((l == 7 && kcc_memcmp(txt, "section", 7) == 0) ||
+                         (l == 11 && kcc_memcmp(txt, "__section__", 11) == 0)) want_section = 1;
+                else if ((l == 5 && kcc_memcmp(txt, "alias", 5) == 0) ||
+                         (l == 9 && kcc_memcmp(txt, "__alias__", 9) == 0)) want_alias = 1;
             } else if (tt == TOK_NUMBER) {
                 if (want_align) {
                     want_align = 0;
                     kcc_attr_align = kcc_pp_atoi(kcc_tok_start, kcc_tok_len);
                 }
+            } else if (tt == TOK_STRING_LIT && (want_section || want_alias)) {
+                /* strip the surrounding quotes of e.g. section(".init.text") */
+                const char *s = (const char *)kcc_strtab_intern(
+                    kcc_tok_start + 1, kcc_tok_len >= 2 ? kcc_tok_len - 2 : 0);
+                if (want_section) { kcc_attr_section = s; want_section = 0; }
+                else { kcc_attr_alias = s; want_alias = 0; }
             }
             kcc_pp_next();
             if (depth == 0) break;
@@ -807,6 +847,11 @@ void *kcc_parse_decl(void) {
     struct Node *d = (struct Node *)kcc_parse_declarator(base);
     if (d == 0) { kcc_parse_sync(); return 0; }
     kcc_parse_skip_attributes();
+    /* Record any linkage attributes gathered from the leading (decl-specs) and
+       trailing lists, then clear them so they do not leak into the next decl. */
+    if (d->f1 && (kcc_attr_weak || kcc_attr_section || kcc_attr_alias))
+        kcc_attr_record((const char *)d->f1);
+    kcc_attr_weak = 0; kcc_attr_section = 0; kcc_attr_alias = 0;
 
     if (d->tag == AST_FUNC_DECL) {
         if (kcc_tok_type == TOK_LBRACE) {

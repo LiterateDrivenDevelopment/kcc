@@ -1019,7 +1019,13 @@ syntax is:
 \textit{pointer}\texttt{?} \textit{direct-declarator}
 \end{center}
 where a pointer is one or more \texttt{*} optionally followed by
-type qualifiers.
+type qualifiers.  A GNU \texttt{\_\_attribute\_\_((\ldots))} is also tolerated
+among those qualifiers (a pointer attribute) and immediately before the direct
+declarator's name; kcc does not model such attributes, so it consumes and
+discards them.  The kernel headers rely on this---\texttt{extern char~*
+\_\_must\_check skip\_spaces(const char~*)} places
+\texttt{\_\_attribute\_\_((\_\_warn\_unused\_result\_\_))} exactly between the
+\texttt{*} and the name.
 
 @d Decl: parse declarator @{
 // -- kcc_parse_declarator ----------------------------------------------
@@ -1062,7 +1068,16 @@ _kcc_parse_declarator:
     b.eq .Ldeclr_pq_restrict
     cmp x0, #TOK__ATOMIC
     b.eq .Ldeclr_pq_atomic
+    cmp x0, #TOK_ATTRIBUTE
+    b.eq .Ldeclr_pq_attr
     b .Ldeclr_ptr_build
+
+.Ldeclr_pq_attr:
+    // GNU `__attribute__((...))` after the `*` (a pointer attribute, e.g.
+    // `char * __must_check f(...)` in the kernel headers).  kcc does not model
+    // pointer attributes, so consume and ignore them, then keep scanning.
+    bl _kcc_parse_skip_attributes
+    b .Ldeclr_ptr_quals
 
 .Ldeclr_pq_const:
     orr x20, x20, #1
@@ -1091,6 +1106,9 @@ _kcc_parse_declarator:
     b .Ldeclr_ptr_loop
 
 .Ldeclr_direct:
+    // A GNU attribute may also sit just before the direct declarator's name
+    // (`T __attribute__((...)) x`); skip it (a no-op when absent).
+    bl _kcc_parse_skip_attributes
     // Parse direct declarator
     mov x0, x19
     bl _kcc_parse_direct_declarator

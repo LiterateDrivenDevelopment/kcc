@@ -696,6 +696,12 @@ __extension__ typedef long long ll;
 static __inline__ __attribute__((always_inline)) int g(__const int x __attribute__((unused))){ return x + 1; }
 int f(int y){ return y; }
 int main(void){ struct S s; s.x = 41; ll v = 100; return (g(s.x) == 42 && f(0) == 0 && v == 100) ? 0 : 1; }"
+# A GNU attribute between a pointer type and the declarator name (kernel headers'
+# `char * __must_check f(...)` after __must_check expands).
+difftest "gnu-attr-mid-declarator" \
+    "char * __attribute__((warn_unused_result)) pick(char *a){ return a; }
+int __attribute__((unused)) mid(void){ return 5; }
+int main(void){ char b[3]; b[0] = 37; return (pick(b)[0] == 37 && mid() == 5) ? 0 : 1; }"
 # GNU typeof: a type-specifier that is the type of a parenthesised type-name or
 # expression.  Used in declarations, casts, and sizeof; __typeof__ is the alias.
 difftest "gnu-typeof" \

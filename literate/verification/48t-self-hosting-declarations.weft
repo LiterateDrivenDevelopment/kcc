@@ -324,7 +324,10 @@ struct DeclSpecs kcc_parse_decl_specs(void) {
 
 A declarator wraps the base type in pointer nodes (each with its qualifiers),
 then hands off to the direct declarator, which reads the name (or a grouped
-inner declarator) and the array and function suffixes.  Array dimensions nest
+inner declarator) and the array and function suffixes.  A GNU
+\texttt{\_\_attribute\_\_} among the pointer qualifiers (\texttt{char~*
+\_\_must\_check f}) or just before the name is consumed and discarded, the way
+the assembly declarator does.  Array dimensions nest
 left-to-right (the first bracket is outermost); a function suffix builds a
 \texttt{TYPE\_FUNC} and a \texttt{FUNC\_DECL}, tagging the variadic flag into bit
 0 of the params pointer.  A grouped declarator such as \texttt{int (*fp)(int)}
@@ -344,6 +347,7 @@ void *kcc_parse_declarator(void *base) {
             else if (t == TOK_VOLATILE) { q |= 2; kcc_pp_next(); }
             else if (t == TOK_RESTRICT) { q |= 4; kcc_pp_next(); }
             else if (t == TOK__ATOMIC) { q |= 8; kcc_pp_next(); }
+            else if (t == TOK_ATTRIBUTE) kcc_parse_skip_attributes(); /* pointer attr, e.g. `* __must_check` */
             else break;
         }
         struct Node *p = (struct Node *)kcc_ast_alloc(AST_TYPE_PTR);
@@ -351,6 +355,9 @@ void *kcc_parse_declarator(void *base) {
         p->f1 = q;
         type = p;
     }
+    /* A GNU attribute may precede the direct declarator's name (a no-op here
+       when absent): `T __attribute__((...)) x`. */
+    if (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
     return kcc_parse_direct_declarator(type);
 }
 

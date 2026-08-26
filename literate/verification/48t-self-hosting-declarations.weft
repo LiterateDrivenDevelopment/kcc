@@ -95,7 +95,7 @@ enum {
     TOK_UNSIGNED = 40, TOK_VOID = 41, TOK_VOLATILE = 42,
     TOK__ALIGNAS = 44, TOK__ATOMIC = 46, TOK__BOOL = 47, TOK__COMPLEX = 48,
     TOK__IMAGINARY = 50, TOK__NORETURN = 51, TOK__STATIC_ASSERT = 52,
-    TOK__THREAD_LOCAL = 53, TOK_ATTRIBUTE = 54, TOK_TYPEOF = 55,
+    TOK__THREAD_LOCAL = 53, TOK_ATTRIBUTE = 54, TOK_TYPEOF = 55, TOK_ASM = 56,
     TOK_EXTENSION = 57,
     TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62, TOK_RBRACE = 63,
     TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66, TOK_COMMA = 67,
@@ -851,6 +851,20 @@ void *kcc_parse_decl(void) {
     struct Node *d = (struct Node *)kcc_parse_declarator(base);
     if (d == 0) { kcc_parse_sync(); return 0; }
     kcc_parse_skip_attributes();
+    /* A GCC asm label / named-register binding may follow a declarator:
+       `T v asm("string")`.  With `register` storage it binds v to a hardware
+       register (arch/x86 `current_stack_pointer asm("%rsp")`); otherwise it
+       renames the symbol at link.  Parse and accept it so the declaration is not
+       rejected; trailing attributes are then skipped as usual.  (The binding is
+       not yet honoured in codegen---a plain object is emitted---which suffices
+       for the header declarations the kernel build pulls in.) */
+    if (kcc_tok_type == TOK_ASM) {
+        kcc_pp_next();
+        kcc_parse_expect(TOK_LPAREN);
+        if (kcc_tok_type == TOK_STRING_LIT) kcc_pp_next();
+        kcc_parse_expect(TOK_RPAREN);
+        kcc_parse_skip_attributes();
+    }
     /* Record any linkage attributes gathered from the leading (decl-specs) and
        trailing lists, then clear them so they do not leak into the next decl. */
     if (d->f1 && (kcc_attr_weak || kcc_attr_section || kcc_attr_alias))

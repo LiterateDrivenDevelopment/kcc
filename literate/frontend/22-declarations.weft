@@ -76,6 +76,31 @@ _kcc_parse_decl:
     // whether a definition body, initialiser, comma, or ';' follows.
     bl _kcc_parse_skip_attributes
 
+    // A GCC asm label / named-register binding may follow a declarator:
+    // `T v asm("string")`.  With `register` storage it binds v to a hardware
+    // register (arch/x86 `current_stack_pointer asm("%rsp")`); otherwise it
+    // renames the symbol at link.  Parse and accept it (not yet honoured in
+    // codegen), then skip any trailing attributes.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ASM
+    b.ne .Ldecl_no_asm_label
+    bl _kcc_pp_next                    // consume 'asm'
+    mov x0, #TOK_LPAREN
+    bl _kcc_parse_expect
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_STRING_LIT
+    b.ne .Ldecl_asm_norparen
+    bl _kcc_pp_next                    // consume the register/label string
+.Ldecl_asm_norparen:
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    bl _kcc_parse_skip_attributes
+.Ldecl_no_asm_label:
+
     // Check what kind of declaration this is
     ldr x22, [x21, #AST_TAG]    // x22 = node tag
 

@@ -750,6 +750,17 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
 
 \section{Predefined Macros and Command-Line Defines}
 
+\texttt{pp\_predefine} seeds the macro table, for every translation unit, with
+the object-like built-ins a hosted C compiler is expected to define---the
+\texttt{\_\_STDC\_\_} family, \texttt{\_\_LP64\_\_}, and the dynamically
+substituted \texttt{\_\_LINE\_\_}.  Under \texttt{-{}-target=x86\_64-linux} it adds
+\texttt{\_\_linux\_\_} and \texttt{\_\_x86\_64\_\_} so headers pick their glibc
+bindings, and---so that gcc-oriented build systems (Kbuild's
+\texttt{scripts/cc-version.sh}) recognise kcc as a supported compiler, exactly as
+clang and icc do---the GCC identity macros \texttt{\_\_GNUC\_\_} /
+\texttt{\_\_GNUC\_MINOR\_\_} / \texttt{\_\_GNUC\_PATCHLEVEL\_\_}.  Finally it
+replays any \texttt{-D} command-line macros on top.
+
 @l c
 @d Selfhost: pp predefined @{
 static void pp_def_simple(const char *name, unsigned long nl, const char *body, unsigned long bl) {
@@ -1152,6 +1163,17 @@ unsigned long kcc_pp_atoi(const char *p, unsigned long len) {
 @}
 
 \section{File Inclusion and Built-in Headers}
+
+\texttt{\#include} resolves a header by trying, in order, the including file's
+own directory, the literal path, and each \texttt{-I} directory; a small set of
+headers is served from memory as built-ins.  Alongside resolution, the
+preprocessor keeps the \emph{dependency list} for \texttt{-MD}: every real
+include file it opens is recorded (built-ins have no path and are skipped), and
+\texttt{kcc\_dep\_write} later emits the Makefile fragment
+\texttt{obj: src headers\ldots} plus trailing phony \texttt{header:} targets---the
+form Kbuild's \texttt{fixdep} reads, and what \texttt{make} needs so a deleted
+header does not wedge the build.  The list is written only when the driver has
+set \texttt{kcc\_dep\_out} from a \texttt{-MD}/\texttt{-Wp,-MMD} option.
 
 @l c
 @d Selfhost: pp include @{

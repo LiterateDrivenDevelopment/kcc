@@ -25,6 +25,11 @@ land in the exported globals the lexer and the diagnostic engine read.  The
 syscall flag values are the numeric constants the assembly used (O\_RDONLY~0,
 SEEK\_END~2, PROT\_READ~1, MAP\_PRIVATE~2).
 
+The path \texttt{-} is a special case for standard input: a pipe can be neither
+\texttt{lseek}'d nor \texttt{mmap}'d, so the whole of \texttt{fd~0} is read into a
+growing arena buffer instead.  gcc-driven build systems pipe a snippet to the
+compiler this way for their capability probes.
+
 @l c
 @d Selfhost: source preamble @{
 long kcc_sys_open(const char *path, int flags, int mode);

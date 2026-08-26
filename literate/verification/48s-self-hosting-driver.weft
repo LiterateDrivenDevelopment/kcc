@@ -309,6 +309,19 @@ include dirs and macros, and finds an explicit \texttt{-o} and the source count;
 a second pass compiles each source, honouring \texttt{-o} only for a single
 input.  It exits with the combined status.
 
+Both passes scan from \texttt{argv[1]} and are \emph{gcc-compatible enough to be
+a drop-in \texttt{CC=}} for a real Kbuild command line, which leads with dozens
+of \texttt{-f}/\texttt{-W}/\texttt{-m}/\texttt{-O} flags and ends with
+\texttt{-c -o out.o in.c}: \texttt{-c} is skipped wherever it sits, the two-word
+options a kernel build uses (\texttt{-isystem dir}, \texttt{-include file},
+\texttt{-MF}, \texttt{-x}, \ldots) consume their second word, and every other
+dash-led token is an option kcc ignores.  Dependency generation is honoured too:
+on \texttt{-MD}/\texttt{-MMD} or the comma-joined \texttt{-Wp,-M[M]D,file} the
+driver records the \texttt{.d} path and, after a successful compile, writes the
+Makefile fragment (\texttt{obj: src headers\ldots}) that Kbuild's \texttt{fixdep}
+consumes; the preprocessor supplies the include list.  \texttt{kcc\_dep\_out}
+stays null otherwise, so an ordinary compile writes no \texttt{.d}.
+
 @l c
 @d Selfhost: driver compile-all @{
 /* Some gcc options take a separate second word (a path or name) that must be

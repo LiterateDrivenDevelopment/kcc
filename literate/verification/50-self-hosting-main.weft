@@ -29,6 +29,22 @@ can only do if the dispatch is faithful.
 
 \section{Entry Point and Mode Dispatch}
 
+\texttt{main} initialises the subsystems, then dispatches on the arguments.  The
+diagnostic modes (\texttt{-{}-dump-tokens}, \texttt{-{}-dump-ast},
+\texttt{-{}-check}, \texttt{-{}-dump-ir}, \ldots) are selected by \texttt{argv[1]};
+anything else is a compile (\texttt{-c} anywhere) or a compile-and-link.
+
+Two behaviours make the driver a usable gcc-style \texttt{CC=}.  First,
+\texttt{-E} (preprocess only) is recognised \emph{anywhere} in the command line
+and takes priority: \texttt{kcc\_run\_preprocess} honours \texttt{-{}-target},
+finds the source operand gcc-style (the last non-flag word, or \texttt{-} for
+standard input), and \texttt{kcc\_pp\_emit\_text} writes the preprocessed token
+stream back as C \emph{source text}---token spellings with line-preserving
+newlines and no line markers---rather than kcc's token dump, because that is the
+form a build system's compiler probe (Kbuild's \texttt{cc-version.sh}) reads.
+Second, the startup banner is written to \texttt{stderr}, keeping \texttt{stdout}
+clean for that probe.
+
 @l c
 @d Selfhost: main @{
 /* subsystem init, front-end phases, sema, IR, driver, syscalls */

@@ -13,6 +13,18 @@ it is an object-like macro.
 The replacement body is the text from after the macro name (or
 parameter list) to the end of the directive line.
 
+Each parameter is an identifier; a bare \texttt{...} in final position makes
+the macro variadic, binding the trailing arguments to \texttt{\_\_VA\_ARGS\_\_}
+(\stdref{6.10.3}).  The parser also accepts the GNU \emph{named} variadic form
+\texttt{name...}---an identifier immediately followed by \texttt{...}---which
+names the rest parameter so the body refers to the trailing arguments as
+\texttt{name} instead of \texttt{\_\_VA\_ARGS\_\_}; the Linux kernel headers use
+this spelling heavily.  Either way the binding name is written into the variadic
+slot \texttt{params[x22]} at definition time---\texttt{\_\_VA\_ARGS\_\_} for the
+bare form, the identifier for the named form---and the fixed-parameter count in
+\texttt{x22} excludes it, so expansion need only collapse the trailing arguments
+into that already-named slot.
+
 @d PP: define @{
 .text
 // -- _kcc_pp_do_define ----------------------------------------------
@@ -122,19 +134,22 @@ _kcc_pp_do_define:
     add  x1, x1, _kcc_tok_len@@PAGEOFF
     ldr  x1, [x1]
 
-    // params[param_count] = {name, len}
+    // params[param_count] = {name, len}.  Do not count it yet: a trailing
+    // `...` would make it a GNU named-variadic parameter (see .Ldef_named_variadic).
     mov x2, #PP_PARAM_SIZE
     mul x3, x22, x2
     add x3, x23, x3
     str x0, [x3, #PP_PARAM_NAME]
     str x1, [x3, #PP_PARAM_LEN]
-    add x22, x22, #1
 
-    // Read next: ',' or ')'
+    // Read next: '...' (named variadic), ',' or ')'
     bl _kcc_lex_next
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.eq .Ldef_named_variadic
+    add x22, x22, #1
     cmp  x0, #TOK_COMMA
     b.ne .Ldef_check_rparen
 
@@ -147,8 +162,33 @@ _kcc_pp_do_define:
     b.ne .Ldef_err_param
     b .Ldef_params_done
 
+.Ldef_named_variadic:
+    // GNU "name...": the identifier just stored in params[x22] binds the
+    // trailing arguments (\stdref{6.10.3}, GNU extension).  Mark variadic and
+    // leave x22 uncounted so that slot stays the variadic slot the expander
+    // collapses into.
+    orr x21, x21, #PP_FLAG_VARIADIC
+    bl _kcc_lex_next
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_RPAREN
+    b.ne .Ldef_err_param
+    b .Ldef_params_done
+
 .Ldef_variadic:
     orr x21, x21, #PP_FLAG_VARIADIC   // mark variadic; ... consumes no param slot
+    // Bind the variadic slot params[x22] to __VA_ARGS__ at definition time
+    // (the named-variadic path above binds it to an identifier instead), so
+    // the expander's collapse need not choose the name.
+    mov x2, #PP_PARAM_SIZE
+    mul x3, x22, x2
+    add x3, x23, x3
+    adrp x4, _kcc_pp_va_args_str@@PAGE
+    add  x4, x4, _kcc_pp_va_args_str@@PAGEOFF
+    str  x4, [x3, #PP_PARAM_NAME]
+    mov  x4, #11
+    str  x4, [x3, #PP_PARAM_LEN]
     bl _kcc_lex_next
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
@@ -794,23 +834,16 @@ been looked up), which the called routines are obliged to preserve.
 
     // Variadic macro (\stdref{6.10.3.1}): collapse the trailing arguments past
     // the fixed parameters into a single __VA_ARGS__ argument---the raw source
-    // span from the first trailing arg to the last, commas and all---and register
-    // "__VA_ARGS__" as the parameter that binds it, so the ordinary substitution
-    // engine replaces __VA_ARGS__ with that text.  Too few args (only fixed ones)
-    // yield an empty __VA_ARGS__.
+    // span from the first trailing arg to the last, commas and all.  The
+    // variadic slot params[NPARAMS] was already bound to its name at definition
+    // time---"__VA_ARGS__" for a plain `...`, or the identifier for a GNU
+    // "name..." parameter---so the ordinary substitution engine replaces that
+    // name with the joined text.  Too few args (only fixed ones) yield an empty
+    // variadic argument.
     ldr  x0, [x21, #PP_MACRO_FLAGS]
     tst  x0, #PP_FLAG_VARIADIC
     b.eq .Lexp_arg_done_va
     ldr  x2, [x21, #PP_MACRO_NPARAMS]   // fixed parameter count
-    ldr  x3, [x21, #PP_MACRO_PARAMS]
-    mov  x4, #PP_PARAM_SIZE
-    mul  x5, x2, x4
-    add  x3, x3, x5                     // &params[NPARAMS]
-    adrp x4, _kcc_pp_va_args_str@@PAGE
-    add  x4, x4, _kcc_pp_va_args_str@@PAGEOFF
-    str  x4, [x3, #PP_PARAM_NAME]
-    mov  x4, #11                        // len("__VA_ARGS__")
-    str  x4, [x3, #PP_PARAM_LEN]
     lsl  x3, x2, #4
     add  x3, x23, x3                    // &arg[NPARAMS]
     cmp  x24, x2

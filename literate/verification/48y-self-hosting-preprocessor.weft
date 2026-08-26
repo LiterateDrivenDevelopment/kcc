@@ -386,6 +386,19 @@ static void pp_dispatch(void) {
 
 \section{\texttt{\#define}, \texttt{\#undef}, and Pragmas}
 
+\texttt{kcc\_pp\_do\_define} reads the macro name and, if a \texttt{(} follows it
+with no intervening space, the parameter list.  Each parameter is an identifier;
+a bare \texttt{...} in final position makes the macro variadic, binding the
+trailing arguments to \texttt{\_\_VA\_ARGS\_\_} (\stdref{6.10.3}).  \kcc{} also
+accepts the GNU \emph{named} variadic form \texttt{name...}: an identifier
+immediately followed by \texttt{...} names the rest parameter, so the macro body
+refers to the trailing arguments as \texttt{name} rather than
+\texttt{\_\_VA\_ARGS\_\_}.  This spelling is pervasive in the Linux kernel
+headers (for example \texttt{ASM\_NO\_INPUT\_CLOBBER(clbr...)}).  In both cases
+the binding name is written into the variadic slot \texttt{params[nparams]} here,
+at definition time, and the fixed-parameter count \texttt{nparams} excludes it;
+the expander later collapses the trailing arguments into that already-named slot.
+
 @l c
 @d Selfhost: pp define @{
 void kcc_pp_do_define(void) {
@@ -411,6 +424,8 @@ void kcc_pp_do_define(void) {
             for (;;) {
                 if (kcc_tok_type == TOK_ELLIPSIS) {
                     flags |= PP_FLAG_VARIADIC;
+                    params[nparams].name = "__VA_ARGS__";
+                    params[nparams].len = 11;
                     kcc_lex_next();
                     if (kcc_tok_type != TOK_RPAREN) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
                     break;
@@ -418,8 +433,18 @@ void kcc_pp_do_define(void) {
                 if (kcc_tok_type != TOK_IDENT) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
                 params[nparams].name = kcc_tok_start;
                 params[nparams].len = kcc_tok_len;
-                nparams++;
                 kcc_lex_next();
+                if (kcc_tok_type == TOK_ELLIPSIS) {
+                    /* GNU named variadic parameter "name...": bind the trailing
+                       arguments to `name` rather than to __VA_ARGS__.  Leave the
+                       name in the variadic slot params[nparams] without counting
+                       it among the fixed parameters. */
+                    flags |= PP_FLAG_VARIADIC;
+                    kcc_lex_next();
+                    if (kcc_tok_type != TOK_RPAREN) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
+                    break;
+                }
+                nparams++;
                 if (kcc_tok_type == TOK_COMMA) { kcc_lex_next(); continue; }
                 if (kcc_tok_type != TOK_RPAREN) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
                 break;
@@ -573,10 +598,10 @@ int kcc_pp_try_expand(void) {
             args[argc].len = 0;
         }
     }
-    /* variadic: collapse trailing args into __VA_ARGS__ */
+    /* variadic: collapse trailing args into the variadic slot params[nparams],
+       whose name (__VA_ARGS__, or the GNU named-rest identifier) was bound when
+       the macro was defined. */
     if (m->flags & PP_FLAG_VARIADIC) {
-        params[nparams].name = "__VA_ARGS__";
-        params[nparams].len = 11;
         if (argc > nparams) {
             const char *first = args[nparams].start;
             const char *last_end = args[argc - 1].start + args[argc - 1].len;

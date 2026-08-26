@@ -1176,7 +1176,9 @@ int isatty(int fd);
 \paragraph{End-to-end tests.}
 The preprocessor already runs ahead of the code generator, so these
 tests compile and execute programs that lean on it: object-like and
-function-like macros, conditional compilation, and---through
+function-like macros---including both spellings of a variadic macro, the
+standard \texttt{...}/\texttt{\_\_VA\_ARGS\_\_} form and the GNU named-rest form
+\texttt{args...}---conditional compilation, and---through
 \texttt{run\_test\_include}---a shared header that supplies both a macro
 constant and a \texttt{struct} definition to the translation unit that
 includes it.  The last case is the one that matters for self-hosting: a
@@ -1199,6 +1201,21 @@ int main(void){ return N * M; }" 15
 run_test "pp-define-funclike" \
     "#define SQ(x) ((x)*(x))
 int main(void){ return SQ(6); }" 36
+
+run_test "pp-variadic-va-args" \
+    "int add3(int a,int b,int c){return a+b+c;}
+#define ADD(...) add3(__VA_ARGS__)
+int main(void){ return ADD(10,20,30); }" 60
+
+run_test "pp-variadic-named" \
+    "int add3(int a,int b,int c){return a+b+c;}
+#define ADD(args...) add3(args)
+int main(void){ return ADD(10,20,30); }" 60
+
+run_test "pp-variadic-named-fixed" \
+    "int mix(int f,int a,int b){return f*100+a*10+b;}
+#define M(fmt, rest...) mix(fmt, rest)
+int main(void){ return M(1, 2, 3); }" 123
 
 run_test "pp-ifdef-true" \
     "#define DEBUG

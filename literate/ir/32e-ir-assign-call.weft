@@ -1619,8 +1619,13 @@ _kcc_ir_build_cond_expr:
     mov x0, x21
     bl _kcc_ir_set_bb
     ldr x0, [x19, #AST_F1]
+    cbz x0, .Lcond_elvis_then    // GNU `a ?: b': reuse the condition value
     bl _kcc_ir_build_expr
     mov x24, x0                  // then_vreg
+    b .Lcond_then_stored
+.Lcond_elvis_then:
+    mov x24, x20                 // omitted middle: the condition (x20) is the value
+.Lcond_then_stored:
 
     mov x0, #IR_STORE
     bl _kcc_ir_alloc_instr

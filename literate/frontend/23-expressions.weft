@@ -229,9 +229,21 @@ _kcc_parse_cond_expr:
     // Consume '?'
     bl _kcc_pp_next
 
+    // GNU `a ?: b': an omitted middle operand (next token is ':') is recorded
+    // as then == 0, so the IR reuses the condition's value.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COLON
+    b.eq .Lcond_elvis
+
     // Parse 'then' expression (full expression, not just assignment)
     bl _kcc_parse_expr
     mov x20, x0                  // x20 = then
+    b .Lcond_colon
+.Lcond_elvis:
+    mov x20, #0                  // omitted: reuse the condition
+.Lcond_colon:
 
     // Expect ':'
     mov x0, #TOK_COLON

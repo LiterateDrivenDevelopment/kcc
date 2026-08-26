@@ -224,7 +224,12 @@ void *kcc_parse_expr_rest(void *lhs) {
         }
         if (kcc_tok_type == TOK_QUESTION) {
             kcc_pp_next();
-            void *then = kcc_parse_expr();
+            /* GNU `a ?: b': the middle operand is omitted and the condition's
+               value is reused.  Record it as f1 == 0 so the IR evaluates the
+               condition once. */
+            void *then = 0;
+            if (kcc_tok_type != TOK_COLON)
+                then = kcc_parse_expr();
             kcc_parse_expect(TOK_COLON);
             void *els = kcc_parse_cond_expr();
             struct Node *n = (struct Node *)kcc_ast_alloc(AST_COND_EXPR);

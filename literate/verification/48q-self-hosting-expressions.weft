@@ -167,7 +167,11 @@ void *kcc_parse_cond_expr(void) {
     struct Node *cond = (struct Node *)kcc_parse_binary_expr(4);
     if (kcc_tok_type != TOK_QUESTION) return cond;
     kcc_pp_next();
-    void *then = kcc_parse_expr();
+    /* GNU `a ?: b': omitted middle operand, recorded as f1 == 0, so the IR
+       reuses the condition's value (evaluating `a' once). */
+    void *then = 0;
+    if (kcc_tok_type != TOK_COLON)
+        then = kcc_parse_expr();
     kcc_parse_expect(TOK_COLON);
     void *els = kcc_parse_cond_expr();
     struct Node *n = (struct Node *)kcc_ast_alloc(AST_COND_EXPR);

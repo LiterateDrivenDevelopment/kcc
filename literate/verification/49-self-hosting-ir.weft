@@ -4245,7 +4245,10 @@ unsigned long kcc_ir_build_cond_expr(void *e) {
     void *merge_bb = kcc_ir_alloc_bb();
     ir_brcond(cond, then_bb, else_bb);
     kcc_ir_set_bb(then_bb);
-    unsigned long tv = kcc_ir_build_expr((void *)IL(e, AST_F1));
+    /* GNU `a ?: b': the omitted middle operand (AST_F1 == 0) reuses the
+       already-computed condition value, so `a' is evaluated exactly once. */
+    void *then_ast = (void *)IL(e, AST_F1);
+    unsigned long tv = then_ast ? kcc_ir_build_expr(then_ast) : cond;
     void *st1 = kcc_ir_alloc_instr(IR_STORE);
     IL(st1, IR_TYPE) = (unsigned long)kcc_type_int_s;
     IL(st1, IR_SRC1) = tv;

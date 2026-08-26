@@ -28,6 +28,7 @@ SEEK\_END~2, PROT\_READ~1, MAP\_PRIVATE~2).
 @l c
 @d Selfhost: source preamble @{
 long kcc_sys_open(const char *path, int flags, int mode);
+long kcc_sys_read(int fd, void *buf, unsigned long len);
 long kcc_sys_close(int fd);
 void *kcc_sys_mmap(void *addr, unsigned long len, int prot, int flags,
                    int fd, long off);
@@ -45,6 +46,27 @@ const char *kcc_src_path = 0;
 @d Selfhost: source open @{
 void kcc_source_open(const char *path) {
     kcc_src_path = path;
+    if (path[0] == '-' && path[1] == 0) {
+        /* "-" means standard input.  A pipe cannot be lseek'd or mmap'd, so read
+           it in full into a growing arena buffer.  gcc-driven build systems pipe
+           a snippet to the compiler this way (Kbuild's scripts/cc-version.sh). */
+        unsigned long cap = 65536, len = 0;
+        char *buf = (char *)kcc_arena_alloc((long)cap);
+        for (;;) {
+            if (len == cap) {
+                unsigned long ncap = cap * 2;
+                char *nb = (char *)kcc_arena_alloc((long)ncap);
+                for (unsigned long i = 0; i < len; i++) nb[i] = buf[i];
+                buf = nb; cap = ncap;
+            }
+            long n = kcc_sys_read(0, buf + len, cap - len);
+            if (n <= 0) break;
+            len += (unsigned long)n;
+        }
+        kcc_src_base = buf;
+        kcc_src_size = len;
+        return;
+    }
     long fd = kcc_sys_open(path, 0, 0);
     if (fd == -1) {
         kcc_io_err("kcc: error: cannot open file: ");

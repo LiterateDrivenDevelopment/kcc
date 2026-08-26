@@ -550,9 +550,6 @@ _kcc_opt_dump_ir:
     .asciz "--dump-ir"
 _kcc_err_ir_usage:
     .asciz "kcc: error: --dump-ir requires a source file\n"
-.globl _kcc_opt_compile
-_kcc_opt_compile:
-    .asciz "-c"
 _kcc_err_compile_usage:
     .asciz "kcc: error: usage: kcc -c <source.c>... [-o <output.o>]\n"
 @}

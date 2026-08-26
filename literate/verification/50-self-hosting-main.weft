@@ -65,6 +65,33 @@ void kcc_driver_link_all(int argc, char **argv);
 extern void *kcc_src_base;
 extern unsigned long kcc_src_size;
 extern char **kcc_envp;                          /* defined by the driver */
+extern unsigned long kcc_target;                 /* set by --target=x86_64[-linux] */
+extern unsigned long kcc_x86_os;
+void kcc_pp_next(void);
+void kcc_io_write(const char *buf, unsigned long len);
+extern unsigned long kcc_tok_type, kcc_tok_len, kcc_tok_line;
+extern const char *kcc_tok_start;
+
+/* gcc-style -E: emit the preprocessed token stream as C source TEXT (not kcc's
+   token dump).  Each token's spelling is written verbatim; a newline is emitted
+   whenever the source line advances, a space separates same-line tokens so they
+   do not fuse.  Line markers are omitted (matching gcc's -P)---the form build-
+   system compiler probes read.  Defined here, in the driver, so it depends only
+   on kcc_pp_next (present in either preprocessor port). */
+static void kcc_pp_emit_text(void) {
+    unsigned long prev_line = 0;
+    for (;;) {
+        kcc_pp_next();
+        if (kcc_tok_type == 0) break;             /* TOK_EOF */
+        unsigned long line = kcc_tok_line;
+        if (prev_line == 0) prev_line = line;
+        else if (line > prev_line) { while (prev_line < line) { kcc_io_puts("\n"); prev_line++; } }
+        else kcc_io_puts(" ");
+        kcc_io_write(kcc_tok_start, kcc_tok_len);
+    }
+    kcc_io_puts("\n");
+    kcc_io_flush();
+}
 
 /* Terminal paths, mirroring the assembly's .Lmain_exit / _error_exit / usage. */
 static void exit_ok(void)          { kcc_io_flush(); kcc_sys_exit(0); }
@@ -74,12 +101,41 @@ static void finish(void) {
     kcc_io_flush(); kcc_sys_exit(0);
 }
 
-/* Translation phases 1-2 then lexer init on the source at argv[2]. */
-static void open_lex(char **argv) {
-    kcc_source_open(argv[2]);
+/* Translation phases 1-2 then lexer init on the source at a given path. */
+static void open_lex_path(const char *path) {
+    kcc_source_open(path);
     kcc_source_encode();                          /* phase 1: trigraphs */
     kcc_source_splice();                          /* phase 2: line splicing */
     kcc_lex_init(kcc_src_base, kcc_src_size);
+}
+static void open_lex(char **argv) { open_lex_path(argv[2]); }
+
+/* Preprocess-only mode (`-E`): find the single source operand in a gcc-style
+   command line (the last non-flag word, or "-" for standard input), skipping
+   options and the two-word ones a compiler probe uses.  --target is honoured
+   first so kcc_x86_os---and thus the __GNUC__ predefine---is set. */
+static int kcc_is_two_arg_opt(const char *a) {
+    return kcc_strcmp(a, "-o") == 0 || kcc_strcmp(a, "-x") == 0 ||
+           kcc_strcmp(a, "-isystem") == 0 || kcc_strcmp(a, "-include") == 0 ||
+           kcc_strcmp(a, "-idirafter") == 0 || kcc_strcmp(a, "-imacros") == 0 ||
+           kcc_strcmp(a, "-iquote") == 0 || kcc_strcmp(a, "-MT") == 0 ||
+           kcc_strcmp(a, "-MF") == 0 || kcc_strcmp(a, "-MQ") == 0;
+}
+static void kcc_run_preprocess(int argc, char **argv) {
+    const char *src = 0;
+    for (int i = 1; i < argc; i++) {
+        char *a = argv[i];
+        if (kcc_strcmp(a, "--target=x86_64") == 0) { kcc_target = 1; continue; }
+        if (kcc_strcmp(a, "--target=x86_64-linux") == 0) { kcc_target = 1; kcc_x86_os = 1; continue; }
+        if (kcc_is_two_arg_opt(a)) { i++; continue; }
+        if (a[0] == '-' && a[1] != 0) continue;   /* an option ("-" alone is stdin) */
+        src = a;                                   /* last operand wins */
+    }
+    if (!src) die_usage("kcc: error: -E requires a source file\n");
+    open_lex_path(src);
+    kcc_pp_init();
+    kcc_pp_emit_text();
+    finish();
 }
 
 int main(int argc, char **argv) {
@@ -92,11 +148,19 @@ int main(int argc, char **argv) {
     /* register dirname(argv[0])+"include" once, before any file, so the shipped
        hosted headers resolve with no -I. */
     kcc_pp_add_default_includes(argv[0]);
-    kcc_io_puts("kcc v0.1.0 - a formal C17 compiler for ARM64\n");
+    /* The startup banner is a diagnostic, so it goes to stderr---keeping stdout
+       clean for `-E` output that build-system compiler probes capture. */
+    kcc_io_err("kcc v0.1.0 - a formal C17 compiler for ARM64\n");
 
     if (argc < 2) {
         kcc_io_puts("usage: kcc [--dump-tokens|-E|--dump-ast|--dump-types|--check|--dump-ir|-c <src> -o <out>] <source.c>\n");
         exit_ok();
+    }
+
+    /* -E (preprocess only) may appear anywhere in a gcc/Kbuild command line;
+       when present it takes priority and emits preprocessed source text. */
+    for (int i = 1; i < argc; i++) {
+        if (kcc_strcmp(argv[i], "-E") == 0) { kcc_run_preprocess(argc, argv); }
     }
 
     const char *a1 = argv[1];
@@ -105,13 +169,6 @@ int main(int argc, char **argv) {
         if (argc < 3) die_usage("kcc: error: --dump-tokens requires a source file\n");
         open_lex(argv);
         kcc_lex_dump_all();
-        finish();
-    }
-    if (kcc_strcmp(a1, "-E") == 0) {
-        if (argc < 3) die_usage("kcc: error: -E requires a source file\n");
-        open_lex(argv);
-        kcc_pp_init();
-        kcc_pp_dump_all();
         finish();
     }
     if (kcc_strcmp(a1, "--dump-ast") == 0) {

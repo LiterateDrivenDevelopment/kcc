@@ -772,6 +772,11 @@ static void pp_predefine(void) {
     if (kcc_x86_os) {                     /* Linux/x86-64 target: let headers pick glibc bindings */
         pp_def_simple("__linux__", 9, "1", 1);
         pp_def_simple("__x86_64__", 10, "1", 1);
+        /* Claim GCC compatibility so gcc-oriented build systems (Kbuild's
+           scripts/cc-version.sh) recognise kcc, exactly as clang and icc do. */
+        pp_def_simple("__GNUC__", 8, "11", 2);
+        pp_def_simple("__GNUC_MINOR__", 14, "2", 1);
+        pp_def_simple("__GNUC_PATCHLEVEL__", 19, "0", 1);
     }
     kcc_pp_apply_cmdline_defines();
 }

@@ -1557,6 +1557,9 @@ _kcc_driver_link_all:
 @d Driver: data @{
 // -- Driver string constants --------------------------------------------------
 .section __TEXT,__cstring,cstring_literals
+.globl _kcc_opt_compile
+_kcc_opt_compile:
+    .asciz "-c"
 _kcc_opt_o:
     .asciz "-o"
 _kcc_opt_wall:

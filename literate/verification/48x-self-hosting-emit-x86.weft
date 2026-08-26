@@ -384,14 +384,20 @@ aggregate the marshaller cannot classify) is refused cleanly rather than
 miscompiled.
 
 Extended inline asm (\texttt{IR\_ASM}) is where the kernel's word-at-a-time and
-atomic idioms live, so \texttt{x86\_emit\_asm} renders it directly.  Only
-register constraints (\verb|"r"|, \verb|"=r"|, \verb|"+r"|) are honoured and at
-most three operands, which covers the kernel sites reached so far; anything else
-is refused rather than silently mis-substituted.  Operand $k$ is placed in
-\texttt{\%r8+k}---all three caller-saved, so the surrounding all-spill code
-survives the asm untouched---with \texttt{\%r11} reserved as the scratch that
-carries an output operand's address.  Each input value is loaded into its
-operand register first; then the template is pasted verbatim except that
+atomic idioms live, so \texttt{x86\_emit\_asm} renders it directly.  Register
+constraints (\verb|"r"|, \verb|"=r"|, \verb|"+r"|) and matching constraints
+(\verb|"0"|, \verb|"1"|, \ldots) are honoured, up to three operands, which covers
+the kernel sites reached so far; anything else is refused rather than silently
+mis-substituted.  Operand $k$ is placed in \texttt{\%r8+k}---all three
+caller-saved, so the surrounding all-spill code survives the asm untouched---with
+\texttt{\%r11} reserved as the scratch that carries an output operand's address.
+A matching constraint does not take a register of its own: it \emph{aliases} the
+tied operand's register (\texttt{regof[k]}), which is exactly the register-tie
+GCC guarantees so a value seeded through one operand can be read or written as
+another---as in \texttt{arch/x86}'s \texttt{variable\_ffs},
+\verb|bsfl %1,%0 : "=r"(r) : "rm"(x), "0"(-1)|, where \texttt{-1} is loaded into
+the output's register so a zero input leaves it unchanged.  Each input value is
+loaded into its assigned register first; then the template is pasted verbatim except that
 \verb|%%| collapses to a literal \texttt{\%} and \verb|%N| (optionally
 size-prefixed \verb|%bN/%wN/%kN/%qN|) expands to operand $N$'s register at the
 operand's own byte width, so an \texttt{int} operand emits \texttt{\%r8d} while a
@@ -443,19 +449,31 @@ static unsigned long x86_asm_opsize(void *node, unsigned long num) {
 }
 static void x86_emit_asm(void *i) {
     void *node = (void *)IL(i, IR_TYPE);         /* the AST_ASM_STMT */
+    /* regof[k] is the register operand k occupies: k for an ordinary operand,
+       or the tied operand's index for a matching constraint ("0", "1", ...),
+       which shares that operand's register (the register-alias GCC guarantees
+       so arch code can seed a register through one operand and read/write it as
+       another, e.g. `bsfl %1,%0 : "=r"(r) : "rm"(x), "0"(-1)`). */
+    unsigned long regof[3];
     unsigned long nop = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4)) {
+        if (nop >= 3) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
         const char *c = (const char *)IL(op, AST_F0);
         char ch = c[0]; if (ch == '=' || ch == '+') ch = c[1];
-        if (ch != 'r') { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
+        if (ch >= '0' && ch <= '9') {
+            unsigned long tied = (unsigned long)(ch - '0');
+            if (tied >= nop) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
+            regof[nop] = regof[tied];            /* alias the tied operand's reg */
+        } else if (ch == 'r') {
+            regof[nop] = nop;
+        } else { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
         nop++;
     }
-    if (nop > 3) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
-    /* load each input value into its %r8+k */
+    /* load each input value into its assigned register */
     unsigned long k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
         unsigned long v = IL(op, AST_F2) & 0xffffffff;
-        if (v) x86_load(v - 1, asmregs[k]);
+        if (v) x86_load(v - 1, asmregs[regof[k]]);
     }
     /* paste the template, rewriting %% -> % and %[bwkq]N -> operand register */
     const char *t = (const char *)IL(i, IR_SRC1);
@@ -475,7 +493,8 @@ static void x86_emit_asm(void *i) {
         if (nx >= '0' && nx <= '9') {
             unsigned long num = 0;
             while (p + 1 < len && t[p + 1] >= '0' && t[p + 1] <= '9') { num = num * 10 + (t[p + 1] - '0'); p++; }
-            x86_asm_wreg(num, sz ? sz : x86_asm_opsize(node, num));
+            unsigned long reg = (num < nop) ? regof[num] : num;
+            x86_asm_wreg(reg, sz ? sz : x86_asm_opsize(node, num));
         } else { kcc_as_ch('%'); }
     }
     kcc_as_ch('\n');
@@ -488,7 +507,7 @@ static void x86_emit_asm(void *i) {
         x86_load(a - 1, s_r11);                  /* r11 = &output */
         unsigned long sz = ah >> 32; if (!sz) sz = 8;
         kcc_as_str(sz == 1 ? s_movb : sz == 2 ? s_movw : sz == 4 ? s_movl : s_movq);
-        x86_asm_wreg(k, sz); kcc_as_str(s_comma); kcc_as_str(s_pr11); kcc_as_ch('\n');
+        x86_asm_wreg(regof[k], sz); kcc_as_str(s_comma); kcc_as_str(s_pr11); kcc_as_ch('\n');
     }
 }
 void kcc_x86_sel(void *i) {

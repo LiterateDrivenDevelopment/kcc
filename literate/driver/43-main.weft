@@ -110,12 +110,22 @@ _main:
     bl _kcc_strcmp
     cbz x0, .Lmain_dump_ir
 
-    // Check if argv[1] is "-c" (compile to object file)
-    ldr x0, [x20, #8]            // argv[1]
+    // Compile-only mode: "-c" anywhere in the argument list, not just as the
+    // first argument.  gcc-driven builds (Kbuild) place the compiler flags
+    // first and end with `-c -o out.o in.c`, so a fixed argv[1] test would miss
+    // the `-c` and fall through to link mode---feeding the object flags to ld.
+    mov x21, #1                  // i = 1
+.Lmain_scan_c:
+    cmp x21, x19
+    b.ge .Lmain_scan_c_done
+    ldr x0, [x20, x21, lsl #3]   // argv[i]
     adrp x1, _kcc_opt_compile@@PAGE
     add  x1, x1, _kcc_opt_compile@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lmain_compile
+    add x21, x21, #1
+    b .Lmain_scan_c
+.Lmain_scan_c_done:
 
     // Not a flag: the argument is a source file.  Compile every source and
     // link the resulting objects into an executable (the default mode).
@@ -540,6 +550,7 @@ _kcc_opt_dump_ir:
     .asciz "--dump-ir"
 _kcc_err_ir_usage:
     .asciz "kcc: error: --dump-ir requires a source file\n"
+.globl _kcc_opt_compile
 _kcc_opt_compile:
     .asciz "-c"
 _kcc_err_compile_usage:

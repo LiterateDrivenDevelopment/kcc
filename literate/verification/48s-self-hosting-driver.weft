@@ -87,6 +87,7 @@ unsigned long kcc_emit_asm = 0;
 unsigned long kcc_host_linux = 0;    /* set to 1 by the Linux _start (os_linux) */
 
 static const char OPT_O[] = "-o";
+static const char OPT_COMPILE[] = "-c";
 static const char OPT_WALL[] = "-Wall";
 static const char OPT_G[] = "-g";
 static const char OPT_EMITASM[] = "--emit-asm";
@@ -304,11 +305,27 @@ input.  It exits with the combined status.
 
 @l c
 @d Selfhost: driver compile-all @{
+/* Some gcc options take a separate second word (a path or name) that must be
+   skipped along with the option so it is not mistaken for a source file.  These
+   are the ones a Kbuild command line actually uses. */
+static int kcc_driver_two_arg_opt(const char *a) {
+    return kcc_strcmp(a, "-isystem") == 0 || kcc_strcmp(a, "-include") == 0 ||
+           kcc_strcmp(a, "-idirafter") == 0 || kcc_strcmp(a, "-imacros") == 0 ||
+           kcc_strcmp(a, "-iquote") == 0 || kcc_strcmp(a, "-x") == 0 ||
+           kcc_strcmp(a, "-MT") == 0 || kcc_strcmp(a, "-MF") == 0 ||
+           kcc_strcmp(a, "-MQ") == 0 || kcc_strcmp(a, "-aux-info") == 0;
+}
+
 void kcc_driver_compile_all(long argc, char **argv) {
     const char *explicit_out = 0;
     long src_count = 0;
-    for (long i = 2; i < argc; ) {
+    /* Pass 1: register -I/-D, capture -o, count sources.  Scan from argv[1] and
+       treat every other dash-led token as an option kcc ignores---the driver is
+       gcc-compatible enough for Kbuild, which leads with dozens of -f/-W/-m/-O
+       flags and ends with `-c -o out.o in.c`. */
+    for (long i = 1; i < argc; ) {
         char *a = argv[i];
+        if (kcc_strcmp(a, OPT_COMPILE) == 0) { i++; continue; }
         if (kcc_strcmp(a, OPT_WALL) == 0) { kcc_warn_all = 1; i++; continue; }
         if (kcc_strcmp(a, OPT_EMITASM) == 0) { kcc_emit_asm = 1; i++; continue; }
         if (kcc_strcmp(a, OPT_TARGET_X86) == 0) { kcc_target = 1; i++; continue; }
@@ -326,21 +343,22 @@ void kcc_driver_compile_all(long argc, char **argv) {
         if (n) { i += (long)n; continue; }
         n = kcc_driver_D(a, next, 1);
         if (n) { i += (long)n; continue; }
+        if (kcc_driver_two_arg_opt(a)) { i += 2; continue; }
+        if (a[0] == '-') { i++; continue; }       /* any other flag: ignore */
         src_count++; i++;
     }
     if (src_count == 0) { kcc_io_err(ERR_NOINPUT); kcc_sys_exit(1); }
 
     long err = 0;
-    for (long i = 2; i < argc; ) {
+    for (long i = 1; i < argc; ) {
         char *a = argv[i];
-        if (kcc_strcmp(a, OPT_WALL) == 0 || kcc_strcmp(a, OPT_G) == 0 ||
-            kcc_strcmp(a, OPT_EMITASM) == 0 || kcc_strcmp(a, OPT_TARGET_X86) == 0 ||
-            kcc_strcmp(a, OPT_TARGET_LINUX) == 0) { i++; continue; }
         if (kcc_strcmp(a, OPT_O) == 0) { i += 2; continue; }
         unsigned long n = kcc_driver_I(a, 0, 0);
         if (n) { i += (long)n; continue; }
         n = kcc_driver_D(a, 0, 0);
         if (n) { i += (long)n; continue; }
+        if (kcc_driver_two_arg_opt(a)) { i += 2; continue; }
+        if (a[0] == '-') { i++; continue; }       /* every option: handled above */
         const char *out;
         if (src_count == 1 && explicit_out) out = explicit_out;
         else out = kcc_driver_obj_name(a);

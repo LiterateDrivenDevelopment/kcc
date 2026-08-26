@@ -763,13 +763,20 @@ _kcc_driver_compile_all:
     mov x19, x0                    // argc
     mov x20, x1                    // argv
 
-    // Pass 1: locate an explicit "-o <out>" and count source files
+    // Pass 1: locate an explicit "-o <out>" and count source files.  Scan from
+    // argv[1]: `-c` may sit anywhere (gcc/Kbuild ordering), so it is skipped as
+    // an option rather than assumed to be argv[1].
     mov x21, #0                    // explicit out (0 = none)
     mov x22, #0                    // source count
-    mov x23, #2                    // i = 2 (skip argv[0], argv[1]=-c)
+    mov x23, #1                    // i = 1
 .Lca_scan:
     cmp x23, x19
     b.ge .Lca_scan_done
+    ldr x0, [x20, x23, lsl #3]     // argv[i]
+    adrp x1, _kcc_opt_compile@@PAGE
+    add  x1, x1, _kcc_opt_compile@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_scan_skipc
     ldr x0, [x20, x23, lsl #3]     // argv[i]
     adrp x1, _kcc_opt_wall@@PAGE
     add  x1, x1, _kcc_opt_wall@@PAGEOFF
@@ -842,6 +849,11 @@ _kcc_driver_compile_all:
     add x22, x22, #1               // a source
     add x23, x23, #1
     b .Lca_scan
+.Lca_scan_skipc:
+    // "-c": the compile-only selector; consumed here so it is not mistaken for a
+    // source file when it appears among the flags (gcc/Kbuild ordering).
+    add x23, x23, #1
+    b .Lca_scan
 .Lca_scan_wall:
     // "-Wall": enable the warning family; not a source
     adrp x0, _kcc_warn_all@@PAGE
@@ -896,13 +908,19 @@ _kcc_driver_compile_all:
 .Lca_scan_done:
     cbz x22, .Lca_no_input
 
-    // Pass 2: compile each source
+    // Pass 2: compile each source.  Scan from argv[1] and skip `-c` wherever it
+    // sits, mirroring pass 1.
     mov x24, #0                    // error accumulator
-    mov x23, #2
+    mov x23, #1
 .Lca_loop:
     cmp x23, x19
     b.ge .Lca_finish
     ldr x25, [x20, x23, lsl #3]    // argv[i]
+    mov x0, x25
+    adrp x1, _kcc_opt_compile@@PAGE
+    add  x1, x1, _kcc_opt_compile@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lca_skip_wall         // "-c": the compile-only selector, skip
     mov x0, x25
     adrp x1, _kcc_opt_wall@@PAGE
     add  x1, x1, _kcc_opt_wall@@PAGEOFF

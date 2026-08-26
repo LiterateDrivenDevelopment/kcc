@@ -169,10 +169,15 @@ int main(int argc, char **argv) {
         kcc_ir_dump();
         finish();
     }
-    if (kcc_strcmp(a1, "-c") == 0) {
-        if (argc < 3) die_usage("kcc: error: usage: kcc -c <source.c>... [-o <output.o>]\n");
-        kcc_driver_compile_all(argc, argv);       /* one object per source */
-        exit_ok();
+    /* Compile-only mode: "-c" anywhere in the argument list, not only as the
+       first argument.  gcc-driven builds (Kbuild) lead with the compiler flags
+       and end with `-c -o out.o in.c`, so a fixed argv[1] test would miss it and
+       fall through to link mode, feeding the object flags to ld. */
+    for (int i = 1; i < argc; i++) {
+        if (kcc_strcmp(argv[i], "-c") == 0) {
+            kcc_driver_compile_all(argc, argv);   /* one object per source */
+            exit_ok();
+        }
     }
 
     /* Not a flag: the argument is a source file.  Compile every source and link

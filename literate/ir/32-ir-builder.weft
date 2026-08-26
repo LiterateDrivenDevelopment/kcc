@@ -2346,6 +2346,20 @@ that in place of the object.  The caller side mirrors this: the call builder
 reserves the result buffer for a union return just as for a struct, or the
 backend unpacks the returned registers into a never-materialised address.
 
+One ABI wrinkle differs between the two targets on a \emph{memory-class}
+(over-16-byte) aggregate return.  AArch64's caller reads the result from the
+\texttt{x8} buffer it handed in, so the callee need only copy through that
+pointer and \texttt{ret} void.  x86-64 SysV instead requires the callee to
+\emph{return} the hidden \texttt{sret} pointer in \texttt{\%rax}, because the
+caller reads the aggregate through that register.  So under
+\texttt{-{}-target=x86\_64} (\texttt{\_kcc\_target}) the memory-class return
+emits a \emph{non-void} \texttt{IR\_RET} whose \texttt{SRC1} is the hidden
+pointer's parameter vreg---which the code generator loads into the return
+register---while the ARM64 path keeps its void \texttt{ret}.  Without this the
+x86 caller read \texttt{\%rax} garbage; when a \emph{self-hosted} kcc then
+returned a struct by value (e.g.\ \texttt{kcc\_ir\_resolve\_designator}'s
+four-word result) it dereferenced that garbage and crashed.
+
 @d IR: build return @{
 // -- kcc_ir_build_return --------------------------------------------------
 // void kcc_ir_build_return(node *ret_stmt)
@@ -2354,9 +2368,10 @@ backend unpacks the returned registers into a never-materialised address.
 .globl _kcc_ir_build_return
 .p2align 2
 _kcc_ir_build_return:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]           // x21 holds the sret vreg across struct_copy (x86 ret)
 
     mov x19, x0
     ldr x0, [x19, #AST_F0]      // return expression
@@ -2475,15 +2490,30 @@ _kcc_ir_build_return:
     b .Libret_sret_loop
 .Libret_sret_done:
     sub x1, x1, #1               // dst = hidden sret vreg
+    mov x21, x1                  // preserve it across the struct_copy call
     mov x0, x20                  // src base
     bl _kcc_ir_emit_struct_copy
 
     mov x0, #IR_RET
     bl _kcc_ir_alloc_instr
+    // x86-64 SysV hands a memory-class aggregate's address back in %rax, and the
+    // caller reads the result through it; so on x86 the callee must RETURN the
+    // hidden sret pointer (the last param vreg), not merely write through it.  A
+    // non-void RET carrying that vreg makes codegen load it into %rax.  AArch64's
+    // caller reads its own x8 buffer, so its RET stays void (unchanged).
+    adrp x1, _kcc_target@@PAGE
+    add  x1, x1, _kcc_target@@PAGEOFF
+    ldr  x1, [x1]
+    cbz  x1, .Libret_ref_void
+    str  x19, [x0, #IR_TYPE]      // struct return type (non-void)
+    str  x21, [x0, #IR_SRC1]      // the sret pointer vreg
+    b    .Libret_ref_emit
+.Libret_ref_void:
     adrp x1, _kcc_type_void@@PAGE
     add  x1, x1, _kcc_type_void@@PAGEOFF
-    ldr x1, [x1]
-    str x1, [x0, #IR_TYPE]
+    ldr  x1, [x1]
+    str  x1, [x0, #IR_TYPE]
+.Libret_ref_emit:
     bl _kcc_ir_emit
 
 .Libret_terminate:
@@ -2496,8 +2526,9 @@ _kcc_ir_build_return:
     str x1, [x0, #BB_FLAGS]
 
 .Libret_done:
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 @| _kcc_ir_build_return
 @}

@@ -1155,7 +1155,19 @@ void kcc_ir_build_return(void *rs) {
                 unsigned long dst = w - 1;
                 kcc_ir_emit_struct_copy(src, dst, sz);
                 void *r = kcc_ir_alloc_instr(IR_RET);
-                IL(r, IR_TYPE) = (unsigned long)kcc_type_void;
+                if (kcc_target) {
+                    /* x86-64 SysV returns a memory-class aggregate by placing
+                       its address back in %rax; the caller reads the result
+                       through that register, so the callee must hand the hidden
+                       sret pointer (the last parameter vreg) back---not merely
+                       write through it.  A non-void RET carrying that vreg makes
+                       the emitter load it into %rax.  (AArch64's caller reads its
+                       own x8 buffer, so its RET stays void: unchanged.) */
+                    IL(r, IR_TYPE) = (unsigned long)rty;
+                    IL(r, IR_SRC1) = dst;
+                } else {
+                    IL(r, IR_TYPE) = (unsigned long)kcc_type_void;
+                }
                 kcc_ir_emit(r);
             } else {
                 void *r = kcc_ir_alloc_instr(IR_RET);

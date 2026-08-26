@@ -40,6 +40,7 @@ void kcc_source_encode(void);
 void kcc_source_splice(void);
 void kcc_lex_init(void *base, unsigned long size);
 void kcc_pp_init(void);
+void kcc_pp_force_include(const char *path);
 void kcc_strtab_init(void);
 void kcc_typedef_init(void);
 void *kcc_parse(void);
@@ -171,6 +172,12 @@ unsigned long kcc_driver_D(const char *arg, const char *next, unsigned long reg)
 
 @l c
 @d Selfhost: driver compile @{
+/* gcc `-include FILE` force-includes, collected from the command line (pass 1)
+   and applied to every translation unit before parsing. */
+#define KCC_MAX_FORCE_INC 32
+static const char *kcc_force_inc[KCC_MAX_FORCE_INC];
+static long kcc_force_inc_n = 0;
+
 int kcc_driver_compile(const char *src, const char *out) {
     kcc_dep_reset();
     kcc_source_open(src);
@@ -178,6 +185,10 @@ int kcc_driver_compile(const char *src, const char *out) {
     kcc_source_splice();
     kcc_lex_init(kcc_src_base, kcc_src_size);
     kcc_pp_init();
+    /* Force-includes are pushed in reverse so the preprocessor reads them back
+       in command-line order, ahead of the primary source. */
+    for (long k = kcc_force_inc_n - 1; k >= 0; k--)
+        kcc_pp_force_include(kcc_force_inc[k]);
     kcc_strtab_init();
     kcc_typedef_init();
     void *tu = kcc_parse();
@@ -315,7 +326,12 @@ of \texttt{-f}/\texttt{-W}/\texttt{-m}/\texttt{-O} flags and ends with
 \texttt{-c -o out.o in.c}: \texttt{-c} is skipped wherever it sits, the two-word
 options a kernel build uses (\texttt{-isystem dir}, \texttt{-include file},
 \texttt{-MF}, \texttt{-x}, \ldots) consume their second word, and every other
-dash-led token is an option kcc ignores.  Dependency generation is honoured too:
+dash-led token is an option kcc ignores.  \texttt{-include FILE} is not merely
+skipped: pass~1 collects each such \texttt{FILE}, and every translation unit is
+then force-included with them (through \texttt{kcc\_pp\_force\_include}) before
+its own text---the mechanism Kbuild uses to inject \texttt{kconfig.h} and
+\texttt{compiler\_types.h}, and thus the \texttt{CONFIG\_*} macros, ahead of each
+kernel object.  Dependency generation is honoured too:
 on \texttt{-MD}/\texttt{-MMD} or the comma-joined \texttt{-Wp,-M[M]D,file} the
 driver records the \texttt{.d} path and, after a successful compile, writes the
 Makefile fragment (\texttt{obj: src headers\ldots}) that Kbuild's \texttt{fixdep}
@@ -381,6 +397,11 @@ void kcc_driver_compile_all(long argc, char **argv) {
         n = kcc_driver_D(a, next, 1);
         if (n) { i += (long)n; continue; }
         { unsigned long nd = kcc_dep_from_arg(a, next); if (nd) { i += (long)nd; continue; } }
+        if (kcc_strcmp(a, "-include") == 0) {      /* gcc -include FILE: force-include it */
+            if (next && kcc_force_inc_n < KCC_MAX_FORCE_INC)
+                kcc_force_inc[kcc_force_inc_n++] = next;
+            i += 2; continue;
+        }
         if (kcc_driver_two_arg_opt(a)) { i += 2; continue; }
         if (a[0] == '-') { i++; continue; }       /* any other flag: ignore */
         src_count++; i++;
@@ -458,11 +479,17 @@ int kcc_driver_spawn(const char *path, char *const argv[]) {
 
 \section{Automatic Linking}
 
-\texttt{link\_all} is the no-\texttt{-c} path: a first pass sets the flags, then
-it scans the arguments building the linker command line---compiling each
-\texttt{.c} to a temporary object (tracked for removal), forwarding an unknown
-\texttt{-flag} verbatim, and handing any other file (a \texttt{.o}, an archive)
-straight to \texttt{ld}.  On a Darwin host it appends the system link line
+\texttt{link\_all} is the no-\texttt{-c} path: a first pass sets the flags---and,
+like \texttt{compile\_all}, collects the \texttt{-include} force-includes and
+consumes the two-word options (\texttt{-isystem}, \texttt{-MF}, \texttt{-x},
+\ldots) and the \texttt{-Wp,-M[M]D} dependency flag so they reach the compile
+step rather than leaking to the linker.  It then scans the arguments building the
+linker command line---compiling each \texttt{.c} to a temporary object (tracked
+for removal), forwarding an unknown \texttt{-flag} verbatim, and handing any
+other file (a \texttt{.o}, an archive) straight to \texttt{ld}.  Collecting
+\texttt{-include} here matters because Kbuild compiles its generated
+\texttt{.s} prepare-stage files with \texttt{-S} (no \texttt{-c}), which routes
+through this path.  On a Darwin host it appends the system link line
 (\texttt{-o out -lSystem -syslibroot <sdk> -arch <arch> -e \_main}).  On a Linux
 host (\texttt{kcc\_host\_linux}, set by \texttt{os\_linux}'s \texttt{\_start}) it
 instead emits and assembles the embedded runtime to a temporary object and links
@@ -495,6 +522,13 @@ void kcc_driver_link_all(long argc, char **argv) {
         if (n) { i += (long)n; continue; }
         n = kcc_driver_D(a, next, 1);
         if (n) { i += (long)n; continue; }
+        { unsigned long nd = kcc_dep_from_arg(a, next); if (nd) { i += (long)nd; continue; } }
+        if (kcc_strcmp(a, "-include") == 0) {      /* gcc -include FILE: force-include it */
+            if (next && kcc_force_inc_n < KCC_MAX_FORCE_INC)
+                kcc_force_inc[kcc_force_inc_n++] = next;
+            i += 2; continue;
+        }
+        if (kcc_driver_two_arg_opt(a)) { i += 2; continue; }
         i++;
     }
 
@@ -523,6 +557,9 @@ void kcc_driver_link_all(long argc, char **argv) {
         if (n) { i += (long)n; continue; }
         n = kcc_driver_D(a, 0, 0);
         if (n) { i += (long)n; continue; }
+        { unsigned long nd = kcc_dep_from_arg(a, 0); if (nd) { i += (long)nd; continue; } }
+        if (kcc_strcmp(a, "-include") == 0) { i += 2; continue; }  /* consumed in pass 1 */
+        if (kcc_driver_two_arg_opt(a)) { i += 2; continue; }
         /* Classify a non-option argument. */
         if (a[0] == '-') {                 /* unknown linker flag: forward */
             larg[k++] = a; i++; continue;

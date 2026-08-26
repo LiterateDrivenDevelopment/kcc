@@ -1209,6 +1209,19 @@ form Kbuild's \texttt{fixdep} reads, and what \texttt{make} needs so a deleted
 header does not wedge the build.  The list is written only when the driver has
 set \texttt{kcc\_dep\_out} from a \texttt{-MD}/\texttt{-Wp,-MMD} option.
 
+\texttt{kcc\_pp\_force\_include} implements gcc's \texttt{-include FILE}: it
+resolves and pushes \texttt{FILE} exactly as \texttt{\#include "FILE"} would, but
+with the path handed in by the driver rather than read from a directive.  The
+driver calls it once per \texttt{-include} file after \texttt{kcc\_pp\_init} and
+before parsing (in reverse order, so the pushed contexts read back in
+command-line order), which places each file's macros and typedefs in scope ahead
+of the primary source.  Kbuild depends on this: every kernel object is compiled
+with \texttt{-include ./include/linux/kconfig.h} (which pulls
+\texttt{autoconf.h} and thus every \texttt{CONFIG\_*} macro) and
+\texttt{-include ./include/linux/compiler\_types.h}, so without honouring
+\texttt{-include} a \texttt{CONFIG\_64BIT}-gated type such as
+\texttt{atomic64\_t} would never be declared.
+
 @l c
 @d Selfhost: pp include @{
 static int pp_file_exists(const char *path) {
@@ -1312,6 +1325,37 @@ void kcc_pp_do_include(void) {
         return;
     }
     kcc_dep_add(rp);                              /* record for -MD dependency output */
+    pp_ctx_push(PP_CTX_INCLUDE);
+    kcc_source_open(rp);
+    kcc_source_encode();
+    kcc_source_splice();
+    kcc_lex_init(kcc_src_base, kcc_src_size);
+    pp_prev_line = 0;
+}
+
+/* Force-include: process FILE as if `#include "FILE"` stood at the very top of
+   the primary translation unit, for gcc's `-include FILE`.  The driver calls
+   this once per -include file (in reverse command-line order) after
+   kcc_pp_init and before parsing, so the pushed contexts are read back in
+   forward order and their macros/typedefs are already in scope when the primary
+   source is reached.  Kbuild leans on this to inject
+   include/linux/kconfig.h (all the CONFIG_* macros via autoconf.h) and
+   compiler_types.h before every kernel object. */
+void kcc_pp_force_include(const char *path) {
+    const char *hdr = pp_builtin_header(path);
+    if (hdr) {
+        unsigned long hlen = kcc_strlen(hdr);
+        pp_ctx_push(PP_CTX_INCLUDE);
+        kcc_src_base = hdr;
+        kcc_src_size = hlen;
+        kcc_src_path = path;
+        kcc_lex_init(hdr, hlen);
+        pp_prev_line = 0;
+        return;
+    }
+    const char *rp = pp_resolve_include(path);
+    if (!rp) { kcc_diag_error(1, 1, m_notfound); return; }
+    kcc_dep_add(rp);
     pp_ctx_push(PP_CTX_INCLUDE);
     kcc_source_open(rp);
     kcc_source_encode();

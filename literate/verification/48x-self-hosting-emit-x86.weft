@@ -456,30 +456,42 @@ static void x86_emit_asm(void *i) {
        another, e.g. `bsfl %1,%0 : "=r"(r) : "rm"(x), "0"(-1)`). */
     unsigned long regof[3];
     unsigned long ismem[3];                       /* operand k is a memory ref */
+    unsigned long isimm[3];                        /* operand k is an immediate */
+    unsigned long immval[3];                        /* its constant value */
     unsigned long nop = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4)) {
         if (nop >= 3) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
         const char *c = (const char *)IL(op, AST_F0);
         char ch = c[0]; if (ch == '=' || ch == '+') ch = c[1];
         ismem[nop] = 0;
-        if (ch >= '0' && ch <= '9') {
+        /* the IR marks a resolved immediate with the top bit of AST_F2 and puts
+           the value in AST_F1; that decision (constant vs register) already
+           accounts for `Ir`-style alternatives. */
+        isimm[nop] = (IL(op, AST_F2) >> 63) & 1;
+        immval[nop] = IL(op, AST_F1);
+        regof[nop] = nop;
+        if (isimm[nop]) {
+            /* immediate: no register of its own */
+        } else if (ch >= '0' && ch <= '9') {
             unsigned long tied = (unsigned long)(ch - '0');
             if (tied >= nop) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
             regof[nop] = regof[tied];            /* alias the tied operand's reg */
-        } else if (ch == 'r') {
-            regof[nop] = nop;
+        } else if (ch == 'r' || ch == 'i' || ch == 'I' || ch == 'n') {
+            /* register (an i/I/n that reached here was not a constant, so its
+               register alternative is used) */
         } else if (ch == 'm') {
             /* memory operand: its register holds the object's *address*, and
                the template references it as %r8+k in parentheses. */
-            regof[nop] = nop;
             ismem[nop] = 1;
         } else { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
         nop++;
     }
     /* load each operand's register: an input's value, or a memory operand's
-       address (held in AST_F3 exactly like an output's address). */
+       address (held in AST_F3 exactly like an output's address).  Immediates
+       need no register. */
     unsigned long k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        if (isimm[k]) continue;
         if (ismem[k]) {
             unsigned long a = IL(op, AST_F3) & 0xffffffff;
             if (a) x86_load(a - 1, asmregs[regof[k]]);
@@ -507,7 +519,10 @@ static void x86_emit_asm(void *i) {
             unsigned long num = 0;
             while (p + 1 < len && t[p + 1] >= '0' && t[p + 1] <= '9') { num = num * 10 + (t[p + 1] - '0'); p++; }
             unsigned long reg = (num < nop) ? regof[num] : num;
-            if (num < nop && ismem[num]) {
+            if (num < nop && isimm[num]) {
+                /* immediate operand: render the constant as $value */
+                kcc_as_ch('$'); kcc_as_dec(immval[num]);
+            } else if (num < nop && ismem[num]) {
                 /* memory operand: dereference the address register */
                 kcc_as_ch('('); x86_asm_wreg(reg, 8); kcc_as_ch(')');
             } else {
@@ -516,11 +531,12 @@ static void x86_emit_asm(void *i) {
         } else { kcc_as_ch('%'); }
     }
     kcc_as_ch('\n');
-    /* store each register output back through its address; a memory operand
-       needs nothing here---the asm wrote the object directly. */
+    /* store each register output back through its address; a memory operand or
+       immediate needs nothing here---the asm wrote the object directly, and an
+       immediate has no destination. */
     k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
-        if (ismem[k]) continue;
+        if (ismem[k] || isimm[k]) continue;
         unsigned long ah = IL(op, AST_F3);
         unsigned long a = ah & 0xffffffff;
         if (!a) continue;

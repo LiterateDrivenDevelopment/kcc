@@ -1051,6 +1051,13 @@ void kcc_ir_asm_addr_of(void *lvalue) {
     kcc_ir_build_expr(u);                         /* returns address vreg */
 }
 
+/* Does the constraint permit an immediate operand ('i'/'I'/'n')? */
+static unsigned long kcc_asm_cons_imm(const char *c) {
+    for (const char *s = c; *s; s++)
+        if (*s == 'i' || *s == 'I' || *s == 'n') return 1;
+    return 0;
+}
+
 void kcc_ir_asm_lower_operands(void *as) {
     void *op = (void *)IL(as, AST_F2);
     while (op) {
@@ -1061,7 +1068,16 @@ void kcc_ir_asm_lower_operands(void *as) {
         char *cons = (char *)IL(op, AST_F0);
         char c = cons[0];
         char cls = (c == '=' || c == '+') ? cons[1] : c;
-        if (cls == 'm') {
+        if (kcc_target && c != '=' && c != '+' &&
+            kcc_asm_cons_imm(cons) && kcc_expr_is_ice(expr)) {
+            /* x86 immediate operand: a constant input the back end renders as
+               $value.  Only on x86 (ARM64's asm path materialises it in a
+               register instead); a matching register alternative ("Ir") on a
+               non-constant value falls through to the register path below. */
+            IL(op, AST_F1) = (unsigned long)kcc_eval_const_int(expr);
+            IL(op, AST_F2) = (1UL << 63);        /* immediate marker */
+            IL(op, AST_F3) = 0;
+        } else if (cls == 'm') {
             /* memory operand ("m"/"=m"/"+m"): the asm accesses the object
                through its address, so we only need that address---no register
                value is loaded and nothing is stored back.  The address goes in

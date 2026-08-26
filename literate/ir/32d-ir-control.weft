@@ -632,6 +632,14 @@ case\_val} and branches to the case body on success or to the next
 comparison on failure.  After all cases, the chain falls through to
 the \texttt{default} body if present, or to the exit block otherwise.
 
+A GNU \emph{case range} (\texttt{case LOW\,\ldots\,HIGH:}, with the high bound in
+the label's \texttt{F3}) lowers to two comparisons instead of one: the dispatch
+block tests \texttt{cond\_vreg >= LOW} (signed) and branches to a \emph{middle}
+block on success, which then tests \texttt{cond\_vreg <= HIGH} and branches to the
+case body; either test failing falls through to the next comparison.  Signed
+comparisons match the promoted controlling type for the small integer and
+character ranges this feature is used for.
+
 Case bodies observe C fall-through semantics: unless a \texttt{break}
 terminates the current basic block, execution flows into the next
 case's body.  The builder achieves this by emitting an unconditional
@@ -1037,6 +1045,9 @@ _kcc_ir_sw_disp:
     b.eq .Lswd_body_f1
     b .Lswd_done
 .Lswd_case:
+    // GNU case range `case LOW ... HIGH:` carries the high bound in F3.
+    ldr x0, [x19, #AST_F3]
+    cbnz x0, .Lswd_case_range
     // Evaluate the case constant → IR_CONST
     ldr x0, [x19, #AST_F0]
     bl _kcc_eval_const_int
@@ -1093,6 +1104,125 @@ _kcc_ir_sw_disp:
     orr x1, x1, #BB_FLAG_TERMINATED
     str x1, [x0, #BB_FLAGS]
     mov x0, x22
+    bl _kcc_ir_set_bb
+    ldr x0, [x19, #AST_F1]       // descend case body for nested cases
+    bl _kcc_ir_sw_disp
+    b .Lswd_done
+
+.Lswd_case_range:
+    // GNU case range: take the case body iff the switch value is in [LOW, HIGH]
+    // (signed).  Dispatch as `cond >= LOW` then, in a middle block, `cond <= HIGH`.
+    // IR_CONST(LOW)
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_eval_const_int
+    mov x21, x0
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // low_const_vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // IR_CMP_SGE(cond_vreg, low_const_vreg)
+    mov x0, #IR_CMP_SGE
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    adrp x0, _kcc_sw_cond_vreg@@PAGE
+    add  x0, x0, _kcc_sw_cond_vreg@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x22, #IR_SRC1]
+    str x21, [x22, #IR_SRC2]     // low_const_vreg
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // ge result vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // Middle BB (high check) and next dispatch BB (false target for both tests)
+    bl _kcc_ir_alloc_bb
+    mov x22, x0                  // mid_bb
+    bl _kcc_ir_alloc_bb
+    mov x20, x0                  // next_bb
+    // IR_BR_COND: cond>=LOW → mid_bb, else next_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_DEST]
+    ldr x1, [x22, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x20, #BB_ID]
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    // Terminate current dispatch BB, switch to mid_bb
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+    mov x0, x22
+    bl _kcc_ir_set_bb
+    // IR_CONST(HIGH)
+    ldr x0, [x19, #AST_F3]
+    bl _kcc_eval_const_int
+    mov x21, x0
+    mov x0, #IR_CONST
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    str x21, [x22, #IR_SRC1]
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // high_const_vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // IR_CMP_SLE(cond_vreg, high_const_vreg)
+    mov x0, #IR_CMP_SLE
+    bl _kcc_ir_alloc_instr
+    mov x22, x0
+    adrp x1, _kcc_type_int_s@@PAGE
+    add  x1, x1, _kcc_type_int_s@@PAGEOFF
+    ldr x1, [x1]
+    str x1, [x22, #IR_TYPE]
+    adrp x0, _kcc_sw_cond_vreg@@PAGE
+    add  x0, x0, _kcc_sw_cond_vreg@@PAGEOFF
+    ldr x0, [x0]
+    str x0, [x22, #IR_SRC1]
+    str x21, [x22, #IR_SRC2]     // high_const_vreg
+    bl _kcc_ir_next_vreg
+    str x0, [x22, #IR_DEST]
+    mov x21, x0                  // le result vreg
+    mov x0, x22
+    bl _kcc_ir_emit
+    // IR_BR_COND: cond<=HIGH → case_bb, else next_bb
+    mov x0, #IR_BR_COND
+    bl _kcc_ir_alloc_instr
+    str x21, [x0, #IR_DEST]
+    ldr x1, [x19, #AST_F2]       // case_bb
+    ldr x1, [x1, #BB_ID]
+    str x1, [x0, #IR_SRC1]
+    ldr x1, [x20, #BB_ID]        // next_bb
+    str x1, [x0, #IR_SRC2]
+    bl _kcc_ir_emit
+    // Terminate mid_bb, switch to next_bb
+    adrp x0, _kcc_ir_cur_bb@@PAGE
+    add  x0, x0, _kcc_ir_cur_bb@@PAGEOFF
+    ldr x0, [x0]
+    ldr x1, [x0, #BB_FLAGS]
+    orr x1, x1, #BB_FLAG_TERMINATED
+    str x1, [x0, #BB_FLAGS]
+    mov x0, x20
     bl _kcc_ir_set_bb
     ldr x0, [x19, #AST_F1]       // descend case body for nested cases
     bl _kcc_ir_sw_disp

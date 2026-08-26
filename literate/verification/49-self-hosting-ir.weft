@@ -3245,7 +3245,10 @@ Each control-flow builder allocates fresh blocks and wires them with
 \texttt{IR\_BR}/\texttt{IR\_BR\_COND}, marking a block terminated after its
 terminator so nothing is appended past a branch.  \texttt{switch} scans its body
 twice (allocate label blocks, emit the dispatch chain) then builds the body once
-so \texttt{case}/\texttt{default} labels place themselves.  The constant
+so \texttt{case}/\texttt{default} labels place themselves.  A case whose label
+carries a high bound in \texttt{f3} is a GNU range and dispatches through two
+signed comparisons (\texttt{>=~LOW} then \texttt{<=~HIGH}) with a middle block,
+rather than the single equality test of an ordinary case.  The constant
 evaluator folds integer constant expressions for case values and array bounds,
 including \texttt{offsetof}-style null-based address constants: \texttt{is\_ice}
 accepts \verb|&(((T*)0)->m)| and \texttt{eval\_const\_int} reduces it to the
@@ -3507,7 +3510,56 @@ void kcc_ir_sw_scan(void *stmt) {
 void kcc_ir_sw_disp(void *stmt) {
     if (!stmt) return;
     unsigned long tag = IL(stmt, AST_TAG);
-    if (tag == AST_CASE_STMT) {
+    if (tag == AST_CASE_STMT && IL(stmt, AST_F3)) {
+        /* GNU case range `case LO ... HI:` — take the case body iff the switch
+           value is in [LO, HI] (signed): dispatch as cond>=LO then cond<=HI,
+           with a middle block between the two comparisons. */
+        unsigned long lo = kcc_eval_const_int((void *)IL(stmt, AST_F0));
+        unsigned long hi = kcc_eval_const_int((void *)IL(stmt, AST_F3));
+        void *lc = kcc_ir_alloc_instr(IR_CONST);
+        IL(lc, IR_TYPE) = (unsigned long)kcc_type_int_s;
+        IL(lc, IR_SRC1) = lo;
+        unsigned long lcv = kcc_ir_next_vreg();
+        IL(lc, IR_DEST) = lcv;
+        kcc_ir_emit(lc);
+        void *ge = kcc_ir_alloc_instr(IR_CMP_SGE);
+        IL(ge, IR_TYPE) = (unsigned long)kcc_type_int_s;
+        IL(ge, IR_SRC1) = kcc_sw_cond_vreg;
+        IL(ge, IR_SRC2) = lcv;
+        unsigned long gev = kcc_ir_next_vreg();
+        IL(ge, IR_DEST) = gev;
+        kcc_ir_emit(ge);
+        void *mid_bb = kcc_ir_alloc_bb();
+        void *next_bb = kcc_ir_alloc_bb();
+        void *bc1 = kcc_ir_alloc_instr(IR_BR_COND);
+        IL(bc1, IR_DEST) = gev;
+        IL(bc1, IR_SRC1) = IL(mid_bb, BB_ID);
+        IL(bc1, IR_SRC2) = IL(next_bb, BB_ID);
+        kcc_ir_emit(bc1);
+        IL(kcc_ir_cur_bb, BB_FLAGS) = IL(kcc_ir_cur_bb, BB_FLAGS) | BB_FLAG_TERMINATED;
+        kcc_ir_set_bb(mid_bb);
+        void *hc = kcc_ir_alloc_instr(IR_CONST);
+        IL(hc, IR_TYPE) = (unsigned long)kcc_type_int_s;
+        IL(hc, IR_SRC1) = hi;
+        unsigned long hcv = kcc_ir_next_vreg();
+        IL(hc, IR_DEST) = hcv;
+        kcc_ir_emit(hc);
+        void *le = kcc_ir_alloc_instr(IR_CMP_SLE);
+        IL(le, IR_TYPE) = (unsigned long)kcc_type_int_s;
+        IL(le, IR_SRC1) = kcc_sw_cond_vreg;
+        IL(le, IR_SRC2) = hcv;
+        unsigned long lev = kcc_ir_next_vreg();
+        IL(le, IR_DEST) = lev;
+        kcc_ir_emit(le);
+        void *bc2 = kcc_ir_alloc_instr(IR_BR_COND);
+        IL(bc2, IR_DEST) = lev;
+        IL(bc2, IR_SRC1) = IL((void *)IL(stmt, AST_F2), BB_ID);  /* case bb */
+        IL(bc2, IR_SRC2) = IL(next_bb, BB_ID);
+        kcc_ir_emit(bc2);
+        IL(kcc_ir_cur_bb, BB_FLAGS) = IL(kcc_ir_cur_bb, BB_FLAGS) | BB_FLAG_TERMINATED;
+        kcc_ir_set_bb(next_bb);
+        kcc_ir_sw_disp((void *)IL(stmt, AST_F1));
+    } else if (tag == AST_CASE_STMT) {
         unsigned long cv = kcc_eval_const_int((void *)IL(stmt, AST_F0));
         void *c = kcc_ir_alloc_instr(IR_CONST);
         IL(c, IR_TYPE) = (unsigned long)kcc_type_int_s;

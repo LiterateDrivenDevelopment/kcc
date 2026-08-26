@@ -292,8 +292,12 @@ statement is forwarded to \texttt{kcc\_sema\_check\_decl}.
     b .Lscs_done
 
 .Lscs_case:
-    ldr x0, [x19, #AST_F0]         // case expression
+    ldr x0, [x19, #AST_F0]         // case expression (value or range low bound)
     bl _kcc_sema_expr
+    ldr x0, [x19, #AST_F3]         // GNU range high bound (0 = single case)
+    cbz x0, .Lscs_case_body
+    bl _kcc_sema_expr
+.Lscs_case_body:
     ldr x0, [x19, #AST_F1]         // statement
     cbz x0, .Lscs_done
     bl _kcc_sema_check_stmt

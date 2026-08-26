@@ -188,6 +188,10 @@ difftest "for-product" \
     "int main(void){ int p = 1; int i = 1; for (i = 1; i <= 5; i = i + 1) p = p * i; return p % 200; }"
 difftest "switch-fallthrough" \
     "int main(void){ int x = 2; int r = 0; switch (x) { case 1: r = r + 1; case 2: r = r + 10; case 3: r = r + 100; break; default: r = 255; } return r; }"
+difftest "switch-case-range" \
+    "int f(int x){ switch (x) { case 0 ... 7: return 1; case 10 ... 20: return 2; default: return 0; } } int main(void){ return f(3)*100 + f(15)*10 + f(8) + f(20); }"
+difftest "switch-case-range-char" \
+    "int cls(char c){ switch (c) { case '0' ... '9': return 1; case 'a' ... 'z': case 'A' ... 'Z': return 2; case '_': return 3; default: return 0; } } int main(void){ return cls('5')*100 + cls('Q')*10 + cls('_') + cls('#')*9; }"
 difftest "break-continue" \
     "int main(void){ int s = 0; int i = 0; while (i < 20) { i = i + 1; if (i == 5) continue; if (i == 12) break; s = s + i; } return s; }"
 difftest "nested-loops" \

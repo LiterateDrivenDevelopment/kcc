@@ -1187,7 +1187,12 @@ _kcc_parse_return:
 
 \section{Labeled Statements}
 
-Case and default labels for switch statements.
+Case and default labels for switch statements.  A \texttt{case} label carries its
+constant in \texttt{F0} and its labelled statement in \texttt{F1}.  \kcc{} also
+accepts the GNU \emph{case range} \texttt{case LOW\,\ldots\,HIGH:}---an ellipsis
+between two constants---which matches every value in the inclusive interval; the
+high bound is parsed into \texttt{F3} (null for an ordinary single-value case).
+The kernel uses this heavily, e.g.\ \texttt{case '0'\,\ldots\,'7':}.
 
 @d Stmt: parse labeled @{
 // -- kcc_parse_case ----------------------------------------------------
@@ -1196,32 +1201,48 @@ Case and default labels for switch statements.
 .globl _kcc_parse_case
 .p2align 2
 _kcc_parse_case:
-    stp x29, x30, [sp, #-32]!
+    stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
 
     // Consume 'case'
     bl _kcc_pp_next
 
-    // Parse constant expression
+    // Parse constant expression (the value, or the low bound of a range)
     bl _kcc_parse_cond_expr
-    mov x19, x0                  // x19 = expr
+    mov x19, x0                  // x19 = low expr
+    mov x20, xzr                 // x20 = high expr (0 = single case)
 
+    // GNU case range: `case LOW ... HIGH:`.  An ellipsis after the first
+    // constant introduces the inclusive upper bound.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.ne .Lpc_colon
+    bl _kcc_pp_next              // consume '...'
+    bl _kcc_parse_cond_expr
+    mov x20, x0                  // x20 = high expr
+
+.Lpc_colon:
     // Expect ':'
     mov x0, #TOK_COLON
     bl _kcc_parse_expect
 
     // Parse statement
     bl _kcc_parse_stmt
-    mov x20, x0                  // x20 = stmt
+    mov x21, x0                  // x21 = stmt
 
     mov x0, #AST_CASE_STMT
     bl _kcc_ast_alloc
-    str x19, [x0, #AST_F0]      // expr
-    str x20, [x0, #AST_F1]      // stmt
+    str x19, [x0, #AST_F0]      // low expr
+    str x21, [x0, #AST_F1]      // stmt
+    str x20, [x0, #AST_F3]      // high expr (0 = single case)
 
+    ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #32
+    ldp x29, x30, [sp], #48
     ret
 
 // -- kcc_parse_default -------------------------------------------------

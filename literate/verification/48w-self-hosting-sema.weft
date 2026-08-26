@@ -382,6 +382,7 @@ void kcc_sema_check_stmt(void *node) {
         return;
     case AST_CASE_STMT:
         kcc_sema_expr((void *)s->f0);
+        if (s->f3) kcc_sema_expr((void *)s->f3);   /* GNU range high bound */
         if (s->f1) kcc_sema_check_stmt((void *)s->f1);
         return;
     case AST_DEFAULT_STMT:

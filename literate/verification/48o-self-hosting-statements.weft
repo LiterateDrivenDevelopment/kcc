@@ -74,7 +74,7 @@ enum {
     TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62, TOK_RBRACE = 63,
     TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66, TOK_COMMA = 67,
     TOK_QUESTION = 92, TOK_COLON = 93,
-    TOK_ASSIGN = 94, TOK_OR_ASSIGN = 104
+    TOK_ASSIGN = 94, TOK_OR_ASSIGN = 104, TOK_ELLIPSIS = 107
 };
 
 /* AST node tags (Chapter: parser). */
@@ -479,7 +479,9 @@ void *kcc_parse_for(void) {
 
 \texttt{goto} interns its target name for later resolution; \texttt{return}
 carries an optional value; \texttt{case} parses a constant expression before its
-colon and \texttt{default} none, each labeling the statement that follows.
+colon and \texttt{default} none, each labeling the statement that follows.  A
+GNU case range \texttt{case LO\,\ldots\,HI:} is recognised when an ellipsis
+follows the first constant; the high bound is stored in the label's \texttt{f3}.
 
 @l c
 @d Selfhost: statements jumps @{
@@ -506,11 +508,17 @@ void *kcc_parse_return(void) {
 void *kcc_parse_case(void) {
     kcc_pp_next();
     void *e = kcc_parse_cond_expr();
+    void *hi = 0;
+    if (kcc_tok_type == TOK_ELLIPSIS) {   /* GNU case range: case LO ... HI: */
+        kcc_pp_next();
+        hi = kcc_parse_cond_expr();
+    }
     kcc_parse_expect(TOK_COLON);
     void *stmt = kcc_parse_stmt();
     struct Node *n = (struct Node *)kcc_ast_alloc(AST_CASE_STMT);
     n->f0 = (unsigned long)e;
     n->f1 = (unsigned long)stmt;
+    n->f3 = (unsigned long)hi;             /* high bound of a range, else 0 */
     return n;
 }
 

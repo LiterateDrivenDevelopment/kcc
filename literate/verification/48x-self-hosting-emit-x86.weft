@@ -148,6 +148,10 @@ S(s_r10, "%r10"); S(s_r11, "%r11"); S(s_rax, "%rax"); S(s_rcx, "%rcx");
 S(s_rdx, "%rdx"); S(s_r11_r10, "%r11, %r10\n"); S(s_r10_nl, "%r10\n");
 S(s_rbx, "%rbx"); S(s_push_rbx, "\tpushq\t%rbx\n"); S(s_pop_rbx, "\tpopq\t%rbx\n");
 S(s_setcc, "\tset"); S(s_tab_al, "\t%al\n"); S(s_movzx_al, "\tmovzbl\t%al, %eax\n");
+S(s_r12, "%r12"); S(s_r13, "%r13"); S(s_r14, "%r14");
+S(s_push_r12, "\tpushq\t%r12\n"); S(s_push_r13, "\tpushq\t%r13\n");
+S(s_push_r14, "\tpushq\t%r14\n"); S(s_pop_r12, "\tpopq\t%r12\n");
+S(s_pop_r13, "\tpopq\t%r13\n"); S(s_pop_r14, "\tpopq\t%r14\n");
 S(s_cl_r10, "%cl, %r10\n"); S(s_c_r10, ", %r10\n"); S(s_c_r10d, ", %r10d\n");
 S(s_pr11_r10, "(%r11), %r10\n"); S(s_pr11_r10d, "(%r11), %r10d\n");
 S(s_pr11, "(%r11)");
@@ -387,12 +391,19 @@ miscompiled.
 
 Extended inline asm (\texttt{IR\_ASM}) is where the kernel's word-at-a-time and
 atomic idioms live, so \texttt{x86\_emit\_asm} renders it directly.  Register
-constraints (\verb|"r"|, \verb|"=r"|, \verb|"+r"|) and matching constraints
-(\verb|"0"|, \verb|"1"|, \ldots) are honoured, up to three operands, which covers
-the kernel sites reached so far; anything else is refused rather than silently
-mis-substituted.  Operand $k$ is placed in \texttt{\%r8+k}---all three
-caller-saved, so the surrounding all-spill code survives the asm untouched---with
-\texttt{\%r11} reserved as the scratch that carries an output operand's address.
+constraints (\verb|"r"|, \verb|"=r"|, \verb|"+r"|, an early-clobber \verb|&|
+ignored) and matching constraints (\verb|"0"|, \verb|"1"|, \ldots) are honoured,
+up to six operands, which covers the kernel sites reached so far (the checksum
+carry-chain in \texttt{arch/x86/lib/csum-partial\_64.c} takes exactly six);
+anything else is refused rather than silently mis-substituted.  An operand may
+also be named, and \verb|%[name]| in the template resolves to it the same way
+\verb|%N| does.  Positional operand $k$ takes register $k$ of
+\texttt{\%r8}, \texttt{\%r9}, \texttt{\%r10}, \texttt{\%r12}, \texttt{\%r13},
+\texttt{\%r14}---the first three
+caller-saved, so the surrounding all-spill code survives the asm untouched, and
+\texttt{\%r12}--\texttt{\%r14}, callee-saved, bracketed with \texttt{pushq}/%
+\texttt{popq} when the operand count spills into them---with \texttt{\%r11}
+reserved as the scratch that carries an output operand's address.
 Beyond the positional \texttt{r} registers, an operand may be pinned to a
 specific register---\texttt{a}/\texttt{b}/\texttt{c}/\texttt{d} for
 \texttt{\%rax}/\texttt{\%rbx}/\texttt{\%rcx}/\texttt{\%rdx} and \texttt{S}/%
@@ -449,11 +460,14 @@ floating-point value through
 /* Extended inline asm: operand k is materialised in %r8+k (all caller-saved);
    %r11 stays free as the scratch that carries an output operand's address. The
    supported subset is `r`/`=r`/`+r` operands, up to three of them. */
-static const char *const asmregs[3] = { s_r8, s_r9, s_r10 };
+/* Up to six positional register operands: r8-r10 are caller-saved; r12-r14 are
+   callee-saved and get a push/pop bracket when used.  r11 stays scratch. */
+static const char *const asmregs[6] = { s_r8, s_r9, s_r10, s_r12, s_r13, s_r14 };
+static const unsigned long asmregnum[6] = { 8, 9, 10, 12, 13, 14 };
 /* Emit operand k's register at the requested byte width: %r8 / %r8d / %r8w /
    %r8b for 8 / 4 / 2 / 1. */
 static void x86_asm_wreg(unsigned long k, unsigned long size) {
-    kcc_as_ch('%'); kcc_as_ch('r'); kcc_as_dec(8 + k);
+    kcc_as_ch('%'); kcc_as_ch('r'); kcc_as_dec(k < 6 ? asmregnum[k] : 8 + k);
     if (size == 4) kcc_as_ch('d');
     else if (size == 2) kcc_as_ch('w');
     else if (size == 1) kcc_as_ch('b');
@@ -511,6 +525,22 @@ static void x86_asm_label_name(void *node, const char *nm, unsigned long nlen) {
         if (j == nlen && ln[j] == 0) { x86_asm_gotobb((void *)IL(l, AST_F2)); return; }
     }
 }
+/* Resolve a symbolic operand reference %[name] to its operand index.  The
+   parser stores each operand's `[name]' in the operand node's F1 (a field the
+   constraint length no longer needs, since the string is NUL-terminated);
+   immediate operands reuse F1 for their value, so they are skipped here. */
+static unsigned long x86_asm_opnum(void *node, const char *nm, unsigned long nlen) {
+    unsigned long k = 0;
+    for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        if ((IL(op, AST_F2) >> 63) & 1) continue;    /* immediate: F1 is a value */
+        const char *on = (const char *)IL(op, AST_F1);
+        if (!on) continue;
+        unsigned long j = 0;
+        while (j < nlen && on[j] && on[j] == nm[j]) j++;
+        if (j == nlen && on[j] == 0) return k;
+    }
+    return k;                                          /* not found: out of range */
+}
 static void x86_emit_asm(void *i) {
     void *node = (void *)IL(i, IR_TYPE);         /* the AST_ASM_STMT */
     /* regof[k] is the register operand k occupies: k for an ordinary operand,
@@ -518,19 +548,22 @@ static void x86_emit_asm(void *i) {
        which shares that operand's register (the register-alias GCC guarantees
        so arch code can seed a register through one operand and read/write it as
        another, e.g. `bsfl %1,%0 : "=r"(r) : "rm"(x), "0"(-1)`). */
-    unsigned long regof[3];
-    unsigned long ismem[3];                       /* operand k is a memory ref */
-    unsigned long isimm[3];                        /* operand k is an immediate */
-    unsigned long immval[3];                        /* its constant value */
-    char spec[3];                                  /* specific-register letter or 0 */
-    char isflag[3];                                /* condition-code output (=@@cc) */
-    const char *flagcond[3];                        /* its setCC suffix */
+    unsigned long regof[6];
+    unsigned long ismem[6];                       /* operand k is a memory ref */
+    unsigned long isimm[6];                        /* operand k is an immediate */
+    unsigned long immval[6];                        /* its constant value */
+    char spec[6];                                  /* specific-register letter or 0 */
+    char isflag[6];                                /* condition-code output (=@@cc) */
+    const char *flagcond[6];                        /* its setCC suffix */
     unsigned long uses_rbx = 0;                    /* any operand pinned to %rbx */
+    unsigned long max_areg = 0;                    /* highest positional register used */
     unsigned long nop = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4)) {
-        if (nop >= 3) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
+        if (nop >= 6) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
         const char *c = (const char *)IL(op, AST_F0);
         char ch = c[0]; if (ch == '=' || ch == '+') ch = c[1];
+        if (ch == '&') ch = c[2];                  /* early-clobber: ignored (each
+                                                      operand already has its own reg) */
         ismem[nop] = 0;
         spec[nop] = 0;
         isflag[nop] = 0;
@@ -571,11 +604,17 @@ static void x86_emit_asm(void *i) {
                the template references it as %r8+k in parentheses. */
             ismem[nop] = 1;
         } else { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
+        /* track the highest positional register (for callee-save push/pop) */
+        if (!spec[nop] && !isimm[nop] && !isflag[nop] && regof[nop] > max_areg)
+            max_areg = regof[nop];
         nop++;
     }
-    /* %rbx is callee-saved; preserve the caller's value around an asm that pins
-       an operand to it (e.g. cpuid's "=b"). */
+    /* Callee-saved registers used as asm operands (rbx, and r12-r14 once the
+       positional operands spill past r10) are preserved around the body. */
     if (uses_rbx) kcc_as_str(s_push_rbx);
+    if (max_areg >= 3) kcc_as_str(s_push_r12);
+    if (max_areg >= 4) kcc_as_str(s_push_r13);
+    if (max_areg >= 5) kcc_as_str(s_push_r14);
     /* load each operand's register: an input's value, or a memory operand's
        address (held in AST_F3 exactly like an output's address).  Immediates
        need no register. */
@@ -624,23 +663,32 @@ static void x86_emit_asm(void *i) {
         else if (nx == 'w') { sz = 2; p++; nx = t[p + 1]; }
         else if (nx == 'k') { sz = 4; p++; nx = t[p + 1]; }
         else if (nx == 'q') { sz = 8; p++; nx = t[p + 1]; }
+        /* An operand reference: a number (%0) or a symbolic name (%[name]). */
+        long num = -1;
         if (nx >= '0' && nx <= '9') {
-            unsigned long num = 0;
-            while (p + 1 < len && t[p + 1] >= '0' && t[p + 1] <= '9') { num = num * 10 + (t[p + 1] - '0'); p++; }
-            unsigned long reg = (num < nop) ? regof[num] : num;
-            unsigned long owidth = sz ? sz : x86_asm_opsize(node, num);
-            if (num < nop && isimm[num]) {
-                /* immediate operand: render the constant as $value */
-                kcc_as_ch('$'); kcc_as_dec(immval[num]);
-            } else if (num < nop && ismem[num]) {
-                /* memory operand: dereference the address register */
-                kcc_as_ch('('); x86_asm_wreg(reg, 8); kcc_as_ch(')');
-            } else if (num < nop && spec[num]) {
-                x86_spec_reg(spec[num], owidth);
-            } else {
-                x86_asm_wreg(reg, owidth);
-            }
-        } else { kcc_as_ch('%'); }
+            unsigned long n = 0;
+            while (p + 1 < len && t[p + 1] >= '0' && t[p + 1] <= '9') { n = n * 10 + (t[p + 1] - '0'); p++; }
+            num = (long)n;
+        } else if (nx == '[') {
+            p++;                                 /* consume '[' */
+            unsigned long ns = p + 1;
+            while (p + 1 < len && t[p + 1] != ']') p++;
+            num = (long)x86_asm_opnum(node, t + ns, (p + 1) - ns);
+            if (p + 1 < len) p++;                /* consume ']' */
+        }
+        if (num < 0) { kcc_as_ch('%'); continue; }
+        unsigned long unum = (unsigned long)num;
+        unsigned long reg = (unum < nop) ? regof[unum] : unum;
+        unsigned long owidth = sz ? sz : x86_asm_opsize(node, unum);
+        if (unum < nop && isimm[unum]) {
+            kcc_as_ch('$'); kcc_as_dec(immval[unum]);   /* $value */
+        } else if (unum < nop && ismem[unum]) {
+            kcc_as_ch('('); x86_asm_wreg(reg, 8); kcc_as_ch(')');  /* (%reg) */
+        } else if (unum < nop && spec[unum]) {
+            x86_spec_reg(spec[unum], owidth);
+        } else {
+            x86_asm_wreg(reg, owidth);
+        }
     }
     kcc_as_ch('\n');
     /* Store the register outputs first; these are all mov instructions, which
@@ -674,6 +722,9 @@ static void x86_emit_asm(void *i) {
         kcc_as_str(sz == 1 ? s_movb : sz == 2 ? s_movw : sz == 4 ? s_movl : s_movq);
         x86_spec_reg('a', sz); kcc_as_str(s_comma); kcc_as_str(s_pr11); kcc_as_ch('\n');
     }
+    if (max_areg >= 5) kcc_as_str(s_pop_r14);
+    if (max_areg >= 4) kcc_as_str(s_pop_r13);
+    if (max_areg >= 3) kcc_as_str(s_pop_r12);
     if (uses_rbx) kcc_as_str(s_pop_rbx);
 }
 void kcc_x86_sel(void *i) {

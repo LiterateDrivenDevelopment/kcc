@@ -268,8 +268,11 @@ void kcc_parse_asm_opsec(void *asm_stmt, unsigned long is_output) {
     for (;;) {
         unsigned long t = kcc_tok_type;
         if (t == TOK_COLON || t == TOK_RPAREN || t == TOK_EOF) return;
+        void *symname = 0;                       /* optional [name] for %[name] */
         if (t == TOK_LBRACKET) {
             kcc_pp_next();
+            if (kcc_tok_type == TOK_IDENT)
+                symname = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
             while (kcc_tok_type != TOK_EOF && kcc_tok_type != TOK_RBRACKET)
                 kcc_pp_next();
             if (kcc_tok_type == TOK_EOF) return;
@@ -281,7 +284,7 @@ void kcc_parse_asm_opsec(void *asm_stmt, unsigned long is_output) {
         kcc_parse_expect(TOK_RPAREN);
         struct Node *op = (struct Node *)kcc_ast_alloc(AST_ASM_OPERAND);
         op->f0 = (unsigned long)c.ptr;
-        op->f1 = c.len;
+        op->f1 = (unsigned long)symname;         /* %[name] target; 0 if unnamed */
         op->f2 = (unsigned long)expr;
         op->f3 = is_output;
         if (as->f2 == 0) {

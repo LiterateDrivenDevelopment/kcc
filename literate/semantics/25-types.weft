@@ -55,6 +55,7 @@ Offset & Field & Description \\
 .equ TY_STRUCT,    14    // F0=struct_decl AST, F1=member vec*
 .equ TY_UNION,     15    // F0=union_decl AST, F1=member vec*
 .equ TY_ENUM,      16    // F0=enum_decl AST
+.equ TY_INT128,    17    // __int128, F0=signed(1)/unsigned(0); size 16, align 16
 
 // -- Specifier bitmask constants (from parser) ----------------------------
 .equ SPEC_VOID,       (1 << 0)
@@ -69,11 +70,19 @@ Offset & Field & Description \\
 .equ SPEC_UNSIGNED,   (1 << 9)
 .equ SPEC_BOOL,       (1 << 10)
 .equ SPEC_COMPLEX,    (1 << 11)
+.equ SPEC_INT128,     (1 << 12)
 @}
 
 \section{Type Initialization}
 
-Pre-allocate singleton descriptors for all basic types.
+Pre-allocate singleton descriptors for all basic types.  Alongside the standard
+integer widths, two singletons cover the GNU 128-bit integer \texttt{\_\_int128}
+(kind \texttt{TY\_INT128}, signed and unsigned): each carries size and
+alignment~16, so it lays out correctly wherever a 16-byte object is expected---%
+notably inside the \texttt{union \_\_u128\_halves} the Linux kernel's
+\texttt{cmpxchg16b} code builds.  Only its \emph{arithmetic} is deferred
+(Appendix~\ref{ch:limitations}); the descriptor itself is a first-class basic
+type.
 
 @d Types: init @{
 // -- kcc_types_init --------------------------------------------------------
@@ -295,6 +304,39 @@ stages can select the correct conversion and promotion rules.
     str xzr, [x19, #TY_F1]
     adrp x1, _kcc_type_llong_u@@PAGE
     add  x1, x1, _kcc_type_llong_u@@PAGEOFF
+    str x19, [x1]
+
+    // signed __int128 (16 bytes, 16-byte aligned)
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_INT128
+    str x1, [x19, #TY_KIND]
+    mov x1, #16
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    mov x1, #1                      // signed
+    str x1, [x19, #TY_F0]
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_int128_s@@PAGE
+    add  x1, x1, _kcc_type_int128_s@@PAGEOFF
+    str x19, [x1]
+
+    // unsigned __int128
+    mov x0, #TY_DESC_SIZE
+    bl _kcc_arena_alloc
+    mov x19, x0
+    mov x1, #TY_INT128
+    str x1, [x19, #TY_KIND]
+    mov x1, #16
+    str x1, [x19, #TY_SIZE]
+    str x1, [x19, #TY_ALIGN]
+    str xzr, [x19, #TY_QUALS]
+    str xzr, [x19, #TY_F0]         // unsigned
+    str xzr, [x19, #TY_F1]
+    adrp x1, _kcc_type_int128_u@@PAGE
+    add  x1, x1, _kcc_type_int128_u@@PAGEOFF
     str x19, [x1]
 @}
 
@@ -674,7 +716,10 @@ _kcc_type_enum:
 
 The parser stores a bitmask of type specifiers in \texttt{AST\_TYPE\_BUILTIN.F0}.
 This function maps each valid combination to the corresponding singleton
-type descriptor.
+type descriptor.  Besides the standard widths it accepts the GNU
+\texttt{\_\_int128} specifier (bit \texttt{SPEC\_INT128}): bare or with
+\texttt{signed} it selects the signed 128-bit singleton, with \texttt{unsigned}
+the unsigned one.
 
 @d Types: resolve specmask @{
 // -- kcc_type_from_specmask -----------------------------------------------
@@ -840,6 +885,18 @@ falls through every comparison returns zero to signal an invalid combination.
     cmp x0, x1
     b.eq .Ltfm_ldouble
 
+    // __int128 / signed __int128  (signed by default)
+    mov x1, #SPEC_INT128
+    cmp x0, x1
+    b.eq .Ltfm_int128_s
+    mov x1, #(SPEC_SIGNED | SPEC_INT128)
+    cmp x0, x1
+    b.eq .Ltfm_int128_s
+    // unsigned __int128
+    mov x1, #(SPEC_UNSIGNED | SPEC_INT128)
+    cmp x0, x1
+    b.eq .Ltfm_int128_u
+
     // Invalid combination
     mov x0, #0
     b .Ltfm_done
@@ -928,6 +985,16 @@ fifteen basic types --- only the symbol name changes.
 .Ltfm_ldouble:
     adrp x0, _kcc_type_ldouble@@PAGE
     add  x0, x0, _kcc_type_ldouble@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_int128_s:
+    adrp x0, _kcc_type_int128_s@@PAGE
+    add  x0, x0, _kcc_type_int128_s@@PAGEOFF
+    ldr  x0, [x0]
+    b .Ltfm_done
+.Ltfm_int128_u:
+    adrp x0, _kcc_type_int128_u@@PAGE
+    add  x0, x0, _kcc_type_int128_u@@PAGEOFF
     ldr  x0, [x0]
 
 .Ltfm_done:
@@ -1018,6 +1085,8 @@ _kcc_type_is_integer:
     cmp x1, #TY_LONG
     b.eq .Ltii_yes
     cmp x1, #TY_LLONG
+    b.eq .Ltii_yes
+    cmp x1, #TY_INT128
     b.eq .Ltii_yes
     cmp x1, #TY_ENUM
     b.eq .Ltii_yes
@@ -1139,6 +1208,8 @@ _kcc_type_rank:
     b.eq .Ltr_long
     cmp x1, #TY_LLONG
     b.eq .Ltr_llong
+    cmp x1, #TY_INT128
+    b.eq .Ltr_int128
     cmp x1, #TY_ENUM
     b.eq .Ltr_int           // enum has rank of int
     // Default: 0
@@ -1161,6 +1232,9 @@ _kcc_type_rank:
     ret
 .Ltr_llong:
     mov x0, #6
+    ret
+.Ltr_int128:
+    mov x0, #7           // __int128 outranks long long
     ret
 @| _kcc_type_rank
 @}
@@ -1447,6 +1521,10 @@ _kcc_type_long_u:     .quad 0
 _kcc_type_llong_s:    .quad 0
 .globl _kcc_type_llong_u
 _kcc_type_llong_u:    .quad 0
+.globl _kcc_type_int128_s
+_kcc_type_int128_s:   .quad 0
+.globl _kcc_type_int128_u
+_kcc_type_int128_u:   .quad 0
 .globl _kcc_type_float
 _kcc_type_float:      .quad 0
 .globl _kcc_type_double
@@ -1494,6 +1572,8 @@ _kcc_ty_str_null:     .asciz "<null>"
 @| _kcc_type_long_u
 @| _kcc_type_llong_s
 @| _kcc_type_llong_u
+@| _kcc_type_int128_s
+@| _kcc_type_int128_u
 @| _kcc_type_float
 @| _kcc_type_double
 @| _kcc_type_ldouble

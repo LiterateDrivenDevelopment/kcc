@@ -648,6 +648,12 @@ run_diag "complex-type"       err "complex types (_Complex/_Imaginary) are not s
     "int main(void){ double _Complex z; return 0; }"
 run_diag "atomic-qual-ok"     clean "" \
     "_Atomic int x; int main(void){ x = 5; return x; }"
+run_diag "int128-arith"       err "128-bit integer arithmetic (__int128) is not yet supported" \
+    "unsigned __int128 f(unsigned __int128 a, unsigned __int128 b){ return a + b; }
+int main(void){ return (int)f(1,2); }"
+run_diag "int128-decl-ok"     clean "" \
+    "typedef unsigned __int128 u128; union h { u128 full; struct { unsigned long lo, hi; }; };
+int main(void){ union h x; x.lo=5; x.hi=0; return (int)(sizeof(u128) + x.lo - 16); }"
 
 echo ""
 echo "=== diagtest: $PASS ok, $FAIL fail ==="

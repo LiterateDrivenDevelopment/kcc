@@ -30,7 +30,8 @@ exactly, casting to a pointer only where a slot is dereferenced.
 
 The kind constants are the type module's: void~1, \_Bool~2, char~3, short~4,
 int~5, long~6, long long~7, float~8, double~9, long double~10, pointer~11,
-array~12, function~13, struct~14, union~15, enum~16.  Three externs remain in
+array~12, function~13, struct~14, union~15, enum~16, and the GNU 128-bit integer
+\texttt{\_\_int128}~17.  Three externs remain in
 the (still-assembly) rest of the compiler: the arena allocator, the layout pass
 that sizes an aggregate on demand (\texttt{kcc\_type\_layout}, which lives in
 declarations), and the two buffered-output helpers the dump routine prints
@@ -64,6 +65,8 @@ void *kcc_type_long_s = 0;
 void *kcc_type_long_u = 0;
 void *kcc_type_llong_s = 0;
 void *kcc_type_llong_u = 0;
+void *kcc_type_int128_s = 0;
+void *kcc_type_int128_u = 0;
 void *kcc_type_float = 0;
 void *kcc_type_double = 0;
 void *kcc_type_ldouble = 0;
@@ -74,8 +77,9 @@ void *kcc_type_ldouble = 0;
 \texttt{kcc\_types\_init} allocates one singleton per basic type at startup and
 records it in the matching global.  A file-local helper \texttt{mk} captures the
 shared shape---allocate, set kind/size/align, zero the qualifiers, store the
-signedness in \texttt{f0} and zero \texttt{f1}---so the fourteen allocations
-read as a table.  Plain \texttt{char} maps to \emph{signed} char, following the
+signedness in \texttt{f0} and zero \texttt{f1}---so the allocations
+read as a table.  The pair of \texttt{\_\_int128} singletons carries size and
+alignment~16 (only its arithmetic is deferred).  Plain \texttt{char} maps to \emph{signed} char, following the
 Apple ARM64 sign convention; the integer types carry their width (1, 2, 4, 8)
 and signedness; and \texttt{long double} is not allocated at all but
 \emph{aliased} to the \texttt{double} descriptor, because the Apple ARM64 ABI
@@ -109,6 +113,8 @@ void kcc_types_init(void) {
     kcc_type_long_u  = mk(6, 8, 8, 0);
     kcc_type_llong_s = mk(7, 8, 8, 1);
     kcc_type_llong_u = mk(7, 8, 8, 0);
+    kcc_type_int128_s = mk(17, 16, 16, 1);
+    kcc_type_int128_u = mk(17, 16, 16, 0);
     kcc_type_float   = mk(8, 4, 4, 0);
     kcc_type_double  = mk(9, 8, 8, 0);
     kcc_type_ldouble = kcc_type_double;
@@ -262,6 +268,7 @@ and semantic analysis reports the error.
 #define SPEC_SIGNED   256
 #define SPEC_UNSIGNED 512
 #define SPEC_BOOL     1024
+#define SPEC_INT128   4096
 
 void *kcc_type_from_specmask(unsigned long m) {
     if (m == SPEC_VOID) return kcc_type_void;
@@ -301,6 +308,10 @@ void *kcc_type_from_specmask(unsigned long m) {
         m == (SPEC_UNSIGNED | SPEC_LONG | SPEC_LLONG | SPEC_INT))
         return kcc_type_llong_u;
 
+    if (m == SPEC_INT128 || m == (SPEC_SIGNED | SPEC_INT128))
+        return kcc_type_int128_s;
+    if (m == (SPEC_UNSIGNED | SPEC_INT128)) return kcc_type_int128_u;
+
     if (m == SPEC_FLOAT) return kcc_type_float;
     if (m == SPEC_DOUBLE) return kcc_type_double;
     if (m == (SPEC_LONG | SPEC_DOUBLE)) return kcc_type_ldouble;
@@ -339,7 +350,8 @@ int kcc_type_compatible(void *a, void *b) {
 
 int kcc_type_is_integer(void *type) {
     unsigned long k = ((struct Type *)type)->kind;
-    if (k == 2 || k == 3 || k == 4 || k == 5 || k == 6 || k == 7 || k == 16)
+    if (k == 2 || k == 3 || k == 4 || k == 5 || k == 6 || k == 7 || k == 16 ||
+        k == 17)
         return 1;
     return 0;
 }
@@ -366,6 +378,7 @@ unsigned long kcc_type_rank(void *type) {
     if (k == 16) return 4;
     if (k == 6) return 5;
     if (k == 7) return 6;
+    if (k == 17) return 7;      /* __int128 outranks long long */
     return 0;
 }
 @}

@@ -1323,6 +1323,18 @@ enters the conversions and \texttt{1 << 1u} stays a signed \texttt{int}.
 Otherwise, the usual arithmetic conversions
 (\texttt{\_kcc\_conv\_usual}) determine the common type.
 
+Before any of that, the checker rejects a binary operator whose left or right
+operand is a \texttt{\_\_int128}.  kcc recognises the 128-bit type and lays it
+out, and copies and by-value passing of one work through the aggregate path, but
+a \texttt{\_\_int128} \emph{rvalue} is still materialised in a single eight-byte
+slot---so an add, shift, or comparison would silently drop the high 64 bits.
+Following the same reject-rather-than-miscompile policy as the \texttt{\_Complex}
+and VLA limitations (Appendix~\ref{ch:limitations}), the checker emits a
+diagnostic here; the unary checker does the same for \texttt{-}, \texttt{+},
+\texttt{\~{}}, and \texttt{++}/\texttt{--}, and the assignment checker for the
+compound forms (plain \texttt{=} is a copy and stays allowed).  Full 128-bit
+arithmetic---register-pair lowering with carry---is a planned follow-up.
+
 The six relational and equality operators additionally run the
 \texttt{-Wsign-compare} check (\texttt{kcc\_sema\_check\_sign\_compare}).
 When one operand is a signed integer and the other unsigned, the usual
@@ -1363,6 +1375,29 @@ _kcc_sema_expr_binary:
     ldr x0, [x19, #AST_F2]
     bl _kcc_sema_expr
     mov x22, x0                     // RHS type
+
+    // Reject any binary operator on a __int128 operand.  kcc recognises the
+    // type and lays it out (16 bytes), and copies / by-value passing / union
+    // punning work through the aggregate path, but a __int128 *rvalue* is still
+    // lowered through a single 8-byte slot, so arithmetic, shifts, and
+    // comparisons would silently drop the high 64 bits (carry is lost).  Reject
+    // rather than miscompile, in the spirit of the _Complex/VLA limitations
+    // (128-bit arithmetic is a planned follow-up).
+    cbz x21, .Lseb_i128_ok
+    ldr x0, [x21, #TY_KIND]
+    cmp x0, #TY_INT128
+    b.eq .Lseb_i128_err
+    cbz x22, .Lseb_i128_ok
+    ldr x0, [x22, #TY_KIND]
+    cmp x0, #TY_INT128
+    b.ne .Lseb_i128_ok
+.Lseb_i128_err:
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, .Lseb_int128_msg@@PAGE
+    add  x2, x2, .Lseb_int128_msg@@PAGEOFF
+    bl _kcc_diag_error
+.Lseb_i128_ok:
 
     // Get operator
     ldr x20, [x19, #AST_F0]
@@ -1553,6 +1588,11 @@ _kcc_sema_check_sign_compare:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
+
+.section __TEXT,__cstring,cstring_literals
+.Lseb_int128_msg:
+    .asciz "128-bit integer arithmetic (__int128) is not yet supported"
+.text
 @}
 
 \subsection{Unary Expression}
@@ -1580,6 +1620,23 @@ _kcc_sema_expr_unary:
     ldr x0, [x19, #AST_F1]
     bl _kcc_sema_expr
     mov x20, x0                     // operand type
+
+    // Reject arithmetic unary operators on a __int128 operand (negate, plus,
+    // bitwise-not, ++/--): like the binary case they would drop the high 64
+    // bits.  Address-of (&) is structural and stays allowed.
+    cbz x20, .Lseu_i128_ok
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_INT128
+    b.ne .Lseu_i128_ok
+    ldr x1, [x19, #AST_F0]
+    cmp x1, #TOK_AMP
+    b.eq .Lseu_i128_ok
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, .Lseb_int128_msg@@PAGE
+    add  x2, x2, .Lseb_int128_msg@@PAGEOFF
+    bl _kcc_diag_error
+.Lseu_i128_ok:
 
     // Get operator
     ldr x0, [x19, #AST_F0]
@@ -1686,6 +1743,23 @@ _kcc_sema_expr_assign:
     // Type-check RHS
     ldr x0, [x19, #AST_F2]
     bl _kcc_sema_expr               // x0 = RHS type
+
+    // Reject compound assignment (+=, -=, <<=, ...) on a __int128 lvalue: it is
+    // arithmetic and would drop the high 64 bits.  Plain '=' is a 16-byte copy
+    // and stays allowed.
+    ldr x1, [x19, #AST_F0]
+    cmp x1, #TOK_ASSIGN
+    b.eq .Lsea_no_i128
+    cbz x20, .Lsea_no_i128
+    ldr x1, [x20, #TY_KIND]
+    cmp x1, #TY_INT128
+    b.ne .Lsea_no_i128
+    ldr x0, [x19, #AST_LINE]
+    ldr x1, [x19, #AST_COL]
+    adrp x2, .Lseb_int128_msg@@PAGE
+    add  x2, x2, .Lseb_int128_msg@@PAGEOFF
+    bl _kcc_diag_error
+.Lsea_no_i128:
 
     // -Wall -Wint-conversion: only for a simple '=' (compound assignment on a
     // pointer is legal arithmetic, not a conversion).

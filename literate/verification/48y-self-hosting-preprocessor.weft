@@ -778,7 +778,12 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
 \texttt{pp\_predefine} seeds the macro table, for every translation unit, with
 the object-like built-ins a hosted C compiler is expected to define---the
 \texttt{\_\_STDC\_\_} family, \texttt{\_\_LP64\_\_}, and the dynamically
-substituted \texttt{\_\_LINE\_\_}.  Under \texttt{-{}-target=x86\_64-linux} it adds
+substituted \texttt{\_\_LINE\_\_}.  It also advertises
+\texttt{\_\_SIZEOF\_INT128\_\_} as~16, the way gcc and clang do on 64-bit
+targets, because kcc now supports the \texttt{\_\_int128} type---the Linux kernel
+gates its \texttt{u128}/\texttt{\_\_u128} typedefs on that macro, so without it
+\texttt{<asm/cmpxchg\_64.h>} would not even see the type.  Under
+\texttt{-{}-target=x86\_64-linux} it adds
 \texttt{\_\_linux\_\_} and \texttt{\_\_x86\_64\_\_} so headers pick their glibc
 bindings, and---so that gcc-oriented build systems (Kbuild's
 \texttt{scripts/cc-version.sh}) recognise kcc as a supported compiler, exactly as
@@ -806,6 +811,10 @@ static void pp_predefine(void) {
     pp_def_simple("__LP64__", 8, "1", 1);
     pp_def_simple("_LP64", 5, "1", 1);
     pp_def_simple("__LINE__", 8, "1", 1);
+    /* kcc supports the GNU 128-bit integer type (16 bytes), so advertise it the
+       way gcc and clang do on 64-bit targets.  The Linux kernel gates its
+       u128/__u128 typedefs on this macro (include/uapi/linux/types.h). */
+    pp_def_simple("__SIZEOF_INT128__", 17, "16", 2);
     if (kcc_x86_os) {                     /* Linux/x86-64 target: let headers pick glibc bindings */
         pp_def_simple("__linux__", 9, "1", 1);
         pp_def_simple("__x86_64__", 10, "1", 1);

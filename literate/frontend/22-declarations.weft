@@ -668,6 +668,8 @@ _kcc_parse_decl_specs:
     b.eq .Ldecl_type_builtin
     cmp x0, #TOK__COMPLEX
     b.eq .Ldecl_type_builtin
+    cmp x0, #TOK_INT128
+    b.eq .Ldecl_type_builtin
 
     // struct/union/enum
     cmp x0, #TOK_STRUCT
@@ -793,9 +795,12 @@ accumulator register~\texttt{x23}.  This approach handles multi-keyword types
 like \texttt{unsigned long long int} correctly: once all specifiers have been
 consumed, the final bitmask encodes the full type.  The special case of two
 successive \texttt{long} keywords is detected by checking whether bit~4 is
-already set before promoting to bit~5 (\texttt{long long}).  Struct, union,
-and enum specifiers build their own type nodes via dedicated sub-parsers,
-while typedef names are looked up in the typedef table and interned.
+already set before promoting to bit~5 (\texttt{long long}).  The GNU
+\texttt{\_\_int128} keyword sets bit~12, combining with \texttt{signed} or
+\texttt{unsigned} the same way the standard integer specifiers do.  Struct,
+union, and enum specifiers build their own type nodes via dedicated
+sub-parsers, while typedef names are looked up in the typedef table and
+interned.
 
 @d Decl: parse specifiers @{
 .Ldecl_type_builtin:
@@ -825,6 +830,8 @@ while typedef names are looked up in the typedef table and interned.
     b.eq .Ldecl_bit_complex
     cmp x0, #TOK__IMAGINARY
     b.eq .Ldecl_bit_complex
+    cmp x0, #TOK_INT128
+    b.eq .Ldecl_bit_int128
     b .Ldecl_bit_done
 
 .Ldecl_bit_void:
@@ -862,6 +869,10 @@ while typedef names are looked up in the typedef table and interned.
     b .Ldecl_bit_done
 .Ldecl_bit_bool:
     orr x23, x23, #(1 << 10)
+    b .Ldecl_bit_done
+.Ldecl_bit_int128:
+    // __int128: the GNU 128-bit integer type specifier (bit 12).
+    orr x23, x23, #(1 << 12)
     b .Ldecl_bit_done
 .Ldecl_bit_complex:
     // _Complex / _Imaginary: kcc has no complex-number type.  Treating a
@@ -2466,6 +2477,8 @@ _kcc_parse_is_type_token:
     cmp x0, #TOK__BOOL
     b.eq .Lis_type_yes
     cmp x0, #TOK__COMPLEX
+    b.eq .Lis_type_yes
+    cmp x0, #TOK_INT128
     b.eq .Lis_type_yes
 
     // struct, union, enum

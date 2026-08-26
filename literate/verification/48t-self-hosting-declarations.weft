@@ -96,7 +96,7 @@ enum {
     TOK__ALIGNAS = 44, TOK__ATOMIC = 46, TOK__BOOL = 47, TOK__COMPLEX = 48,
     TOK__IMAGINARY = 50, TOK__NORETURN = 51, TOK__STATIC_ASSERT = 52,
     TOK__THREAD_LOCAL = 53, TOK_ATTRIBUTE = 54, TOK_TYPEOF = 55, TOK_ASM = 56,
-    TOK_EXTENSION = 57,
+    TOK_EXTENSION = 57, TOK_INT128 = 58,
     TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62, TOK_RBRACE = 63,
     TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66, TOK_COMMA = 67,
     TOK_DOT = 68, TOK_STAR = 73, TOK_QUESTION = 92, TOK_COLON = 93,
@@ -229,7 +229,8 @@ void *kcc_parse_typeof(void) {
 \texttt{decl\_specs} loops over storage classes, qualifiers, function specifiers,
 \texttt{\_Alignas} (whose parenthesised argument is skipped), builtin type
 keywords (each ORing its specifier bit, with two \texttt{long}s promoting to long
-long), struct/union/enum/typeof sub-parsers, typedef names, and interleaved
+long and \texttt{\_\_int128} setting bit~12), struct/union/enum/typeof
+sub-parsers, typedef names, and interleaved
 attributes.  When the loop ends it materialises the type: an aggregate or typedef
 already built, else a \texttt{TYPE\_BUILTIN} from the bitmask (defaulting to
 \texttt{int}), then wraps it in \texttt{TYPE\_QUALS} if any qualifiers appeared.
@@ -279,6 +280,7 @@ struct DeclSpecs kcc_parse_decl_specs(void) {
         if (t == TOK_SIGNED) { mask |= 256; count++; kcc_pp_next(); continue; }
         if (t == TOK_UNSIGNED) { mask |= 512; count++; kcc_pp_next(); continue; }
         if (t == TOK__BOOL) { mask |= 1024; count++; kcc_pp_next(); continue; }
+        if (t == TOK_INT128) { mask |= 4096; count++; kcc_pp_next(); continue; }
         if (t == TOK__COMPLEX || t == TOK__IMAGINARY) {
             kcc_diag_error(kcc_tok_line, kcc_tok_col,
                 "complex types (_Complex/_Imaginary) are not supported");
@@ -772,7 +774,7 @@ unsigned long kcc_parse_is_type_token(void) {
     unsigned long t = kcc_tok_type;
     if (t == TOK_VOID || t == TOK_CHAR || t == TOK_SHORT || t == TOK_INT ||
         t == TOK_LONG || t == TOK_FLOAT || t == TOK_DOUBLE || t == TOK_SIGNED ||
-        t == TOK_UNSIGNED || t == TOK__BOOL || t == TOK__COMPLEX ||
+        t == TOK_UNSIGNED || t == TOK__BOOL || t == TOK__COMPLEX || t == TOK_INT128 ||
         t == TOK_STRUCT || t == TOK_UNION || t == TOK_ENUM || t == TOK_TYPEOF ||
         t == TOK_CONST || t == TOK_VOLATILE || t == TOK_RESTRICT ||
         t == TOK__ATOMIC || t == TOK__ALIGNAS)

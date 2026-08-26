@@ -53,7 +53,7 @@ struct Type { unsigned long kind, size, align, quals, f0, f1; };
 
 /* type kinds */
 enum { TY_VOID=1, TY_BOOL=2, TY_CHAR=3, TY_LLONG=7, TY_PTR=11, TY_ARRAY=12,
-       TY_FUNC=13, TY_STRUCT=14, TY_UNION=15, TY_ENUM=16 };
+       TY_FUNC=13, TY_STRUCT=14, TY_UNION=15, TY_ENUM=16, TY_INT128=17 };
 /* symbol kinds */
 enum { SYM_VAR=1, SYM_FUNC=2, SYM_TYPEDEF=3, SYM_ENUM_CONST=4 };
 
@@ -153,6 +153,7 @@ static const char m_sign_cmp[]   = "comparison of integers of different signedne
 static const char m_int2ptr[]    = "incompatible integer to pointer conversion";
 static const char m_ptr2int[]    = "incompatible pointer to integer conversion";
 static const char m_vla[]        = "variable-length arrays are not supported";
+static const char m_int128[]     = "128-bit integer arithmetic (__int128) is not yet supported";
 static const char m_generic[]    = "_Generic: no association compatible with the controlling type";
 static const char m_main[]       = "main";
 static const char m_va_list[]    = "va_list";
@@ -973,12 +974,27 @@ void kcc_sema_check_int_ptr(void *loc, void *dst, void *src, void *srcexpr) {
 
 \paragraph{Binary, unary, and assignment expressions.}
 
+Each of the three checkers first rejects an operation that would perform 128-bit
+\emph{arithmetic}: a binary operator with a \texttt{\_\_int128} operand, an
+arithmetic unary operator (\texttt{-}/\texttt{+}/\texttt{\~{}}/\texttt{++}/%
+\texttt{--}, but not address-of) on one, or a compound assignment to one.  kcc
+lowers a \texttt{\_\_int128} rvalue through a single eight-byte slot, so these
+would silently drop the high 64 bits; rejecting matches the assembly semantics
+and the \texttt{\_Complex}/VLA policy.  Plain \texttt{=}, copies, and by-value
+passing stay valid.
+
 @l c
 @d Selfhost: sema binunasgn @{
 static void *sema_expr_binary(struct Node *n) {
     struct Type *lt = (struct Type *)kcc_sema_expr((void *)n->f1);
     struct Type *rt = (struct Type *)kcc_sema_expr((void *)n->f2);
     unsigned long op = n->f0;
+    /* Reject any binary operator on a __int128 operand: kcc lowers a __int128
+       rvalue through one 8-byte slot, so arithmetic/shift/comparison would drop
+       the high 64 bits.  Copies and by-value passing use the aggregate path and
+       stay valid (128-bit arithmetic is a planned follow-up). */
+    if ((lt && lt->kind == TY_INT128) || (rt && rt->kind == TY_INT128))
+        kcc_diag_error(n->line, n->col, m_int128);
     switch (op) {
     case TOK_EQ: case TOK_NE: case TOK_LT: case TOK_GT: case TOK_LE: case TOK_GE:
         kcc_sema_check_sign_compare(n, lt, rt);
@@ -1002,6 +1018,10 @@ static void *sema_expr_binary(struct Node *n) {
 static void *sema_expr_unary(struct Node *n) {
     struct Type *ot = (struct Type *)kcc_sema_expr((void *)n->f1);
     unsigned long op = n->f0;
+    /* Reject arithmetic unary operators on a __int128 operand (-, +, ~, ++/--);
+       address-of (&) is structural and stays allowed. */
+    if (ot && ot->kind == TY_INT128 && op != TOK_AMP)
+        kcc_diag_error(n->line, n->col, m_int128);
     switch (op) {
     case TOK_AMP: return kcc_type_ptr(ot);
     case TOK_STAR:
@@ -1017,6 +1037,10 @@ static void *sema_expr_unary(struct Node *n) {
 static void *sema_expr_assign(struct Node *n) {
     void *lt = kcc_sema_expr((void *)n->f1);
     void *rt = kcc_sema_expr((void *)n->f2);
+    /* Compound assignment (+=, -=, ...) on a __int128 lvalue is arithmetic and
+       would drop the high 64 bits; reject it.  Plain '=' is a 16-byte copy. */
+    if (n->f0 != TOK_ASSIGN && lt && ((struct Type *)lt)->kind == TY_INT128)
+        kcc_diag_error(n->line, n->col, m_int128);
     if (n->f0 == TOK_ASSIGN)
         kcc_sema_check_int_ptr(n, lt, rt, (void *)n->f2);
     return lt;

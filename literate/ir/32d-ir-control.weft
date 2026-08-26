@@ -1717,6 +1717,12 @@ run_test "classify-char" \
 
 run_test "func-name-builtin" \
     "int se(const char *a, const char *b){ int i=0; while(a[i] && a[i]==b[i]) i++; return a[i]==b[i]; } int f(void){ return se(__func__, \"f\"); } int main(void){ return f()*10 + (se(__func__, \"main\") ? 2 : 0); }" 12
+
+run_test "int128-layout" \
+    "typedef unsigned __int128 u128; union h { u128 full; struct { unsigned long lo, hi; }; }; int main(void){ return (int)(sizeof(u128) + _Alignof(u128) + sizeof(union h)); }" 48
+
+run_test "int128-copy-abi" \
+    "typedef unsigned __int128 u128; union h { u128 full; struct { unsigned long lo, hi; }; }; u128 id(u128 v){ union h o; o.full = v; return o.full; } int main(void){ union h a; a.lo=42; a.hi=0; union h r; r.full = id(a.full); return (int)r.lo; }" 42
 @}
 
 Function pointers require three pieces to work together: the parser

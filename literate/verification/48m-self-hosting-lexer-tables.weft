@@ -17,19 +17,20 @@ token spellings that diagnostics and \texttt{-{}-dump-tokens} print.
 
 \texttt{kcc\_lex\_kw\_init} creates a 128-slot hash table, stores it in the
 lexer's global \texttt{kcc\_kw\_table}, and inserts every keyword---its text,
-its byte length, and its token code.  The 63 entries are the 44 C17 keywords
+its byte length, and its token code.  The 64 entries are the 44 C17 keywords
 plus the GNU spellings the compiler accepts: the \texttt{\_\_x\_\_}/\texttt{\_\_x}
 forms alias the standard token codes (\texttt{\_\_const}$\to$14,
 \texttt{\_\_inline}$\to$26, \dots), while \texttt{\_\_attribute\_\_},
 \texttt{typeof}, \texttt{asm}, and \texttt{\_\_extension\_\_} take their own
-codes 54--57.  The lengths are carried explicitly, exactly as the assembly
+codes 54--57 and the GNU 128-bit integer keyword \texttt{\_\_int128} takes code
+58.  The lengths are carried explicitly, exactly as the assembly
 table did, so the hash keys match byte-for-byte.
 
 @l c
 @d Selfhost: lexer-tables kw @{
 struct KwEntry { const char *name; unsigned long len; unsigned long token; };
 
-static struct KwEntry kw_reg[63] = {
+static struct KwEntry kw_reg[64] = {
     {"auto", 4, 10}, {"break", 5, 11}, {"case", 4, 12}, {"char", 4, 13},
     {"const", 5, 14}, {"continue", 8, 15}, {"default", 7, 16}, {"do", 2, 17},
     {"double", 6, 18}, {"else", 4, 19}, {"enum", 4, 20}, {"extern", 6, 21},
@@ -50,7 +51,8 @@ static struct KwEntry kw_reg[63] = {
     {"__const", 7, 14}, {"__const__", 9, 14},
     {"__signed", 8, 33}, {"__signed__", 10, 33},
     {"__volatile", 10, 42}, {"__volatile__", 12, 42},
-    {"__restrict", 10, 30}, {"__restrict__", 12, 30}
+    {"__restrict", 10, 30}, {"__restrict__", 12, 30},
+    {"__int128", 8, 58}
 };
 
 void *kcc_ht_init(unsigned long capacity);
@@ -61,7 +63,7 @@ extern void *kcc_kw_table;
 void kcc_lex_kw_init(void) {
     void *ht = kcc_ht_init(128);
     kcc_kw_table = ht;
-    for (unsigned long i = 0; i < 63; i++)
+    for (unsigned long i = 0; i < 64; i++)
         kcc_ht_put(ht, kw_reg[i].name, kw_reg[i].len, kw_reg[i].token);
 }
 @}
@@ -70,7 +72,8 @@ void kcc_lex_kw_init(void) {
 
 \texttt{kcc\_lex\_type\_name} maps a token code to a readable name through a flat
 108-entry table indexed by the code.  The gaps in the code space---6--9, and
-54--59 between the keywords and the punctuators---are null, and both an
+54--57/59 between the keywords and the punctuators (code~58 is
+\texttt{\_\_int128})---are null, and both an
 out-of-range code and a null slot return \texttt{"unknown"}.  The punctuator
 names follow Clang's dump convention (\texttt{l\_paren}, \texttt{semi},
 \texttt{plusplus}, \dots); the entries are listed positionally so the index is
@@ -89,7 +92,7 @@ static const char *tok_names[108] = {
     "unsigned", "void", "volatile", "while", "_Alignas", "_Alignof",
     "_Atomic", "_Bool", "_Complex", "_Generic", "_Imaginary", "_Noreturn",
     "_Static_assert", "_Thread_local",
-    0, 0, 0, 0, 0, 0,                        /* 54-59 reserved */
+    0, 0, 0, 0, "__int128", 0,               /* 54-57,59 reserved; 58 __int128 */
     "l_paren", "r_paren", "l_brace", "r_brace", "l_bracket", "r_bracket",
     "semi", "comma", "dot", "arrow", "plusplus", "minusminus", "amp", "star",
     "plus", "minus", "tilde", "exclaim", "slash", "percent", "lessless",

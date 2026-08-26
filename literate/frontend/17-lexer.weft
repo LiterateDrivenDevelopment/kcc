@@ -88,6 +88,7 @@ We assign a unique integer code to each.  Codes 0--9 are structural,
 .equ TOK_TYPEOF,      55      // typeof / __typeof__ / __typeof
 .equ TOK_ASM,         56      // asm / __asm__ / __asm
 .equ TOK_EXTENSION,   57      // __extension__ (a no-op prefix)
+.equ TOK_INT128,      58      // __int128 (GNU 128-bit integer type specifier)
 
 // Punctuators (section 6.4.6) — codes 60+
 .equ TOK_LPAREN,      60      // (
@@ -1587,6 +1588,7 @@ _kcc_tn_imaginary:    .asciz "_Imaginary"
 _kcc_tn_noreturn:     .asciz "_Noreturn"
 _kcc_tn_static_assert: .asciz "_Static_assert"
 _kcc_tn_thread_local: .asciz "_Thread_local"
+_kcc_tn_int128:       .asciz "__int128"
 @| _kcc_lex_type_name
 @| _kcc_tn_eof
 @| _kcc_tn_identifier
@@ -1638,6 +1640,7 @@ _kcc_tn_thread_local: .asciz "_Thread_local"
 @| _kcc_tn_noreturn
 @| _kcc_tn_static_assert
 @| _kcc_tn_thread_local
+@| _kcc_tn_int128
 @}
 
 \paragraph{Punctuator name strings.}
@@ -1810,7 +1813,9 @@ _kcc_tok_names:
     .quad _kcc_tn_noreturn        // 51
     .quad _kcc_tn_static_assert   // 52
     .quad _kcc_tn_thread_local    // 53
-    .quad 0, 0, 0, 0, 0, 0       // 54-59  reserved
+    .quad 0, 0, 0, 0             // 54-57  reserved
+    .quad _kcc_tn_int128          // 58  __int128
+    .quad 0                       // 59  reserved
     // Punctuators 60-107
     .quad _kcc_tn_lparen          // 60
     .quad _kcc_tn_rparen          // 61
@@ -1935,6 +1940,7 @@ _kcc_kw_s_vol1:       .asciz "__volatile"
 _kcc_kw_s_vol2:       .asciz "__volatile__"
 _kcc_kw_s_restr1:     .asciz "__restrict"
 _kcc_kw_s_restr2:     .asciz "__restrict__"
+_kcc_kw_s_int128:     .asciz "__int128"
 
 // -- Keyword registration table -------------------------------------
 // Each entry: (string_ptr, string_len, token_type) = 24 bytes
@@ -2004,8 +2010,9 @@ _kcc_kw_reg_table:
     .quad _kcc_kw_s_vol2,       12, 42    // __volatile__
     .quad _kcc_kw_s_restr1,     10, 30    // __restrict → TOK_RESTRICT
     .quad _kcc_kw_s_restr2,     12, 30    // __restrict__
+    .quad _kcc_kw_s_int128,      8, 58    // __int128 → TOK_INT128
 
-.equ KW_COUNT, 63
+.equ KW_COUNT, 64
 .equ KW_ENTRY_BYTES, 24       // 3 quads per entry
 @| _kcc_kw_s_auto
 @| _kcc_kw_s_break

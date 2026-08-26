@@ -1033,6 +1033,13 @@ void kcc_ir_build_stmt(void *s) {
         kcc_ir_build_stmt((void *)IL(s, AST_F0));
     } else if (tag == AST_ASM_STMT) {
         kcc_ir_asm_lower_operands(s);
+        /* `asm goto': resolve each target label (chained off AST_F3) to its
+           block and stash the block in the label node's F2, so the back end
+           can expand %lN to that block's assembly label. */
+        for (void *l = (void *)IL(s, AST_F3); l; l = (void *)IL(l, AST_F4)) {
+            void *bb = kcc_ir_label_bb((const char *)IL(l, AST_F0));
+            IL(l, AST_F2) = (unsigned long)bb;
+        }
         void *ai = kcc_ir_alloc_instr(IR_ASM);
         IL(ai, IR_SRC1) = IL(s, AST_F0);
         IL(ai, IR_SRC2) = IL(s, AST_F1);

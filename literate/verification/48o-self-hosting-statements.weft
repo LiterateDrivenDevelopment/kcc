@@ -248,9 +248,12 @@ void *kcc_parse_expr_rest(void *lhs) {
 
 \section{Inline Assembly}
 
-The extended inline-asm grammar carries, after the template, up to three
-colon-separated operand lists (outputs, inputs, clobbers; a fourth
-\texttt{goto}-label list is consumed but unmodelled).  \texttt{parse\_asm\_opsec}
+The extended inline-asm grammar carries, after the template, up to four
+colon-separated lists: outputs, inputs, clobbers, and---for \texttt{asm
+goto}---the target labels.  Each label name is interned and hung off the
+statement's \texttt{f3} chain, where the IR resolves it to a block and the back
+end expands \texttt{\%lN}/\texttt{\%l[name]} to that block's label.
+\texttt{parse\_asm\_opsec}
 reads one list, building an \texttt{AST\_ASM\_OPERAND} per operand---an optional
 \texttt{[name]} skipped, a string constraint, and a parenthesised
 expression---and appending it to the statement's operand chain through
@@ -318,8 +321,20 @@ void *kcc_parse_asm_extended(const char *tmpl, unsigned long len) {
     kcc_parse_asm_clobbers();
     if (kcc_tok_type != TOK_COLON) { kcc_parse_expect(TOK_RPAREN); return a; }
     kcc_pp_next();                              /* ':' before goto labels */
-    while (kcc_tok_type != TOK_RPAREN && kcc_tok_type != TOK_EOF)
+    /* Record each `asm goto' target label (a comma-separated identifier list)
+       as its own node chained off f3; the IR resolves the names to blocks and
+       the back end expands %lN to the Nth one. */
+    while (kcc_tok_type != TOK_RPAREN && kcc_tok_type != TOK_EOF) {
+        if (kcc_tok_type == TOK_IDENT) {
+            void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+            struct Node *l = (struct Node *)kcc_ast_alloc(AST_ASM_OPERAND);
+            l->f0 = (unsigned long)name;
+            if (a->f3 == 0) a->f3 = (unsigned long)l;
+            else { struct Node *p = (struct Node *)a->f3;
+                   while (p->f4) p = (struct Node *)p->f4; p->f4 = (unsigned long)l; }
+        }
         kcc_pp_next();
+    }
     kcc_parse_expect(TOK_RPAREN);
     return a;
 }

@@ -743,6 +743,20 @@ elements; and \texttt{parse\_decl} ties it together---function definition versus
 prototype, variable and typedef declarations (with multi-declarator chains),
 bare aggregate types, and \texttt{\_Static\_assert}.
 
+Between the declarator (with its trailing attributes) and the initializer or
+terminator, GCC permits an \emph{asm label} or \emph{named-register binding}:
+\texttt{T v asm("string")}.  With \texttt{register} storage it ties the variable
+to a hardware register---\texttt{arch/x86} declares
+\texttt{register unsigned long current\_stack\_pointer asm("\%rsp")}---and
+otherwise it renames the symbol at link time.  \texttt{parse\_decl} consumes an
+optional \texttt{asm(\ldots)} here by paren balance rather than assuming a lone
+string, because the operand is routinely a macro that expands to several
+adjacent string literals (x86's \texttt{\_ASM\_SP} becomes \texttt{" " "rsp" " "}).
+The binding is accepted but not yet honoured in code generation---a plain object
+is emitted---which suffices for the header declarations a kernel build pulls in;
+aliasing a register variable's reads and writes to the named register is left
+for when a compiled function actually uses one.
+
 @l c
 @d Selfhost: declarations rest @{
 void *kcc_parse_type_name(void) {
@@ -861,7 +875,16 @@ void *kcc_parse_decl(void) {
     if (kcc_tok_type == TOK_ASM) {
         kcc_pp_next();
         kcc_parse_expect(TOK_LPAREN);
-        if (kcc_tok_type == TOK_STRING_LIT) kcc_pp_next();
+        /* Consume everything to the matching ')'.  The operand is usually a
+           string literal, but macros expand it to several adjacent strings
+           (arch/x86 `asm(_ASM_SP)` → `" " "rsp" " "`), so skip tokens by paren
+           balance rather than assuming a single string. */
+        long depth = 1;
+        while (depth > 0 && kcc_tok_type != TOK_EOF) {
+            if (kcc_tok_type == TOK_LPAREN) depth++;
+            else if (kcc_tok_type == TOK_RPAREN) { depth--; if (depth == 0) break; }
+            kcc_pp_next();
+        }
         kcc_parse_expect(TOK_RPAREN);
         kcc_parse_skip_attributes();
     }

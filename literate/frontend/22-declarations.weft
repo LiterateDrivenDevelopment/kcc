@@ -28,6 +28,18 @@ The specifiers include storage class (\texttt{typedef}, \texttt{static},
 struct/union/enum, typedef names), and qualifiers (\texttt{const},
 \texttt{volatile}, \texttt{restrict}, \texttt{\_Atomic}).
 
+After a declarator and its trailing attributes, GCC allows an \emph{asm label}
+or \emph{named-register binding}: \texttt{T v asm("string")}.  With
+\texttt{register} storage it binds the variable to a hardware register
+(\texttt{arch/x86} declares
+\texttt{register unsigned long current\_stack\_pointer asm("\%rsp")}); otherwise
+it renames the symbol at link time.  The parser consumes an optional
+\texttt{asm(\ldots)} here by paren balance---not assuming a single string, since
+the operand is often a macro expanding to several adjacent string literals
+(\texttt{\_ASM\_SP} becomes \texttt{" " "rsp" " "}).  It is accepted but not yet
+honoured in code generation, which is enough for the header declarations a
+kernel build pulls in.
+
 @d Decl: parse declaration @{
 // -- kcc_parse_decl ----------------------------------------------------
 // node *kcc_parse_decl(void)
@@ -89,13 +101,29 @@ _kcc_parse_decl:
     bl _kcc_pp_next                    // consume 'asm'
     mov x0, #TOK_LPAREN
     bl _kcc_parse_expect
+    // Consume everything to the matching ')'.  The operand is usually a string
+    // literal, but macros expand it to several adjacent strings (arch/x86
+    // `asm(_ASM_SP)` → `" " "rsp" " "`), so skip by paren balance.
+    mov x23, #1                        // depth
+.Ldecl_asm_skip:
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
-    cmp  x0, #TOK_STRING_LIT
-    b.ne .Ldecl_asm_norparen
-    bl _kcc_pp_next                    // consume the register/label string
-.Ldecl_asm_norparen:
+    cmp  x0, #TOK_EOF
+    b.eq .Ldecl_asm_done
+    cmp  x0, #TOK_LPAREN
+    b.ne .Ldecl_asm_notlp
+    add  x23, x23, #1
+    b .Ldecl_asm_adv
+.Ldecl_asm_notlp:
+    cmp  x0, #TOK_RPAREN
+    b.ne .Ldecl_asm_adv
+    sub  x23, x23, #1
+    cbz  x23, .Ldecl_asm_done
+.Ldecl_asm_adv:
+    bl _kcc_pp_next
+    b .Ldecl_asm_skip
+.Ldecl_asm_done:
     mov x0, #TOK_RPAREN
     bl _kcc_parse_expect
     bl _kcc_parse_skip_attributes

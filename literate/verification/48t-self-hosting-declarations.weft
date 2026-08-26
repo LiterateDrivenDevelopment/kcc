@@ -75,6 +75,10 @@ unsigned long kcc_attr_weak = 0;
 const char *kcc_attr_section = 0;
 const char *kcc_attr_alias = 0;
 void *kcc_attr_ht = 0;
+/* Name of the function whose body is currently being parsed, so that a primary
+   expression `__func__` (\stdref{6.4.2.2}) can materialise it as a string
+   literal.  Null outside any function body. */
+const char *kcc_cur_func_name = 0;
 void kcc_attr_record(const char *name) {
     if (!kcc_attr_ht) kcc_attr_ht = kcc_ht_init(64);
     struct AttrRec *r = (struct AttrRec *)kcc_arena_alloc(sizeof(struct AttrRec));
@@ -855,7 +859,9 @@ void *kcc_parse_decl(void) {
 
     if (d->tag == AST_FUNC_DECL) {
         if (kcc_tok_type == TOK_LBRACE) {
+            kcc_cur_func_name = (const char *)d->f1;   /* for __func__ in the body */
             d->f3 = (unsigned long)kcc_parse_compound();
+            kcc_cur_func_name = 0;
             if (storage == 3) d->f2 |= 2;      /* static function → local linkage */
             return d;
         }

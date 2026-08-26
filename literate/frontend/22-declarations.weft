@@ -89,9 +89,18 @@ _kcc_parse_decl:
     cmp  x0, #TOK_LBRACE
     b.ne .Ldecl_func_proto
 
-    // Function definition: parse body
+    // Function definition: parse body.  Publish the function name so a `__func__`
+    // primary expression inside the body can materialise it (\stdref{6.4.2.2}); clear
+    // it afterwards so a file-scope `__func__` does not see a stale name.
+    ldr x0, [x21, #AST_F1]      // function name pointer
+    adrp x1, _kcc_cur_func_name@@PAGE
+    add  x1, x1, _kcc_cur_func_name@@PAGEOFF
+    str  x0, [x1]
     bl _kcc_parse_compound
     str x0, [x21, #AST_F3]      // body
+    adrp x1, _kcc_cur_func_name@@PAGE
+    add  x1, x1, _kcc_cur_func_name@@PAGEOFF
+    str  xzr, [x1]
     // Record internal linkage.  A FuncDecl packs its params pointer in F2 with
     // the variadic flag in bit 0; we reuse the next free low bit (bit 1) for the
     // `static` storage class so the emitter can give the symbol local linkage.
@@ -321,6 +330,8 @@ _kcc_attr_packed:  .quad 0      // set to 1 when the last attribute run named `p
 _kcc_attr_align:   .quad 0      // set to N when it named `aligned(N)` (0 = none)
 .globl _kcc_attr_ht
 _kcc_attr_ht:      .quad 0      // linkage-attribute side table (weak/section/alias); C-port only
+.globl _kcc_cur_func_name
+_kcc_cur_func_name: .quad 0     // name of the function whose body is being parsed (for __func__); 0 outside
 .section __TEXT,__cstring,cstring_literals
 _kcc_attr_s_packed:   .asciz "packed"
 _kcc_attr_s_packed2:  .asciz "__packed__"

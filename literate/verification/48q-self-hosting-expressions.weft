@@ -45,6 +45,8 @@ struct StrLit { void *ptr; unsigned long len; };
 extern unsigned long kcc_tok_type;
 extern const char *kcc_tok_start;
 extern unsigned long kcc_tok_len;
+extern const char *kcc_cur_func_name;   /* set by the declarator parser for __func__ */
+unsigned long kcc_strlen(const char *s);
 
 void kcc_pp_next(void);
 void kcc_parse_expect(unsigned long tok_type);
@@ -420,6 +422,24 @@ void *kcc_parse_primary_expr(void) {
     unsigned long len = kcc_tok_len;
 
     if (t == TOK_IDENT) {
+        /* __func__ (\stdref{6.4.2.2}): inside a function body it stands for a
+           static string literal of the enclosing function's name.  Materialise it
+           as an ordinary string-literal node so the rest of the pipeline (its
+           char[] type, decay to char*, and data emission) needs no special case.
+           Outside any function it falls through to the undeclared-identifier
+           diagnostic. */
+        if (len == 8 && start[0] == '_' && start[1] == '_' &&
+            start[2] == 'f' && start[3] == 'u' && start[4] == 'n' &&
+            start[5] == 'c' && start[6] == '_' && start[7] == '_' &&
+            kcc_cur_func_name) {
+            unsigned long fl = kcc_strlen(kcc_cur_func_name);
+            struct StrLit s = kcc_strlit_process(kcc_cur_func_name, fl);
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_STR_LIT);
+            n->f0 = (unsigned long)s.ptr;
+            n->f1 = s.len;
+            kcc_pp_next();
+            return n;
+        }
         void *name = kcc_strtab_intern(start, len);
         struct Node *n = (struct Node *)kcc_ast_alloc(AST_IDENT_EXPR);
         n->f0 = (unsigned long)name;

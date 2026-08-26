@@ -854,6 +854,19 @@ consuming the token.  Otherwise the node would record the position of
 the following token, and a diagnostic caret on, say, an undeclared
 identifier would point one token too far to the right.
 
+One identifier is special.  \texttt{\_\_func\_\_} (\stdref{6.4.2.2}) is a
+predefined identifier that, inside a function body, behaves as though a
+\texttt{static const char \_\_func\_\_[]} holding the enclosing function's
+name were declared at the top of the body.  The declarator parser publishes
+that name in \texttt{\_kcc\_cur\_func\_name} while it parses the body, so when
+the primary parser sees the identifier spelled exactly \texttt{\_\_func\_\_}
+(matched as one little-endian word after a length check) and a name is
+published, it emits a \emph{string-literal} node built from that name---reusing
+the whole string pipeline (its \texttt{char[]} type, decay to \texttt{char*},
+and data emission) rather than special-casing a new node kind.  Outside any
+function the name is null and the token falls through to the ordinary
+identifier path, where it earns the usual undeclared-identifier diagnostic.
+
 For string literals, the lexer delivers the raw token including the
 surrounding double quotes.  We strip the quotes, then call
 \texttt{kcc\_strlit\_process} (Chapter~\ref{ch:string-literals}) to translate
@@ -907,6 +920,46 @@ _kcc_parse_primary_expr:
     b .Lprimary_done
 
 .Lprimary_ident:
+    // __func__ (\stdref{6.4.2.2}): inside a function body it stands for a static
+    // string literal of the enclosing function's name.  When the identifier is
+    // exactly "__func__" and a function name is published, emit a string-literal
+    // node (reusing the whole string pipeline) instead of an identifier.  The
+    // eight-byte spelling is matched as one little-endian word after a length
+    // check.  Outside a function it falls through to the ordinary identifier.
+    adrp x0, _kcc_tok_len@@PAGE
+    add  x0, x0, _kcc_tok_len@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #8
+    b.ne .Lprimary_ident_real
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    ldr  x1, [x0]                 // the 8 identifier bytes
+    movz x2, #0x5f5f
+    movk x2, #0x7566, lsl #16
+    movk x2, #0x636e, lsl #32
+    movk x2, #0x5f5f, lsl #48     // "__func__" as a little-endian word
+    cmp  x1, x2
+    b.ne .Lprimary_ident_real
+    adrp x0, _kcc_cur_func_name@@PAGE
+    add  x0, x0, _kcc_cur_func_name@@PAGEOFF
+    ldr  x0, [x0]
+    cbz  x0, .Lprimary_ident_real
+    mov  x19, x0                  // function name (callee-saved across strlen)
+    bl   _kcc_strlen
+    mov  x1, x0                   // len
+    mov  x0, x19                  // name ptr
+    bl   _kcc_strlit_process      // → x0 = processed bytes, x1 = length
+    mov  x19, x0
+    mov  x20, x1
+    bl   _kcc_pp_next             // consume __func__
+    mov  x0, #AST_STR_LIT
+    bl   _kcc_ast_alloc
+    str  x19, [x0, #AST_F0]       // str_ptr
+    str  x20, [x0, #AST_F1]       // str_len
+    b .Lprimary_done
+
+.Lprimary_ident_real:
     // Intern the identifier name
     adrp x0, _kcc_tok_start@@PAGE
     add  x0, x0, _kcc_tok_start@@PAGEOFF

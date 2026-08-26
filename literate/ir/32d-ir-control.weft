@@ -1714,6 +1714,9 @@ run_test "string-compare" \
 
 run_test "classify-char" \
     "int cls(char c) { if(c>='a' && c<='z') return 1; if(c>='0' && c<='9') return 2; return 0; } int main(void) { return cls('x') + cls('3') + cls(' '); }" 3
+
+run_test "func-name-builtin" \
+    "int se(const char *a, const char *b){ int i=0; while(a[i] && a[i]==b[i]) i++; return a[i]==b[i]; } int f(void){ return se(__func__, \"f\"); } int main(void){ return f()*10 + (se(__func__, \"main\") ? 2 : 0); }" 12
 @}
 
 Function pointers require three pieces to work together: the parser

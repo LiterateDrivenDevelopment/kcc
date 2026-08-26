@@ -1128,6 +1128,17 @@ match, the argument text is copied to the output buffer instead of
 the parameter name.  Non-identifier characters and unmatched
 identifiers are copied verbatim.
 
+A string literal or character constant is lexically a \emph{single}
+preprocessing token, so a parameter name that happens to appear inside
+quotes is not a parameter at all and must never be replaced
+(\stdref{6.10.3.1}).  The walker therefore recognises a leading \texttt{"}
+or \texttt{'} and copies the entire literal---through its matching close
+delimiter, honouring backslash escapes---straight to the output before the
+identifier logic can see it.  Without this, a body such as
+\texttt{puts("value x here")} would wrongly expand \texttt{x}, and an
+inline-asm template \texttt{"...\%[ptr]..."} whose operand-name letters
+collide with a macro parameter would be silently rewritten.
+
 The \texttt{\#\#} token-paste operator (\stdref{6.10.3.3}) is handled in
 the same pass.  Pasting two tokens is, at the textual level, simply making
 them \emph{adjacent}: when the concatenated output is rescanned the lexer
@@ -1180,6 +1191,15 @@ _kcc_pp_substitute:
     add x0, x19, x27
     ldrb w0, [x0]
 
+    // A string literal or character constant is a single token whose contents
+    // are never subject to parameter replacement (\stdref{6.10.3.1}); copy it
+    // through verbatim so a parameter name inside quotes---`x` in
+    // "value x here", or `%[ptr]` in an inline-asm template---is not rewritten.
+    cmp w0, #0x22                // "
+    b.eq .Lsub_qlit
+    cmp w0, #0x27                // '
+    b.eq .Lsub_qlit
+
     // Token paste: a `##` in the body concatenates the token to its left with
     // the token to its right by making them textually adjacent in the output,
     // so the rescan lexes them as one token.
@@ -1215,6 +1235,39 @@ _kcc_pp_substitute:
     add x26, x26, #1
     add x27, x27, #1
     b .Lsub_loop
+
+.Lsub_qlit:
+    // Copy a "..." or '...' literal verbatim through its matching close
+    // delimiter, honouring backslash escapes.  w1 holds the delimiter.
+    mov w1, w0
+    add x2, x25, x26             // emit opening delimiter
+    strb w0, [x2]
+    add x26, x26, #1
+    add x27, x27, #1
+.Lsub_qlit_body:
+    cmp x27, x20
+    b.hs .Lsub_loop              // unterminated at body end: stop, resume loop
+    add x2, x19, x27
+    ldrb w0, [x2]
+    add x2, x25, x26             // emit this byte
+    strb w0, [x2]
+    add x26, x26, #1
+    add x27, x27, #1
+    cmp w0, #0x5c                // backslash: next byte is escaped, copy verbatim
+    b.ne .Lsub_qlit_notesc
+    cmp x27, x20
+    b.hs .Lsub_loop
+    add x2, x19, x27
+    ldrb w0, [x2]
+    add x2, x25, x26
+    strb w0, [x2]
+    add x26, x26, #1
+    add x27, x27, #1
+    b .Lsub_qlit_body
+.Lsub_qlit_notesc:
+    cmp w0, w1                   // matching close delimiter ends the literal
+    b.eq .Lsub_loop
+    b .Lsub_qlit_body
 
 .Lsub_stringize:
     // `# param` → a string literal of the argument's spelling.  Consume the

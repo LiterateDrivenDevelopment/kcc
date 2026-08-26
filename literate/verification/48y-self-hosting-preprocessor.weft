@@ -679,6 +679,22 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
     unsigned long i = 0;
     while (i < blen) {
         char c = body[i];
+        if (c == '"' || c == '\'') {
+            /* A string literal or character constant is a single token: its
+               contents are never subject to parameter replacement (\stdref{6.10.3.1}).
+               Copy it through verbatim, honouring backslash escapes, so that a
+               parameter name that happens to appear inside quotes---e.g. `x` in
+               `"value x here"`, or `%[ptr]` in an inline-asm template---survives. */
+            char q = c;
+            out[op++] = body[i++];
+            while (i < blen) {
+                char d = body[i];
+                out[op++] = d; i++;
+                if (d == '\\' && i < blen) { out[op++] = body[i++]; continue; }
+                if (d == q) break;
+            }
+            continue;
+        }
         if (c == '#') {
             if (i + 1 < blen && body[i + 1] == '#') {
                 /* ## paste: trim emitted whitespace, skip operator + whitespace */

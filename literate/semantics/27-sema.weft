@@ -61,9 +61,13 @@ corresponding type constructor.  Struct and union nodes with a body
 (field list) create a new type descriptor; those without a body are
 forward references and look up the tag in the symbol table to find
 the original definition.  Typedef names are resolved via
-symbol table lookup.  Qualified types are currently passed through to
-the base type.  Any unrecognised or null type node falls back to
-\texttt{int}.
+symbol table lookup, with two built-in exceptions that no declaration
+introduces: the name \texttt{va\_list} and its GNU spelling
+\texttt{\_\_builtin\_va\_list} both resolve to the opaque eight-byte pointer
+the variadic builtins use (Section~\ref{sec:variadic-defs}), so a freestanding
+\texttt{<stdarg.h>} needs no header support.  Qualified types are currently
+passed through to the base type.  Any unrecognised or null type node falls back
+to \texttt{int}.
 
 @d Sema: resolve type @{
 // -- kcc_sema_resolve_type ------------------------------------------------
@@ -344,11 +348,18 @@ _kcc_sema_resolve_type:
 .Lsrt_name_builtin:
     // Built-in typedef va_list → an 8-byte pointer.  (No <stdarg.h>: the
     // variadic builtins below treat it as an opaque cursor into the stack.)
+    // The GNU spelling __builtin_va_list (kernel <stdarg.h>) is an alias.
     mov x0, x20
     adrp x1, _kcc_sema_str_va_list@@PAGE
     add  x1, x1, _kcc_sema_str_va_list@@PAGEOFF
     bl _kcc_strcmp
+    cbz x0, .Lsrt_va_list_ptr
+    mov x0, x20
+    adrp x1, _kcc_sema_str_builtin_va_list@@PAGE
+    add  x1, x1, _kcc_sema_str_builtin_va_list@@PAGEOFF
+    bl _kcc_strcmp
     cbnz x0, .Lsrt_fallback
+.Lsrt_va_list_ptr:
     adrp x0, _kcc_type_int_s@@PAGE
     add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr x0, [x0]
@@ -608,6 +619,7 @@ _kcc_sema_str_colon:    .asciz ": "
 _kcc_sema_str_eq:       .asciz " = "
 _kcc_sema_str_nl:       .asciz "\n"
 _kcc_sema_str_va_list:  .asciz "va_list"
+_kcc_sema_str_builtin_va_list: .asciz "__builtin_va_list"
 @| _kcc_sema_cur_ret
 @| _kcc_sema_callee_ctx
 @| _kcc_sema_callee_implicit
@@ -619,4 +631,5 @@ _kcc_sema_str_va_list:  .asciz "va_list"
 @| _kcc_sema_str_eq
 @| _kcc_sema_str_nl
 @| _kcc_sema_str_va_list
+@| _kcc_sema_str_builtin_va_list
 @}

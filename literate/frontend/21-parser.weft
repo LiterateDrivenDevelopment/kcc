@@ -512,7 +512,13 @@ retrieving the last hash table on the scope stack and inserting the name
 with a sentinel value of~1.  \texttt{kcc\_typedef\_lookup} searches scopes
 from top to bottom, returning~1 on the first hit.  This top-down search
 ensures that an inner scope's typedef shadows an outer variable of the
-same name, matching the C17 scoping rules \stdref{6.2.1}.
+same name, matching the C17 scoping rules \stdref{6.2.1}.  Before the scope
+scan it recognises two built-in type names that no user declaration
+introduces: \texttt{va\_list} and its GNU spelling \texttt{\_\_builtin\_va\_list}
+(the latter is what a freestanding \texttt{<stdarg.h>}, such as the kernel's
+under \texttt{-nostdinc}, typedefs \texttt{va\_list} from).  Both resolve to the
+opaque eight-byte pointer sema hands back
+(Section~\ref{sec:variadic-defs}).
 
 @d Parser: typedef table @{
 // -- kcc_typedef_add ---------------------------------------------------
@@ -571,12 +577,24 @@ _kcc_typedef_lookup:
     mov x20, x1                  // x20 = len
 
     // Built-in typedef: va_list resolves to a pointer (variadic definitions).
+    // Its GNU spelling __builtin_va_list (used by the kernel's <stdarg.h>) is
+    // an alias for the same type.
     cmp x20, #7
-    b.ne .Ltypedef_scan
+    b.ne .Ltypedef_try_builtin_va
     adrp x0, _kcc_str_va_list@@PAGE
     add  x0, x0, _kcc_str_va_list@@PAGEOFF
     mov x1, x19
     mov x2, #7
+    bl _kcc_memcmp
+    cbz x0, .Ltypedef_found
+
+.Ltypedef_try_builtin_va:
+    cmp x20, #17
+    b.ne .Ltypedef_scan
+    adrp x0, _kcc_str_builtin_va_list@@PAGE
+    add  x0, x0, _kcc_str_builtin_va_list@@PAGEOFF
+    mov x1, x19
+    mov x2, #17
     bl _kcc_memcmp
     cbz x0, .Ltypedef_found
 
@@ -1708,6 +1726,7 @@ _kcc_ast_n_int_lit:       .asciz "IntLit"
 _kcc_ast_n_float_lit:     .asciz "FloatLit"
 _kcc_ast_n_va_arg:        .asciz "VaArg"
 _kcc_str_va_list:         .asciz "va_list"
+_kcc_str_builtin_va_list: .asciz "__builtin_va_list"
 _kcc_ast_n_str_lit:       .asciz "StrLit"
 _kcc_ast_n_char_lit:      .asciz "CharLit"
 _kcc_ast_n_binary_expr:   .asciz "BinaryExpr"
@@ -1783,4 +1802,5 @@ _kcc_ast_n_generic_assoc: .asciz "GenericAssoc"
 @| _kcc_ast_n_generic_assoc
 @| _kcc_ast_n_va_arg
 @| _kcc_str_va_list
+@| _kcc_str_builtin_va_list
 @}

@@ -643,7 +643,12 @@ _kcc_parse_cast_expr:
 Postfix expressions (\stdref{6.5.2}): a primary expression followed
 by zero or more postfix operations: array subscript \texttt{[i]},
 function call \texttt{(args)}, member access \texttt{.field} or
-\texttt{->field}, and postfix \texttt{++}/\texttt{--}.
+\texttt{->field}, and postfix \texttt{++}/\texttt{--}.  The call form has one
+special case: \texttt{va\_arg(ap,\,T)} (and its GNU spelling
+\texttt{\_\_builtin\_va\_arg}, which the kernel's \texttt{<stdarg.h>} expands
+to) takes a \emph{type name} as its second operand, so it is diverted to a
+dedicated parse that reads a type instead of an argument expression and builds
+an \texttt{AST\_VA\_ARG} node.
 
 @d Expr: parse postfix @{
 // -- kcc_parse_postfix_expr --------------------------------------------
@@ -734,6 +739,12 @@ _kcc_parse_postfix_tail:
     ldr x0, [x19, #AST_F0]      // interned callee name
     adrp x1, _kcc_str_va_arg@@PAGE
     add  x1, x1, _kcc_str_va_arg@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lpostfix_va_arg
+    // Its GNU spelling __builtin_va_arg (kernel <stdarg.h> maps va_arg to it).
+    ldr x0, [x19, #AST_F0]      // reload (strcmp clobbered x0; x19 is preserved)
+    adrp x1, _kcc_str_builtin_va_arg@@PAGE
+    add  x1, x1, _kcc_str_builtin_va_arg@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lpostfix_va_arg
 
@@ -1926,6 +1937,8 @@ _kcc_expr_msg_expected:
 
 _kcc_str_va_arg:
     .asciz "va_arg"
+_kcc_str_builtin_va_arg:
+    .asciz "__builtin_va_arg"
 
 // -- Precedence table --------------------------------------------------
 // Indexed by (tok_type - 60).  48 entries covering all punctuators.

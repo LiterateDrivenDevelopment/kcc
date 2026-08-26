@@ -833,15 +833,27 @@ _kcc_ir_build_call:
     ldr x20, [x0, #AST_F0]       // x20 = callee name ptr
 
     // Variadic builtins: va_start(ap, last) and va_end(ap) are lowered
-    // specially rather than emitted as calls.
+    // specially rather than emitted as calls.  Their GNU spellings
+    // __builtin_va_start / __builtin_va_end (the kernel's <stdarg.h> maps the
+    // va_* macros to them) are accepted as aliases.
     mov x0, x20
     adrp x1, _kcc_ir_str_va_start@@PAGE
     add  x1, x1, _kcc_ir_str_va_start@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Libc_va_start
     mov x0, x20
+    adrp x1, _kcc_ir_str_builtin_va_start@@PAGE
+    add  x1, x1, _kcc_ir_str_builtin_va_start@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_va_start
+    mov x0, x20
     adrp x1, _kcc_ir_str_va_end@@PAGE
     add  x1, x1, _kcc_ir_str_va_end@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_va_end
+    mov x0, x20
+    adrp x1, _kcc_ir_str_builtin_va_end@@PAGE
+    add  x1, x1, _kcc_ir_str_builtin_va_end@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Libc_va_end
 
@@ -1195,6 +1207,18 @@ callee needs only a cursor into that stack area.  Accordingly
 argument; \texttt{va\_arg(ap, T)} reads the eight-byte slot at the cursor
 and advances it; and \texttt{va\_end} is a no-op.
 
+\kcc{} also answers to the GNU \texttt{\_\_builtin\_} spellings of these
+operators---\texttt{\_\_builtin\_va\_start}, \texttt{\_\_builtin\_va\_arg},
+\texttt{\_\_builtin\_va\_end}, and the type \texttt{\_\_builtin\_va\_list}---as
+exact aliases for the short names.  A freestanding \texttt{<stdarg.h>} (the
+kernel's, reached under \texttt{-nostdinc}) is written entirely in terms of
+these builtins: \texttt{typedef \_\_builtin\_va\_list va\_list;} and
+\texttt{\#define va\_arg(v,\,T) \_\_builtin\_va\_arg(v,\,T)}, so once the macros
+expand it is the \texttt{\_\_builtin\_} form that reaches the parser and the IR
+builder.  Recognising both spellings lets \kcc{} consume such a header without a
+built-in \texttt{<stdarg.h>} of its own.  (\texttt{va\_copy}/%
+\texttt{\_\_builtin\_va\_copy} is not yet provided.)
+
 Both sides depend on the prototype's fixed-parameter count.  Sema records it
 when it checks a function declaration, storing the count in the otherwise
 unused \texttt{TY\_QUALS} slot of the \texttt{TY\_FUNC} descriptor (zero there
@@ -1441,9 +1465,12 @@ _kcc_ir_build_va_arg:
 .section __TEXT,__cstring,cstring_literals
 _kcc_ir_str_va_start:    .asciz "va_start"
 _kcc_ir_str_va_end:      .asciz "va_end"
+_kcc_ir_str_builtin_va_start: .asciz "__builtin_va_start"
+_kcc_ir_str_builtin_va_end:   .asciz "__builtin_va_end"
 .text
 @| _kcc_ir_ident_alloca _kcc_ir_build_va_start _kcc_ir_build_va_arg
 @| _kcc_ir_str_va_start _kcc_ir_str_va_end
+@| _kcc_ir_str_builtin_va_start _kcc_ir_str_builtin_va_end
 @}
 
 \paragraph{End-to-end tests.}

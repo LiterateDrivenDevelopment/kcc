@@ -208,7 +208,9 @@ an expression), and \texttt{\_Alignof}.  Cast distinguishes a parenthesised type
 (a cast, or a compound literal on \texttt{\{}) from a parenthesised expression and
 a GNU statement expression (on \texttt{(\{}); each non-cast form runs through the
 postfix tail so suffixes can chain.  Postfix applies subscript, call (with the
-\texttt{va\_arg} special form), member access, and postfix \texttt{++}/\texttt{--}.
+\texttt{va\_arg} special form---also matched under its GNU
+\texttt{\_\_builtin\_va\_arg} spelling), member access, and postfix
+\texttt{++}/\texttt{--}.
 
 @l c
 @d Selfhost: expressions unary @{
@@ -319,7 +321,8 @@ void *kcc_parse_postfix_tail(void *expr) {
             cur = n;
         } else if (t == TOK_LPAREN) {
             if (cur->tag == AST_IDENT_EXPR &&
-                kcc_strcmp((const char *)cur->f0, "va_arg") == 0) {
+                (kcc_strcmp((const char *)cur->f0, "va_arg") == 0 ||
+                 kcc_strcmp((const char *)cur->f0, "__builtin_va_arg") == 0)) {
                 kcc_pp_next();
                 void *ap = kcc_parse_assign_expr();
                 kcc_parse_expect(TOK_COMMA);

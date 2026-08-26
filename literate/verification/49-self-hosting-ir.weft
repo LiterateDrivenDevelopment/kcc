@@ -3624,7 +3624,11 @@ counterpart---\texttt{\_\_builtin\_trap} to \texttt{abort} and
 \texttt{\_\_builtin\_abs/labs/llabs} to their unprefixed forms---which is
 correct while the milestone links against a C library.
 
-Variadic access has two lowerings.  On ARM64 a \texttt{va\_list} is a bare
+Variadic access has two lowerings; \texttt{build\_call} reaches them by name,
+accepting both the short \texttt{va\_start}/\texttt{va\_end} operators and their
+GNU \texttt{\_\_builtin\_va\_start}/\texttt{\_\_builtin\_va\_end} spellings (a
+freestanding \texttt{<stdarg.h>} expands the \texttt{va\_*} macros to the
+\texttt{\_\_builtin\_} forms).  On ARM64 a \texttt{va\_list} is a bare
 pointer that walks the homogeneous save area, so \texttt{va\_start} records the
 frame base and \texttt{va\_arg} bumps the cursor by eight.  On x86-64 the System~V
 ABI splits arguments across the integer and vector banks, so \texttt{va\_start}
@@ -3901,8 +3905,10 @@ unsigned long kcc_ir_build_call(void *e) {
     const char *name = 0;
     if (IL(callee, AST_TAG) == AST_IDENT_EXPR) {
         name = (const char *)IL(callee, AST_F0);
-        if (kcc_strcmp(name, "va_start") == 0) return kcc_ir_build_va_start(e);
-        if (kcc_strcmp(name, "va_end") == 0) return 0;
+        if (kcc_strcmp(name, "va_start") == 0 ||
+            kcc_strcmp(name, "__builtin_va_start") == 0) return kcc_ir_build_va_start(e);
+        if (kcc_strcmp(name, "va_end") == 0 ||
+            kcc_strcmp(name, "__builtin_va_end") == 0) return 0;
         /* Common GNU builtins the kernel leans on pervasively:
            __builtin_expect(x,c) is a branch hint -> just x; constant_p is a
            compile-time predicate; the mem* builtins are the libc entry points. */

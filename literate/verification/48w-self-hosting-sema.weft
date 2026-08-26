@@ -156,6 +156,7 @@ static const char m_vla[]        = "variable-length arrays are not supported";
 static const char m_generic[]    = "_Generic: no association compatible with the controlling type";
 static const char m_main[]       = "main";
 static const char m_va_list[]    = "va_list";
+static const char m_builtin_va_list[] = "__builtin_va_list";
 static const char *sema_noreturn_tbl[] = {
     "exit", "_exit", "_Exit", "abort", "longjmp",
     "__builtin_unreachable", "__builtin_trap", 0
@@ -201,8 +202,10 @@ into a canonical descriptor: builtins from the specifier bitmask; pointer, array
 and function types by recursion and construction (an array folds its length as an
 integer constant expression, rejecting VLAs; a variadic function records its
 fixed count in \texttt{TY\_QUALS}); struct/union bodies reused when the tag
-already names this same definition; typedef names by symbol lookup; and a
-\texttt{volatile} qualifier by cloning the descriptor with the volatile bit set.
+already names this same definition; typedef names by symbol lookup (with
+\texttt{va\_list} and its \texttt{\_\_builtin\_va\_list} spelling recognised as
+built-in aliases for the opaque pointer); and a \texttt{volatile} qualifier by
+cloning the descriptor with the volatile bit set.
 
 @l c
 @d Selfhost: sema resolve @{
@@ -289,8 +292,9 @@ void *kcc_sema_resolve_type(void *node) {
         if (!name) return kcc_type_int_s;
         void *sym = kcc_symtab_lookup(name, kcc_strlen(name));
         if (sym) return (void *)SL(sym, SYM_TYPE);
-        /* built-in typedef va_list → pointer */
+        /* built-in typedef va_list (and its __builtin_va_list spelling) → pointer */
         if (kcc_strcmp(name, m_va_list) == 0) return kcc_type_ptr(kcc_type_int_s);
+        if (kcc_strcmp(name, m_builtin_va_list) == 0) return kcc_type_ptr(kcc_type_int_s);
         return kcc_type_int_s;
     }
     if (tag == AST_TYPE_QUALS) {

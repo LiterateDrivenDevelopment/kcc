@@ -78,6 +78,9 @@ extern void *kcc_src_base;
 extern unsigned long kcc_src_size;
 extern unsigned long kcc_target;
 extern unsigned long kcc_x86_os;
+extern const char *kcc_dep_out;                  /* .d output path for -MD/-Wp,-MMD */
+void kcc_dep_reset(void);
+void kcc_dep_write(const char *obj, const char *src);
 extern void *kcc_x86_tu;
 extern unsigned long kcc_warn_all;
 extern unsigned long kcc_dwarf_enabled;
@@ -169,6 +172,7 @@ unsigned long kcc_driver_D(const char *arg, const char *next, unsigned long reg)
 @l c
 @d Selfhost: driver compile @{
 int kcc_driver_compile(const char *src, const char *out) {
+    kcc_dep_reset();
     kcc_source_open(src);
     kcc_source_encode();
     kcc_source_splice();
@@ -187,7 +191,9 @@ int kcc_driver_compile(const char *src, const char *out) {
     if (kcc_ir_validate()) { kcc_io_flush(); return 1; }
     if (kcc_target) {
         kcc_x86_tu = tu;
-        return kcc_driver_x86_object(out);
+        int r = kcc_driver_x86_object(out);
+        if (r == 0) kcc_dep_write(out, src);      /* -MD: emit the dependency file */
+        return r;
     }
     kcc_code_init();
     kcc_linker_init();
@@ -313,7 +319,25 @@ static int kcc_driver_two_arg_opt(const char *a) {
            kcc_strcmp(a, "-idirafter") == 0 || kcc_strcmp(a, "-imacros") == 0 ||
            kcc_strcmp(a, "-iquote") == 0 || kcc_strcmp(a, "-x") == 0 ||
            kcc_strcmp(a, "-MT") == 0 || kcc_strcmp(a, "-MF") == 0 ||
-           kcc_strcmp(a, "-MQ") == 0 || kcc_strcmp(a, "-aux-info") == 0;
+           kcc_strcmp(a, "-MQ") == 0 || kcc_strcmp(a, "-aux-info") == 0 ||
+           kcc_strcmp(a, "-MD") == 0 || kcc_strcmp(a, "-MMD") == 0;
+}
+
+/* Recognise the dependency-file options and record the .d path.  Kbuild uses the
+   comma-joined `-Wp,-MMD,<file>`; the standalone `-MD <file>`/`-MMD <file>` take
+   the next word.  Returns the number of argv slots consumed (0 if not a dep opt). */
+static int kcc_str_startswith(const char *s, const char *pre) {
+    while (*pre) { if (*s++ != *pre++) return 0; }
+    return 1;
+}
+static unsigned long kcc_dep_from_arg(const char *a, const char *next) {
+    if (kcc_str_startswith(a, "-Wp,-MMD,")) { kcc_dep_out = a + 9; return 1; }
+    if (kcc_str_startswith(a, "-Wp,-MD,"))  { kcc_dep_out = a + 8; return 1; }
+    if (kcc_strcmp(a, "-MD") == 0 || kcc_strcmp(a, "-MMD") == 0) {
+        if (next) { kcc_dep_out = next; return 2; }
+        return 1;
+    }
+    return 0;
 }
 
 void kcc_driver_compile_all(long argc, char **argv) {
@@ -343,6 +367,7 @@ void kcc_driver_compile_all(long argc, char **argv) {
         if (n) { i += (long)n; continue; }
         n = kcc_driver_D(a, next, 1);
         if (n) { i += (long)n; continue; }
+        { unsigned long nd = kcc_dep_from_arg(a, next); if (nd) { i += (long)nd; continue; } }
         if (kcc_driver_two_arg_opt(a)) { i += 2; continue; }
         if (a[0] == '-') { i++; continue; }       /* any other flag: ignore */
         src_count++; i++;

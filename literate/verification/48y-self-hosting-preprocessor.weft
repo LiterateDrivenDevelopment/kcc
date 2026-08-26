@@ -92,6 +92,7 @@ unsigned long kcc_strlen(const char *s);
 void kcc_diag_error(unsigned long line, unsigned long col, const char *msg);
 void kcc_diag_warning(unsigned long line, unsigned long col, const char *msg);
 long kcc_sys_open(const char *path, unsigned long flags, unsigned long mode);
+long kcc_sys_write(long fd, const void *buf, unsigned long len);
 long kcc_sys_close(long fd);
 void kcc_sys_exit(long code);
 void kcc_source_open(const char *path);
@@ -1254,12 +1255,35 @@ void kcc_pp_do_include(void) {
         if (!system) kcc_diag_error(pp_dir_line, 1, m_notfound);
         return;
     }
+    kcc_dep_add(rp);                              /* record for -MD dependency output */
     pp_ctx_push(PP_CTX_INCLUDE);
     kcc_source_open(rp);
     kcc_source_encode();
     kcc_source_splice();
     kcc_lex_init(kcc_src_base, kcc_src_size);
     pp_prev_line = 0;
+}
+
+/* Dependency tracking for `-MD`/`-Wp,-MMD,file`: record every real include file
+   opened while preprocessing, then write a Makefile fragment `obj: src hdrs...`
+   that Kbuild's fixdep consumes.  Built-in headers have no path and are skipped. */
+const char *kcc_dep_out = 0;                  /* the .d output path, set by the driver */
+static const char *kcc_dep_list[1024];
+static unsigned long kcc_dep_n = 0;
+void kcc_dep_reset(void) { kcc_dep_n = 0; }
+void kcc_dep_add(const char *path) { if (kcc_dep_n < 1024) kcc_dep_list[kcc_dep_n++] = path; }
+static void dep_puts(long fd, const char *s) { kcc_sys_write(fd, s, kcc_strlen(s)); }
+void kcc_dep_write(const char *obj, const char *src) {
+    if (!kcc_dep_out) return;
+    /* O_WRONLY|O_CREAT|O_TRUNC = 0x241 on Linux, mode 0644; -MD is a Kbuild
+       (Linux) feature so the Linux flag values apply. */
+    long fd = kcc_sys_open(kcc_dep_out, 0x241, 0644);
+    if (fd < 0) return;
+    dep_puts(fd, obj); dep_puts(fd, ": "); dep_puts(fd, src);
+    for (unsigned long i = 0; i < kcc_dep_n; i++) { dep_puts(fd, " \\\n  "); dep_puts(fd, kcc_dep_list[i]); }
+    dep_puts(fd, "\n\n");
+    for (unsigned long i = 0; i < kcc_dep_n; i++) { dep_puts(fd, kcc_dep_list[i]); dep_puts(fd, ":\n"); }
+    kcc_sys_close(fd);
 }
 
 void kcc_pp_do_error(void) {

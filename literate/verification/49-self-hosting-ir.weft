@@ -1060,7 +1060,21 @@ void kcc_ir_asm_lower_operands(void *as) {
         if (ety && IL(ety, TY_SIZE)) size = IL(ety, TY_SIZE);
         char *cons = (char *)IL(op, AST_F0);
         char c = cons[0];
-        if (c == '=') {
+        char cls = (c == '=' || c == '+') ? cons[1] : c;
+        if (cls == 'm') {
+            /* memory operand ("m"/"=m"/"+m"): the asm accesses the object
+               through its address, so we only need that address---no register
+               value is loaded and nothing is stored back.  The address goes in
+               AST_F3, as for an output, and the back end tells the two apart by
+               the constraint spelling. */
+            void *u = kcc_ast_alloc(AST_UNARY_EXPR);
+            IL(u, AST_F0) = TOK_AMP;
+            IL(u, AST_F1) = IL(op, AST_F2);
+            IL(u, AST_F2) = 1;
+            unsigned long addr = kcc_ir_build_expr(u);
+            IL(op, AST_F3) = ((addr + 1) | (size << 32));
+            IL(op, AST_F2) = 0;
+        } else if (c == '=') {
             /* output: address only. asm_addr_of returns the vreg via build_expr */
             void *u = kcc_ast_alloc(AST_UNARY_EXPR);
             IL(u, AST_F0) = TOK_AMP;
@@ -2479,6 +2493,11 @@ unsigned long kcc_ir_build_unary(void *e) {
         if (otag == AST_SUBSCRIPT) return kcc_ir_build_subscript_addr(operand);
         if (otag == AST_MEMBER) return kcc_ir_build_member_addr(operand);
         if (otag == AST_COMPOUND_LIT) return kcc_ir_build_compound_lit(operand);
+        /* &(*p) is just p---the address-of and dereference cancel.  Needed by
+           memory-constraint asm operands (`"m"(*addr)`), where the address of
+           the pointed-to object is the pointer value itself. */
+        if (otag == AST_UNARY_EXPR && IL(operand, AST_F0) == TOK_STAR)
+            return kcc_ir_build_expr((void *)IL(operand, AST_F1));
         if (otag != AST_IDENT_EXPR) return 0;
         char *name = (char *)IL(operand, AST_F0);
         if (!name) return 0;

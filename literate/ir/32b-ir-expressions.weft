@@ -4912,6 +4912,8 @@ _kcc_ir_build_unary:
     b.eq .Libu_addr_member
     cmp x0, #AST_COMPOUND_LIT
     b.eq .Libu_addr_compound
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Libu_addr_deref
     cmp x0, #AST_IDENT_EXPR
     b.ne .Libu_addr_zero         // unsupported operand → 0
 
@@ -4942,6 +4944,17 @@ _kcc_ir_build_unary:
     // &s.f / &s->f: the member address
     mov x0, x21
     bl _kcc_ir_build_member_addr
+    b .Libu_done
+
+.Libu_addr_deref:
+    // &(*e) cancels to e (the pointer value); needed by memory-constraint asm
+    // operands (`"m"(*addr)`), whose address is the pointer itself.
+    ldr x1, [x21, #AST_F0]      // unary operator
+    cmp x1, #TOK_STAR
+    b.ne .Libu_addr_zero         // any other unary → unsupported
+    ldr x0, [x21, #AST_F1]      // inner expression (the pointer)
+    cbz x0, .Libu_addr_zero
+    bl _kcc_ir_build_expr
     b .Libu_done
 
 .Libu_addr_compound:

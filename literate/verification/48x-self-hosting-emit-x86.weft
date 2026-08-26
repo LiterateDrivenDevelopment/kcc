@@ -455,25 +455,38 @@ static void x86_emit_asm(void *i) {
        so arch code can seed a register through one operand and read/write it as
        another, e.g. `bsfl %1,%0 : "=r"(r) : "rm"(x), "0"(-1)`). */
     unsigned long regof[3];
+    unsigned long ismem[3];                       /* operand k is a memory ref */
     unsigned long nop = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4)) {
         if (nop >= 3) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
         const char *c = (const char *)IL(op, AST_F0);
         char ch = c[0]; if (ch == '=' || ch == '+') ch = c[1];
+        ismem[nop] = 0;
         if (ch >= '0' && ch <= '9') {
             unsigned long tied = (unsigned long)(ch - '0');
             if (tied >= nop) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
             regof[nop] = regof[tied];            /* alias the tied operand's reg */
         } else if (ch == 'r') {
             regof[nop] = nop;
+        } else if (ch == 'm') {
+            /* memory operand: its register holds the object's *address*, and
+               the template references it as %r8+k in parentheses. */
+            regof[nop] = nop;
+            ismem[nop] = 1;
         } else { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
         nop++;
     }
-    /* load each input value into its assigned register */
+    /* load each operand's register: an input's value, or a memory operand's
+       address (held in AST_F3 exactly like an output's address). */
     unsigned long k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
-        unsigned long v = IL(op, AST_F2) & 0xffffffff;
-        if (v) x86_load(v - 1, asmregs[regof[k]]);
+        if (ismem[k]) {
+            unsigned long a = IL(op, AST_F3) & 0xffffffff;
+            if (a) x86_load(a - 1, asmregs[regof[k]]);
+        } else {
+            unsigned long v = IL(op, AST_F2) & 0xffffffff;
+            if (v) x86_load(v - 1, asmregs[regof[k]]);
+        }
     }
     /* paste the template, rewriting %% -> % and %[bwkq]N -> operand register */
     const char *t = (const char *)IL(i, IR_SRC1);
@@ -494,13 +507,20 @@ static void x86_emit_asm(void *i) {
             unsigned long num = 0;
             while (p + 1 < len && t[p + 1] >= '0' && t[p + 1] <= '9') { num = num * 10 + (t[p + 1] - '0'); p++; }
             unsigned long reg = (num < nop) ? regof[num] : num;
-            x86_asm_wreg(reg, sz ? sz : x86_asm_opsize(node, num));
+            if (num < nop && ismem[num]) {
+                /* memory operand: dereference the address register */
+                kcc_as_ch('('); x86_asm_wreg(reg, 8); kcc_as_ch(')');
+            } else {
+                x86_asm_wreg(reg, sz ? sz : x86_asm_opsize(node, num));
+            }
         } else { kcc_as_ch('%'); }
     }
     kcc_as_ch('\n');
-    /* store each output register back through its address */
+    /* store each register output back through its address; a memory operand
+       needs nothing here---the asm wrote the object directly. */
     k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        if (ismem[k]) continue;
         unsigned long ah = IL(op, AST_F3);
         unsigned long a = ah & 0xffffffff;
         if (!a) continue;

@@ -10,7 +10,7 @@
 \chapter{The Driver}
 \label{ch:driver}
 
-This chapter is where execution begins.  The \texttt{\_main} function receives \texttt{argc} and \texttt{argv} from the macOS kernel, initializes the compiler's core subsystems (arena allocator, keyword table, I/O), and dispatches to the appropriate pipeline based on the command-line flags.  Supported modes include \texttt{--dump-tokens} for lexer debugging, \texttt{--dump-ast} for parser output, \texttt{--dump-ir} for IR inspection, and \texttt{-c} for full compilation to a Mach-O object file.
+This chapter is where execution begins.  The \texttt{\_main} function receives \texttt{argc} and \texttt{argv} from the macOS kernel, initializes the compiler's core subsystems (arena allocator, keyword table, I/O), and dispatches to the appropriate pipeline based on the command-line flags.  Supported modes include \texttt{--dump-tokens} for lexer debugging, \texttt{--dump-ast} for parser output, \texttt{--dump-ir} for IR inspection, and \texttt{-c} for full compilation to a Mach-O object file.  The diagnostic modes are selected by \texttt{argv[1]}, but \texttt{-c} is recognised \emph{anywhere} in the argument list: a gcc-driven build (Kbuild) leads with its flags and ends with \texttt{-c -o out.o in.c}, so a fixed \texttt{argv[1]} test would miss the \texttt{-c} and fall through to link mode.
 
 \section{Entry Point}
 

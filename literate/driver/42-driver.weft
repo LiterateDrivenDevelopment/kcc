@@ -341,6 +341,16 @@ instead of exiting: the loop must survive an individual file's outcome,
 accumulate the failures, and exit once at the end with the combined
 result.
 
+Both scanning passes begin at \texttt{argv[1]} and skip \texttt{-c} wherever it
+sits.  A hand-written invocation puts \texttt{-c} first, but a gcc-driven build
+(Kbuild) leads with the flags and ends with \texttt{-c -o out.o in.c}; treating
+\texttt{-c} as the compile-only selector regardless of position---rather than
+assuming \texttt{argv[1]}---lets \kcc{} stand in as a drop-in \texttt{CC=} for
+such command lines.  \texttt{\_kcc\_opt\_compile} (the \texttt{"-c"} string) is
+therefore defined here in the driver, so the scan resolves it whether or not the
+assembly \texttt{main}---which the self-host build can replace with the C
+port---is linked in.
+
 Because every per-translation-unit subsystem (\texttt{ir\_init},
 \texttt{code\_init}, \texttt{linker\_init}, the string, typedef, type,
 and symbol tables) reinitialises its state at the top of

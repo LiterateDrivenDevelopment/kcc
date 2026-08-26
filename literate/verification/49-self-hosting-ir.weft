@@ -655,6 +655,27 @@ void kcc_ir_emit_global_inits(void) {
         if (IL(d, AST_TAG) == AST_FUNC_DECL) {
             void *body = (void *)IL(d, AST_F3);
             if (body) {
+                /* Re-register this function's static-locals: emit_modinit reset
+                   the mangled-name table, so an initializer that takes the
+                   address of a sibling static (`static T *p[] = { other, ... }')
+                   would otherwise resolve to the source name and link against an
+                   undefined symbol.  Register before emitting any init store. */
+                void *rs = (void *)IL(body, AST_F0);
+                while (rs) {
+                    if (IL(rs, AST_TAG) == AST_VAR_DECL && IL(rs, AST_F3) == 3 &&
+                        IL(rs, AST_F1)) {
+                        void *nm = (void *)IL(rs, AST_F1);
+                        unsigned long kl = kcc_strlen((const char *)nm);
+                        kcc_ht_put(kcc_ir_statics, nm, kl,
+                                   (void *)kcc_ir_static_name(rs));
+                        void *tn = (void *)IL(rs, AST_F0);
+                        if (tn) {
+                            void *rt = kcc_sema_resolve_type(tn);
+                            if (rt) kcc_ht_put(kcc_ir_static_types, nm, kl, rt);
+                        }
+                    }
+                    rs = (void *)IL(rs, AST_F4);
+                }
                 void *s = (void *)IL(body, AST_F0);
                 while (s) {
                     if (IL(s, AST_TAG) == AST_VAR_DECL && IL(s, AST_F3) == 3 &&
@@ -675,6 +696,12 @@ void kcc_ir_emit_global_inits(void) {
         }
         d = (void *)IL(d, AST_F4);
     }
+    /* Discard the static-local names seeded above: this runs at the top of
+       main (or a module-init), and leaving other functions' statics in the
+       table would let them shadow a like-named global in the body that
+       follows (a static `c` masking the global `c`). */
+    kcc_ir_statics = kcc_ht_init(16);
+    kcc_ir_static_types = kcc_ht_init(16);
 }
 
 void kcc_ir_emit_aggregate_init(void *init_list, void *agg, unsigned long base) {

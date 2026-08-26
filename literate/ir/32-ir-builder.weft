@@ -168,8 +168,13 @@ self-hosted lexer relies on.
 A second pass then seeds the \texttt{static} locals
 (\S\ref{sec:ir-static-locals}).  Since these are hoisted to globals but
 their declarations live inside function bodies, this pass walks each
-function's top-level statement list for \texttt{static} declarations
-that carry an initialiser, materialises the mangled symbol with an
+function's top-level statement list for \texttt{static} declarations.
+Before emitting any store it first re-registers that function's
+static-locals in the mangled-name table: the module-init function reset
+that table, so an initialiser that takes the address of a sibling static
+(\texttt{static T *p[] = \{ other\_static, \ldots \}}) would otherwise
+resolve to the source name and link against an undefined symbol.  It then
+materialises each static's own mangled symbol with an
 \texttt{IR\_GLOBAL\_REF}, and hands it to the shared
 \texttt{\_kcc\_ir\_emit\_init\_stores} routine---so a scalar, an
 aggregate list, or a string static is initialised by exactly the same
@@ -693,13 +698,63 @@ _kcc_ir_emit_global_inits:
     cbz x0, .Legi_done
     ldr x19, [x0, #AST_F0]      // first top-level decl
 .Legi_fn_loop:
-    cbz x19, .Legi_done
+    cbz x19, .Legi_reset
     ldr x0, [x19, #AST_TAG]
     cmp x0, #AST_FUNC_DECL
     b.ne .Legi_fn_next
     ldr x0, [x19, #AST_F3]      // function body (compound stmt)
     cbz x0, .Legi_fn_next
-    ldr x20, [x0, #AST_F0]      // first body item
+    ldr x23, [x0, #AST_F0]      // body head (preserved across the reg sweep)
+
+    // Registration sweep: seed this function's static-locals into kcc_ir_statics
+    // (and static_types) so an initializer taking the address of a sibling
+    // static (`static T *p[] = { other_static, .. }`) resolves to the hoisted
+    // mangled symbol.  emit_modinit reset the table, so without this the
+    // reference would link against the source name and be undefined.
+    mov x24, x23                // cursor
+.Legi_reg_loop:
+    cbz x24, .Legi_reg_done
+    ldr x0, [x24, #AST_TAG]
+    cmp x0, #AST_VAR_DECL
+    b.ne .Legi_reg_next
+    ldr x0, [x24, #AST_F3]      // storage class
+    cmp x0, #3
+    b.ne .Legi_reg_next
+    ldr x0, [x24, #AST_F1]      // name
+    cbz x0, .Legi_reg_next
+    // name -> static_name(decl)
+    mov x0, x24
+    bl _kcc_ir_static_name
+    mov x21, x0                 // mangled (callee-saved, survives strlen)
+    ldr x0, [x24, #AST_F1]      // name
+    bl _kcc_strlen
+    mov x2, x0                  // keylen
+    ldr x1, [x24, #AST_F1]      // key = name
+    mov x3, x21                 // value = mangled
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    bl _kcc_ht_put
+    // name -> resolve_type(decl->F0) into static_types
+    ldr x0, [x24, #AST_F0]      // type node
+    cbz x0, .Legi_reg_next
+    bl _kcc_sema_resolve_type
+    cbz x0, .Legi_reg_next
+    mov x21, x0                 // rt (survives strlen)
+    ldr x0, [x24, #AST_F1]      // name
+    bl _kcc_strlen
+    mov x2, x0                  // keylen
+    ldr x1, [x24, #AST_F1]      // key = name
+    mov x3, x21                 // value = rt
+    adrp x0, _kcc_ir_static_types@@PAGE
+    add  x0, x0, _kcc_ir_static_types@@PAGEOFF
+    ldr x0, [x0]
+    bl _kcc_ht_put
+.Legi_reg_next:
+    ldr x24, [x24, #AST_F4]
+    b .Legi_reg_loop
+.Legi_reg_done:
+    mov x20, x23                // reset to body head for the emit loop
 .Legi_stmt_loop:
     cbz x20, .Legi_fn_next
     ldr x0, [x20, #AST_TAG]
@@ -752,6 +807,21 @@ _kcc_ir_emit_global_inits:
 .Legi_fn_next:
     ldr x19, [x19, #AST_F4]
     b .Legi_fn_loop
+
+.Legi_reset:
+    // Discard the static-local names seeded above: this runs at the top of main
+    // (or a module-init), and leaving other functions' statics in the table
+    // would let them shadow a like-named global in the body that follows.
+    mov x0, #16
+    bl _kcc_ht_init
+    adrp x1, _kcc_ir_statics@@PAGE
+    add  x1, x1, _kcc_ir_statics@@PAGEOFF
+    str x0, [x1]
+    mov x0, #16
+    bl _kcc_ht_init
+    adrp x1, _kcc_ir_static_types@@PAGE
+    add  x1, x1, _kcc_ir_static_types@@PAGEOFF
+    str x0, [x1]
 
 .Legi_done:
     ldp x23, x24, [sp, #48]

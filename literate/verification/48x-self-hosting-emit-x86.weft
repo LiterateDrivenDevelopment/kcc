@@ -147,6 +147,7 @@ S(s_div_rcx, "\tdivq\t%rcx\n");
 S(s_r10, "%r10"); S(s_r11, "%r11"); S(s_rax, "%rax"); S(s_rcx, "%rcx");
 S(s_rdx, "%rdx"); S(s_r11_r10, "%r11, %r10\n"); S(s_r10_nl, "%r10\n");
 S(s_rbx, "%rbx"); S(s_push_rbx, "\tpushq\t%rbx\n"); S(s_pop_rbx, "\tpopq\t%rbx\n");
+S(s_setcc, "\tset"); S(s_tab_al, "\t%al\n"); S(s_movzx_al, "\tmovzbl\t%al, %eax\n");
 S(s_cl_r10, "%cl, %r10\n"); S(s_c_r10, ", %r10\n"); S(s_c_r10d, ", %r10d\n");
 S(s_pr11_r10, "(%r11), %r10\n"); S(s_pr11_r10d, "(%r11), %r10d\n");
 S(s_pr11, "(%r11)");
@@ -401,7 +402,14 @@ specific register---\texttt{a}/\texttt{b}/\texttt{c}/\texttt{d} for
 template renders it at the operand's width (\texttt{\%eax}, \texttt{\%cl}, \ldots).
 Because \texttt{\%rbx} is callee-saved, an asm that pins an operand to it is
 bracketed with \texttt{pushq}/\texttt{popq \%rbx} so the caller's value survives;
-the others are caller-saved and need no save.  A matching constraint does not
+the others are caller-saved and need no save.  A condition-code output
+(\texttt{"=@@cc\meta{cond}"}, as \texttt{test\_and\_set\_bit}'s \texttt{"=@@ccc"})
+takes no register and is not named in the template: after the body a
+\texttt{set\meta{cond}} captures the still-live flag into \texttt{\%al}, which is
+zero-extended and stored---the condition suffix maps straight onto the
+\texttt{setCC} mnemonic (\texttt{c}, \texttt{z}, \texttt{l}, \ldots).  Register
+outputs are stored first, with plain \texttt{mov}s that leave the flags intact
+for these.  A matching constraint does not
 take a register of its own: it \emph{aliases} the tied operand's register
 (specific one included), which is exactly the register-tie GCC guarantees so a
 value seeded through one operand can be read or written as another---as in
@@ -496,6 +504,8 @@ static void x86_emit_asm(void *i) {
     unsigned long isimm[3];                        /* operand k is an immediate */
     unsigned long immval[3];                        /* its constant value */
     char spec[3];                                  /* specific-register letter or 0 */
+    char isflag[3];                                /* condition-code output (=@@cc) */
+    const char *flagcond[3];                        /* its setCC suffix */
     unsigned long uses_rbx = 0;                    /* any operand pinned to %rbx */
     unsigned long nop = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4)) {
@@ -504,6 +514,17 @@ static void x86_emit_asm(void *i) {
         char ch = c[0]; if (ch == '=' || ch == '+') ch = c[1];
         ismem[nop] = 0;
         spec[nop] = 0;
+        isflag[nop] = 0;
+        /* `=@@cc<cond>`: a condition-code output.  It takes no register and is
+           not named in the template; after the asm a setCC captures the flag. */
+        if (c[0] == '=' && c[1] == '@@' && c[2] == 'c' && c[3] == 'c') {
+            isflag[nop] = 1;
+            isimm[nop] = 0;
+            flagcond[nop] = c + 4;
+            regof[nop] = nop;
+            nop++;
+            continue;
+        }
         /* the IR marks a resolved immediate with the top bit of AST_F2 and puts
            the value in AST_F1; that decision (constant vs register) already
            accounts for `Ir`-style alternatives. */
@@ -541,7 +562,7 @@ static void x86_emit_asm(void *i) {
        need no register. */
     unsigned long k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
-        if (isimm[k]) continue;
+        if (isimm[k] || isflag[k]) continue;
         const char *dst = spec[k] ? x86_spec64(spec[k]) : asmregs[regof[k]];
         if (ismem[k]) {
             unsigned long a = IL(op, AST_F3) & 0xffffffff;
@@ -585,12 +606,12 @@ static void x86_emit_asm(void *i) {
         } else { kcc_as_ch('%'); }
     }
     kcc_as_ch('\n');
-    /* store each register output back through its address; a memory operand or
-       immediate needs nothing here---the asm wrote the object directly, and an
-       immediate has no destination. */
+    /* Store the register outputs first; these are all mov instructions, which
+       leave the flags the asm set intact for the condition-code outputs below
+       (and store any %rax result before setCC would overwrite %al). */
     k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
-        if (ismem[k] || isimm[k]) continue;
+        if (ismem[k] || isimm[k] || isflag[k]) continue;
         unsigned long ah = IL(op, AST_F3);
         unsigned long a = ah & 0xffffffff;
         if (!a) continue;
@@ -600,6 +621,21 @@ static void x86_emit_asm(void *i) {
         if (spec[k]) x86_spec_reg(spec[k], sz);
         else x86_asm_wreg(regof[k], sz);
         kcc_as_str(s_comma); kcc_as_str(s_pr11); kcc_as_ch('\n');
+    }
+    /* Condition-code outputs: setCC captures the still-live flag into %al,
+       zero-extend, and store it at the destination's width. */
+    k = 0;
+    for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
+        if (!isflag[k]) continue;
+        unsigned long ah = IL(op, AST_F3);
+        unsigned long a = ah & 0xffffffff;
+        if (!a) continue;
+        kcc_as_str(s_setcc); kcc_as_str(flagcond[k]); kcc_as_str(s_tab_al);
+        kcc_as_str(s_movzx_al);
+        unsigned long sz = ah >> 32; if (!sz) sz = 4;
+        x86_load(a - 1, s_r11);
+        kcc_as_str(sz == 1 ? s_movb : sz == 2 ? s_movw : sz == 4 ? s_movl : s_movq);
+        x86_spec_reg('a', sz); kcc_as_str(s_comma); kcc_as_str(s_pr11); kcc_as_ch('\n');
     }
     if (uses_rbx) kcc_as_str(s_pop_rbx);
 }

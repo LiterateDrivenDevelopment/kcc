@@ -710,6 +710,14 @@ difftest "builtin-types-compatible" \
 _Static_assert(__builtin_types_compatible_p(typeof(a), typeof(a)), \"same\");
 _Static_assert(!__builtin_types_compatible_p(typeof(a), typeof(b)), \"diff\");
 int main(void){ return __builtin_types_compatible_p(int, int)*100 + __builtin_types_compatible_p(int, long)*10 + __builtin_types_compatible_p(unsigned, unsigned); }"
+# GNU `, ##__VA_ARGS__` comma elision: the trailing comma vanishes when the
+# variadic argument is empty (the kernel's static_assert(expr) macro).
+difftest "gnu-va-comma-elision" \
+    "int add3(int a,int b,int c){ return a*100+b*10+c; }
+#define M(a, ...) add3(a, ##__VA_ARGS__)
+#define ONE(a, ...) sink(a, ##__VA_ARGS__)
+int sink(int a){ return a; }
+int main(void){ return M(1, 2, 3) - ONE(123) * 0 - 123; }"
 # GNU typeof: a type-specifier that is the type of a parenthesised type-name or
 # expression.  Used in declarations, casts, and sizeof; __typeof__ is the alias.
 difftest "gnu-typeof" \

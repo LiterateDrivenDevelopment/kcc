@@ -636,7 +636,12 @@ int kcc_pp_try_expand(void) {
 behind a \emph{drain floor}, so expansion stops at the argument boundary rather
 than reading into the enclosing text.  \texttt{pp\_substitute} walks the body,
 replacing parameter names with (prescan-expanded) argument text and honouring
-the \texttt{\#} (stringise) and \texttt{\#\#} (paste) operators.
+the \texttt{\#} (stringise) and \texttt{\#\#} (paste) operators.  It also
+implements the GNU comma-elision special case \texttt{,\,\#\#\,\_\_VA\_ARGS\_\_}:
+when the right operand of \texttt{\#\#} is a parameter whose argument is empty,
+the paste deletes both the operand and a preceding comma---the mechanism behind
+the kernel's \texttt{static\_assert(expr,\,...)} wrapper, and thus a hard
+prerequisite for the \texttt{<linux/bitops.h>} sanity assertions.
 
 @l c
 @d Selfhost: pp substitute @{
@@ -723,6 +728,24 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
         }
         if (c == '#') {
             if (i + 1 < blen && body[i + 1] == '#') {
+                /* GNU comma elision `, ## __VA_ARGS__`: when the right operand of
+                   ## is a parameter whose argument is empty, the ## deletes it and
+                   a preceding comma (used pervasively via the kernel's
+                   `static_assert(expr, ...)` macro). */
+                unsigned long pj = i + 2;
+                while (pj < blen && (body[pj] == ' ' || body[pj] == 0x09)) pj++;
+                unsigned long ps = pj;
+                while (pj < blen && is_idn((unsigned char)body[pj])) pj++;
+                unsigned long plen = pj - ps;
+                long ppi = -1;
+                for (unsigned long k = 0; k < np; k++)
+                    if (params[k].len == plen && kcc_memcmp(body + ps, params[k].name, plen) == 0) { ppi = (long)k; break; }
+                if (ppi >= 0 && args[ppi].len == 0) {
+                    while (op && (out[op - 1] == ' ' || out[op - 1] == 0x09)) op--;
+                    if (op && out[op - 1] == ',') op--;     /* drop the dangling comma */
+                    i = pj;                                  /* consume ## and the empty operand */
+                    continue;
+                }
                 /* ## paste: trim emitted whitespace, skip operator + whitespace */
                 while (op && (out[op - 1] == ' ' || out[op - 1] == 0x09)) op--;
                 i += 2;

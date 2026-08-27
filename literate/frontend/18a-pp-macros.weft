@@ -1183,8 +1183,14 @@ a substituted argument or a literal, lands flush against the left one.
 Operands are taken from the substituted argument text; because kcc's
 arguments are already prescan-expanded and a paste operand is normally a
 bare identifier or number, this matches the standard in every case a real
-header exercises.  A lone \texttt{\#} is the stringisation operator, handled
-just below.
+header exercises.  One GNU special case is handled first: in
+\texttt{,\,\#\#\,\_\_VA\_ARGS\_\_}, when the right operand is a parameter whose
+argument is empty, the paste deletes the operand \emph{and} a preceding comma
+(peeking the operand identifier and consulting its argument length before the
+ordinary trim).  This is what makes the kernel's
+\texttt{static\_assert(expr,\,...)} macro---and hence the
+\texttt{<linux/bitops.h>} assertions---expand correctly.  A lone \texttt{\#} is
+the stringisation operator, handled just below.
 
 @d PP: expand @{
 // -- _kcc_pp_substitute ---------------------------------------------
@@ -1408,6 +1414,103 @@ _kcc_pp_substitute:
     b .Lsub_loop
 
 .Lsub_paste:
+    // GNU comma elision `, ## PARAM`: if the ## right operand is a parameter
+    // whose argument is empty, the ## deletes it and a preceding comma (the
+    // kernel's `static_assert(expr, ...)` macro relies on this).  Peek the
+    // operand identifier; if it names a parameter with an empty argument, drop
+    // the comma and consume both the ## and the operand.
+    add x9, x27, #2              // past the ##
+.Lsub_ce_ws:
+    cmp x9, x20
+    b.hs .Lsub_paste_trim
+    add x0, x19, x9
+    ldrb w0, [x0]
+    cmp w0, #0x20
+    b.eq .Lsub_ce_ws_adv
+    cmp w0, #0x09
+    b.ne .Lsub_ce_id0
+.Lsub_ce_ws_adv:
+    add x9, x9, #1
+    b .Lsub_ce_ws
+.Lsub_ce_id0:
+    mov x10, x9                 // operand identifier start
+.Lsub_ce_idc:
+    cmp x9, x20
+    b.hs .Lsub_ce_idend
+    add x0, x19, x9
+    ldrb w0, [x0]
+    cmp w0, #'_'
+    b.eq .Lsub_ce_idadv
+    cmp w0, #'0'
+    b.lo .Lsub_ce_idend
+    cmp w0, #'9'
+    b.ls .Lsub_ce_idadv
+    cmp w0, #'a'
+    b.lo .Lsub_ce_idup
+    cmp w0, #'z'
+    b.ls .Lsub_ce_idadv
+.Lsub_ce_idup:
+    cmp w0, #'A'
+    b.lo .Lsub_ce_idend
+    cmp w0, #'Z'
+    b.hi .Lsub_ce_idend
+.Lsub_ce_idadv:
+    add x9, x9, #1
+    b .Lsub_ce_idc
+.Lsub_ce_idend:
+    sub x11, x9, x10            // operand identifier length
+    cbz x11, .Lsub_paste_trim
+    mov x12, #0                 // param index k
+.Lsub_ce_match:
+    cmp x12, x22
+    b.hs .Lsub_paste_trim       // no parameter matched → normal paste
+    mov x13, #PP_PARAM_SIZE
+    mul x13, x12, x13
+    add x13, x21, x13           // &params[k]
+    ldr x14, [x13, #PP_PARAM_LEN]
+    cmp x14, x11
+    b.ne .Lsub_ce_next
+    stp x10, x11, [sp, #-16]!
+    stp x12, x13, [sp, #-16]!
+    add x0, x19, x10
+    ldr x1, [x13, #PP_PARAM_NAME]
+    mov x2, x11
+    bl _kcc_memcmp
+    ldp x12, x13, [sp], #16
+    ldp x10, x11, [sp], #16
+    cbnz x0, .Lsub_ce_next
+    // Parameter k matched.  Is its argument empty? (args[k].len at offset 8)
+    lsl x13, x12, #4
+    add x13, x23, x13
+    ldr x14, [x13, #8]
+    cbnz x14, .Lsub_paste_trim  // non-empty operand → normal paste
+    // Empty operand: trim trailing whitespace, then drop a trailing comma.
+.Lsub_ce_trim:
+    cbz x26, .Lsub_ce_done
+    sub x1, x26, #1
+    add x3, x25, x1
+    ldrb w4, [x3]
+    cmp w4, #0x20
+    b.eq .Lsub_ce_trim_adv
+    cmp w4, #0x09
+    b.ne .Lsub_ce_comma
+.Lsub_ce_trim_adv:
+    mov x26, x1
+    b .Lsub_ce_trim
+.Lsub_ce_comma:
+    sub x1, x26, #1
+    add x3, x25, x1
+    ldrb w4, [x3]
+    cmp w4, #','
+    b.ne .Lsub_ce_done
+    mov x26, x1
+.Lsub_ce_done:
+    mov x27, x9                 // consume the ## and the empty operand
+    b .Lsub_loop
+.Lsub_ce_next:
+    add x12, x12, #1
+    b .Lsub_ce_match
+
     // Drop any whitespace already emitted for the left operand, so it abuts.
 .Lsub_paste_trim:
     cbz x26, .Lsub_paste_skip

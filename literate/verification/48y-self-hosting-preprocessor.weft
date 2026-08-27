@@ -283,7 +283,9 @@ void kcc_pp_dump_all(void) {
 
 \section{Helpers: Skip-Line and Rest-of-Line}
 
-\texttt{pp\_skip\_line} advances the cursor past the line's newline;
+\texttt{pp\_skip\_line} advances the cursor past the line's newline, skipping a
+block comment that spans the newline so a skipped directive's logical line ends
+where the comment does;
 \texttt{pp\_rest\_of\_line} returns the directive's remaining text, trimmed,
 scanning past block comments and string/character literals so a newline inside
 one does not end the directive.
@@ -294,7 +296,23 @@ static void pp_skip_line(void) {
     const char *p = kcc_lex_cursor;
     const char *end = kcc_lex_end;
     while (p < end) {
-        char c = *p++;
+        char c = *p;
+        /* A block comment is whitespace that may span newlines (phase 3), so a
+           directive's trailing `/ * ... * /` extends its logical line past those
+           newlines.  Skip the whole comment, or a skipped `#define X 0x20 / *
+           ...multi-line... * /` would leave the cursor mid-comment and the
+           apostrophe in a word like "that's" would then be lexed as a char
+           constant (kernel uapi/linux/openat2.h). */
+        if (c == '/' && p + 1 < end && p[1] == '*') {
+            p += 2;
+            while (p < end && !(*p == '*' && p + 1 < end && p[1] == '/')) {
+                if (*p == 0x0A) { kcc_lex_line++; kcc_lex_line_start = p + 1; }
+                p++;
+            }
+            if (p < end) p += 2;                 /* consume the closing star-slash */
+            continue;
+        }
+        p++;
         if (c == 0x0A) {
             kcc_lex_line++;
             kcc_lex_line_start = p;

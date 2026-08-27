@@ -745,6 +745,18 @@ int main(void){ int x = 7, y = 0;
 difftest "builtin-file-macro" \
     "int main(void){ const char *f = __FILE__; int n = 0; while (f[n]) n++;
      return (n >= 2 && f[n-1] == 'c' && f[n-2] == '.') ? 0 : 1; }"
+# A directive skipped inside an inactive #if group whose trailing block comment
+# spans a newline.  Skipping must consume the whole comment; otherwise the
+# cursor is left mid-comment and the apostrophe in "that's" is lexed as a char
+# constant (the kernel re-includes uapi/linux/openat2.h, whose RESOLVE_CACHED
+# #define carries exactly such a comment, so its guarded body is skipped).
+difftest "skip-directive-block-comment" \
+    "#if 0
+#define FOO 1 /* only complete if it can be
+	done. May return -EAGAIN if that's not
+	possible. */
+#endif
+int main(void){ return 0; }"
 # A function-like macro whose parameters are spelled like keywords.  In
 # translation phase 4 there are no keywords (C17 6.4.1), so `int` and `struct`
 # are ordinary parameter names; they must bind and substitute in the body.  The

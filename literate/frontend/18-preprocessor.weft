@@ -798,7 +798,9 @@ bodies and \texttt{\#if} expressions can be extracted cleanly.
 @d PP: helpers @{
 .text
 // -- _kcc_pp_skip_line ----------------------------------------------
-// Advances the lexer cursor past the end of the current line.
+// Advances the lexer cursor past the end of the current line, skipping any
+// block comment that spans the newline so the logical directive line ends
+// where the comment does (not at the first physical newline inside it).
 .p2align 2
 _kcc_pp_skip_line:
     adrp x0, _kcc_lex_cursor@@PAGE
@@ -811,6 +813,50 @@ _kcc_pp_skip_line:
     cmp  x1, x2
     b.hs .Lsl_done
     ldrb w3, [x1]
+    // A block comment is whitespace that may span newlines, so a directive's
+    // trailing `/ * ... * /` extends its logical line.  Skip the whole comment;
+    // otherwise a skipped multi-line `#define X 0x20 / * ... * /` would leave
+    // the cursor mid-comment and an apostrophe in a word like "that's" would be
+    // lexed as a character constant (kernel uapi/linux/openat2.h re-include).
+    cmp  w3, #'/'
+    b.ne .Lsl_notcmt
+    add  x5, x1, #1
+    cmp  x5, x2
+    b.hs .Lsl_notcmt
+    ldrb w4, [x5]
+    cmp  w4, #'*'
+    b.ne .Lsl_notcmt
+    add  x1, x1, #2                 // enter comment, past the opening star
+.Lsl_cmt:
+    cmp  x1, x2
+    b.hs .Lsl_done                  // EOF inside comment
+    ldrb w3, [x1]
+    cmp  w3, #'*'
+    b.ne .Lsl_cmt_nl
+    add  x5, x1, #1
+    cmp  x5, x2
+    b.hs .Lsl_cmt_adv
+    ldrb w4, [x5]
+    cmp  w4, #'/'
+    b.ne .Lsl_cmt_nl
+    add  x1, x1, #2                 // consume closing star-slash
+    b .Lsl_loop
+.Lsl_cmt_nl:
+    cmp  w3, #0x0A
+    b.ne .Lsl_cmt_adv
+    adrp x4, _kcc_lex_line@@PAGE
+    add  x4, x4, _kcc_lex_line@@PAGEOFF
+    ldr  x5, [x4]
+    add  x5, x5, #1
+    str  x5, [x4]
+    add  x5, x1, #1
+    adrp x4, _kcc_lex_line_start@@PAGE
+    add  x4, x4, _kcc_lex_line_start@@PAGEOFF
+    str  x5, [x4]
+.Lsl_cmt_adv:
+    add  x1, x1, #1
+    b .Lsl_cmt
+.Lsl_notcmt:
     add  x1, x1, #1
     cmp  w3, #0x0A
     b.ne .Lsl_loop

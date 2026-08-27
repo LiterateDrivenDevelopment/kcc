@@ -1214,8 +1214,27 @@ _kcc_pp_substitute:
     mov x23, x4               // args array
     mov x24, x5               // arg count
 
-    // Allocate output buffer (generous: 4KB)
-    mov x0, #4096
+    // Allocate the output buffer sized to the inputs rather than a fixed 4 KB:
+    // a macro that substitutes several large arguments (e.g. the kernel's
+    // `pr_alert(fmt, data_race(x), data_race(y), ...)`, whose arguments are big
+    // _Generic expansions) can otherwise overflow and truncate mid-token.  The
+    // bound is body length + 4x the total argument length (covering a parameter
+    // repeated a few times) + slack.  (The C preprocessor port grows on demand;
+    // this reference binary never preprocesses such macros, so the generous
+    // input-sized bound suffices.)
+    mov x9, #0                // k
+    mov x10, x20              // total = body len
+.Lsub_cap_loop:
+    cmp x9, x24
+    b.hs .Lsub_cap_done
+    lsl x11, x9, #4
+    add x11, x23, x11         // &args[k]
+    ldr x12, [x11, #8]        // args[k].len
+    add x10, x10, x12, lsl #2 // total += 4 * len
+    add x9, x9, #1
+    b .Lsub_cap_loop
+.Lsub_cap_done:
+    add x0, x10, #4096        // + slack
     bl _kcc_arena_alloc
     mov x25, x0               // x25 = output buffer
     mov x26, #0                // x26 = output position

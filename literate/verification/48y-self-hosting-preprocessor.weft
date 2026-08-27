@@ -705,10 +705,29 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
                           unsigned long np, void *aa, unsigned long ac, unsigned long *lo) {
     struct PPArg *args = (struct PPArg *)aa;
     (void)ac;
-    char *out = (char *)kcc_arena_alloc(4096);
+    /* The output buffer must grow: a macro like the kernel's `pr_alert(fmt,
+       data_race(x), data_race(y), ...)` substitutes several arguments that are
+       themselves large _Generic expansions, easily exceeding any fixed size (a
+       former 4 KB buffer truncated mid-string -> "unterminated string literal").
+       `guard` bounds the most any single iteration can emit---a string literal
+       spanning the rest of the body, or a stringised/pasted argument (up to
+       twice its length)---so one check per iteration keeps `out` big enough. */
+    unsigned long maxarg = 0;
+    for (unsigned long k = 0; k < np; k++)
+        if (args[k].len > maxarg) maxarg = args[k].len;
+    unsigned long guard = blen + 2 * maxarg + 16;
+    unsigned long cap = guard + 256;
+    char *out = (char *)kcc_arena_alloc(cap);
     unsigned long op = 0;
     unsigned long i = 0;
     while (i < blen) {
+        if (op + guard > cap) {
+            unsigned long nc = cap * 2;
+            while (nc < op + guard) nc *= 2;
+            char *nb = (char *)kcc_arena_alloc(nc);
+            kcc_memcpy(nb, out, op);
+            out = nb; cap = nc;
+        }
         char c = body[i];
         if (c == '"' || c == '\'') {
             /* A string literal or character constant is a single token: its

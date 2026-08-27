@@ -553,7 +553,7 @@ _kcc_pp_try_expand:
     // fresh at each use, so a static macro body cannot represent it.
     tst  x0, #PP_FLAG_BUILTIN
     b.eq .Lexp_not_dyn
-    cmp  x20, #8              // name length of "__LINE__"
+    cmp  x20, #8              // "__LINE__" and "__FILE__" are both length 8
     b.ne .Lexp_not_dyn
     mov  x0, x19
     adrp x1, _kcc_pp_pre_linem@@PAGE
@@ -561,6 +561,12 @@ _kcc_pp_try_expand:
     mov  x2, #8
     bl _kcc_memcmp
     cbz  x0, .Lexp_line_dyn
+    mov  x0, x19
+    adrp x1, _kcc_pp_pre_filem@@PAGE
+    add  x1, x1, _kcc_pp_pre_filem@@PAGEOFF
+    mov  x2, #8
+    bl _kcc_memcmp
+    cbz  x0, .Lexp_file_dyn
 .Lexp_not_dyn:
 
     // Check if function-like
@@ -649,6 +655,49 @@ _kcc_pp_try_expand:
     mov  x0, #PP_CTX_EXPAND
     mov  x1, x21                 // macro_def for unmark on pop
     mov  x2, x23                 // digit buffer
+    mov  x3, x22                 // length
+    bl _kcc_pp_ctx_push_expand
+    mov  x0, #1
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lexp_file_dyn:
+    // __FILE__ — expand to the current source path as a string-literal token.
+    // _kcc_src_path tracks the file being read (the include machinery saves and
+    // restores it, §6.10.8.1), so this is the header's own name inside a header.
+    adrp x0, _kcc_src_path@@PAGE
+    add  x0, x0, _kcc_src_path@@PAGEOFF
+    ldr  x22, [x0]               // x22 = path pointer (0 before any file)
+    cbnz x22, .Lexp_file_have
+    adrp x22, _kcc_pp_file_unknown@@PAGE
+    add  x22, x22, _kcc_pp_file_unknown@@PAGEOFF
+.Lexp_file_have:
+    mov  x0, x22
+    bl _kcc_strlen
+    mov  x23, x0                 // x23 = path length
+    add  x0, x23, #3             // 2 quotes + 1 slack
+    bl _kcc_arena_alloc
+    mov  x24, x0                 // x24 = buffer
+    mov  w1, #'"'
+    strb w1, [x24]               // opening quote
+    add  x0, x24, #1
+    mov  x1, x22
+    mov  x2, x23
+    bl _kcc_memcpy               // path bytes after the quote
+    add  x0, x24, #1
+    add  x0, x0, x23
+    mov  w1, #'"'
+    strb w1, [x0]                // closing quote
+    add  x22, x23, #2            // token length = path + 2 quotes
+    ldr  x0, [x21, #PP_MACRO_FLAGS]
+    orr  x0, x0, #PP_FLAG_EXPANDING
+    str  x0, [x21, #PP_MACRO_FLAGS]
+    mov  x0, #PP_CTX_EXPAND
+    mov  x1, x21                 // macro_def for unmark on pop
+    mov  x2, x24                 // buffer
     mov  x3, x22                 // length
     bl _kcc_pp_ctx_push_expand
     mov  x0, #1
@@ -1765,6 +1814,13 @@ line of each \emph{use}, \texttt{\_kcc\_pp\_try\_expand} recognises it and
 substitutes the current \texttt{\_kcc\_lex\_line} formatted as a decimal
 token, rather than expanding a fixed body.  Registering it still lets
 \verb|#ifdef __LINE__| see it and prevents \verb|#undef|.
+\texttt{\_\_FILE\_\_} works the same way: recognised in
+\texttt{\_kcc\_pp\_try\_expand}, it substitutes the current source path
+(\texttt{\_kcc\_src\_path}, which the \texttt{\#include} machinery saves and
+restores per file, so it names the header when used inside one) wrapped in
+double quotes as a fresh string-literal token.  The kernel reaches
+\texttt{\_\_FILE\_\_} through \texttt{WARN()}/\texttt{BUG()}/\texttt{pr\_*} in
+roughly half of all source files.
 
 Four further macros advertise the \emph{conditional features}
 (\stdref{6.10.8.3}) kcc does not implement.  Atomics, threads, complex
@@ -1880,6 +1936,17 @@ _kcc_pp_predefine:
     adrp x0, _kcc_pp_pre_linem@@PAGE
     add  x0, x0, _kcc_pp_pre_linem@@PAGEOFF
     mov  x1, #8                // len("__LINE__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    // __FILE__ — like __LINE__, registered so `#ifdef __FILE__` sees it and it
+    // cannot be #undef'd; _kcc_pp_try_expand substitutes the current source path
+    // as a string literal dynamically at each use (§6.10.8.1).
+    adrp x0, _kcc_pp_pre_filem@@PAGE
+    add  x0, x0, _kcc_pp_pre_filem@@PAGEOFF
+    mov  x1, #8                // len("__FILE__")
     adrp x2, _kcc_pp_pre_one@@PAGE
     add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
     mov  x3, #1

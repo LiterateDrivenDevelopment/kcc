@@ -374,7 +374,7 @@ _kcc_pp_do_if:
 // (`#line line`).  We evaluate the operand exactly as an #if expression --
 // macro-expanded, then parsed as an integer -- and store the difference from
 // the physical line in _kcc_line_delta, which __LINE__ then adds.  The optional
-// file-name string is not modelled (__FILE__ is unimplemented) and is ignored.
+// file-name string is ignored; __FILE__ tracks _kcc_src_path directly.
 .p2align 2
 .globl _kcc_pp_do_line
 _kcc_pp_do_line:

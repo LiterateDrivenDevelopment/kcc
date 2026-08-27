@@ -737,6 +737,14 @@ int main(void){ int x = 7, y = 0;
   if (__builtin_expect(!!(f(&x) > 0), 0)) y += 10;
   if (__builtin_expect(f(&x) == 7, 1)) y += 3;
   return (y == 13) ? 0 : 1; }"
+# __FILE__ predefined macro (C17 6.10.8.1): expands to the current source path
+# as a string literal.  The path itself differs between build environments, so
+# the check is path-independent — the difftest harness compiles both kcc and
+# clang on a file named d.c, so __FILE__ is a non-empty string ending in ".c".
+# The kernel reaches __FILE__ through WARN()/BUG()/pr_* in ~half of all files.
+difftest "builtin-file-macro" \
+    "int main(void){ const char *f = __FILE__; int n = 0; while (f[n]) n++;
+     return (n >= 2 && f[n-1] == 'c' && f[n-2] == '.') ? 0 : 1; }"
 # GNU attribute trailing a continuation declarator, before its '=' (the kernel's
 # DEFINE_LOCK_GUARD_0 emits `T a = ..., *b __attribute__((__unused__)) = &a;`).
 difftest "gnu-attr-trailing-declarator" \

@@ -516,9 +516,13 @@ void kcc_pp_do_pragma(void) {
 \section{Macro Expansion}
 
 \texttt{kcc\_pp\_try\_expand} looks the identifier up, honours the anti-recursion
-flag, substitutes \texttt{\_\_LINE\_\_} dynamically, and for a function-like
-macro collects arguments (across context boundaries, never past the argument
-prescan floor), prescan-expands them, substitutes, and pushes the result.
+flag, substitutes \texttt{\_\_LINE\_\_} and \texttt{\_\_FILE\_\_} dynamically,
+and for a function-like macro collects arguments (across context boundaries,
+never past the argument prescan floor), prescan-expands them, substitutes, and
+pushes the result.  \texttt{\_\_FILE\_\_} cannot be a static body because its
+value is the current source path (\texttt{kcc\_src\_path}, which the include
+machinery saves and restores per file); it is emitted as a freshly-quoted
+string-literal token at each use.
 
 @l c
 @d Selfhost: pp expand @{
@@ -546,6 +550,20 @@ int kcc_pp_try_expand(void) {
         const char *d = pp_line_digits(&dl);
         m->flags |= PP_FLAG_EXPANDING;
         pp_ctx_push_expand(m, d, dl);
+        return 1;
+    }
+    /* dynamic __FILE__ → the current source path as a string literal.  The
+     * include machinery saves/restores kcc_src_path, so this is the header's
+     * own name inside a header (C17 6.10.8.1). */
+    if ((m->flags & PP_FLAG_BUILTIN) && namelen == 8 && kcc_memcmp(name, "__FILE__", 8) == 0) {
+        const char *p = kcc_src_path ? kcc_src_path : "<stdin>";
+        unsigned long pl = kcc_strlen(p);
+        char *buf = (char *)kcc_arena_alloc(pl + 3);
+        buf[0] = '"';
+        kcc_memcpy(buf + 1, p, pl);
+        buf[pl + 1] = '"';
+        m->flags |= PP_FLAG_EXPANDING;
+        pp_ctx_push_expand(m, buf, pl + 2);
         return 1;
     }
     if (!(m->flags & PP_FLAG_FUNCLIKE)) {
@@ -853,6 +871,7 @@ static void pp_predefine(void) {
     pp_def_simple("__LP64__", 8, "1", 1);
     pp_def_simple("_LP64", 5, "1", 1);
     pp_def_simple("__LINE__", 8, "1", 1);
+    pp_def_simple("__FILE__", 8, "1", 1);   /* substituted dynamically in kcc_pp_try_expand */
     /* kcc supports the GNU 128-bit integer type (16 bytes), so advertise it the
        way gcc and clang do on 64-bit targets.  The Linux kernel gates its
        u128/__u128 typedefs on this macro (include/uapi/linux/types.h). */

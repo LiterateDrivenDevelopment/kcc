@@ -1101,6 +1101,8 @@ _kcc_pp_pre_lp64:     .asciz "__LP64__"
 _kcc_pp_pre_lp64b:    .asciz "_LP64"
 _kcc_pp_va_args_str:  .asciz "__VA_ARGS__"
 _kcc_pp_pre_linem:    .asciz "__LINE__"
+_kcc_pp_pre_filem:    .asciz "__FILE__"
+_kcc_pp_file_unknown: .asciz "<stdin>"
 _kcc_pp_pre_one:      .asciz "1"
 _kcc_pp_pre_c17val:   .asciz "201710L"
 

@@ -13,7 +13,10 @@ it is an object-like macro.
 The replacement body is the text from after the macro name (or
 parameter list) to the end of the directive line.
 
-Each parameter is an identifier; a bare \texttt{...} in final position makes
+Each parameter is an identifier---or, as with the macro name, a token the lexer
+classified as a keyword, since translation phase~4 has no keywords
+(\stdref{6.4.1}) and the kernel's \texttt{TRACE\_EVENT} names a parameter
+\texttt{struct}.  A bare \texttt{...} in final position makes
 the macro variadic, binding the trailing arguments to \texttt{\_\_VA\_ARGS\_\_}
 (\stdref{6.10.3}).  The parser also accepts the GNU \emph{named} variadic form
 \texttt{name...}---an identifier immediately followed by \texttt{...}---which
@@ -122,9 +125,16 @@ _kcc_pp_do_define:
     ldr  x0, [x0]
     cmp  x0, #TOK_ELLIPSIS
     b.eq .Ldef_variadic
-    // Expect identifier
+    // Expect a parameter name.  As with the macro name (translation phase 4 has
+    // no keywords, \stdref{6.4.1}), the lexer may have classified it as a
+    // keyword token, so accept TOK_IDENT or any keyword-class code [10, 60):
+    // the kernel's TRACE_EVENT names a parameter `struct`.
     cmp  x0, #TOK_IDENT
-    b.ne .Ldef_err_param
+    b.eq .Ldef_param_name_ok
+    sub  x1, x0, #10
+    cmp  x1, #50
+    b.hs .Ldef_err_param
+.Ldef_param_name_ok:
 
     // Store parameter name
     adrp x0, _kcc_tok_start@@PAGE

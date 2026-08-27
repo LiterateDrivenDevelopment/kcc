@@ -430,7 +430,10 @@ void kcc_pp_do_define(void) {
                     if (kcc_tok_type != TOK_RPAREN) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
                     break;
                 }
-                if (kcc_tok_type != TOK_IDENT) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
+                /* A parameter name, like the macro name, may be a keyword-class
+                   token [10,60): phase 4 has no keywords (6.4.1), and the
+                   kernel's TRACE_EVENT names a parameter `struct`. */
+                if (kcc_tok_type != TOK_IDENT && (kcc_tok_type - 10) >= 50) { kcc_diag_error(pp_dir_line, 1, m_def_param); pp_skip_line(); return; }
                 params[nparams].name = kcc_tok_start;
                 params[nparams].len = kcc_tok_len;
                 kcc_lex_next();

@@ -745,6 +745,13 @@ int main(void){ int x = 7, y = 0;
 difftest "builtin-file-macro" \
     "int main(void){ const char *f = __FILE__; int n = 0; while (f[n]) n++;
      return (n >= 2 && f[n-1] == 'c' && f[n-2] == '.') ? 0 : 1; }"
+# A function-like macro whose parameters are spelled like keywords.  In
+# translation phase 4 there are no keywords (C17 6.4.1), so `int` and `struct`
+# are ordinary parameter names; they must bind and substitute in the body.  The
+# kernel's TRACE_EVENT(name, proto, args, struct, assign, print) relies on this.
+difftest "macro-keyword-params" \
+    "#define ADD(int, struct) ((int) + (struct))
+int main(void){ return ADD(3, 4) == 7 ? 0 : 1; }"
 # GNU attribute trailing a continuation declarator, before its '=' (the kernel's
 # DEFINE_LOCK_GUARD_0 emits `T a = ..., *b __attribute__((__unused__)) = &a;`).
 difftest "gnu-attr-trailing-declarator" \

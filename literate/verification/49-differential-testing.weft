@@ -727,6 +727,10 @@ int main(void){ return (int)(__alignof__(long)*10 + __alignof(int)); }"
 difftest "gnu-builtin-offsetof" \
     "struct R { long a; long ss; int f; }; struct N { int x; struct R r; char arr[4]; };
 int main(void){ return (int)(__builtin_offsetof(struct R, ss) + __builtin_offsetof(struct R, f) + __builtin_offsetof(struct N, r.ss) + __builtin_offsetof(struct N, arr[2])); }"
+# GNU attribute trailing a continuation declarator, before its '=' (the kernel's
+# DEFINE_LOCK_GUARD_0 emits `T a = ..., *b __attribute__((__unused__)) = &a;`).
+difftest "gnu-attr-trailing-declarator" \
+    "int main(void){ int a = 5, *b __attribute__((__unused__)) = &a; int c __attribute__((__unused__)) = 3; return *b + c - 8; }"
 # GNU typeof: a type-specifier that is the type of a parenthesised type-name or
 # expression.  Used in declarations, casts, and sizeof; __typeof__ is the alias.
 difftest "gnu-typeof" \

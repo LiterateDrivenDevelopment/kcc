@@ -195,7 +195,11 @@ each subsequent declarator is parsed against the original base type in
 first declaration node.  The first declarator in such a list may itself be a
 function prototype (\texttt{int f(int), g(int), a;}): the prototype path joins
 the very same loop when it sees a comma, so a mixture of prototypes and
-objects under one set of specifiers parses into one chain.
+objects under one set of specifiers parses into one chain.  Each continuation
+declarator may carry a trailing GNU \texttt{\_\_attribute\_\_} before its
+\texttt{=} (the first declarator's is consumed upstream); it is skipped, matching
+the kernel's \texttt{DEFINE\_LOCK\_GUARD\_0} expansion
+\texttt{T a = \ldots, *b \_\_attribute\_\_((\_\_unused\_\_)) = \&a;}.
 
 @d Decl: parse declaration @{
 .Ldecl_not_func:
@@ -248,6 +252,12 @@ objects under one set of specifiers parses into one chain.
     bl _kcc_parse_declarator
     mov x25, x0                  // x25 = new decl
     cbz x25, .Ldecl_var_loop_end
+
+    // A GNU attribute may trail this declarator before its `=` or the next
+    // `,` (e.g. `T a, *b __attribute__((__unused__)) = &a;`, as the kernel's
+    // DEFINE_LOCK_GUARD_0 expansion produces).  The first declarator is handled
+    // upstream; the continuation declarators are handled here.
+    bl _kcc_parse_skip_attributes
 
     str x20, [x25, #AST_F3]     // storage_class
 

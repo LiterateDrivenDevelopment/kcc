@@ -927,6 +927,9 @@ void *kcc_parse_decl(void) {
         return d;
     } else {
         d->f3 = storage;
+        /* GNU attribute trailing the declarator, before '='/','/';' (the kernel's
+           DEFINE_LOCK_GUARD_0 emits `T a, *b __attribute__((__unused__)) = &a;`). */
+        if (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
         if (kcc_tok_type == TOK_ASSIGN) {
             kcc_pp_next();
             d->f2 = (unsigned long)kcc_parse_initializer();
@@ -944,6 +947,7 @@ void *kcc_parse_decl(void) {
         struct Node *nd = (struct Node *)kcc_parse_declarator(base);
         if (nd == 0) break;
         nd->f3 = storage;
+        if (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
         if (kcc_tok_type == TOK_ASSIGN) {
             kcc_pp_next();
             nd->f2 = (unsigned long)kcc_parse_initializer();

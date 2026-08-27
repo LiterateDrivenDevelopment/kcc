@@ -997,12 +997,20 @@ static void *sema_expr_binary(struct Node *n) {
     struct Type *lt = (struct Type *)kcc_sema_expr((void *)n->f1);
     struct Type *rt = (struct Type *)kcc_sema_expr((void *)n->f2);
     unsigned long op = n->f0;
-    /* Reject any binary operator on a __int128 operand: kcc lowers a __int128
-       rvalue through one 8-byte slot, so arithmetic/shift/comparison would drop
-       the high 64 bits.  Copies and by-value passing use the aggregate path and
-       stay valid (128-bit arithmetic is a planned follow-up). */
-    if ((lt && lt->kind == TY_INT128) || (rt && rt->kind == TY_INT128))
-        kcc_diag_error(n->line, n->col, m_int128);
+    /* A __int128 rvalue is lowered as the address of a sixteen-byte stack slot
+       (Section~\ref{sec:ir-int128}), but only two operators are actually
+       implemented: an unsigned 128-bit multiply --- whose low 128 bits are the
+       same for signed and unsigned operands, so it is accepted either way ---
+       and a logical right shift of an unsigned __int128.  Together these are
+       exactly the kernel's math64.h mul_u64_u32_shr / mul_u64_u64_shr helpers.
+       Every other operator would still need carry-aware two-word arithmetic
+       that is not yet emitted, so it stays rejected. */
+    if ((lt && lt->kind == TY_INT128) || (rt && rt->kind == TY_INT128)) {
+        unsigned long i128_ok = (op == TOK_STAR)
+            || (op == TOK_SHR && lt && lt->kind == TY_INT128 && lt->f0 == 0);
+        if (!i128_ok)
+            kcc_diag_error(n->line, n->col, m_int128);
+    }
     switch (op) {
     case TOK_EQ: case TOK_NE: case TOK_LT: case TOK_GT: case TOK_LE: case TOK_GE:
         kcc_sema_check_sign_compare(n, lt, rt);

@@ -98,7 +98,8 @@ code generator later consults.
 /* type kinds */
 enum { TY_VOID=1, TY_BOOL=2, TY_CHAR=3, TY_SHORT=4, TY_INT=5, TY_LONG=6,
        TY_LLONG=7, TY_FLOAT=8, TY_DOUBLE=9, TY_LDOUBLE=10, TY_PTR=11,
-       TY_ARRAY=12, TY_FUNC=13, TY_STRUCT=14, TY_UNION=15, TY_ENUM=16 };
+       TY_ARRAY=12, TY_FUNC=13, TY_STRUCT=14, TY_UNION=15, TY_ENUM=16,
+       TY_INT128=17 };
 /* IR opcodes */
 enum {
     IR_ADD=1, IR_SUB=2, IR_MUL=3, IR_SDIV=4, IR_UDIV=5, IR_SMOD=6, IR_UMOD=7,
@@ -168,6 +169,7 @@ struct kcc_member_res kcc_type_find_member(void *sty, const char *name);
 /* type singletons (pointers to descriptors) defined by the types module */
 extern void *kcc_type_int_s, *kcc_type_long_s, *kcc_type_long_u,
             *kcc_type_double, *kcc_type_float, *kcc_type_void;
+extern void *kcc_type_int128_u;      /* unsigned __int128 (16-byte) singleton */
 extern unsigned long kcc_target;     /* 1 when compiling for x86-64 (System V va_list) */
 
 /* -- IR builder global state (this module is its definition site) -- */
@@ -2094,6 +2096,31 @@ typed at the operand's own width---\texttt{double} for a floating operand, a
 \texttt{find\_bit} loop tests exactly such a masked word) still reports true only
 when the whole word is zero.
 
+\paragraph{\texttt{\_\_int128} arithmetic.}\label{sec:ir-int128}
+A \texttt{\_\_int128} rvalue is materialised as the \emph{address of a
+sixteen-byte stack slot} --- a two-eightbyte \texttt{IR\_ALLOCA} holding the
+value little-endian, low half at offset~0 and high half at offset~8 --- exactly
+the representation the aggregate paths already use for a two-word struct.  Two
+operators are lowered, which together are precisely the kernel's
+\texttt{math64.h} helpers \texttt{mul\_u64\_u32\_shr} and
+\texttt{mul\_u64\_u64\_shr} (\texttt{(u64)(((unsigned \_\_int128)a * b) >>
+s)}): an unsigned multiply and a logical right shift, both computed with
+ordinary 64-bit IR operations on the two halves so no register-pair opcode or
+back-end change is needed.  The multiply is the schoolbook
+$64\times64\rightarrow128$ expansion (split each operand into 32-bit limbs, four
+partial products, recombine with carries) plus the two cross terms
+$a_{lo}b_{hi}+a_{hi}b_{lo}$ folded into the high word; its low 128 bits are
+correct for signed and unsigned alike.  The shift is branchless: it forms the
+within-a-word shift of the pair by $n\bmod 64$ (guarding the
+$\text{hi}\ll(64-n)$ spill against the $n\equiv0$ case that would otherwise be
+a shift by 64), then selects between that and the $\ge 64$ result with an
+all-ones/zero mask derived from bit~6 of the count, since the IR has no select
+opcode.  A widening cast zero- or sign-fills the high half; a narrowing cast
+back to an integer simply loads the low half.  This is a self-hosting-port
+(Linux/x86-64) capability: the assembly reference still rejects \texttt{\_\_int128}
+arithmetic (Appendix~\ref{sec:lim-int128}), as it does the other kernel-only
+builtins.
+
 @l c
 @d Selfhost: ir exprs @{
 unsigned long kcc_ir_build_ident(void *e) {
@@ -2425,8 +2452,128 @@ static unsigned long bin_short_or(void *e) {
     return res;
 }
 
+/* --- __int128 arithmetic ------------------------------------------------
+   A 128-bit value is the address of a fresh two-slot (16-byte) alloca, low
+   half at offset 0 and high half at offset 8.  All arithmetic below is built
+   from ordinary 64-bit IR ops on the two halves. */
+static unsigned long kcc_ir_i128_slot(void) {
+    void *a = kcc_ir_alloc_instr(IR_ALLOCA);
+    IL(a, IR_TYPE) = (unsigned long)kcc_type_int128_u;
+    IL(a, IR_SRC1) = 2;                       /* two eight-byte slots */
+    unsigned long avreg = kcc_ir_next_vreg();
+    IL(a, IR_DEST) = avreg;
+    kcc_ir_emit(a);
+    return avreg;
+}
+static void kcc_ir_i128_set(unsigned long slot, unsigned long lo, unsigned long hi) {
+    kcc_ir_emit_indexed_store(slot, 0, lo, 0);
+    kcc_ir_emit_indexed_store(slot, 8, hi, 0);
+}
+/* Width code 0 is a plain 8-byte integer load (kcc_ir_load_width); a literal
+   8 would instead select the single-float form in the back ends. */
+static unsigned long kcc_ir_i128_lo(unsigned long addr) { return kcc_ir_emit_load(addr, 0); }
+static unsigned long kcc_ir_i128_hi(unsigned long addr) {
+    return kcc_ir_emit_load(kcc_ir_emit_gep_const(addr, 8), 0);
+}
+/* Build a subexpression as a 128-bit slot address: a value already typed
+   __int128 yields the slot directly; a narrower integer is widened (zero- or
+   sign-filled high half) into a fresh slot. */
+static unsigned long kcc_ir_i128_operand(void *node) {
+    void *ty = (void *)IL(node, AST_F3);
+    if (ty && (unsigned long)ty >= 0x1000 && IL(ty, TY_KIND) == TY_INT128)
+        return kcc_ir_build_expr(node);
+    unsigned long v = kcc_ir_build_expr(node);
+    unsigned long slot = kcc_ir_i128_slot();
+    unsigned long hi = kcc_ir_emit_const(0);
+    if (ty && (unsigned long)ty >= 0x1000 && IL(ty, TY_KIND) != TY_PTR && IL(ty, TY_F0) != 0)
+        hi = kcc_ir_emit_binop(IR_ASHR, v, kcc_ir_emit_const(63));
+    kcc_ir_i128_set(slot, v, hi);
+    return slot;
+}
+/* Low 128 bits of A*B (correct for signed and unsigned operands). */
+static unsigned long kcc_ir_i128_mul(unsigned long A, unsigned long B) {
+    unsigned long a_lo = kcc_ir_i128_lo(A), a_hi = kcc_ir_i128_hi(A);
+    unsigned long b_lo = kcc_ir_i128_lo(B), b_hi = kcc_ir_i128_hi(B);
+    unsigned long M   = kcc_ir_emit_const(0xFFFFFFFF);
+    unsigned long c32 = kcc_ir_emit_const(32);
+    unsigned long alo = kcc_ir_emit_binop(IR_AND, a_lo, M);
+    unsigned long ahi = kcc_ir_emit_binop(IR_LSHR, a_lo, c32);
+    unsigned long blo = kcc_ir_emit_binop(IR_AND, b_lo, M);
+    unsigned long bhi = kcc_ir_emit_binop(IR_LSHR, b_lo, c32);
+    unsigned long ll = kcc_ir_emit_binop(IR_MUL, alo, blo);
+    unsigned long lh = kcc_ir_emit_binop(IR_MUL, alo, bhi);
+    unsigned long hl = kcc_ir_emit_binop(IR_MUL, ahi, blo);
+    unsigned long hh = kcc_ir_emit_binop(IR_MUL, ahi, bhi);
+    /* mid = (ll>>32) + (lh & M) + (hl & M) */
+    unsigned long mid = kcc_ir_emit_binop(IR_ADD,
+        kcc_ir_emit_binop(IR_ADD, kcc_ir_emit_binop(IR_LSHR, ll, c32),
+                                  kcc_ir_emit_binop(IR_AND, lh, M)),
+        kcc_ir_emit_binop(IR_AND, hl, M));
+    unsigned long res_lo = kcc_ir_emit_binop(IR_OR,
+        kcc_ir_emit_binop(IR_AND, ll, M),
+        kcc_ir_emit_binop(IR_SHL, mid, c32));
+    /* high 64 of a_lo*b_lo */
+    unsigned long hi_ll = kcc_ir_emit_binop(IR_ADD,
+        kcc_ir_emit_binop(IR_ADD, hh, kcc_ir_emit_binop(IR_LSHR, lh, c32)),
+        kcc_ir_emit_binop(IR_ADD, kcc_ir_emit_binop(IR_LSHR, hl, c32),
+                                  kcc_ir_emit_binop(IR_LSHR, mid, c32)));
+    unsigned long cross = kcc_ir_emit_binop(IR_ADD,
+        kcc_ir_emit_binop(IR_MUL, a_lo, b_hi),
+        kcc_ir_emit_binop(IR_MUL, a_hi, b_lo));
+    unsigned long res_hi = kcc_ir_emit_binop(IR_ADD, hi_ll, cross);
+    unsigned long slot = kcc_ir_i128_slot();
+    kcc_ir_i128_set(slot, res_lo, res_hi);
+    return slot;
+}
+/* Logical right shift of the 128-bit value at A by the 64-bit count n, for
+   n in [0,127].  Branchless: no select opcode exists. */
+static unsigned long kcc_ir_i128_lshr(unsigned long A, unsigned long n) {
+    unsigned long lo = kcc_ir_i128_lo(A), hi = kcc_ir_i128_hi(A);
+    unsigned long c0 = kcc_ir_emit_const(0);
+    unsigned long c63 = kcc_ir_emit_const(63);
+    unsigned long c64 = kcc_ir_emit_const(64);
+    unsigned long ones = kcc_ir_emit_const(0xFFFFFFFFFFFFFFFFUL);
+    unsigned long n6 = kcc_ir_emit_binop(IR_AND, n, c63);         /* n & 63 */
+    /* spill = (n6!=0) ? (hi << (64-n6)) : 0  — avoids a shift by 64 */
+    unsigned long sh = kcc_ir_emit_binop(IR_AND, kcc_ir_emit_binop(IR_SUB, c64, n6), c63);
+    unsigned long spill_raw = kcc_ir_emit_binop(IR_SHL, hi, sh);
+    unsigned long ne = kcc_ir_emit_binop(IR_CMP_NE, n6, c0);      /* 0/1 */
+    unsigned long nzmask = kcc_ir_emit_binop(IR_SUB, c0, ne);     /* 0 or all-ones */
+    unsigned long spill = kcc_ir_emit_binop(IR_AND, spill_raw, nzmask);
+    unsigned long s_lo = kcc_ir_emit_binop(IR_OR, kcc_ir_emit_binop(IR_LSHR, lo, n6), spill);
+    unsigned long s_hi = kcc_ir_emit_binop(IR_LSHR, hi, n6);
+    /* select the >=64 result (lo=hi>>n6, hi=0) via a mask from bit 6 of n */
+    unsigned long ge = kcc_ir_emit_binop(IR_AND, kcc_ir_emit_binop(IR_LSHR, n, kcc_ir_emit_const(6)),
+                                                 kcc_ir_emit_const(1));
+    unsigned long gemask = kcc_ir_emit_binop(IR_SUB, c0, ge);     /* all-ones if n>=64 */
+    unsigned long notmask = kcc_ir_emit_binop(IR_XOR, gemask, ones);
+    unsigned long r_lo = kcc_ir_emit_binop(IR_OR,
+        kcc_ir_emit_binop(IR_AND, s_hi, gemask),
+        kcc_ir_emit_binop(IR_AND, s_lo, notmask));
+    unsigned long r_hi = kcc_ir_emit_binop(IR_AND, s_hi, notmask);
+    unsigned long slot = kcc_ir_i128_slot();
+    kcc_ir_i128_set(slot, r_lo, r_hi);
+    return slot;
+}
+/* Dispatch a binary operator whose result type is __int128.  sema has already
+   restricted these to unsigned multiply and logical right shift. */
+static unsigned long kcc_ir_i128_binary(void *e) {
+    unsigned long op_tok = IL(e, AST_F0);
+    unsigned long A = kcc_ir_i128_operand((void *)IL(e, AST_F1));
+    if (op_tok == TOK_SHR) {
+        unsigned long nsh = kcc_ir_build_expr((void *)IL(e, AST_F2));
+        return kcc_ir_i128_lshr(A, nsh);
+    }
+    /* TOK_STAR */
+    unsigned long B = kcc_ir_i128_operand((void *)IL(e, AST_F2));
+    return kcc_ir_i128_mul(A, B);
+}
+
 unsigned long kcc_ir_build_binary(void *e) {
     unsigned long op_tok = IL(e, AST_F0);
+    { void *rty0 = (void *)IL(e, AST_F3);
+      if (rty0 && (unsigned long)rty0 >= 0x1000 && IL(rty0, TY_KIND) == TY_INT128)
+          return kcc_ir_i128_binary(e); }
     if (op_tok == TOK_AND) return bin_short_and(e);
     if (op_tok == TOK_OR) return bin_short_or(e);
     unsigned long a = kcc_ir_build_expr((void *)IL(e, AST_F1));
@@ -4359,6 +4506,32 @@ unsigned long kcc_ir_build_cast(void *cast) {
     if (!to) return src;
     void *from = (void *)IL(inner, AST_F3);
     if (!from) return src;
+    /* __int128 casts.  Widening an integer into a __int128 fills a fresh
+       16-byte slot (low half = src, high half zero- or sign-extended) and
+       yields the slot address.  Narrowing a __int128 back to an integer loads
+       its low half, then resizes if the target is under 8 bytes. */
+    if (IL(to, TY_KIND) == TY_INT128) {
+        if (IL(from, TY_KIND) == TY_INT128) return src;   /* already a slot */
+        unsigned long slot = kcc_ir_i128_slot();
+        unsigned long hi = kcc_ir_emit_const(0);
+        if (IL(from, TY_KIND) != TY_PTR && IL(from, TY_F0) != 0)
+            hi = kcc_ir_emit_binop(IR_ASHR, src, kcc_ir_emit_const(63));
+        kcc_ir_i128_set(slot, src, hi);
+        return slot;
+    }
+    if (IL(from, TY_KIND) == TY_INT128) {
+        unsigned long lo = kcc_ir_emit_load(src, 0);   /* 0 = 8-byte integer load */
+        unsigned long ts0 = IL(to, TY_SIZE);
+        if (ts0 >= 8) return lo;
+        void *inst = kcc_ir_alloc_instr(IL(to, TY_F0) ? IR_SEXT : IR_ZEXT);
+        IL(inst, IR_TYPE) = (unsigned long)to;
+        IL(inst, IR_SRC1) = lo;
+        IL(inst, IR_SRC2) = ts0;
+        unsigned long r0 = kcc_ir_next_vreg();
+        IL(inst, IR_DEST) = r0;
+        kcc_ir_emit(inst);
+        return r0;
+    }
     if (kcc_ir_type_is_fp(to) || kcc_ir_type_is_fp(from))
         return kcc_ir_convert(src, from, to);
     /* integer resize */

@@ -38,7 +38,7 @@ the \texttt{<stdatomic.h>} generic machinery; \texttt{\_Complex} needs a
 two-component value representation and complex arithmetic lowering.  Both are
 rejected in the declaration specifiers.
 
-\paragraph{\texttt{\_\_int128} arithmetic.}
+\paragraph{\texttt{\_\_int128} arithmetic.}\label{sec:lim-int128}
 The GNU 128-bit integer type \texttt{\_\_int128} (and \texttt{unsigned
 \_\_int128}) \emph{is} recognised as a type: it has size and alignment~16, lays
 out correctly inside structs and unions, and---because kcc classifies a 16-byte
@@ -46,13 +46,21 @@ value like a two-eightbyte aggregate---can be copied, assigned with plain
 \texttt{=}, passed and returned by value, and read or written through a union of
 two \texttt{unsigned long} halves.  That is exactly the surface the Linux
 kernel's \texttt{cmpxchg16b} path uses (\texttt{union \_\_u128\_halves} plus
-inline assembly on the halves).  What is \emph{not} yet implemented is 128-bit
-\emph{arithmetic}: a \texttt{\_\_int128} rvalue is still lowered through a single
-eight-byte slot, so an add, subtract, multiply, shift, comparison, compound
-assignment, or unary negation would silently drop the high 64~bits.  Rather than
-miscompile, kcc rejects every such operation in the semantic analyser (the type
-would need register-pair lowering with carry, e.g.\ \textsc{adds}/\textsc{adc},
-in the IR and both back ends).
+inline assembly on the halves).
+
+The self-hosting (Linux/x86-64) port additionally lowers the two 128-bit
+operations the kernel's \texttt{math64.h} needs---an unsigned multiply and a
+logical right shift, i.e.\ \texttt{mul\_u64\_u32\_shr} and
+\texttt{mul\_u64\_u64\_shr}---by materialising a \texttt{\_\_int128} rvalue as a
+sixteen-byte stack slot and computing on the two halves with ordinary 64-bit
+operations (Section~\ref{sec:ir-int128}).  Everything else---add, subtract,
+divide, modulo, left shift, comparison, compound assignment, unary
+negation, and a \emph{signed} right shift---still needs carry-aware two-word
+arithmetic that is not yet emitted, so the semantic analyser rejects it rather
+than silently drop the high 64~bits.  The assembly reference goes further and
+rejects \emph{all} \texttt{\_\_int128} arithmetic, as it does the other
+kernel-only builtins: register-pair lowering with carry
+(\textsc{adds}/\textsc{adc}) in the direct back ends remains future work.
 
 \paragraph{Extended inline assembly beyond two operands.}
 Basic inline assembly and the common two-operand extended forms

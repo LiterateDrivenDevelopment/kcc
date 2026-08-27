@@ -702,6 +702,14 @@ difftest "gnu-attr-mid-declarator" \
     "char * __attribute__((warn_unused_result)) pick(char *a){ return a; }
 int __attribute__((unused)) mid(void){ return 5; }
 int main(void){ char b[3]; b[0] = 37; return (pick(b)[0] == 37 && mid() == 5) ? 0 : 1; }"
+# GNU __builtin_types_compatible_p: a compile-time 0/1, plus a file-scope
+# _Static_assert built from it (the kernel's __same_type sanity checks in
+# bitops.h -- the single construct that stopped ~76% of a kernel .c sample).
+difftest "builtin-types-compatible" \
+    "int a; long b;
+_Static_assert(__builtin_types_compatible_p(typeof(a), typeof(a)), \"same\");
+_Static_assert(!__builtin_types_compatible_p(typeof(a), typeof(b)), \"diff\");
+int main(void){ return __builtin_types_compatible_p(int, int)*100 + __builtin_types_compatible_p(int, long)*10 + __builtin_types_compatible_p(unsigned, unsigned); }"
 # GNU typeof: a type-specifier that is the type of a parenthesised type-name or
 # expression.  Used in declarations, casts, and sizeof; __typeof__ is the alias.
 difftest "gnu-typeof" \

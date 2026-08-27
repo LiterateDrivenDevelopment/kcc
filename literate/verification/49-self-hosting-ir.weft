@@ -124,6 +124,7 @@ enum {
     AST_SIZEOF_EXPR=62, AST_ALIGNOF_EXPR=63, AST_COMMA_EXPR=64, AST_INIT_LIST=65,
     AST_DESIGNATOR=66, AST_COMPOUND_LIT=67, AST_PAREN_EXPR=68, AST_GENERIC=69,
     AST_FLOAT_LIT=71, AST_VA_ARG=72, AST_STMT_EXPR=73, AST_ASM_STMT=74,
+    AST_TYPES_COMPAT=76,
     AST_TYPE_PTR=22, AST_TYPE_ARRAY=23, AST_TYPE_FUNC=24, AST_TYPE_QUALS=28
 };
 /* token kinds (operators) */
@@ -149,6 +150,7 @@ void kcc_vec_push(void *, const void *);
 void *kcc_ast_alloc(unsigned long tag);
 void *kcc_sema_resolve_type(void *);
 void *kcc_sema_expr(void *);
+unsigned long kcc_type_compatible(void *a, void *b);
 unsigned long kcc_sema_int_signedness(void *);
 unsigned long kcc_type_layout(void *);
 void *kcc_type_param_adjust(void *);
@@ -502,6 +504,7 @@ unsigned long kcc_rodata_const_intexpr(void *n) {
     if (!n) return 0;
     unsigned long tag = IL(n, AST_TAG);
     if (tag == AST_INT_LIT || tag == AST_CHAR_LIT) return 1;
+    if (tag == AST_TYPES_COMPAT) return 1;   /* folds to 0/1 */
     if (tag == AST_PAREN_EXPR) return kcc_rodata_const_intexpr((void *)IL(n, AST_F0));
     if (tag == AST_CAST_EXPR) return kcc_rodata_const_intexpr((void *)IL(n, AST_F1));
     if (tag == AST_UNARY_EXPR) {
@@ -1231,6 +1234,7 @@ unsigned long kcc_ir_build_expr(void *e) {
     if (tag == AST_SUBSCRIPT) return kcc_ir_build_subscript(e);
     if (tag == AST_MEMBER) return kcc_ir_build_member(e);
     if (tag == AST_VA_ARG) return kcc_ir_build_va_arg(e);
+    if (tag == AST_TYPES_COMPAT) return kcc_ir_emit_const(kcc_eval_const_int(e));
     if (tag == AST_GENERIC) return kcc_ir_build_expr((void *)IL(e, AST_F2));
     if (tag == AST_COMPOUND_LIT) {
         unsigned long addr = kcc_ir_build_compound_lit(e);
@@ -3367,6 +3371,11 @@ unsigned long kcc_eval_const_int(void *n) {
         else { ty = (void *)IL(op, AST_F3); if (!ty) ty = kcc_sema_expr(op); }
         if (!ty) return 0;
         return kcc_type_layout(ty);
+    }
+    if (tag == AST_TYPES_COMPAT) {
+        void *t1 = kcc_sema_resolve_type((void *)IL(n, AST_F0));
+        void *t2 = kcc_sema_resolve_type((void *)IL(n, AST_F1));
+        return kcc_type_compatible(t1, t2);
     }
     if (tag == AST_IDENT_EXPR) {
         char *name = (char *)IL(n, AST_F0);

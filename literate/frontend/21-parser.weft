@@ -131,6 +131,7 @@ Offset & Field & Description \\
 .equ AST_STMT_EXPR,      73   // GNU ({...}): F0=compound, F3=resolved type
 .equ AST_ASM_STMT,       74   // inline asm: F0=template ptr, F1=len, F2=operands, F3=noperands
 .equ AST_ASM_OPERAND,    75   // F0=constraint ptr, F1=constraint len, F2=expr, F3=is_output, F4=next
+.equ AST_TYPES_COMPAT,   76   // __builtin_types_compatible_p: F0=type1, F1=type2 → int const 0/1
 @}
 
 \section{AST Node Allocation}

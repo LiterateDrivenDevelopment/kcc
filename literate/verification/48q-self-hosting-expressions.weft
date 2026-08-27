@@ -78,7 +78,7 @@ enum {
     AST_COMMA_EXPR = 64, AST_COMPOUND_LIT = 67, AST_PAREN_EXPR = 68,
     AST_GENERIC = 69, AST_GENERIC_ASSOC = 70, AST_IDENT_EXPR = 50,
     AST_INT_LIT = 51, AST_STR_LIT = 52, AST_CHAR_LIT = 53, AST_FLOAT_LIT = 71,
-    AST_VA_ARG = 72, AST_STMT_EXPR = 73
+    AST_VA_ARG = 72, AST_STMT_EXPR = 73, AST_TYPES_COMPAT = 76
 };
 
 static unsigned char prec_table[48] = {
@@ -331,6 +331,19 @@ void *kcc_parse_postfix_tail(void *expr) {
                 struct Node *n = (struct Node *)kcc_ast_alloc(AST_VA_ARG);
                 n->f0 = (unsigned long)ap;
                 n->f1 = (unsigned long)ty;
+                cur = n;
+            } else if (cur->tag == AST_IDENT_EXPR &&
+                kcc_strcmp((const char *)cur->f0, "__builtin_types_compatible_p") == 0) {
+                /* GNU __builtin_types_compatible_p(type, type): both operands are
+                   type names; folds to the integer constant 1/0. */
+                kcc_pp_next();
+                void *t1 = kcc_parse_type_name();
+                kcc_parse_expect(TOK_COMMA);
+                void *t2 = kcc_parse_type_name();
+                kcc_parse_expect(TOK_RPAREN);
+                struct Node *n = (struct Node *)kcc_ast_alloc(AST_TYPES_COMPAT);
+                n->f0 = (unsigned long)t1;
+                n->f1 = (unsigned long)t2;
                 cur = n;
             } else {
                 kcc_pp_next();

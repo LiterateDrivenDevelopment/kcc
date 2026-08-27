@@ -648,7 +648,13 @@ special case: \texttt{va\_arg(ap,\,T)} (and its GNU spelling
 \texttt{\_\_builtin\_va\_arg}, which the kernel's \texttt{<stdarg.h>} expands
 to) takes a \emph{type name} as its second operand, so it is diverted to a
 dedicated parse that reads a type instead of an argument expression and builds
-an \texttt{AST\_VA\_ARG} node.
+an \texttt{AST\_VA\_ARG} node.  \texttt{\_\_builtin\_types\_compatible\_p(T1,\,T2)}
+is handled the same way, but with \emph{two} type-name operands; it builds an
+\texttt{AST\_TYPES\_COMPAT} node that later folds to the integer constant~1 (the
+types are compatible per \stdref{6.2.7}) or~0.  The Linux kernel leans on it
+through \texttt{\_\_same\_type}, above all in the file-scope \texttt{static\_assert}
+sanity checks of \texttt{<linux/bitops.h>}---a single construct that, in a sweep,
+blocked roughly three-quarters of a real kernel \texttt{.c} sample.
 
 @d Expr: parse postfix @{
 // -- kcc_parse_postfix_expr --------------------------------------------
@@ -747,6 +753,14 @@ _kcc_parse_postfix_tail:
     add  x1, x1, _kcc_str_builtin_va_arg@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lpostfix_va_arg
+    // GNU __builtin_types_compatible_p(type-name, type-name): both operands are
+    // type names; it folds to the integer constant 1/0 (used pervasively by the
+    // kernel's __same_type sanity static_asserts).
+    ldr x0, [x19, #AST_F0]
+    adrp x1, _kcc_str_types_compat@@PAGE
+    add  x1, x1, _kcc_str_types_compat@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lpostfix_types_compat
 
 .Lpostfix_call_normal:
     // Consume '('
@@ -779,6 +793,23 @@ _kcc_parse_postfix_tail:
     bl _kcc_ast_alloc
     str x20, [x0, #AST_F0]      // va_list expr
     str x21, [x0, #AST_F1]      // type node
+    mov x19, x0
+    b .Lpostfix_loop
+
+.Lpostfix_types_compat:
+    bl _kcc_pp_next              // consume '('
+    bl _kcc_parse_type_name      // first type
+    mov x20, x0
+    mov x0, #TOK_COMMA
+    bl _kcc_parse_expect
+    bl _kcc_parse_type_name      // second type
+    mov x21, x0
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, #AST_TYPES_COMPAT
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]      // type 1
+    str x21, [x0, #AST_F1]      // type 2
     mov x19, x0
     b .Lpostfix_loop
 @| _kcc_parse_postfix_expr
@@ -1939,6 +1970,8 @@ _kcc_str_va_arg:
     .asciz "va_arg"
 _kcc_str_builtin_va_arg:
     .asciz "__builtin_va_arg"
+_kcc_str_types_compat:
+    .asciz "__builtin_types_compatible_p"
 
 // -- Precedence table --------------------------------------------------
 // Indexed by (tok_type - 60).  48 entries covering all punctuators.

@@ -284,6 +284,8 @@ _kcc_rodata_const_intexpr:
     b.eq .Lrci_binary
     cmp x0, #AST_IDENT_EXPR
     b.eq .Lrci_ident
+    cmp x0, #AST_TYPES_COMPAT
+    b.eq .Lrci_yes                  // __builtin_types_compatible_p folds to 0/1
     b .Lrci_no
 .Lrci_ident:
     // An identifier is a constant only when it names an enum constant; the

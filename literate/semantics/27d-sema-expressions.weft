@@ -73,6 +73,8 @@ _kcc_sema_expr:
     b.eq .Lse_paren
     cmp x20, #AST_VA_ARG
     b.eq .Lse_va_arg
+    cmp x20, #AST_TYPES_COMPAT
+    b.eq .Lse_types_compat
     cmp x20, #AST_GENERIC
     b.eq .Lse_generic
     cmp x20, #AST_COMPOUND_LIT
@@ -207,6 +209,17 @@ _kcc_sema_expr:
     bl _kcc_sema_resolve_type
     adrp x0, _kcc_type_long_u@@PAGE
     add  x0, x0, _kcc_type_long_u@@PAGEOFF
+    ldr  x0, [x0]
+    b .Lse_store
+.Lse_types_compat:
+    // __builtin_types_compatible_p(type, type): resolve both operand types so
+    // their descriptors exist for the constant folder; the result type is int.
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_resolve_type
+    adrp x0, _kcc_type_int_s@@PAGE
+    add  x0, x0, _kcc_type_int_s@@PAGEOFF
     ldr  x0, [x0]
     b .Lse_store
 .Lse_comma:

@@ -666,6 +666,14 @@ encountered during that walk branches the current block into its
 pre-allocated block and continues there, giving C fall-through for free and
 placing interior labels exactly where they textually occur.
 
+The constant folder \texttt{\_kcc\_eval\_const\_int} that backs case values and
+array bounds also evaluates \texttt{\_\_builtin\_types\_compatible\_p}: it resolves
+both operand types and returns \texttt{\_kcc\_type\_compatible}'s 1/0 verdict, so
+the builtin is a genuine integer constant expression usable in a
+\texttt{static\_assert}, an array bound, or a \texttt{\_Generic}-style
+compile-time choice.  The rodata predicate accepts it too, so a file-scope
+initializer folds rather than being mistaken for a run-time value.
+
 @d IR: build switch @{
 // -- kcc_eval_const_int ---------------------------------------------------
 // int64_t kcc_eval_const_int(node *n)
@@ -706,6 +714,8 @@ _kcc_eval_const_int:
     b.eq .Lec_sizeof
     cmp x0, #AST_IDENT_EXPR
     b.eq .Lec_ident
+    cmp x0, #AST_TYPES_COMPAT
+    b.eq .Lec_types_compat
 .Lec_zero:
     mov x0, #0
     b .Lec_ret
@@ -758,6 +768,18 @@ _kcc_eval_const_int:
 .Lec_sizeof_size:
     cbz x0, .Lec_zero
     bl _kcc_type_layout         // x0 = byte size
+    b .Lec_ret
+.Lec_types_compat:
+    // __builtin_types_compatible_p(T1, T2) → 1 if compatible, else 0.  x20/x21
+    // are free here (only x19 holds the node, restored at the epilogue's ldp).
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_sema_resolve_type
+    mov x20, x0
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_sema_resolve_type
+    mov x1, x0
+    mov x0, x20
+    bl _kcc_type_compatible
     b .Lec_ret
 .Lec_paren:
     ldr x0, [x19, #AST_F0]

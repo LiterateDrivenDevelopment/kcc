@@ -74,7 +74,8 @@ enum {
     AST_CALL_EXPR=58, AST_SUBSCRIPT=59, AST_MEMBER=60, AST_CAST_EXPR=61,
     AST_SIZEOF_EXPR=62, AST_ALIGNOF_EXPR=63, AST_COMMA_EXPR=64, AST_INIT_LIST=65,
     AST_DESIGNATOR=66, AST_COMPOUND_LIT=67, AST_PAREN_EXPR=68, AST_GENERIC=69,
-    AST_FLOAT_LIT=71, AST_VA_ARG=72, AST_STMT_EXPR=73, AST_ASM_STMT=74
+    AST_FLOAT_LIT=71, AST_VA_ARG=72, AST_STMT_EXPR=73, AST_ASM_STMT=74,
+    AST_TYPES_COMPAT=76
 };
 
 /* tokens (operators) */
@@ -759,6 +760,12 @@ void *kcc_sema_expr(void *node) {
         if (n->f0) kcc_sema_expr((void *)n->f0);
         if (!n->f1) t = kcc_type_int_s;
         else t = kcc_sema_resolve_type((void *)n->f1);
+        break;
+    case AST_TYPES_COMPAT:
+        /* __builtin_types_compatible_p: resolve both operand types; result int */
+        if (n->f0) kcc_sema_resolve_type((void *)n->f0);
+        if (n->f1) kcc_sema_resolve_type((void *)n->f1);
+        t = kcc_type_int_s;
         break;
     case AST_INIT_LIST: {
         struct Node *el = (struct Node *)n->f0;

@@ -71,6 +71,8 @@ _kcc_ir_build_expr:
     b.eq .Libe_member
     cmp x0, #AST_VA_ARG
     b.eq .Libe_va_arg
+    cmp x0, #AST_TYPES_COMPAT
+    b.eq .Libe_types_compat
     cmp x0, #AST_GENERIC
     b.eq .Libe_generic
     cmp x0, #AST_COMPOUND_LIT
@@ -202,6 +204,13 @@ _kcc_ir_build_expr:
 .Libe_alignof:
     mov x0, x19
     bl _kcc_ir_build_alignof
+    b .Libe_done
+
+.Libe_types_compat:
+    // __builtin_types_compatible_p folds to an integer constant (1/0).
+    mov x0, x19
+    bl _kcc_eval_const_int
+    bl _kcc_ir_emit_const
     b .Libe_done
 
 .Libe_subscript:

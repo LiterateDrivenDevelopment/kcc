@@ -2789,7 +2789,11 @@ compile-time assertion checking.  It takes the form
 \texttt{\_Static\_assert(constant-expression, string-literal);} and produces
 an \texttt{AST\_STATIC\_ASSERT} node carrying the condition expression and
 the diagnostic message string.  The assertion is evaluated during semantic
-analysis; at parse time we only need to extract the two operands.
+analysis; at parse time we only need to extract the two operands.  Interning the
+message string requires \emph{both} its pointer and its length: the source
+buffer is not null-terminated at the token's end, so passing the pointer alone
+(a latent bug, harmless until the kernel's file-scope \texttt{static\_assert}s
+first exercised this path) ran the intern hash off the mapping and faulted.
 
 @d Decl: parse static assert @{
 // -- kcc_parse_static_assert -------------------------------------------
@@ -2817,10 +2821,16 @@ _kcc_parse_static_assert:
     mov x0, #TOK_COMMA
     bl _kcc_parse_expect
 
-    // Get message string
+    // Get message string.  Intern needs BOTH the pointer and the length; the
+    // source is not null-terminated at the token's end, so omitting the length
+    // (a latent bug before file-scope _Static_assert was exercised) walked the
+    // FNV hash off the mapping and faulted.
     adrp x0, _kcc_tok_start@@PAGE
     add  x0, x0, _kcc_tok_start@@PAGEOFF
     ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
     bl _kcc_strtab_intern
     mov x20, x0                  // x20 = message
 

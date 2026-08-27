@@ -722,6 +722,11 @@ int main(void){ return M(1, 2, 3) - ONE(123) * 0 - 123; }"
 difftest "gnu-alignof-spelling" \
     "_Static_assert(__alignof__(unsigned long) == __alignof__(unsigned long long), \"a\");
 int main(void){ return (int)(__alignof__(long)*10 + __alignof(int)); }"
+# GNU __builtin_offsetof (the kernel's offsetof): single, nested, and used in an
+# integer context (kernel ptrace.h MAX_REG_OFFSET).
+difftest "gnu-builtin-offsetof" \
+    "struct R { long a; long ss; int f; }; struct N { int x; struct R r; char arr[4]; };
+int main(void){ return (int)(__builtin_offsetof(struct R, ss) + __builtin_offsetof(struct R, f) + __builtin_offsetof(struct N, r.ss) + __builtin_offsetof(struct N, arr[2])); }"
 # GNU typeof: a type-specifier that is the type of a parenthesised type-name or
 # expression.  Used in declarations, casts, and sizeof; __typeof__ is the alias.
 difftest "gnu-typeof" \

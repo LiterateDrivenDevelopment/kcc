@@ -78,7 +78,8 @@ enum {
     AST_COMMA_EXPR = 64, AST_COMPOUND_LIT = 67, AST_PAREN_EXPR = 68,
     AST_GENERIC = 69, AST_GENERIC_ASSOC = 70, AST_IDENT_EXPR = 50,
     AST_INT_LIT = 51, AST_STR_LIT = 52, AST_CHAR_LIT = 53, AST_FLOAT_LIT = 71,
-    AST_VA_ARG = 72, AST_STMT_EXPR = 73, AST_TYPES_COMPAT = 76
+    AST_VA_ARG = 72, AST_STMT_EXPR = 73, AST_TYPES_COMPAT = 76,
+    AST_TYPE_BUILTIN = 20, AST_TYPE_PTR = 22
 };
 
 static unsigned char prec_table[48] = {
@@ -209,8 +210,10 @@ an expression), and \texttt{\_Alignof}.  Cast distinguishes a parenthesised type
 a GNU statement expression (on \texttt{(\{}); each non-cast form runs through the
 postfix tail so suffixes can chain.  Postfix applies subscript, call (with the
 \texttt{va\_arg} special form---also matched under its GNU
-\texttt{\_\_builtin\_va\_arg} spelling), member access, and postfix
-\texttt{++}/\texttt{--}.
+\texttt{\_\_builtin\_va\_arg} spelling---and the type-name builtins
+\texttt{\_\_builtin\_types\_compatible\_p} and \texttt{\_\_builtin\_offsetof},
+the latter synthesised into \texttt{(unsigned long)\&((T\,*)0)->designator}),
+member access, and postfix \texttt{++}/\texttt{--}.
 
 @l c
 @d Selfhost: expressions unary @{
@@ -345,6 +348,47 @@ void *kcc_parse_postfix_tail(void *expr) {
                 n->f0 = (unsigned long)t1;
                 n->f1 = (unsigned long)t2;
                 cur = n;
+            } else if (cur->tag == AST_IDENT_EXPR &&
+                kcc_strcmp((const char *)cur->f0, "__builtin_offsetof") == 0) {
+                /* __builtin_offsetof(T, desig) -> (unsigned long)&((T*)0)->desig
+                   (arrow for the first designator component, dot/subscript after);
+                   the constant folder reduces it to the member's byte offset. */
+                kcc_pp_next();
+                void *T = kcc_parse_type_name();
+                struct Node *ptrT = (struct Node *)kcc_ast_alloc(AST_TYPE_PTR);
+                ptrT->f0 = (unsigned long)T; ptrT->f1 = 0;
+                struct Node *zero = (struct Node *)kcc_ast_alloc(AST_INT_LIT);
+                zero->f0 = 0;
+                struct Node *e = (struct Node *)kcc_ast_alloc(AST_CAST_EXPR);
+                e->f0 = (unsigned long)ptrT; e->f1 = (unsigned long)zero;
+                kcc_parse_expect(TOK_COMMA);
+                unsigned long arrow = 1;
+                for (;;) {
+                    if (kcc_tok_type == TOK_IDENT) {
+                        void *nm = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+                        kcc_pp_next();
+                        struct Node *m = (struct Node *)kcc_ast_alloc(AST_MEMBER);
+                        m->f0 = (unsigned long)e; m->f1 = (unsigned long)nm; m->f2 = arrow;
+                        e = m; arrow = 0;
+                    } else if (kcc_tok_type == TOK_DOT) {
+                        kcc_pp_next(); arrow = 0;
+                    } else if (kcc_tok_type == TOK_LBRACKET) {
+                        kcc_pp_next();
+                        void *idx = kcc_parse_assign_expr();
+                        kcc_parse_expect(TOK_RBRACKET);
+                        struct Node *s = (struct Node *)kcc_ast_alloc(AST_SUBSCRIPT);
+                        s->f0 = (unsigned long)e; s->f1 = (unsigned long)idx;
+                        e = s; arrow = 0;
+                    } else break;
+                }
+                kcc_parse_expect(TOK_RPAREN);
+                struct Node *addr = (struct Node *)kcc_ast_alloc(AST_UNARY_EXPR);
+                addr->f0 = TOK_AMP; addr->f1 = (unsigned long)e; addr->f2 = 1;
+                struct Node *ty = (struct Node *)kcc_ast_alloc(AST_TYPE_BUILTIN);
+                ty->f0 = 528;   /* unsigned long: SPEC_UNSIGNED(1<<9)|SPEC_LONG(1<<4) */
+                struct Node *cst = (struct Node *)kcc_ast_alloc(AST_CAST_EXPR);
+                cst->f0 = (unsigned long)ty; cst->f1 = (unsigned long)addr;
+                cur = cst;
             } else {
                 kcc_pp_next();
                 void *args = kcc_parse_arg_list();

@@ -655,6 +655,13 @@ types are compatible per \stdref{6.2.7}) or~0.  The Linux kernel leans on it
 through \texttt{\_\_same\_type}, above all in the file-scope \texttt{static\_assert}
 sanity checks of \texttt{<linux/bitops.h>}---a single construct that, in a sweep,
 blocked roughly three-quarters of a real kernel \texttt{.c} sample.
+\texttt{\_\_builtin\_offsetof(T,\,designator)} (the kernel's \texttt{offsetof})
+is handled by a small helper, \texttt{\_kcc\_parse\_builtin\_offsetof}, that
+\emph{synthesises} the classic form \texttt{(size\_t)\&((T\,*)0)->designator}:
+a \texttt{(T\,*)0} cast, an arrow member for the first designator component and
+dot/subscript for the rest, an address-of, and a cast to \texttt{unsigned long}
+so the result is an integer constant.  The existing constant folder then reduces
+it to the member's byte offset, so no new evaluation path is needed.
 
 @d Expr: parse postfix @{
 // -- kcc_parse_postfix_expr --------------------------------------------
@@ -761,6 +768,13 @@ _kcc_parse_postfix_tail:
     add  x1, x1, _kcc_str_types_compat@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Lpostfix_types_compat
+    // GNU __builtin_offsetof(type-name, member-designator): the kernel's
+    // offsetof.  Synthesised into `&((T*)0)->designator` by a dedicated helper.
+    ldr x0, [x19, #AST_F0]
+    adrp x1, _kcc_str_builtin_offsetof@@PAGE
+    add  x1, x1, _kcc_str_builtin_offsetof@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Lpostfix_offsetof
 
 .Lpostfix_call_normal:
     // Consume '('
@@ -796,6 +810,11 @@ _kcc_parse_postfix_tail:
     mov x19, x0
     b .Lpostfix_loop
 
+.Lpostfix_offsetof:
+    bl _kcc_parse_builtin_offsetof
+    mov x19, x0
+    b .Lpostfix_loop
+
 .Lpostfix_types_compat:
     bl _kcc_pp_next              // consume '('
     bl _kcc_parse_type_name      // first type
@@ -812,8 +831,118 @@ _kcc_parse_postfix_tail:
     str x21, [x0, #AST_F1]      // type 2
     mov x19, x0
     b .Lpostfix_loop
+
+// -- kcc_parse_builtin_offsetof ----------------------------------------
+// node *kcc_parse_builtin_offsetof(void)
+// On entry the current token is the '(' of __builtin_offsetof(T, desig).
+// Synthesises the AST for `&((T*)0)->desig` (arrow for the first designator
+// component, dot/subscript for the rest), which the existing constant folder
+// reduces to the member's byte offset.
+.p2align 2
+.globl _kcc_parse_builtin_offsetof
+_kcc_parse_builtin_offsetof:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    str x23, [sp, #48]
+
+    bl _kcc_pp_next               // consume '('
+    bl _kcc_parse_type_name       // T
+    mov x20, x0
+    mov x0, #AST_TYPE_PTR         // ptrT = (T *)
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]
+    str xzr, [x0, #AST_F1]
+    mov x20, x0
+    mov x0, #AST_INT_LIT          // zero literal
+    bl _kcc_ast_alloc
+    str xzr, [x0, #AST_F0]
+    mov x21, x0
+    mov x0, #AST_CAST_EXPR        // (T *)0
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]
+    str x21, [x0, #AST_F1]
+    mov x19, x0                   // x19 = current expr
+    mov x0, #TOK_COMMA
+    bl _kcc_parse_expect
+    mov x22, #1                   // first designator uses '->'
+.Lofs_loop:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_IDENT
+    b.eq .Lofs_member
+    cmp x0, #TOK_DOT
+    b.eq .Lofs_dot
+    cmp x0, #TOK_LBRACKET
+    b.eq .Lofs_subscript
+    b .Lofs_done
+.Lofs_dot:
+    bl _kcc_pp_next               // consume '.'; the next member uses '.'
+    mov x22, #0
+    b .Lofs_loop
+.Lofs_member:
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    bl _kcc_strtab_intern
+    mov x23, x0
+    bl _kcc_pp_next
+    mov x0, #AST_MEMBER
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str x23, [x0, #AST_F1]
+    str x22, [x0, #AST_F2]        // arrow(1) first, dot(0) after
+    mov x19, x0
+    mov x22, #0
+    b .Lofs_loop
+.Lofs_subscript:
+    bl _kcc_pp_next               // consume '['
+    bl _kcc_parse_assign_expr
+    mov x23, x0
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect
+    mov x0, #AST_SUBSCRIPT
+    bl _kcc_ast_alloc
+    str x19, [x0, #AST_F0]
+    str x23, [x0, #AST_F1]
+    mov x19, x0
+    mov x22, #0
+    b .Lofs_loop
+.Lofs_done:
+    mov x0, #TOK_RPAREN
+    bl _kcc_parse_expect
+    mov x0, #AST_UNARY_EXPR       // &(...)
+    bl _kcc_ast_alloc
+    mov x1, #TOK_AMP
+    str x1, [x0, #AST_F0]
+    str x19, [x0, #AST_F1]
+    mov x1, #1
+    str x1, [x0, #AST_F2]         // prefix
+    mov x19, x0                   // x19 = &((T*)0)->desig
+    // Wrap in a cast to size_t (unsigned long) so the offset is an INTEGER
+    // constant, not a pointer---exactly the classic `(size_t)&...` offsetof.
+    mov x0, #AST_TYPE_BUILTIN
+    bl _kcc_ast_alloc
+    mov x1, #528                  // SPEC_UNSIGNED(1<<9) | SPEC_LONG(1<<4)
+    str x1, [x0, #AST_F0]
+    mov x20, x0
+    mov x0, #AST_CAST_EXPR
+    bl _kcc_ast_alloc
+    str x20, [x0, #AST_F0]        // type = unsigned long
+    str x19, [x0, #AST_F1]        // operand = the address
+    ldr x23, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
 @| _kcc_parse_postfix_expr
 @| _kcc_parse_postfix_tail
+@| _kcc_parse_builtin_offsetof
 @}
 
 \paragraph{Member access and increment/decrement.}
@@ -1972,6 +2101,8 @@ _kcc_str_builtin_va_arg:
     .asciz "__builtin_va_arg"
 _kcc_str_types_compat:
     .asciz "__builtin_types_compatible_p"
+_kcc_str_builtin_offsetof:
+    .asciz "__builtin_offsetof"
 
 // -- Precedence table --------------------------------------------------
 // Indexed by (tok_type - 60).  48 entries covering all punctuators.

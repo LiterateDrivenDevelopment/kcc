@@ -904,6 +904,15 @@ void *kcc_parse_decl(void) {
     kcc_attr_weak = 0; kcc_attr_section = 0; kcc_attr_alias = 0;
 
     if (d->tag == AST_FUNC_DECL) {
+        if (storage == 1) {
+            /* typedef of a function type (`typedef int f(int);`, or the kernel's
+               parenthesised `typedef int (f)(int);`): register the name, not a
+               function.  The FuncDecl carries the name in f1 like a VarDecl. */
+            if (d->f1) kcc_typedef_add((const char *)d->f1, kcc_strlen((const char *)d->f1));
+            d->tag = AST_TYPEDEF_DECL;
+            kcc_parse_expect(TOK_SEMI);
+            return d;
+        }
         if (kcc_tok_type == TOK_LBRACE) {
             kcc_cur_func_name = (const char *)d->f1;   /* for __func__ in the body */
             d->f3 = (unsigned long)kcc_parse_compound();

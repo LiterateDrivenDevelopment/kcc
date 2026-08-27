@@ -731,6 +731,12 @@ int main(void){ return (int)(__builtin_offsetof(struct R, ss) + __builtin_offset
 # DEFINE_LOCK_GUARD_0 emits `T a = ..., *b __attribute__((__unused__)) = &a;`).
 difftest "gnu-attr-trailing-declarator" \
     "int main(void){ int a = 5, *b __attribute__((__unused__)) = &a; int c __attribute__((__unused__)) = 3; return *b + c - 8; }"
+# Function-TYPE typedef, incl. the parenthesised-name form the kernel's percpu.h
+# uses (`typedef int (pcpu_fc_cpu_distance_fn_t)(unsigned, unsigned);`).
+difftest "function-type-typedef" \
+    "typedef int fn_t(int); typedef int (fn2_t)(int);
+int sq(int a){ return a*a; } int prototype(fn_t cb, int x);
+int main(void){ fn_t *p = sq; fn2_t *q = sq; return p(6) + q(1); }"
 # GNU typeof: a type-specifier that is the type of a parenthesised type-name or
 # expression.  Used in declarations, casts, and sizeof; __typeof__ is the alias.
 difftest "gnu-typeof" \

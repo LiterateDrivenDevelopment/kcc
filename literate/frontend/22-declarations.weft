@@ -26,7 +26,13 @@ A declaration (\stdref{6.7}) has the form:
 The specifiers include storage class (\texttt{typedef}, \texttt{static},
 \texttt{extern}, etc.), type specifiers (\texttt{int}, \texttt{char},
 struct/union/enum, typedef names), and qualifiers (\texttt{const},
-\texttt{volatile}, \texttt{restrict}, \texttt{\_Atomic}).
+\texttt{volatile}, \texttt{restrict}, \texttt{\_Atomic}).  A \texttt{typedef}
+whose declarator is a \emph{function} type---\texttt{typedef int f(int);}, or the
+parenthesised-name form \texttt{typedef int (f)(int);} the kernel's
+\texttt{<linux/percpu.h>} uses---produces a function declarator node just like a
+prototype, so it is intercepted before the function-declaration paths and its
+name registered as a typedef (the node carries the name in the same field a
+variable declarator does).
 
 After a declarator and its trailing attributes, GCC allows an \emph{asm label}
 or \emph{named-register binding}: \texttt{T v asm("string")}.  With
@@ -135,6 +141,13 @@ _kcc_parse_decl:
     // If it's a function declarator and next token is '{', it's a definition
     cmp x22, #AST_FUNC_DECL
     b.ne .Ldecl_not_func
+
+    // A `typedef` whose declarator is a function type---`typedef int f(int);`,
+    // or the kernel's parenthesised `typedef int (f)(int);`---still declares a
+    // typedef NAME, not a function.  Register it before the function-decl paths
+    // (the FuncDecl node carries the name in F1, exactly like a VarDecl).
+    cmp x20, #1                  // storage class 1 = typedef
+    b.eq .Ldecl_typedef
 
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF

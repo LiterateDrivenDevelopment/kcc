@@ -1941,6 +1941,8 @@ _kcc_kw_s_vol2:       .asciz "__volatile__"
 _kcc_kw_s_restr1:     .asciz "__restrict"
 _kcc_kw_s_restr2:     .asciz "__restrict__"
 _kcc_kw_s_int128:     .asciz "__int128"
+_kcc_kw_s_alignof1:   .asciz "__alignof__"
+_kcc_kw_s_alignof2:   .asciz "__alignof"
 
 // -- Keyword registration table -------------------------------------
 // Each entry: (string_ptr, string_len, token_type) = 24 bytes
@@ -2011,8 +2013,10 @@ _kcc_kw_reg_table:
     .quad _kcc_kw_s_restr1,     10, 30    // __restrict → TOK_RESTRICT
     .quad _kcc_kw_s_restr2,     12, 30    // __restrict__
     .quad _kcc_kw_s_int128,      8, 58    // __int128 → TOK_INT128
+    .quad _kcc_kw_s_alignof1,   11, 45    // __alignof__ → TOK__ALIGNOF
+    .quad _kcc_kw_s_alignof2,    9, 45    // __alignof
 
-.equ KW_COUNT, 64
+.equ KW_COUNT, 66
 .equ KW_ENTRY_BYTES, 24       // 3 quads per entry
 @| _kcc_kw_s_auto
 @| _kcc_kw_s_break

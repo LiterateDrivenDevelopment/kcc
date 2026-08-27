@@ -771,6 +771,19 @@ is placed in an SSE register \texttt{d0}--\texttt{d7} rather than
 parameters (an unprototyped or variadic tail), where each argument keeps its
 own promoted type.
 
+Two GNU builtins are intercepted by name before dispatch, alongside the
+variadic operators.  \texttt{\_\_builtin\_va\_start} and
+\texttt{\_\_builtin\_va\_end} lower to their variadic handlers
+(Section~\ref{sec:variadic-defs}), and \texttt{\_\_builtin\_expect(x, c)}
+--- a branch-prediction hint --- lowers to just its first argument
+\texttt{x}, since with no profile feedback the hint has no effect on the
+value.  The kernel reaches this builtin constantly: \texttt{likely(e)} and
+\texttt{unlikely(e)} expand to \texttt{\_\_builtin\_expect(!!(e), 1)} and
+\texttt{\_\_builtin\_expect(!!(e), 0)}, wrapping arbitrary
+sub-expressions, calls among them.  Were it not intercepted it would be
+emitted as a direct call to an undefined external \texttt{\_\_builtin\_expect}
+and fail to link.
+
 The callee decides direct versus indirect dispatch.  A bare name is a
 direct \texttt{IR\_CALL} by symbol only when it truly names a
 \emph{function}: it is neither a local variable nor a global object whose
@@ -856,6 +869,17 @@ _kcc_ir_build_call:
     add  x1, x1, _kcc_ir_str_builtin_va_end@@PAGEOFF
     bl _kcc_strcmp
     cbz x0, .Libc_va_end
+
+    // __builtin_expect(x, c) is a branch-prediction hint; with no profile
+    // feedback its value is exactly its first argument, so lower it to that
+    // argument and drop the hint.  The kernel's likely()/unlikely() expand to
+    // it around ordinary sub-expressions (including calls), so intercepting it
+    // by name here keeps those uses from becoming an undefined external.
+    mov x0, x20
+    adrp x1, _kcc_ir_str_builtin_expect@@PAGE
+    add  x1, x1, _kcc_ir_str_builtin_expect@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_builtin_expect
 
     // Direct name, a local function-pointer variable, or a global one?
     mov x0, x20
@@ -1175,6 +1199,11 @@ _kcc_ir_build_call:
     mov x0, #0                  // va_end is a no-op in this ABI
     b .Libc_epilogue
 
+.Libc_builtin_expect:
+    ldr x0, [x19, #AST_F1]      // first argument (the predicted expression)
+    bl _kcc_ir_build_expr       // its vreg is the whole builtin's value
+    b .Libc_epilogue
+
 .Libc_done_zero:
     mov x0, #0
 .Libc_done:
@@ -1467,10 +1496,12 @@ _kcc_ir_str_va_start:    .asciz "va_start"
 _kcc_ir_str_va_end:      .asciz "va_end"
 _kcc_ir_str_builtin_va_start: .asciz "__builtin_va_start"
 _kcc_ir_str_builtin_va_end:   .asciz "__builtin_va_end"
+_kcc_ir_str_builtin_expect:   .asciz "__builtin_expect"
 .text
 @| _kcc_ir_ident_alloca _kcc_ir_build_va_start _kcc_ir_build_va_arg
 @| _kcc_ir_str_va_start _kcc_ir_str_va_end
 @| _kcc_ir_str_builtin_va_start _kcc_ir_str_builtin_va_end
+@| _kcc_ir_str_builtin_expect
 @}
 
 \paragraph{End-to-end tests.}

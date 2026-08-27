@@ -1065,6 +1065,12 @@ static void *sema_expr_call(struct Node *n) {
     sema_callee_ctx = (callee->tag == AST_IDENT_EXPR);
     struct Type *ct = (struct Type *)kcc_sema_expr(callee);
     sema_callee_ctx = 0;
+    /* Capture whether the callee was an implicit (undeclared) function BEFORE
+       checking the arguments: sema_callee_implicit is a global, and evaluating
+       an argument that is itself a call resets it to 0 at that nested call's
+       entry.  Reading it after the arg loop would then misfire "called object
+       is not a function" for e.g. __builtin_expect(!!(f(x) > 0), 0). */
+    unsigned long callee_implicit = sema_callee_implicit;
     struct Node *arg = (struct Node *)n->f1;
     while (arg) { kcc_sema_expr(arg); arg = (struct Node *)arg->f4; }
     if (ct->kind == TY_FUNC) return (void *)ct->f0;
@@ -1073,7 +1079,7 @@ static void *sema_expr_call(struct Node *n) {
         if (fn->kind != TY_FUNC) return kcc_type_int_s;
         return (void *)fn->f0;
     }
-    if (sema_callee_implicit) return kcc_type_int_s;
+    if (callee_implicit) return kcc_type_int_s;
     kcc_diag_error(n->line, n->col, m_not_func);
     return kcc_type_int_s;
 }

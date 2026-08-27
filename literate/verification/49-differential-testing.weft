@@ -727,6 +727,16 @@ int main(void){ return (int)(__alignof__(long)*10 + __alignof(int)); }"
 difftest "gnu-builtin-offsetof" \
     "struct R { long a; long ss; int f; }; struct N { int x; struct R r; char arr[4]; };
 int main(void){ return (int)(__builtin_offsetof(struct R, ss) + __builtin_offsetof(struct R, f) + __builtin_offsetof(struct N, r.ss) + __builtin_offsetof(struct N, arr[2])); }"
+# A function call nested inside a __builtin_expect argument.  __builtin_expect is
+# an undeclared bare name taken as an implicit function; the inner call must not
+# clobber that "implicit callee" status (kernel likely()/unlikely() wrap calls
+# like static_key_count(k) this way — jump_label.h and 13 other lib/ files).
+difftest "builtin-expect-nested-call" \
+    "static int f(int *p){ return *p; }
+int main(void){ int x = 7, y = 0;
+  if (__builtin_expect(!!(f(&x) > 0), 0)) y += 10;
+  if (__builtin_expect(f(&x) == 7, 1)) y += 3;
+  return (y == 13) ? 0 : 1; }"
 # GNU attribute trailing a continuation declarator, before its '=' (the kernel's
 # DEFINE_LOCK_GUARD_0 emits `T a = ..., *b __attribute__((__unused__)) = &a;`).
 difftest "gnu-attr-trailing-declarator" \

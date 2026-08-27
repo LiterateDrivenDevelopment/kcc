@@ -1911,6 +1911,21 @@ is a pointer-to-function, the pointer is dereferenced first.
 Implicit function declarations (callee not found) fall back to
 \texttt{int} return.
 
+The ``implicit'' status is signalled by a global flag,
+\texttt{\_kcc\_sema\_callee\_implicit}, that
+\texttt{kcc\_sema\_expr\_ident} raises when it takes an undeclared bare
+name in call position (\S6.5.2.2) rather than diagnosing it.  That flag
+is process-global, but a call's arguments may themselves be calls, and
+each nested call clears the flag on entry to track its own callee.  The
+check for ``called object is not a function'' must therefore consult a
+\emph{snapshot} of the flag taken immediately after the callee is
+resolved, before the argument loop runs --- otherwise an argument such
+as \texttt{f(x)} inside \texttt{\_\_builtin\_expect(!!(f(x) > 0), 0)}
+would clobber the outer callee's implicit marker and the compiler would
+wrongly reject the enclosing call.  The assembly parks the snapshot in
+the callee-saved \texttt{x22}; the C port keeps it in the local
+\texttt{callee\_implicit}.
+
 @d Sema: expr call @{
 // -- kcc_sema_expr_call ---------------------------------------------------
 // type_desc *kcc_sema_expr_call(node *expr)
@@ -1922,6 +1937,7 @@ _kcc_sema_expr_call:
     mov x29, sp
     stp x19, x20, [sp, #16]
     str x21, [sp, #32]
+    str x22, [sp, #40]
 
     // Type-check callee.  When it is a bare identifier, enter "callee
     // context" so an undeclared name is taken as an implicit function
@@ -1942,6 +1958,15 @@ _kcc_sema_expr_call:
     add  x3, x3, _kcc_sema_callee_ctx@@PAGEOFF
     str xzr, [x3]
 
+    // Snapshot the implicit-function marker for THIS call before checking the
+    // arguments.  _kcc_sema_callee_implicit is a global; an argument that is
+    // itself a call clears it on entry, so reading it after the loop would lose
+    // the outer callee's status and misfire "called object is not a function"
+    // for e.g. __builtin_expect(!!(f(x) > 0), 0).
+    adrp x22, _kcc_sema_callee_implicit@@PAGE
+    add  x22, x22, _kcc_sema_callee_implicit@@PAGEOFF
+    ldr  x22, [x22]
+
     // Type-check arguments
     ldr x21, [x19, #AST_F1]        // first arg
 .Lsec_arg_loop:
@@ -1961,11 +1986,10 @@ _kcc_sema_expr_call:
 
     // Not a function type.  Unless the callee was an implicit function
     // declaration (an undeclared bare name in call position), this is an
-    // error: something that is not a function is being called.
-    adrp x0, _kcc_sema_callee_implicit@@PAGE
-    add  x0, x0, _kcc_sema_callee_implicit@@PAGEOFF
-    ldr  x0, [x0]
-    cbnz x0, .Lsec_default_int
+    // error: something that is not a function is being called.  Use the
+    // snapshot taken before the argument loop, not the (possibly clobbered)
+    // global.
+    cbnz x22, .Lsec_default_int
     ldr x0, [x19, #AST_LINE]
     ldr x1, [x19, #AST_COL]
     adrp x2, _kcc_sema_err_not_func@@PAGE
@@ -1995,6 +2019,7 @@ _kcc_sema_expr_call:
     ldr  x0, [x0]
 
 .Lsec_done:
+    ldr x22, [sp, #40]
     ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48

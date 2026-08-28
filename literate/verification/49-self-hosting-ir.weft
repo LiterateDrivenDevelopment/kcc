@@ -1162,10 +1162,12 @@ void kcc_ir_asm_lower_operands(void *as) {
             IL(op, AST_F3) = 0;
         }
         /* Record a symbolic operand's emit-name for `%P` rendering, unless it
-           took the immediate path (F2 bit 63).  The name goes in F1 (free for
-           every non-immediate operand) with F2 bit 62 flagging its presence. */
+           took the immediate path (F2 bit 63).  The name goes in the unused COL
+           field (the emitter never reads an operand's source column) with F2 bit
+           62 flagging its presence---F1 must stay the operand's `[name]`, which
+           the back end matches to resolve a `%[name]` reference. */
         if (sym && !((IL(op, AST_F2) >> 63) & 1)) {
-            IL(op, AST_F1) = (unsigned long)sym;
+            IL(op, AST_COL) = (unsigned long)sym;
             IL(op, AST_F2) = IL(op, AST_F2) | (1UL << 62);
         }
         op = (void *)IL(op, AST_F4);

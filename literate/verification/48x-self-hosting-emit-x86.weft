@@ -87,6 +87,7 @@ extern unsigned long kcc_modinit_present;
 #define TY_FLOAT 8
 #define TY_DOUBLE 9
 #define AST_TAG 0
+#define AST_COL 16
 #define AST_F0 24
 #define AST_F1 32
 #define AST_F2 40
@@ -622,8 +623,8 @@ static void x86_emit_asm(void *i) {
            accounts for `Ir`-style alternatives. */
         isimm[nop] = (IL(op, AST_F2) >> 63) & 1;
         immval[nop] = IL(op, AST_F1);
-        issym[nop] = (IL(op, AST_F2) >> 62) & 1;    /* symbolic operand: name in F1 (for %P) */
-        symname[nop] = issym[nop] ? (const char *)IL(op, AST_F1) : 0;
+        issym[nop] = (IL(op, AST_F2) >> 62) & 1;    /* symbolic operand: name in COL (for %P) */
+        symname[nop] = issym[nop] ? (const char *)IL(op, AST_COL) : 0;
         regof[nop] = nop;
         if (isimm[nop]) {
             /* immediate: no register of its own */

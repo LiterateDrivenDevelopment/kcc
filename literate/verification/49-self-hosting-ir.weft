@@ -308,7 +308,6 @@ void *kcc_ir_subobj(void *agg, unsigned long idx, unsigned long *out_off);
 void kcc_ir_elem_off_width(void *ty, unsigned long idx, unsigned long *out_off, unsigned long *out_width);
 unsigned long kcc_ir_agg_count(void *ty);
 unsigned long kcc_ir_initlist_count(void *list);
-unsigned long kcc_ir_compound_apply(void *ty, unsigned long base, void *list);
 void kcc_loop_push(unsigned long break_id, unsigned long continue_id);
 void kcc_loop_pop(void);
 void kcc_ir_sw_scan(void *stmt);

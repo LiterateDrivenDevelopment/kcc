@@ -745,6 +745,18 @@ int main(void){ int x = 7, y = 0;
 difftest "builtin-file-macro" \
     "int main(void){ const char *f = __FILE__; int n = 0; while (f[n]) n++;
      return (n >= 2 && f[n-1] == 'c' && f[n-2] == '.') ? 0 : 1; }"
+# GNU array-range designator `[lo ... hi] = v` fills every element in the range
+# (the kernel's lib/atomic64.c seeds its lock table `[0 ... (NR_LOCKS-1)]`), and
+# a designator index is a constant EXPRESSION, not just a literal, so [NR-1] and
+# the range bounds must be folded.  Covers a scalar range and a struct range.
+difftest "designator-range-and-const-index" \
+    "#define NR 4
+struct s { int a; int b; };
+static struct s g[NR] = { [0 ... (NR - 1)] = { .a = 7, .b = 3 } };
+int main(void){ int v[4] = { [NR - 2] = 9 };
+  int sum = v[2];
+  for (int i = 0; i < NR; i++) sum += g[i].a + g[i].b;
+  return (sum == 9 + 4*(7+3)) ? 0 : 1; }"
 # A directive skipped inside an inactive #if group whose trailing block comment
 # spans a newline.  Skipping must consume the whole comment; otherwise the
 # cursor is left mid-comment and the apostrophe in "that's" is lexed as a char

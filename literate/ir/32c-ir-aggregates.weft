@@ -400,7 +400,11 @@ scalar landing on a scalar sub-object, is written by
 which follows the \texttt{AST\_F2} links one sub-object at a time
 (\texttt{\_kcc\_ir\_subobj} descending both the byte offset and the type)
 to the leaf, and retargets the cursor to the first designator's position so
-plain elements that follow resume from there.  The remaining subtlety is
+plain elements that follow resume from there.  A GNU array-range designator
+(\texttt{is\_field}~=~2) is handled before that chain walk: the same
+initializer value is filled into every element from the low index
+(\texttt{F0}) to the high index (\texttt{F2}) inclusive, and the cursor
+resumes just past the range.  The remaining subtlety is
 \emph{brace elision} (\stdref{6.7.9p20}): when a plain scalar meets an
 aggregate sub-object that has no brace of its own, the scalar and those
 after it flow into that aggregate's leaves in order.
@@ -1247,6 +1251,9 @@ _kcc_ir_fill_list:
     ldr x0, [x22, #AST_TAG]
     cmp x0, #AST_DESIGNATOR
     b.ne .Lfll_plain
+    ldr x0, [x22, #AST_F1]       // is_field? 2 = GNU array range
+    cmp x0, #2
+    b.eq .Lfll_range
     // Designator chain: retarget the cursor and fill the named leaf.
     mov x0, x19
     mov x1, x21
@@ -1263,6 +1270,37 @@ _kcc_ir_fill_list:
     mov x4, x26
     bl _kcc_ir_fill_one
     add x23, x23, #1
+    ldr x22, [x22, #AST_F4]
+    b .Lfll_loop
+.Lfll_range:
+    // GNU array range `[lo ... hi] = value`: fill every element in [lo, hi]
+    // with the same initializer.  x24 = running pos (preserved by fill_one and
+    // subobj, both callee-saving x24); the high bound is re-read from the
+    // designator node each iteration because fill_one does NOT preserve x25.
+    ldr x24, [x22, #AST_F0]      // pos = lo
+.Lfll_range_loop:
+    ldr x25, [x22, #AST_F2]      // hi (re-read: not call-preserved)
+    cmp x24, x25
+    b.hi .Lfll_range_next
+    mov x0, x19                  // ty
+    mov x1, x24                  // pos
+    bl _kcc_ir_subobj            // x0=off, x2=sub_type; publishes _kcc_ir_member_field
+    add x5, x21, x0              // x5 = absolute offset
+    mov x6, x2                   // x6 = sub_type
+    adrp x0, _kcc_ir_member_field@@PAGE
+    add  x0, x0, _kcc_ir_member_field@@PAGEOFF
+    ldr x4, [x0]                 // x4 = leaf field
+    ldr x3, [x22, #AST_F3]       // x3 = value node
+    mov x0, x6                   // x0 = sub_type
+    mov x1, x20                  // x1 = base
+    mov x2, x5                   // x2 = absolute offset
+    bl _kcc_ir_fill_one
+    add x24, x24, #1
+    b .Lfll_range_loop
+.Lfll_range_next:
+    ldr x25, [x22, #AST_F2]      // hi
+    add x25, x25, #1
+    mov x23, x25                 // cursor resumes after the range
     ldr x22, [x22, #AST_F4]
     b .Lfll_loop
 .Lfll_plain:

@@ -3218,6 +3218,19 @@ void kcc_ir_fill_list(void *ty, unsigned long base, unsigned long base_off, void
     unsigned long cursor = 0;
     while (elem) {
         if (IL(elem, AST_TAG) == AST_DESIGNATOR) {
+            if (IL(elem, AST_F1) == 2) {          /* GNU array range [lo ... hi] = v */
+                unsigned long lo = IL(elem, AST_F0);
+                unsigned long hi = IL(elem, AST_F2);
+                void *val = (void *)IL(elem, AST_F3);
+                for (unsigned long pos = lo; pos <= hi; pos++) {
+                    unsigned long off;
+                    void *sub = kcc_ir_subobj(ty, pos, &off);
+                    kcc_ir_fill_one(sub, base, base_off + off, val, kcc_ir_member_field);
+                }
+                cursor = hi + 1;
+                elem = (void *)IL(elem, AST_F4);
+                continue;
+            }
             struct desig_res dr = kcc_ir_resolve_designator(ty, base_off, elem);
             cursor = dr.first_pos;
             kcc_ir_fill_one(dr.sub_type, base, dr.off, (void *)IL(elem, AST_F3), dr.field);

@@ -750,7 +750,10 @@ void *kcc_parse_enum(void) {
 \texttt{initializer} reads an expression or a brace list of possibly-designated
 elements; and \texttt{parse\_decl} ties it together---function definition versus
 prototype, variable and typedef declarations (with multi-declarator chains),
-bare aggregate types, and \texttt{\_Static\_assert}.
+bare aggregate types, and \texttt{\_Static\_assert}.  A designator accepts the
+GNU array-range form \texttt{[lo \ldots{} hi]} (marked by \texttt{is\_field}~=~2,
+high index in \texttt{F2}) and folds its indices as full constant expressions,
+matching the assembly parser.
 
 Between the declarator (with its trailing attributes) and the initializer or
 terminator, GCC permits an \emph{asm label} or \emph{named-register binding}:
@@ -790,12 +793,12 @@ unsigned long kcc_parse_is_type_token(void) {
     return kcc_typedef_lookup(kcc_tok_start, kcc_tok_len) ? 1 : 0;
 }
 
+extern unsigned long kcc_eval_const_int(void *n);
 static unsigned long parse_const_index(void *e) {
-    struct Node *n = (struct Node *)e;
-    while (n && n->tag == AST_PAREN_EXPR) n = (struct Node *)n->f0;
-    if (n == 0) return 0;
-    if (n->tag == AST_INT_LIT || n->tag == AST_CHAR_LIT) return n->f0;
-    return 0;
+    /* Fold the whole constant expression, not just a bare literal, so a
+       designator index like [NR - 1] or a GNU range [0 ... (NR - 1)] resolves
+       (the kernel's atomic64.c sizes its lock table this way). */
+    return kcc_eval_const_int(e);
 }
 
 static void *parse_designated_element(void) {
@@ -816,12 +819,19 @@ static void *parse_designated_element(void) {
             kcc_pp_next();
             void *ie = kcc_parse_assign_expr();
             unsigned long idx = parse_const_index(ie);
-            kcc_parse_expect(TOK_RBRACKET);
             struct Node *d = (struct Node *)kcc_ast_alloc(AST_DESIGNATOR);
             d->f0 = idx;
             d->f1 = 0;
+            if (kcc_tok_type == TOK_ELLIPSIS) {   /* GNU array range [lo ... hi] */
+                kcc_pp_next();
+                void *he = kcc_parse_assign_expr();
+                d->f2 = parse_const_index(he);     /* high index (leaf: no chain) */
+                d->f1 = 2;
+            }
+            kcc_parse_expect(TOK_RBRACKET);
             if (head == 0) { head = d; tail = d; }
             else { tail->f2 = (unsigned long)d; tail = d; }
+            if (d->f1 == 2) break;                 /* a range is always the leaf */
         } else break;
     }
     kcc_parse_expect(TOK_ASSIGN);

@@ -2595,6 +2595,17 @@ nodes before the \texttt{=}; the IR builder (\S\ref{sec:ir-aggregates})
 then walks that chain to the leaf.  A single designator is simply a chain
 of length one.
 
+The GNU array-range form \texttt{[lo \ldots{} hi]} names \emph{every} element
+from \texttt{lo} to \texttt{hi} inclusive (the kernel's \texttt{atomic64.c}
+seeds a lock table with \texttt{[0 \ldots{} (NR\_LOCKS - 1)] = \ldots}).  A range
+is recorded on one \texttt{AST\_DESIGNATOR} whose \texttt{is\_field} field is set
+to~2 to mark it, with the low index in \texttt{F0} and the high index in
+\texttt{F2}; it is always a leaf, so the designator loop ends after it and the
+IR builder fills the run.  A designator index is a constant \emph{expression},
+not just a literal---\texttt{[NR - 1]}, \texttt{[1 << 8]}---so
+\texttt{\_kcc\_parse\_const\_index} folds it through the full integer
+constant-expression evaluator.
+
 @d Decl: parse init @{
 // -- kcc_parse_initializer ---------------------------------------------
 // node *kcc_parse_initializer(void)
@@ -2693,7 +2704,7 @@ _kcc_parse_designated_element:
     stp x29, x30, [sp, #-48]!
     mov x29, sp
     stp x19, x20, [sp, #16]
-    str x21, [sp, #32]
+    stp x21, x22, [sp, #32]
 
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
@@ -2740,7 +2751,35 @@ _kcc_parse_designated_element:
     bl _kcc_pp_next               // consume '['
     bl _kcc_parse_assign_expr     // index expression
     bl _kcc_parse_const_index     // fold to an integer
-    mov x21, x0                   // index value (survives ast_alloc)
+    mov x21, x0                   // low index value (survives ast_alloc)
+    // GNU array-range designator `[lo ... hi]`?  A range is always a leaf, so
+    // after it the designator loop ends and the initializer follows.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_ELLIPSIS
+    b.ne .Lde_index_single
+    bl _kcc_pp_next               // consume '...'
+    bl _kcc_parse_assign_expr     // high index expression
+    bl _kcc_parse_const_index
+    mov x22, x0                   // high index (survives ast_alloc)
+    mov x0, #TOK_RBRACKET
+    bl _kcc_parse_expect          // consume ']'
+    mov x0, #AST_DESIGNATOR
+    bl _kcc_ast_alloc
+    str x21, [x0, #AST_F0]       // low index
+    mov x2, #2
+    str x2, [x0, #AST_F1]        // range marker (2 = array range)
+    str x22, [x0, #AST_F2]       // high index
+    cbnz x19, .Lde_range_tail
+    mov x19, x0                   // bare `[lo ... hi]`: head = this node
+    mov x20, x0
+    b .Lde_desig_end
+.Lde_range_tail:
+    str x0, [x20, #AST_F2]       // (chained ranges unsupported; kernel uses bare)
+    b .Lde_desig_end
+
+.Lde_index_single:
     mov x0, #TOK_RBRACKET
     bl _kcc_parse_expect          // consume ']'
     mov x0, #AST_DESIGNATOR
@@ -2767,39 +2806,20 @@ _kcc_parse_designated_element:
     mov x0, x19
 
 .Lde_ret:
-    ldr x21, [sp, #32]
+    ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
     ret
 
 // -- kcc_parse_const_index ---------------------------------------------
 // uint64_t kcc_parse_const_index(node *e)
-// Extracts the integer value of a constant array-index designator.  A
-// literal (after unwrapping parentheses) is used directly; anything else
-// folds to 0 (non-constant designator indices are not yet supported).
+// Folds a constant array-index designator to its integer value.  It defers to
+// the full integer constant-expression evaluator, so an index like [NR - 1] or
+// the high bound of a GNU range [0 ... (NR - 1)] resolves (the kernel's
+// atomic64.c sizes its lock table this way), not just a bare literal.
 .p2align 2
 _kcc_parse_const_index:
-    cbz x0, .Lpci_zero
-.Lpci_unwrap:
-    ldr x1, [x0, #AST_TAG]
-    cmp x1, #AST_PAREN_EXPR
-    b.ne .Lpci_check
-    ldr x0, [x0, #AST_F0]
-    cbz x0, .Lpci_zero
-    b .Lpci_unwrap
-.Lpci_check:
-    cmp x1, #AST_INT_LIT
-    b.eq .Lpci_val
-    cmp x1, #AST_CHAR_LIT
-    b.eq .Lpci_val
-    mov x0, #0
-    ret
-.Lpci_val:
-    ldr x0, [x0, #AST_F0]
-    ret
-.Lpci_zero:
-    mov x0, #0
-    ret
+    b _kcc_eval_const_int
 @| _kcc_parse_initializer
 @| _kcc_parse_designated_element
 @| _kcc_parse_const_index

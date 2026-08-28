@@ -1078,6 +1078,32 @@ static unsigned long kcc_asm_cons_imm(const char *c) {
     return 0;
 }
 
+/* If an asm operand's expression names a function or file-scope object (or the
+   address of one), return the symbol's emit-name.  The back end renders a `%P`
+   reference to such an operand as the bare symbol (so `call %P[f]` becomes
+   `call f`), which is what the kernel's ALTERNATIVE and percpu templates need.
+   Returns 0 for a local or non-symbolic expression, which have no linker name;
+   `%P` then falls back to the operand's materialised register. */
+static const char *kcc_asm_operand_symname(void *expr) {
+    if (!expr) return 0;
+    unsigned long tag = IL(expr, AST_TAG);
+    while (tag == AST_PAREN_EXPR) { expr = (void *)IL(expr, AST_F0); if (!expr) return 0; tag = IL(expr, AST_TAG); }
+    if (tag == AST_UNARY_EXPR && IL(expr, AST_F0) == TOK_AMP)
+        return kcc_asm_operand_symname((void *)IL(expr, AST_F1));   /* &sym */
+    if (tag != AST_IDENT_EXPR) return 0;
+    char *name = (char *)IL(expr, AST_F0);
+    if (!name) return 0;
+    unsigned long keylen = kcc_strlen(name);
+    if (kcc_ir_locals && kcc_ht_get(kcc_ir_locals, name, keylen)) return 0;  /* a local */
+    if (kcc_ir_statics) {
+        void *mangled = kcc_ht_get(kcc_ir_statics, name, keylen);
+        if (mangled) return (const char *)mangled;                 /* static: mangled name */
+    }
+    void *sym = kcc_symtab_lookup(name, keylen);
+    if (sym && IL(sym, SYM_KIND) == SYM_ENUM_CONST) return 0;       /* an enum const is a value */
+    return name;                                                    /* file-scope function/object */
+}
+
 void kcc_ir_asm_lower_operands(void *as) {
     void *op = (void *)IL(as, AST_F2);
     while (op) {
@@ -1088,6 +1114,7 @@ void kcc_ir_asm_lower_operands(void *as) {
         char *cons = (char *)IL(op, AST_F0);
         char c = cons[0];
         char cls = (c == '=' || c == '+') ? cons[1] : c;
+        const char *sym = kcc_target ? kcc_asm_operand_symname(expr) : 0;
         if (kcc_target && c != '=' && c != '+' &&
             kcc_asm_cons_imm(cons) && kcc_expr_is_ice(expr)) {
             /* x86 immediate operand: a constant input the back end renders as
@@ -1133,6 +1160,13 @@ void kcc_ir_asm_lower_operands(void *as) {
             unsigned long val = kcc_ir_build_expr((void *)IL(op, AST_F2));
             IL(op, AST_F2) = ((val + 1) | (size << 32));
             IL(op, AST_F3) = 0;
+        }
+        /* Record a symbolic operand's emit-name for `%P` rendering, unless it
+           took the immediate path (F2 bit 63).  The name goes in F1 (free for
+           every non-immediate operand) with F2 bit 62 flagging its presence. */
+        if (sym && !((IL(op, AST_F2) >> 63) & 1)) {
+            IL(op, AST_F1) = (unsigned long)sym;
+            IL(op, AST_F2) = IL(op, AST_F2) | (1UL << 62);
         }
         op = (void *)IL(op, AST_F4);
     }

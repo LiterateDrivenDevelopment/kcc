@@ -418,7 +418,14 @@ specific register---\texttt{a}/\texttt{b}/\texttt{c}/\texttt{d} for
 template renders it at the operand's width (\texttt{\%eax}, \texttt{\%cl}, \ldots).
 Because \texttt{\%rbx} is callee-saved, an asm that pins an operand to it is
 bracketed with \texttt{pushq}/\texttt{popq \%rbx} so the caller's value survives;
-the others are caller-saved and need no save.  A condition-code output
+the others are caller-saved and need no save.  A specific register can also be
+the register \emph{alternative} of a multi-alternative constraint whose other
+alternative is an immediate: the \texttt{in}/\texttt{out} port constraint
+\texttt{"Nd"} means an immediate port or \texttt{\%dx}, so a non-constant port
+must land in \texttt{\%dx}, not a positional register.  When the constraint that
+reached the register path carries no general-register letter
+(\texttt{r}/\texttt{q}/\texttt{g}/\texttt{p}) but does name a specific one, that
+specific register is used.  A condition-code output
 (\texttt{"=@@cc\meta{cond}"}, as \texttt{test\_and\_set\_bit}'s \texttt{"=@@ccc"})
 takes no register and is not named in the template: after the body a
 \texttt{set\meta{cond}} captures the still-live flag into \texttt{\%al}, which is
@@ -442,6 +449,25 @@ operand registers live in the AST node's operand list rather than in the IR
 instruction's source fields, the optimiser must renumber and mark them
 explicitly (see the optimiser's CSE and dead-code passes)---otherwise
 store-to-load forwarding would leave an input reading a swept load's slot.
+
+The \verb|%P| and \verb|%c| operand modifiers print an operand \emph{bare}: a
+symbol or constant without the \texttt{\$}/register decoration, so
+\verb|call %P[func]| becomes a direct \texttt{call func}, \verb|movq %P[var], %r8|
+loads the object's address by name, and \verb|.4byte %c[feature]| emits the bare
+feature number.  The kernel leans on it in \texttt{ALTERNATIVE} (\verb|call %P[old]| /
+\verb|call %P[new]|) and percpu templates, where the operand is a
+\texttt{"i"}-constrained function or a memory object, not a plain value.  kcc
+materialises every asm operand into a register or immediate and so would
+otherwise have lost the name; to support \verb|%P| the operand lowering records
+the emit-name of a symbolic operand (a function or file-scope object, or the
+address of one) alongside the materialised register---\texttt{F1} holds the
+name and a marker bit in \texttt{F2} flags its presence.  Rendering a
+\verb|%P| reference then emits that bare symbol; for a \verb|%P| operand with no
+symbol (a constant, or an address that lives only in a register) it falls back
+to the bare value or the raw address register.  This makes the
+\texttt{ALTERNATIVE}/percpu translation units assemble; note that kcc does not
+emit the \texttt{.altinstructions} metadata that would patch the alternative at
+run time, so only the default (\texttt{oldinstr}) path is exercised.
 
 Floating point is a first-class citizen of both the call boundary and the return
 path.  \texttt{x86\_marshal} classifies each outgoing argument the System~V
@@ -481,7 +507,10 @@ static unsigned long x86_asm_opsize(void *node, unsigned long num) {
     void *op = (void *)IL(node, AST_F2);
     for (unsigned long j = 0; op && j < num; j++) op = (void *)IL(op, AST_F4);
     if (!op) return 8;
-    unsigned long e = IL(op, AST_F2) ? IL(op, AST_F2) : IL(op, AST_F3);
+    /* mask off the top-two marker bits (63 = immediate, 62 = symbolic) so they
+       neither flip the F2-vs-F3 selection nor bleed into the size in bits 32+ */
+    unsigned long f2 = IL(op, AST_F2) & ~(3UL << 62);
+    unsigned long e = f2 ? f2 : (IL(op, AST_F3) & ~(3UL << 62));
     unsigned long sz = e >> 32;
     return sz ? sz : 8;
 }
@@ -557,6 +586,8 @@ static void x86_emit_asm(void *i) {
     unsigned long ismem[6];                       /* operand k is a memory ref */
     unsigned long isimm[6];                        /* operand k is an immediate */
     unsigned long immval[6];                        /* its constant value */
+    unsigned long issym[6];                         /* operand k names a symbol (for %P) */
+    const char *symname[6];                         /* its emit-name */
     char spec[6];                                  /* specific-register letter or 0 */
     char isflag[6];                                /* condition-code output (=@@cc) */
     const char *flagcond[6];                        /* its setCC suffix */
@@ -587,6 +618,8 @@ static void x86_emit_asm(void *i) {
            accounts for `Ir`-style alternatives. */
         isimm[nop] = (IL(op, AST_F2) >> 63) & 1;
         immval[nop] = IL(op, AST_F1);
+        issym[nop] = (IL(op, AST_F2) >> 62) & 1;    /* symbolic operand: name in F1 (for %P) */
+        symname[nop] = issym[nop] ? (const char *)IL(op, AST_F1) : 0;
         regof[nop] = nop;
         if (isimm[nop]) {
             /* immediate: no register of its own */
@@ -605,7 +638,18 @@ static void x86_emit_asm(void *i) {
                taken for a non-constant value.  `g` (general: reg/mem/imm) and
                `p` (address) admit a register, which is what kcc materialises the
                operand into; `q` (byte-addressable register) is any register on
-               x86-64.  All are handled exactly like `r`. */
+               x86-64.  All are handled exactly like `r`.
+
+               But a constraint whose only register alternative is a *specific*
+               register---the x86 in/out port `"Nd"` (immediate or %dx)---must use
+               that register for a non-constant value, not a positional one. */
+            unsigned long has_gen = 0; char sp = 0;
+            for (const char *cc = c; *cc; cc++) {
+                if (*cc == 'r' || *cc == 'q' || *cc == 'g' || *cc == 'p') has_gen = 1;
+                else if (!sp && (*cc == 'a' || *cc == 'b' || *cc == 'c' ||
+                                 *cc == 'd' || *cc == 'S' || *cc == 'D')) sp = *cc;
+            }
+            if (!has_gen && sp) { spec[nop] = sp; if (sp == 'b') uses_rbx = 1; }
         } else if (ch == 'a' || ch == 'b' || ch == 'c' || ch == 'd' ||
                    ch == 'S' || ch == 'D') {
             /* pinned to a specific register (mul/div use a/d, cpuid a/b/c/d,
@@ -672,7 +716,9 @@ static void x86_emit_asm(void *i) {
             continue;
         }
         unsigned long sz = 0;                    /* 0 = the operand's own size */
-        if (nx == 'b') { sz = 1; p++; nx = t[p + 1]; }
+        unsigned long raw = 0;                   /* %P/%c: render the operand bare (symbol/const) */
+        if (nx == 'P' || nx == 'c') { raw = 1; p++; nx = t[p + 1]; }
+        else if (nx == 'b') { sz = 1; p++; nx = t[p + 1]; }
         else if (nx == 'w') { sz = 2; p++; nx = t[p + 1]; }
         else if (nx == 'k') { sz = 4; p++; nx = t[p + 1]; }
         else if (nx == 'q') { sz = 8; p++; nx = t[p + 1]; }
@@ -693,7 +739,13 @@ static void x86_emit_asm(void *i) {
         unsigned long unum = (unsigned long)num;
         unsigned long reg = (unum < nop) ? regof[unum] : unum;
         unsigned long owidth = sz ? sz : x86_asm_opsize(node, unum);
-        if (unum < nop && isimm[unum]) {
+        if (raw && unum < nop && issym[unum]) {
+            x86_sym(symname[unum]);                     /* %P[f] -> bare symbol: call f */
+        } else if (raw && unum < nop && isimm[unum]) {
+            kcc_as_dec(immval[unum]);                   /* %P on a constant -> bare value, no $ */
+        } else if (raw && unum < nop) {
+            x86_asm_wreg(reg, 8);                       /* %P without a symbol -> bare address register */
+        } else if (unum < nop && isimm[unum]) {
             kcc_as_ch('$'); kcc_as_dec(immval[unum]);   /* $value */
         } else if (unum < nop && ismem[unum]) {
             kcc_as_ch('('); x86_asm_wreg(reg, 8); kcc_as_ch(')');  /* (%reg) */

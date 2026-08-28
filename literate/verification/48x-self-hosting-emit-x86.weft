@@ -392,7 +392,11 @@ miscompiled.
 Extended inline asm (\texttt{IR\_ASM}) is where the kernel's word-at-a-time and
 atomic idioms live, so \texttt{x86\_emit\_asm} renders it directly.  Register
 constraints (\verb|"r"|, \verb|"=r"|, \verb|"+r"|, an early-clobber \verb|&|
-ignored) and matching constraints (\verb|"0"|, \verb|"1"|, \ldots) are honoured,
+ignored)---together with \verb|"g"| (general: reg/mem/imm), \verb|"q"|
+(byte-addressable register, which on x86-64 is any register), and \verb|"p"|
+(address), all of which kcc materialises into a register just like \verb|"r"|,
+and which dominate the kernel's inline asm---and matching constraints
+(\verb|"0"|, \verb|"1"|, \ldots) are honoured,
 up to six operands, which covers the kernel sites reached so far (the checksum
 carry-chain in \texttt{arch/x86/lib/csum-partial\_64.c} takes exactly six);
 anything else is refused rather than silently mis-substituted.  An operand may
@@ -590,9 +594,13 @@ static void x86_emit_asm(void *i) {
             if (tied >= nop) { kcc_io_err(s_unsup); kcc_io_flush(); kcc_sys_exit(1); }
             regof[nop] = regof[tied];            /* alias the tied operand's reg */
             spec[nop] = spec[tied];              /* ...including a specific one */
-        } else if (ch == 'r' || ch == 'i' || ch == 'I' || ch == 'n') {
+        } else if (ch == 'r' || ch == 'i' || ch == 'I' || ch == 'n' ||
+                   ch == 'g' || ch == 'q' || ch == 'p') {
             /* register (an i/I/n that reached here was not a constant, so its
-               register alternative is used) */
+               register alternative is used).  `g` (general: reg/mem/imm) and
+               `p` (address) admit a register, which is what kcc materialises the
+               operand into; `q` (byte-addressable register) is any register on
+               x86-64.  So all three are handled exactly like `r`. */
         } else if (ch == 'a' || ch == 'b' || ch == 'c' || ch == 'd' ||
                    ch == 'S' || ch == 'D') {
             /* pinned to a specific register (mul/div use a/d, cpuid a/b/c/d,

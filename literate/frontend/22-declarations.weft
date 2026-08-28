@@ -274,6 +274,23 @@ the kernel's \texttt{DEFINE\_LOCK\_GUARD\_0} expansion
 
     str x20, [x25, #AST_F3]     // storage_class
 
+    // A typedef continuation (`typedef ... A, *B;`) registers this further name
+    // and tags the node, exactly as the first declarator was.  x22 is free here
+    // (the first node is tracked in x23) and callee-saved across the calls.
+    cmp x20, #1
+    b.ne .Ldecl_var_td_skip
+    ldr x0, [x25, #AST_F1]      // name
+    cbz x0, .Ldecl_var_td_tag
+    mov x22, x0                  // save name across strlen
+    bl _kcc_strlen
+    mov x1, x0                   // len
+    mov x0, x22                  // name
+    bl _kcc_typedef_add
+.Ldecl_var_td_tag:
+    mov x0, #AST_TYPEDEF_DECL
+    str x0, [x25, #AST_TAG]
+.Ldecl_var_td_skip:
+
     // Check for initializer
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
@@ -307,7 +324,11 @@ the kernel's \texttt{DEFINE\_LOCK\_GUARD\_0} expansion
 A typedef declaration (\texttt{storage\_class == 1}) registers the declared
 name in the typedef table so the lexer can disambiguate identifiers from type
 names in subsequent parsing.  The node tag is rewritten to
-\texttt{AST\_TYPEDEF\_DECL}.  This block also handles bare type declarations
+\texttt{AST\_TYPEDEF\_DECL}.  A single \texttt{typedef} may introduce several
+names---the kernel's \texttt{typedef struct \{~\ldots~\} Rec\_Type, *Rec\_Pointer;}---so
+when a comma follows the first name the parser joins the shared multi-declarator
+loop, which registers each further name as a typedef and tags its node in turn.
+This block also handles bare type declarations
 such as \texttt{struct S \{~\ldots~\};} where no declarator follows the
 specifiers, as well as \texttt{\_Static\_assert} forwarding and error
 recovery with synchronisation to the next semicolon.
@@ -328,6 +349,14 @@ recovery with synchronisation to the next semicolon.
     // Change tag to TYPEDEF_DECL
     mov x0, #AST_TYPEDEF_DECL
     str x0, [x21, #AST_TAG]
+    // A single typedef may name several types---`typedef struct {...} A, *B;`---
+    // so a comma continues into the shared multi-declarator loop, which
+    // registers each further name as a typedef too.
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp  x0, #TOK_COMMA
+    b.eq .Ldecl_more_vars
     mov x0, #TOK_SEMI
     bl _kcc_parse_expect
     mov x0, x21

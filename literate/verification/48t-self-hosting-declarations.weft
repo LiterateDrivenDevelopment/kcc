@@ -942,8 +942,14 @@ void *kcc_parse_decl(void) {
             kcc_typedef_add(nm, kcc_strlen(nm));
         }
         d->tag = AST_TYPEDEF_DECL;
-        kcc_parse_expect(TOK_SEMI);
-        return d;
+        /* A single typedef may name several types---the kernel's
+           `typedef struct {...} Rec_Type, *Rec_Pointer;`---so a comma continues
+           into the shared multi-declarator loop, which registers each further
+           name as a typedef too. */
+        if (kcc_tok_type != TOK_COMMA) {
+            kcc_parse_expect(TOK_SEMI);
+            return d;
+        }
     } else {
         d->f3 = storage;
         /* GNU attribute trailing the declarator, before '='/','/';' (the kernel's
@@ -966,6 +972,10 @@ void *kcc_parse_decl(void) {
         struct Node *nd = (struct Node *)kcc_parse_declarator(base);
         if (nd == 0) break;
         nd->f3 = storage;
+        if (storage == 1) {                       /* typedef: register each further name */
+            if (nd->f1) kcc_typedef_add((const char *)nd->f1, kcc_strlen((const char *)nd->f1));
+            nd->tag = AST_TYPEDEF_DECL;
+        }
         if (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
         if (kcc_tok_type == TOK_ASSIGN) {
             kcc_pp_next();

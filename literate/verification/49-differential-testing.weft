@@ -790,6 +790,15 @@ difftest "macro-body-comment-apostrophe" \
     "#define M(X) int X##_a(void){ return 0; } /* a node's interval: X can't be null */ int X##_b(void){ return 7; }
 M(foo)
 int main(void){ return foo_a() + foo_b() - 7; }"
+# A single `typedef` may introduce several names, and a later declarator may be a
+# pointer -- the kernel's Dhrystone `typedef struct {...} Rec_Type, *Rec_Pointer;`.
+# Each name past the first must be registered as a typedef, not left to trip the
+# next declaration.  Covers a struct typedef with a pointer second name and a
+# plain `typedef int A, *B;`.
+difftest "typedef-multiple-declarators" \
+    "typedef struct rec { int x; } Rec, *RecP;
+typedef int A, *B;
+int main(void){ Rec r; r.x = 5; RecP p = &r; A a = 3; B b = &a; return p->x - a + *b - 5; }"
 # GNU array-range designator `[lo ... hi] = v` fills every element in the range
 # (the kernel's lib/atomic64.c seeds its lock table `[0 ... (NR_LOCKS-1)]`), and
 # a designator index is a constant EXPRESSION, not just a literal, so [NR-1] and

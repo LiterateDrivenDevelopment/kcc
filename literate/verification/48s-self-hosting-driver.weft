@@ -178,6 +178,14 @@ unsigned long kcc_driver_D(const char *arg, const char *next, unsigned long reg)
 static const char *kcc_force_inc[KCC_MAX_FORCE_INC];
 static long kcc_force_inc_n = 0;
 
+/* Force-includes are pushed in reverse so the preprocessor reads them back in
+   command-line order, ahead of the primary source.  Shared by the compile path
+   and by preprocess-only (`-E`), which must honour `-include` identically. */
+void kcc_driver_apply_force_includes(void) {
+    for (long k = kcc_force_inc_n - 1; k >= 0; k--)
+        kcc_pp_force_include(kcc_force_inc[k]);
+}
+
 int kcc_driver_compile(const char *src, const char *out) {
     kcc_dep_reset();
     kcc_source_open(src);
@@ -185,10 +193,7 @@ int kcc_driver_compile(const char *src, const char *out) {
     kcc_source_splice();
     kcc_lex_init(kcc_src_base, kcc_src_size);
     kcc_pp_init();
-    /* Force-includes are pushed in reverse so the preprocessor reads them back
-       in command-line order, ahead of the primary source. */
-    for (long k = kcc_force_inc_n - 1; k >= 0; k--)
-        kcc_pp_force_include(kcc_force_inc[k]);
+    kcc_driver_apply_force_includes();
     kcc_strtab_init();
     kcc_typedef_init();
     void *tu = kcc_parse();
@@ -367,6 +372,39 @@ static unsigned long kcc_dep_from_arg(const char *a, const char *next) {
         return 1;
     }
     return 0;
+}
+
+/* Register the preprocessing-relevant flags of a gcc-style command line---the
+   target, every `-I` directory, every `-D` macro, and every `-include`
+   force-include---and return the source operand (the last non-flag word, or "-"
+   for standard input).  Preprocess-only mode (`-E`) uses this so that a bare
+   `kcc -E` sees exactly the include search path and macros the compile path
+   would, which a Kbuild `-nostdinc -I... -include...` command line depends on.
+   The compile path keeps its own scan because it additionally counts sources
+   and captures `-o`. */
+const char *kcc_driver_register_flags(long argc, char **argv) {
+    const char *src = 0;
+    for (long i = 1; i < argc; ) {
+        char *a = argv[i];
+        if (kcc_strcmp(a, "-E") == 0) { i++; continue; }
+        if (kcc_strcmp(a, OPT_TARGET_X86) == 0) { kcc_target = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_TARGET_LINUX) == 0) { kcc_target = 1; kcc_x86_os = 1; i++; continue; }
+        if (kcc_strcmp(a, OPT_O) == 0) { i += 2; continue; }   /* skip `-o out` */
+        const char *next = (i + 1 < argc) ? argv[i + 1] : 0;
+        unsigned long n = kcc_driver_I(a, next, 1);
+        if (n) { i += (long)n; continue; }
+        n = kcc_driver_D(a, next, 1);
+        if (n) { i += (long)n; continue; }
+        if (kcc_strcmp(a, "-include") == 0) {
+            if (next && kcc_force_inc_n < KCC_MAX_FORCE_INC)
+                kcc_force_inc[kcc_force_inc_n++] = next;
+            i += 2; continue;
+        }
+        if (kcc_driver_two_arg_opt(a)) { i += 2; continue; }
+        if (a[0] == '-' && a[1] != 0) { i++; continue; }  /* other flag; "-" alone is stdin */
+        src = a; i++;                                     /* last operand wins */
+    }
+    return src;
 }
 
 void kcc_driver_compile_all(long argc, char **argv) {

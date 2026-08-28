@@ -36,9 +36,12 @@ anything else is a compile (\texttt{-c} anywhere) or a compile-and-link.
 
 Two behaviours make the driver a usable gcc-style \texttt{CC=}.  First,
 \texttt{-E} (preprocess only) is recognised \emph{anywhere} in the command line
-and takes priority: \texttt{kcc\_run\_preprocess} honours \texttt{-{}-target},
-finds the source operand gcc-style (the last non-flag word, or \texttt{-} for
-standard input), and \texttt{kcc\_pp\_emit\_text} writes the preprocessed token
+and takes priority: \texttt{kcc\_run\_preprocess} registers the target, include
+directories (\texttt{-I}), macros (\texttt{-D}), and force-includes
+(\texttt{-include}) through the shared \texttt{kcc\_driver\_register\_flags}---so
+a \texttt{\#include} resolves exactly as it would when compiling, not silently
+vanishing---then preprocesses the source operand it returns (the last non-flag
+word, or \texttt{-} for standard input), and \texttt{kcc\_pp\_emit\_text} writes the preprocessed token
 stream back as C \emph{source text}---token spellings with line-preserving
 newlines and no line markers---rather than kcc's token dump, because that is the
 form a build system's compiler probe (Kbuild's \texttt{cc-version.sh}) reads.
@@ -78,6 +81,8 @@ void kcc_opt_run(void);
 void kcc_ir_dump(void);
 void kcc_driver_compile_all(int argc, char **argv);
 void kcc_driver_link_all(int argc, char **argv);
+const char *kcc_driver_register_flags(long argc, char **argv);
+void kcc_driver_apply_force_includes(void);
 extern void *kcc_src_base;
 extern unsigned long kcc_src_size;
 extern char **kcc_envp;                          /* defined by the driver */
@@ -126,30 +131,18 @@ static void open_lex_path(const char *path) {
 }
 static void open_lex(char **argv) { open_lex_path(argv[2]); }
 
-/* Preprocess-only mode (`-E`): find the single source operand in a gcc-style
-   command line (the last non-flag word, or "-" for standard input), skipping
-   options and the two-word ones a compiler probe uses.  --target is honoured
-   first so kcc_x86_os---and thus the __GNUC__ predefine---is set. */
-static int kcc_is_two_arg_opt(const char *a) {
-    return kcc_strcmp(a, "-o") == 0 || kcc_strcmp(a, "-x") == 0 ||
-           kcc_strcmp(a, "-isystem") == 0 || kcc_strcmp(a, "-include") == 0 ||
-           kcc_strcmp(a, "-idirafter") == 0 || kcc_strcmp(a, "-imacros") == 0 ||
-           kcc_strcmp(a, "-iquote") == 0 || kcc_strcmp(a, "-MT") == 0 ||
-           kcc_strcmp(a, "-MF") == 0 || kcc_strcmp(a, "-MQ") == 0;
-}
+/* Preprocess-only mode (`-E`): register the command line's target, include
+   directories, macros, and force-includes exactly as the compile path does---so
+   the headers a Kbuild `-nostdinc -I... -include...` line names actually
+   resolve---then preprocess the source operand it returns and emit the token
+   text.  Without registering `-I`/`-D`/`-include` here, every `#include` would
+   fail to find its header and the output would be the unexpanded source. */
 static void kcc_run_preprocess(int argc, char **argv) {
-    const char *src = 0;
-    for (int i = 1; i < argc; i++) {
-        char *a = argv[i];
-        if (kcc_strcmp(a, "--target=x86_64") == 0) { kcc_target = 1; continue; }
-        if (kcc_strcmp(a, "--target=x86_64-linux") == 0) { kcc_target = 1; kcc_x86_os = 1; continue; }
-        if (kcc_is_two_arg_opt(a)) { i++; continue; }
-        if (a[0] == '-' && a[1] != 0) continue;   /* an option ("-" alone is stdin) */
-        src = a;                                   /* last operand wins */
-    }
+    const char *src = kcc_driver_register_flags(argc, argv);
     if (!src) die_usage("kcc: error: -E requires a source file\n");
     open_lex_path(src);
     kcc_pp_init();
+    kcc_driver_apply_force_includes();
     kcc_pp_emit_text();
     finish();
 }

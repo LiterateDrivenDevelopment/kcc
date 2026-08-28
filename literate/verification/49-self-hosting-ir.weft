@@ -3460,7 +3460,13 @@ including \texttt{offsetof}-style null-based address constants: \texttt{is\_ice}
 accepts \verb|&(((T*)0)->m)| and \texttt{eval\_const\_int} reduces it to the
 member's byte offset (via \texttt{eval\_addr}), so a bound such as
 \verb|char b[sizeof(P)-offsetof(P,tail)]| lays out at its true size rather than
-being rejected as a variable-length array.
+being rejected as a variable-length array.  It also folds the bit-counting
+builtins---\texttt{\_\_builtin\_clz}/\texttt{ctz}/\texttt{popcount}/\texttt{ffs}
+and their \texttt{l}/\texttt{ll} widths---and the \texttt{?:} operator, because
+the kernel derives array bounds through \texttt{ilog2} and \texttt{BITS\_TO\_LONGS},
+which expand to \verb|__builtin_constant_p(n) ? (63 - __builtin_clzll(n)) : ...|;
+without folding the clz call and the ternary, such a bound looks variable and the
+array is wrongly rejected as a VLA.
 
 When the controlling expression is itself an integer constant expression, the
 whole dispatch is dead weight: only one arm can ever run, yet emitting every
@@ -3591,12 +3597,66 @@ void kcc_ir_build_for(void *s) {
     kcc_ir_set_bb(exit_bb);
 }
 
+/* The kernel computes array bounds (ilog2/const_ilog2/BITS_TO_LONGS, hash
+   orders) through the bit-counting builtins, so they must fold in a constant
+   expression.  kcc_call_foldable_builtin recognises the call; kcc_call_builtin_value
+   evaluates it from the constant argument. */
+static unsigned long kcc_clz_w(unsigned long x, unsigned long width) {
+    x &= (width >= 64) ? ~0UL : ((1UL << width) - 1);
+    if (x == 0) return width;
+    unsigned long n = 0;
+    while (!(x & (1UL << (width - 1)))) { x <<= 1; n++; }
+    return n;
+}
+static unsigned long kcc_ctz_w(unsigned long x, unsigned long width) {
+    x &= (width >= 64) ? ~0UL : ((1UL << width) - 1);
+    if (x == 0) return width;
+    unsigned long n = 0;
+    while (!(x & 1UL)) { x >>= 1; n++; }
+    return n;
+}
+static unsigned long kcc_popcount_w(unsigned long x) {
+    unsigned long n = 0;
+    while (x) { n += x & 1UL; x >>= 1; }
+    return n;
+}
+unsigned long kcc_call_foldable_builtin(void *n) {
+    void *callee = (void *)IL(n, AST_F0);
+    if (!callee || IL(callee, AST_TAG) != AST_IDENT_EXPR) return 0;
+    const char *m = (const char *)IL(callee, AST_F0);
+    if (!m) return 0;
+    if (kcc_strcmp(m, "__builtin_clz") == 0 || kcc_strcmp(m, "__builtin_clzl") == 0 ||
+        kcc_strcmp(m, "__builtin_clzll") == 0 || kcc_strcmp(m, "__builtin_ctz") == 0 ||
+        kcc_strcmp(m, "__builtin_ctzl") == 0 || kcc_strcmp(m, "__builtin_ctzll") == 0 ||
+        kcc_strcmp(m, "__builtin_popcount") == 0 || kcc_strcmp(m, "__builtin_popcountl") == 0 ||
+        kcc_strcmp(m, "__builtin_popcountll") == 0 || kcc_strcmp(m, "__builtin_ffs") == 0 ||
+        kcc_strcmp(m, "__builtin_ffsl") == 0 || kcc_strcmp(m, "__builtin_ffsll") == 0)
+        return 1;
+    return 0;
+}
+unsigned long kcc_call_builtin_value(void *n) {
+    const char *m = (const char *)IL((void *)IL(n, AST_F0), AST_F0);  /* "__builtin_..." */
+    unsigned long x = kcc_eval_const_int((void *)IL(n, AST_F1));
+    unsigned long len = kcc_strlen(m);
+    unsigned long w = (m[len - 1] == 'l') ? 64 : 32;   /* an l/ll suffix widens to long */
+    if (m[10] == 'c' && m[11] == 'l') return kcc_clz_w(x, w);           /* __builtin_clz*  */
+    if (m[10] == 'c' && m[11] == 't') return kcc_ctz_w(x, w);           /* __builtin_ctz*  */
+    if (m[10] == 'p') return kcc_popcount_w(x);                         /* __builtin_popcount* */
+    return x ? kcc_ctz_w(x, w) + 1 : 0;                                 /* __builtin_ffs*  */
+}
+
 unsigned long kcc_eval_const_int(void *n) {
     if (!n) return 0;
     unsigned long tag = IL(n, AST_TAG);
     if (tag == AST_INT_LIT || tag == AST_CHAR_LIT) return IL(n, AST_F0);
     if (tag == AST_CALL_EXPR && kcc_call_is_bcp(n))
         return kcc_expr_is_ice((void *)IL(n, AST_F1)) ? 1 : 0;   /* __builtin_constant_p(x) */
+    if (tag == AST_CALL_EXPR && kcc_call_foldable_builtin(n))
+        return kcc_call_builtin_value(n);                        /* __builtin_clz/ctz/popcount/ffs */
+    if (tag == AST_COND_EXPR)
+        return kcc_eval_const_int((void *)IL(n, AST_F0))
+               ? kcc_eval_const_int((void *)IL(n, AST_F1))
+               : kcc_eval_const_int((void *)IL(n, AST_F2));
     if (tag == AST_PAREN_EXPR) return kcc_eval_const_int((void *)IL(n, AST_F0));
     if (tag == AST_CAST_EXPR) return kcc_eval_const_int((void *)IL(n, AST_F1));
     if (tag == AST_SIZEOF_EXPR) {
@@ -3709,9 +3769,14 @@ unsigned long kcc_expr_is_ice(void *n) {
         return kcc_expr_is_ice((void *)IL(n, AST_F2));
     }
     if (tag == AST_COND_EXPR) {
-        if (!kcc_expr_is_ice((void *)IL(n, AST_F0))) return 0;
-        if (!kcc_expr_is_ice((void *)IL(n, AST_F1))) return 0;
-        return kcc_expr_is_ice((void *)IL(n, AST_F2));
+        void *cond = (void *)IL(n, AST_F0);
+        if (!kcc_expr_is_ice(cond)) return 0;
+        /* A constant condition selects one branch; only that branch need be a
+           constant expression (\stdref{6.6}), so the kernel's
+           `__builtin_constant_p(n) ? <const> : __ilog2_u32(n)` is constant even
+           though its else branch is a function call. */
+        return kcc_eval_const_int(cond) ? kcc_expr_is_ice((void *)IL(n, AST_F1))
+                                        : kcc_expr_is_ice((void *)IL(n, AST_F2));
     }
     if (tag == AST_IDENT_EXPR) {
         char *name = (char *)IL(n, AST_F0);
@@ -3725,6 +3790,10 @@ unsigned long kcc_expr_is_ice(void *n) {
        integer constant expression regardless of x.  The kernel gates whole
        code paths on it (`__builtin_constant_p(nr) ? ... : ...`). */
     if (tag == AST_CALL_EXPR && kcc_call_is_bcp(n)) return 1;
+    /* A foldable bit-counting builtin is an integer constant expression when its
+       argument is (the kernel's ilog2/BITS_TO_LONGS array bounds). */
+    if (tag == AST_CALL_EXPR && kcc_call_foldable_builtin(n))
+        return kcc_expr_is_ice((void *)IL(n, AST_F1));
     return 0;
 }
 

@@ -745,6 +745,17 @@ int main(void){ int x = 7, y = 0;
 difftest "builtin-file-macro" \
     "int main(void){ const char *f = __FILE__; int n = 0; while (f[n]) n++;
      return (n >= 2 && f[n-1] == 'c' && f[n-2] == '.') ? 0 : 1; }"
+# The # stringize operator (C17 6.10.3.2) keeps adjacent tokens adjacent: a
+# single space appears only where the source had whitespace, none between tokens
+# written together like `a.b` or `.section`.  The kernel's EXPORT_SYMBOL builds
+# an `asm(".section ...")` template via __stringify, so `.section` splitting into
+# `. section` makes the emitted asm unassemblable.
+difftest "stringize-token-adjacency" \
+    "#define S1(x) #x
+#define S(x) S1(x)
+int main(void){ const char *p = S(a.b); const char *q = S(a b);
+  return (p[0]=='a' && p[1]=='.' && p[2]=='b' && p[3]==0 &&
+          q[0]=='a' && q[1]==' ' && q[2]=='b' && q[3]==0) ? 0 : 1; }"
 # GNU array-range designator `[lo ... hi] = v` fills every element in the range
 # (the kernel's lib/atomic64.c seeds its lock table `[0 ... (NR_LOCKS-1)]`), and
 # a designator index is a constant EXPRESSION, not just a literal, so [NR-1] and

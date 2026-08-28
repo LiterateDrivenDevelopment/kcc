@@ -1087,6 +1087,7 @@ _kcc_pp_expand_arg:
     bl _kcc_arena_alloc
     mov x21, x0                  // out_buf
     mov x22, #0                  // out_len
+    mov x27, #0                  // prev_end: end of the last token emitted
 
     // Push the argument text as an expand context with no macro.
     mov x0, #PP_CTX_EXPAND
@@ -1129,10 +1130,16 @@ _kcc_pp_expand_arg:
     bl _kcc_memcpy               // memcpy(new, old, out_len)
     ldr x21, [sp, #136]
 .Lea_do_append:
-    // Separate consecutive tokens with a space, but emit none before the first
-    // token: a leading space would defeat a `##` paste whose right operand is
-    // this (prescanned) argument.
+    // Separate consecutive tokens with a single space ONLY where the source had
+    // whitespace: two tokens adjacent in the same buffer (`.` then `section` in
+    // `.section`) must stay joined, or a later `#`-stringify would produce
+    // `. section` and break asm templates like EXPORT_SYMBOL's `.section`.  A
+    // buffer change (macro-expansion boundary) leaves the token start != prev_end
+    // and gets a space, which also blocks accidental token paste.  No separator
+    // precedes the first token (a leading space would defeat a `##` paste).
     cbz x22, .Lea_no_sep
+    cmp x25, x27                 // token adjacent to the previous one?
+    b.eq .Lea_no_sep
     mov w0, #0x20                // separator space
     strb w0, [x21, x22]
     add x22, x22, #1
@@ -1142,6 +1149,7 @@ _kcc_pp_expand_arg:
     mov x2, x26
     bl _kcc_memcpy
     add x22, x22, x26
+    add x27, x25, x26            // prev_end = token start + length
     b .Lea_loop
 
 .Lea_done:

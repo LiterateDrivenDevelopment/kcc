@@ -699,6 +699,7 @@ static const char *pp_expand_arg(const char *text, unsigned long len, unsigned l
     unsigned long cap = len * 4 + 256;
     char *out = (char *)kcc_arena_alloc(cap);
     unsigned long outlen = 0;
+    const char *prev_end = 0;
     pp_ctx_push_expand(0, text, len);
     for (;;) {
         kcc_pp_next();
@@ -712,9 +713,16 @@ static const char *pp_expand_arg(const char *text, unsigned long len, unsigned l
             kcc_memcpy(nb, out, outlen);
             out = nb; cap = ncap;
         }
-        if (outlen) out[outlen++] = ' ';
+        /* Separate tokens with a single space ONLY where the source had
+           whitespace: two tokens adjacent in the same buffer (`.` then `section`
+           in `.section`) must stay joined, or `#`-stringify would produce
+           `. section` and break asm templates like EXPORT_SYMBOL's `.section`.
+           A buffer change (macro-expansion boundary) leaves ts != prev_end, so a
+           space is inserted there, which also prevents accidental token paste. */
+        if (outlen && ts != prev_end) out[outlen++] = ' ';
         kcc_memcpy(out + outlen, ts, tl);
         outlen += tl;
+        prev_end = ts + tl;
     }
     pp_drain_floor = saved_floor;
     pp_has_pending = saved_pending;

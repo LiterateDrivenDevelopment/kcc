@@ -327,44 +327,57 @@ static const char *pp_rest_of_line(unsigned long *len_out) {
     const char *end = kcc_lex_end;
     while (p < end && (*p == ' ' || *p == 0x09)) p++;
     const char *start = p;
+    /* Return a comment-stripped copy of the body (translation phase 3, which
+       precedes macro definition): a macro body must not retain comments, or an
+       apostrophe or quote inside one---as in the kernel's doc comment
+       "a node's interval"---would later flip pp_substitute into char/string mode
+       and copy the rest of the body verbatim, leaving every parameter and `##`
+       past that point unexpanded.  Each comment becomes one space so adjacent
+       tokens stay separated; string and character literals are copied intact. */
+    unsigned long cap = (unsigned long)(end - start) + 2;
+    char *out = (char *)kcc_arena_alloc(cap);
+    unsigned long op = 0;
     int state = 0;                              /* 0 normal,1 block,2 str,3 char */
     const char *nl = 0;
     while (p < end) {
         char c = *p;
-        if (state == 1) {
-            if (c == '*' && p + 1 < end && p[1] == '/') { state = 0; p += 2; continue; }
+        if (state == 1) {                       /* block comment: skip, emit a space at its end */
+            if (c == '*' && p + 1 < end && p[1] == '/') { state = 0; p += 2; out[op++] = ' '; continue; }
             if (c == 0x0A) kcc_lex_line++;
             p++;
             continue;
         }
-        if (state == 2) {
-            if (c == 0x5C) { p += 2; continue; }
-            if (c == '"') { state = 0; p++; continue; }
+        if (state == 2) {                       /* string literal: copy verbatim */
+            if (c == 0x5C) { out[op++] = c; if (p + 1 < end) out[op++] = p[1]; p += 2; continue; }
+            if (c == '"') { out[op++] = c; state = 0; p++; continue; }
             if (c == 0x0A) { nl = p; break; }
-            p++;
+            out[op++] = c; p++;
             continue;
         }
-        if (state == 3) {
-            if (c == 0x5C) { p += 2; continue; }
-            if (c == 0x27) { state = 0; p++; continue; }
+        if (state == 3) {                       /* character constant: copy verbatim */
+            if (c == 0x5C) { out[op++] = c; if (p + 1 < end) out[op++] = p[1]; p += 2; continue; }
+            if (c == 0x27) { out[op++] = c; state = 0; p++; continue; }
             if (c == 0x0A) { nl = p; break; }
-            p++;
+            out[op++] = c; p++;
             continue;
         }
         if (c == 0x0A) { nl = p; break; }
-        if (c == '"') { state = 2; p++; continue; }
-        if (c == 0x27) { state = 3; p++; continue; }
+        if (c == '"') { out[op++] = c; state = 2; p++; continue; }
+        if (c == 0x27) { out[op++] = c; state = 3; p++; continue; }
         if (c == '/' && p + 1 < end && p[1] == '*') { state = 1; p += 2; continue; }
-        p++;
+        if (c == '/' && p + 1 < end && p[1] == '/') {   /* line comment: to logical end-of-line */
+            p += 2;
+            while (p < end && *p != 0x0A) p++;
+            continue;
+        }
+        out[op++] = c; p++;
     }
-    const char *tail;
-    if (nl) { kcc_lex_cursor = nl; tail = nl; }
-    else { kcc_lex_cursor = end; tail = p; }
+    if (nl) kcc_lex_cursor = nl;
+    else kcc_lex_cursor = end;
     /* trim trailing whitespace */
-    const char *e = tail;
-    while (e > start && (e[-1] == ' ' || e[-1] == 0x09)) e--;
-    *len_out = (unsigned long)(e - start);
-    return start;
+    while (op && (out[op - 1] == ' ' || out[op - 1] == 0x09)) op--;
+    *len_out = op;
+    return out;
 }
 @}
 

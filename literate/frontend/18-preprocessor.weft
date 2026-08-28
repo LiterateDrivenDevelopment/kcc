@@ -879,170 +879,230 @@ _kcc_pp_skip_line:
 // Advances cursor to the newline (lexer will skip it).
 .p2align 2
 _kcc_pp_rest_of_line:
-    stp x29, x30, [sp, #-16]!
+    stp x29, x30, [sp, #-80]!
     mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    str x25, [sp, #64]
 
-    adrp x2, _kcc_lex_cursor@@PAGE
-    add  x2, x2, _kcc_lex_cursor@@PAGEOFF
-    ldr  x0, [x2]             // cursor
-    mov  x4, x2               // save ptr to cursor global
-
+    adrp x23, _kcc_lex_cursor@@PAGE
+    add  x23, x23, _kcc_lex_cursor@@PAGEOFF
+    ldr  x19, [x23]          // cursor (scan pointer)
     adrp x2, _kcc_lex_end@@PAGE
     add  x2, x2, _kcc_lex_end@@PAGEOFF
-    ldr  x1, [x2]             // end
+    ldr  x20, [x2]           // end
 
     // Skip leading spaces/tabs
 .Lrol_skip:
-    cmp  x0, x1
+    cmp  x19, x20
     b.hs .Lrol_empty
-    ldrb w3, [x0]
+    ldrb w3, [x19]
     cmp  w3, #' '
     b.eq .Lrol_sk
     cmp  w3, #0x09
     b.eq .Lrol_sk
     b .Lrol_start
 .Lrol_sk:
-    add  x0, x0, #1
+    add  x19, x19, #1
     b .Lrol_skip
 
 .Lrol_start:
-    mov  x5, x0               // text start
-    mov  x7, #0               // state: 0=normal 1=block-comment 2=string 3=char
-    // Scan to the newline that terminates the directive.  A block comment is
-    // whitespace that may span physical lines (\stdref{5.1.1.2} phase 3): the
-    // newline \emph{inside} it does not end the directive, so we keep scanning
-    // to the closing \texttt{*/} --- otherwise the comment's continuation line
-    // (e.g. the second line of a two-line comment after a \texttt{\#define})
-    // would be lexed as code.  String and character literals are tracked so a
-    // \texttt{/*} inside one is not mistaken for a comment.
+    mov  x25, x19            // text start
+    // Return a comment-stripped copy of the body (\stdref{5.1.1.2} phase 3,
+    // which precedes macro definition): a body must not retain comments, or an
+    // apostrophe or quote inside one---as in the kernel's "a node's interval"
+    // doc comment---would later flip the substitutor into char/string mode and
+    // copy the rest of the body verbatim, leaving every parameter and \#\# past
+    // that point unexpanded.  Each comment becomes one space so adjacent tokens
+    // stay separated; string and character literals are copied intact.  The
+    // output never exceeds the input, so (end - start + 2) bytes suffice.
+    sub  x0, x20, x25
+    add  x0, x0, #2
+    bl   _kcc_arena_alloc
+    mov  x21, x0             // output buffer base
+    mov  x22, #0             // op = output length
+    mov  x24, #0             // state: 0=normal 1=block-comment 2=string 3=char
 .Lrol_scan:
-    cmp  x0, x1
+    cmp  x19, x20
     b.hs .Lrol_at_end
-    ldrb w3, [x0]
-    cmp  x7, #1
+    ldrb w3, [x19]
+    cmp  x24, #1
     b.eq .Lrol_st_block
-    cmp  x7, #2
+    cmp  x24, #2
     b.eq .Lrol_st_str
-    cmp  x7, #3
+    cmp  x24, #3
     b.eq .Lrol_st_char
     // normal state
     cmp  w3, #0x0A
     b.eq .Lrol_found_nl
     cmp  w3, #'"'
     b.eq .Lrol_enter_str
-    cmp  w3, #0x27            // '
+    cmp  w3, #0x27           // '
     b.eq .Lrol_enter_char
     cmp  w3, #'/'
-    b.ne .Lrol_adv1
-    add  x8, x0, #1
-    cmp  x8, x1
-    b.hs .Lrol_adv1
+    b.ne .Lrol_emit
+    add  x8, x19, #1
+    cmp  x8, x20
+    b.hs .Lrol_emit
     ldrb w9, [x8]
     cmp  w9, #'*'
-    b.ne .Lrol_adv1
-    mov  x7, #1              // enter block comment
-    add  x0, x0, #2
+    b.eq .Lrol_enter_block
+    cmp  w9, #'/'
+    b.eq .Lrol_line_comment
+    b .Lrol_emit
+.Lrol_emit:
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    add  x19, x19, #1
     b .Lrol_scan
 .Lrol_enter_str:
-    mov  x7, #2
-    add  x0, x0, #1
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    mov  x24, #2
+    add  x19, x19, #1
     b .Lrol_scan
 .Lrol_enter_char:
-    mov  x7, #3
-    add  x0, x0, #1
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    mov  x24, #3
+    add  x19, x19, #1
     b .Lrol_scan
-.Lrol_adv1:
-    add  x0, x0, #1
+.Lrol_enter_block:
+    mov  x24, #1            // enter block comment (copy nothing)
+    add  x19, x19, #2
     b .Lrol_scan
+.Lrol_line_comment:
+    add  x19, x19, #2       // // comment: skip to the end of the logical line
+.Lrol_lc:
+    cmp  x19, x20
+    b.hs .Lrol_at_end
+    ldrb w3, [x19]
+    cmp  w3, #0x0A
+    b.eq .Lrol_found_nl
+    add  x19, x19, #1
+    b .Lrol_lc
 .Lrol_st_block:
     cmp  w3, #'*'
     b.ne .Lrol_block_adv
-    add  x8, x0, #1
-    cmp  x8, x1
+    add  x8, x19, #1
+    cmp  x8, x20
     b.hs .Lrol_block_adv
     ldrb w9, [x8]
     cmp  w9, #'/'
     b.ne .Lrol_block_adv
-    mov  x7, #0             // close block comment
-    add  x0, x0, #2
+    mov  x24, #0           // close block comment: emit a single space
+    mov  w3, #' '
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    add  x19, x19, #2
     b .Lrol_scan
 .Lrol_block_adv:
-    cmp  w3, #0x0A          // newline inside comment: keep line count accurate
-    b.ne .Lrol_adv1
+    cmp  w3, #0x0A         // newline inside comment: keep line count accurate
+    b.ne .Lrol_block_next
     adrp x8, _kcc_lex_line@@PAGE
     add  x8, x8, _kcc_lex_line@@PAGEOFF
     ldr  x9, [x8]
     add  x9, x9, #1
     str  x9, [x8]
-    add  x0, x0, #1
+.Lrol_block_next:
+    add  x19, x19, #1
     b .Lrol_scan
 .Lrol_st_str:
-    cmp  w3, #0x5C          // backslash: skip the escaped character
+    cmp  w3, #0x5C         // backslash: copy it and the escaped character
     b.ne .Lrol_str_q
-    add  x0, x0, #2
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    add  x8, x19, #1
+    cmp  x8, x20
+    b.hs .Lrol_str_adv2
+    ldrb w9, [x8]
+    strb w9, [x21, x22]
+    add  x22, x22, #1
+.Lrol_str_adv2:
+    add  x19, x19, #2
     b .Lrol_scan
 .Lrol_str_q:
     cmp  w3, #'"'
     b.ne .Lrol_str_nl
-    mov  x7, #0
-    add  x0, x0, #1
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    mov  x24, #0
+    add  x19, x19, #1
     b .Lrol_scan
 .Lrol_str_nl:
-    cmp  w3, #0x0A          // an unterminated string still ends at the newline
+    cmp  w3, #0x0A         // an unterminated string still ends at the newline
     b.eq .Lrol_found_nl
-    add  x0, x0, #1
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    add  x19, x19, #1
     b .Lrol_scan
 .Lrol_st_char:
     cmp  w3, #0x5C
     b.ne .Lrol_char_q
-    add  x0, x0, #2
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    add  x8, x19, #1
+    cmp  x8, x20
+    b.hs .Lrol_char_adv2
+    ldrb w9, [x8]
+    strb w9, [x21, x22]
+    add  x22, x22, #1
+.Lrol_char_adv2:
+    add  x19, x19, #2
     b .Lrol_scan
 .Lrol_char_q:
     cmp  w3, #0x27
     b.ne .Lrol_char_nl
-    mov  x7, #0
-    add  x0, x0, #1
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    mov  x24, #0
+    add  x19, x19, #1
     b .Lrol_scan
 .Lrol_char_nl:
     cmp  w3, #0x0A
     b.eq .Lrol_found_nl
-    add  x0, x0, #1
+    strb w3, [x21, x22]
+    add  x22, x22, #1
+    add  x19, x19, #1
     b .Lrol_scan
 
 .Lrol_found_nl:
-    // Set cursor to newline (lexer will skip it later)
-    str  x0, [x4]
-    // Trim trailing whitespace
-    mov  x6, x0
+    str  x19, [x23]          // cursor = newline (lexer will skip it later)
+    b .Lrol_trim
+.Lrol_at_end:
+    str  x20, [x23]          // cursor = end
 .Lrol_trim:
-    cmp  x6, x5
-    b.ls .Lrol_trimmed
-    sub  x6, x6, #1
-    ldrb w3, [x6]
+    // Trim trailing whitespace from the output buffer.
+    cbz  x22, .Lrol_ret
+    sub  x8, x22, #1
+    ldrb w3, [x21, x8]
     cmp  w3, #' '
-    b.eq .Lrol_trim
+    b.eq .Lrol_trim_dec
     cmp  w3, #0x09
-    b.eq .Lrol_trim
-    add  x6, x6, #1
-    b .Lrol_ret
-.Lrol_trimmed:
-    mov  x6, x5
+    b.ne .Lrol_ret
+.Lrol_trim_dec:
+    sub  x22, x22, #1
+    b .Lrol_trim
 .Lrol_ret:
-    mov  x0, x5               // text start
-    sub  x1, x6, x5           // text length
-    ldp  x29, x30, [sp], #16
+    mov  x0, x21             // stripped body start
+    mov  x1, x22             // stripped body length
+    ldr  x25, [sp, #64]
+    ldp  x23, x24, [sp, #48]
+    ldp  x21, x22, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #80
     ret
 
-.Lrol_at_end:
-    str  x1, [x4]             // cursor = end
-    mov  x6, x0
-    b .Lrol_ret
-
 .Lrol_empty:
-    str  x1, [x4]
-    mov  x0, x1
+    str  x20, [x23]          // cursor = end
+    mov  x0, x19             // start == end: empty body
     mov  x1, #0
-    ldp  x29, x30, [sp], #16
+    ldr  x25, [sp, #64]
+    ldp  x23, x24, [sp, #48]
+    ldp  x21, x22, [sp, #32]
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #80
     ret
 @}
 

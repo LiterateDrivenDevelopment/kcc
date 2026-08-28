@@ -781,6 +781,15 @@ difftest "stringize-token-adjacency" \
 int main(void){ const char *p = S(a.b); const char *q = S(a b);
   return (p[0]=='a' && p[1]=='.' && p[2]=='b' && p[3]==0 &&
           q[0]=='a' && q[1]==' ' && q[2]=='b' && q[3]==0) ? 0 : 1; }"
+# A comment in a macro body must be removed before the body is stored (phase 3),
+# or an apostrophe/quote inside it (as in the kernel's `interval_tree` doc
+# comment "a node's interval") flips the argument substitutor into char/string
+# mode and copies the rest of the body verbatim, leaving parameters and ## after
+# it unexpanded.  Here the comment holds an odd apostrophe between two uses of X.
+difftest "macro-body-comment-apostrophe" \
+    "#define M(X) int X##_a(void){ return 0; } /* a node's interval: X can't be null */ int X##_b(void){ return 7; }
+M(foo)
+int main(void){ return foo_a() + foo_b() - 7; }"
 # GNU array-range designator `[lo ... hi] = v` fills every element in the range
 # (the kernel's lib/atomic64.c seeds its lock table `[0 ... (NR_LOCKS-1)]`), and
 # a designator index is a constant EXPRESSION, not just a literal, so [NR-1] and

@@ -315,6 +315,7 @@ void kcc_ir_sw_scan(void *stmt);
 void kcc_ir_sw_disp(void *stmt);
 unsigned long kcc_eval_const_int(void *n);
 unsigned long kcc_expr_is_ice(void *n);
+unsigned long kcc_call_is_bcp(void *n);
 unsigned long kcc_eval_addr(void *n);
 unsigned long kcc_addr_is_iconst(void *n);
 unsigned long kcc_rodata_binop_ok(unsigned long op);
@@ -3439,7 +3440,19 @@ static void ir_brcond(unsigned long cond, void *tb, void *fb) {
 }
 
 void kcc_ir_build_if(void *s) {
-    unsigned long cond = kcc_ir_build_expr((void *)IL(s, AST_F0));
+    /* A compile-time-constant condition selects one branch; build only that
+       one and drop the other entirely.  The kernel's size-dispatched inline
+       asm depends on this: the untaken branch (e.g. a byte `cmpxchgb` reached
+       only when `size==1`) would otherwise be lowered and emit an assembler
+       error even though it can never run. */
+    void *cond_e = (void *)IL(s, AST_F0);
+    if (kcc_expr_is_ice(cond_e)) {
+        void *taken = kcc_eval_const_int(cond_e) ? (void *)IL(s, AST_F1)
+                                                 : (void *)IL(s, AST_F2);
+        if (taken) kcc_ir_build_stmt(taken);
+        return;
+    }
+    unsigned long cond = kcc_ir_build_expr(cond_e);
     void *then_bb = kcc_ir_alloc_bb();
     void *else_node = (void *)IL(s, AST_F2);
     if (else_node) {
@@ -3528,6 +3541,8 @@ unsigned long kcc_eval_const_int(void *n) {
     if (!n) return 0;
     unsigned long tag = IL(n, AST_TAG);
     if (tag == AST_INT_LIT || tag == AST_CHAR_LIT) return IL(n, AST_F0);
+    if (tag == AST_CALL_EXPR && kcc_call_is_bcp(n))
+        return kcc_expr_is_ice((void *)IL(n, AST_F1)) ? 1 : 0;   /* __builtin_constant_p(x) */
     if (tag == AST_PAREN_EXPR) return kcc_eval_const_int((void *)IL(n, AST_F0));
     if (tag == AST_CAST_EXPR) return kcc_eval_const_int((void *)IL(n, AST_F1));
     if (tag == AST_SIZEOF_EXPR) {
@@ -3652,7 +3667,19 @@ unsigned long kcc_expr_is_ice(void *n) {
         if (IL(sym, SYM_KIND) == SYM_ENUM_CONST) return 1;
         return 0;
     }
+    /* __builtin_constant_p(x) is itself a constant (0 or 1), so it is an
+       integer constant expression regardless of x.  The kernel gates whole
+       code paths on it (`__builtin_constant_p(nr) ? ... : ...`). */
+    if (tag == AST_CALL_EXPR && kcc_call_is_bcp(n)) return 1;
     return 0;
+}
+
+/* True when n is a call to __builtin_constant_p. */
+unsigned long kcc_call_is_bcp(void *n) {
+    void *callee = (void *)IL(n, AST_F0);
+    if (!callee || IL(callee, AST_TAG) != AST_IDENT_EXPR) return 0;
+    char *cn = (char *)IL(callee, AST_F0);
+    return cn && kcc_strcmp(cn, "__builtin_constant_p") == 0;
 }
 
 /* Allocate a block for every case/default label reachable in a switch body. */
@@ -4480,6 +4507,18 @@ unsigned long kcc_ir_build_string_lit(void *lit) {
 }
 
 unsigned long kcc_ir_build_cond_expr(void *e) {
+    /* Constant condition: evaluate only the taken arm (and lower only it).
+       The kernel's `__builtin_constant_p(nr) ? constant_test_bit(nr,a)
+       : variable_test_bit(nr,a)` folds here — for a runtime `nr` the predicate
+       is 0, so the constant-only arm (whose asm needs an immediate) is dropped. */
+    void *cc = (void *)IL(e, AST_F0);
+    if (kcc_expr_is_ice(cc)) {
+        if (kcc_eval_const_int(cc)) {
+            void *ta = (void *)IL(e, AST_F1);
+            return ta ? kcc_ir_build_expr(ta) : kcc_ir_build_expr(cc);
+        }
+        return kcc_ir_build_expr((void *)IL(e, AST_F2));
+    }
     void *tmp = kcc_ir_alloc_instr(IR_ALLOCA);
     IL(tmp, IR_TYPE) = (unsigned long)kcc_type_int_s;
     unsigned long slot = kcc_ir_next_vreg();

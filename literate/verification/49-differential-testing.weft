@@ -745,6 +745,18 @@ int main(void){ int x = 7, y = 0;
 difftest "builtin-file-macro" \
     "int main(void){ const char *f = __FILE__; int n = 0; while (f[n]) n++;
      return (n >= 2 && f[n-1] == 'c' && f[n-2] == '.') ? 0 : 1; }"
+# Constant-condition folding: an `if`, `?:`, or `__builtin_constant_p` whose
+# controlling expression is a compile-time constant selects one arm, and only
+# that arm is lowered (the kernel gates size-dispatched inline asm on exactly
+# this).  __builtin_constant_p is 1 for a constant, 0 for a runtime value.
+difftest "constant-condition-fold" \
+    "int main(void){ int r = 0; int n = 3;
+       if (1) r += 3; else r += 100;
+       if (0) r += 100; else r += 4;
+       r += (1 ? 5 : 100); r += (0 ? 100 : 6);
+       r += __builtin_constant_p(42) ? 7 : 100;
+       r += __builtin_constant_p(n) ? 100 : 8;
+       return r - (3+4+5+6+7+8); }"
 # The # stringize operator (C17 6.10.3.2) keeps adjacent tokens adjacent: a
 # single space appears only where the source had whitespace, none between tokens
 # written together like `a.b` or `.section`.  The kernel's EXPORT_SYMBOL builds

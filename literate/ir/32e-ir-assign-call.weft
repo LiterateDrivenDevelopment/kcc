@@ -881,6 +881,15 @@ _kcc_ir_build_call:
     bl _kcc_strcmp
     cbz x0, .Libc_builtin_expect
 
+    // __builtin_constant_p(x): a compile-time predicate, 1 if x is an integer
+    // constant expression and 0 otherwise.  The kernel gates whole code paths on
+    // it; folding it to a constant here lets a constant `? :` drop its dead arm.
+    mov x0, x20
+    adrp x1, _kcc_ir_str_builtin_constant_p@@PAGE
+    add  x1, x1, _kcc_ir_str_builtin_constant_p@@PAGEOFF
+    bl _kcc_strcmp
+    cbz x0, .Libc_builtin_constant_p
+
     // Direct name, a local function-pointer variable, or a global one?
     mov x0, x20
     bl _kcc_strlen
@@ -1204,6 +1213,12 @@ _kcc_ir_build_call:
     bl _kcc_ir_build_expr       // its vreg is the whole builtin's value
     b .Libc_epilogue
 
+.Libc_builtin_constant_p:
+    ldr x0, [x19, #AST_F1]      // first argument
+    bl _kcc_expr_is_ice         // 1 if a constant expression, else 0
+    bl _kcc_ir_emit_const       // materialise that 0/1
+    b .Libc_epilogue
+
 .Libc_done_zero:
     mov x0, #0
 .Libc_done:
@@ -1497,11 +1512,12 @@ _kcc_ir_str_va_end:      .asciz "va_end"
 _kcc_ir_str_builtin_va_start: .asciz "__builtin_va_start"
 _kcc_ir_str_builtin_va_end:   .asciz "__builtin_va_end"
 _kcc_ir_str_builtin_expect:   .asciz "__builtin_expect"
+_kcc_ir_str_builtin_constant_p: .asciz "__builtin_constant_p"
 .text
 @| _kcc_ir_ident_alloca _kcc_ir_build_va_start _kcc_ir_build_va_arg
 @| _kcc_ir_str_va_start _kcc_ir_str_va_end
 @| _kcc_ir_str_builtin_va_start _kcc_ir_str_builtin_va_end
-@| _kcc_ir_str_builtin_expect
+@| _kcc_ir_str_builtin_expect _kcc_ir_str_builtin_constant_p
 @}
 
 \paragraph{End-to-end tests.}

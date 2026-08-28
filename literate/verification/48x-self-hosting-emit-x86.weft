@@ -590,6 +590,7 @@ static void x86_emit_asm(void *i) {
     unsigned long immval[6];                        /* its constant value */
     unsigned long issym[6];                         /* operand k names a symbol (for %P) */
     const char *symname[6];                         /* its emit-name */
+    unsigned long isaddr[6];                         /* operand k is an address ("p"): %P -> (%reg) */
     char spec[6];                                  /* specific-register letter or 0 */
     char isflag[6];                                /* condition-code output (=@@cc) */
     const char *flagcond[6];                        /* its setCC suffix */
@@ -603,6 +604,7 @@ static void x86_emit_asm(void *i) {
         if (ch == '&') ch = c[2];                  /* early-clobber: ignored (each
                                                       operand already has its own reg) */
         ismem[nop] = 0;
+        isaddr[nop] = (ch == 'p');                 /* "p": an address held in a register */
         spec[nop] = 0;
         isflag[nop] = 0;
         /* `=@@cc<cond>`: a condition-code output.  It takes no register and is
@@ -745,11 +747,12 @@ static void x86_emit_asm(void *i) {
             x86_sym(symname[unum]);                     /* %P[f] -> bare symbol: call f */
         } else if (raw && unum < nop && isimm[unum]) {
             kcc_as_dec(immval[unum]);                   /* %P on a constant -> bare value, no $ */
-        } else if (raw && unum < nop && ismem[unum]) {
-            /* %P on a memory operand (the kernel's percpu `%%gs:%P[var]`): kcc
-               holds the object's address in a register, so a memory reference
-               `(%reg)` is the bare-pointer form---`%gs:(%r9)` assembles and, like
-               GCC's `%gs:var`, dereferences the object. */
+        } else if (raw && unum < nop && (ismem[unum] || isaddr[unum])) {
+            /* %P on a memory ("m") or address ("p") operand---the kernel's percpu
+               read `%%gs:%P[var]` with `[var] "p"(&var)`: kcc holds the object's
+               address in a register, so a memory reference `(%reg)` is the
+               bare-pointer form.  `%gs:(%r9)` assembles and, like GCC's
+               `%gs:var`, dereferences the object. */
             kcc_as_ch('('); x86_asm_wreg(reg, 8); kcc_as_ch(')');
         } else if (raw && unum < nop) {
             x86_asm_wreg(reg, 8);                       /* %P without a symbol -> bare address register */

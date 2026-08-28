@@ -463,8 +463,10 @@ the emit-name of a symbolic operand (a function or file-scope object, or the
 address of one) alongside the materialised register---\texttt{F1} holds the
 name and a marker bit in \texttt{F2} flags its presence.  Rendering a
 \verb|%P| reference then emits that bare symbol; for a \verb|%P| operand with no
-symbol (a constant, or an address that lives only in a register) it falls back
-to the bare value or the raw address register.  This makes the
+symbol it falls back to the bare value (a constant), a memory reference
+\verb|(%reg)| (a memory operand, as in the percpu read
+\verb|movq %%gs:%P[var], %0| \(\rightarrow\) \verb|movq %gs:(%r9), ...|), or the
+raw address register (anything else).  This makes the
 \texttt{ALTERNATIVE}/percpu translation units assemble; note that kcc does not
 emit the \texttt{.altinstructions} metadata that would patch the alternative at
 run time, so only the default (\texttt{oldinstr}) path is exercised.
@@ -743,6 +745,12 @@ static void x86_emit_asm(void *i) {
             x86_sym(symname[unum]);                     /* %P[f] -> bare symbol: call f */
         } else if (raw && unum < nop && isimm[unum]) {
             kcc_as_dec(immval[unum]);                   /* %P on a constant -> bare value, no $ */
+        } else if (raw && unum < nop && ismem[unum]) {
+            /* %P on a memory operand (the kernel's percpu `%%gs:%P[var]`): kcc
+               holds the object's address in a register, so a memory reference
+               `(%reg)` is the bare-pointer form---`%gs:(%r9)` assembles and, like
+               GCC's `%gs:var`, dereferences the object. */
+            kcc_as_ch('('); x86_asm_wreg(reg, 8); kcc_as_ch(')');
         } else if (raw && unum < nop) {
             x86_asm_wreg(reg, 8);                       /* %P without a symbol -> bare address register */
         } else if (unum < nop && isimm[unum]) {

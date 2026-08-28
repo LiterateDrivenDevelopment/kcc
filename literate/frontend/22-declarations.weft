@@ -239,6 +239,17 @@ the kernel's \texttt{DEFINE\_LOCK\_GUARD\_0} expansion
     bl _kcc_parse_initializer
     str x0, [x21, #AST_F2]      // init
 
+    // __auto_type: resolve the deferred typeof node (x19 = base type) against
+    // the initializer just parsed, so the variable takes the initializer's type.
+    ldr x1, [x19, #AST_TAG]
+    cmp x1, #AST_TYPE_TYPEOF
+    b.ne .Ldecl_var_no_init
+    ldr x1, [x19, #AST_F1]
+    cmp x1, #2                   // deferred-auto marker
+    b.ne .Ldecl_var_no_init
+    str x0, [x19, #AST_F0]       // F0 = initializer expression
+    str xzr, [x19, #AST_F1]      // F1 = 0: expression mode
+
 .Ldecl_var_no_init:
     // Check for more declarators (comma-separated)
     adrp x0, _kcc_tok_type@@PAGE
@@ -442,6 +453,7 @@ _kcc_attr_s_packed:   .asciz "packed"
 _kcc_attr_s_packed2:  .asciz "__packed__"
 _kcc_attr_s_aligned:  .asciz "aligned"
 _kcc_attr_s_aligned2: .asciz "__aligned__"
+_kcc_str_auto_type:   .asciz "__auto_type"
 _kcc_decl_msg_complex: .asciz "complex types (_Complex/_Imaginary) are not supported"
 .text
 .globl _kcc_parse_skip_attributes
@@ -852,7 +864,12 @@ already set before promoting to bit~5 (\texttt{long long}).  The GNU
 \texttt{unsigned} the same way the standard integer specifiers do.  Struct,
 union, and enum specifiers build their own type nodes via dedicated
 sub-parsers, while typedef names are looked up in the typedef table and
-interned.
+interned.  The GNU \texttt{\_\_auto\_type} specifier---an identifier, so matched
+by spelling---infers its type from the initializer: it emits a deferred
+\texttt{typeof} node (\texttt{F1}=2) that \texttt{kcc\_parse\_decl} fills with
+the initializer expression once parsed, and \texttt{kcc\_parse\_is\_type\_token}
+likewise reports it as a type so a block-scope \texttt{\_\_auto\_type x = e;} is
+parsed as a declaration rather than an expression.
 
 @d Decl: parse specifiers @{
 .Ldecl_type_builtin:
@@ -975,6 +992,33 @@ interned.
     // Only treat as typedef name if no type specifier seen yet
     cbnz x22, .Ldecl_specs_done
 
+    // GNU __auto_type: the type is inferred from the initializer parsed later
+    // (`__auto_type x = e` means `typeof(e) x = e`).  Emit a deferred typeof
+    // node (F1=2) that kcc_parse_decl fills with the initializer.
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x1, #11
+    b.ne .Ldecl_specs_not_auto
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_str_auto_type@@PAGE
+    add  x1, x1, _kcc_str_auto_type@@PAGEOFF
+    mov  x2, #11
+    bl _kcc_memcmp
+    cbnz x0, .Ldecl_specs_not_auto
+    bl _kcc_pp_next               // consume __auto_type
+    mov x0, #AST_TYPE_TYPEOF
+    bl _kcc_ast_alloc
+    str xzr, [x0, #AST_F0]        // deferred operand
+    mov x1, #2
+    str x1, [x0, #AST_F1]         // F1=2: auto, fill F0 from the initializer
+    mov x20, x0                   // x20 = type node
+    add x22, x22, #1              // count++
+    b .Ldecl_specs_loop
+
+.Ldecl_specs_not_auto:
     // Check if this identifier is a typedef name
     adrp x0, _kcc_tok_start@@PAGE
     add  x0, x0, _kcc_tok_start@@PAGEOFF
@@ -2581,6 +2625,23 @@ _kcc_parse_is_type_token:
     cmp x0, #TOK_IDENT
     b.ne .Lis_type_no
 
+    // __auto_type begins a declaration even inside a block (the statement
+    // parser uses this predicate to tell a declaration from an expression).
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    cmp  x1, #11
+    b.ne .Lis_type_td
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_str_auto_type@@PAGE
+    add  x1, x1, _kcc_str_auto_type@@PAGEOFF
+    mov  x2, #11
+    bl _kcc_memcmp
+    cbz x0, .Lis_type_yes       // spelled __auto_type
+
+.Lis_type_td:
     // Lookup in typedef table
     adrp x0, _kcc_tok_start@@PAGE
     add  x0, x0, _kcc_tok_start@@PAGEOFF

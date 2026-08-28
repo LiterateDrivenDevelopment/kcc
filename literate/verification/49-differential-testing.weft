@@ -799,6 +799,14 @@ difftest "typedef-multiple-declarators" \
     "typedef struct rec { int x; } Rec, *RecP;
 typedef int A, *B;
 int main(void){ Rec r; r.x = 5; RecP p = &r; A a = 3; B b = &a; return p->x - a + *b - 5; }"
+# GNU __auto_type infers a variable's type from its initializer (`__auto_type x
+# = e` means `typeof(e) x = e`).  The kernel's WARN/min/max macros use it, so it
+# must parse as a declaration both at file scope and inside a block.  Covers
+# integer, long (width from the initializer), and pointer inference.
+difftest "auto-type" \
+    "__auto_type g = 100;
+int main(void){ __auto_type x = 5; __auto_type y = x + 2L; __auto_type z = &x;
+  return (int)(x + y) - 12 + (*z - 5) + (g - 100); }"
 # GNU array-range designator `[lo ... hi] = v` fills every element in the range
 # (the kernel's lib/atomic64.c seeds its lock table `[0 ... (NR_LOCKS-1)]`), and
 # a designator index is a constant EXPRESSION, not just a literal, so [NR-1] and

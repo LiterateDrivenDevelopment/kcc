@@ -292,6 +292,17 @@ struct DeclSpecs kcc_parse_decl_specs(void) {
         if (t == TOK_ATTRIBUTE || t == TOK_EXTENSION) { kcc_parse_skip_attributes(); continue; }
         if (t == TOK_IDENT) {
             if (count) break;
+            /* GNU __auto_type: the declared type is inferred from the
+               initializer (parsed later), i.e. `__auto_type x = e` means
+               `typeof(e) x = e`.  Leave a deferred typeof node (f1==2) that the
+               declaration fills with the initializer once it is parsed. */
+            if (kcc_tok_len == 11 && kcc_memcmp(kcc_tok_start, "__auto_type", 11) == 0) {
+                kcc_pp_next();
+                struct Node *n = (struct Node *)kcc_ast_alloc(AST_TYPE_TYPEOF);
+                n->f0 = 0; n->f1 = 2;
+                type = n; count++;
+                continue;
+            }
             if (!kcc_typedef_lookup(kcc_tok_start, kcc_tok_len)) break;
             void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
             kcc_pp_next();
@@ -790,6 +801,10 @@ unsigned long kcc_parse_is_type_token(void) {
         t == TOK__ATOMIC || t == TOK__ALIGNAS)
         return 1;
     if (t != TOK_IDENT) return 0;
+    /* __auto_type begins a declaration (`__auto_type x = e;`) even inside a
+       block, where the statement parser uses this predicate to tell a
+       declaration from an expression statement. */
+    if (kcc_tok_len == 11 && kcc_memcmp(kcc_tok_start, "__auto_type", 11) == 0) return 1;
     return kcc_typedef_lookup(kcc_tok_start, kcc_tok_len) ? 1 : 0;
 }
 
@@ -958,6 +973,14 @@ void *kcc_parse_decl(void) {
         if (kcc_tok_type == TOK_ASSIGN) {
             kcc_pp_next();
             d->f2 = (unsigned long)kcc_parse_initializer();
+        }
+        /* __auto_type: resolve the deferred typeof node against the initializer
+           just parsed, so the variable takes the initializer's type. */
+        if (base) {
+            struct Node *bn = (struct Node *)base;
+            if (bn->tag == AST_TYPE_TYPEOF && bn->f1 == 2 && d->f2) {
+                bn->f0 = d->f2; bn->f1 = 0;
+            }
         }
         if (kcc_tok_type != TOK_COMMA) {
             kcc_parse_expect(TOK_SEMI);

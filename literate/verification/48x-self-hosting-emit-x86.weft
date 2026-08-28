@@ -595,12 +595,16 @@ static void x86_emit_asm(void *i) {
             regof[nop] = regof[tied];            /* alias the tied operand's reg */
             spec[nop] = spec[tied];              /* ...including a specific one */
         } else if (ch == 'r' || ch == 'i' || ch == 'I' || ch == 'n' ||
-                   ch == 'g' || ch == 'q' || ch == 'p') {
-            /* register (an i/I/n that reached here was not a constant, so its
-               register alternative is used).  `g` (general: reg/mem/imm) and
+                   ch == 'g' || ch == 'q' || ch == 'p' || ch == 'e' ||
+                   ch == 'J' || ch == 'K' || ch == 'L' || ch == 'M' ||
+                   ch == 'N' || ch == 'O' || ch == 'Z') {
+            /* register.  An immediate-class letter that reached here (the IR did
+               not mark the operand a constant) means a multi-alternative
+               constraint like `"er"` or `"Ir"` whose register alternative is
+               taken for a non-constant value.  `g` (general: reg/mem/imm) and
                `p` (address) admit a register, which is what kcc materialises the
                operand into; `q` (byte-addressable register) is any register on
-               x86-64.  So all three are handled exactly like `r`. */
+               x86-64.  All are handled exactly like `r`. */
         } else if (ch == 'a' || ch == 'b' || ch == 'c' || ch == 'd' ||
                    ch == 'S' || ch == 'D') {
             /* pinned to a specific register (mul/div use a/d, cpuid a/b/c/d,

@@ -757,6 +757,19 @@ difftest "constant-condition-fold" \
        r += __builtin_constant_p(42) ? 7 : 100;
        r += __builtin_constant_p(n) ? 100 : 8;
        return r - (3+4+5+6+7+8); }"
+# Constant-switch folding: a switch on a compile-time-constant value selects a
+# single arm (or default, or none), building only that arm with fall-through and
+# break honoured.  The kernel's __raw_cmpxchg switches on a constant `sizeof`
+# and each arm has a differently-sized cmpxchg; folding emits only the live one.
+# Covers exact match, fall-through, default, a case-label chain, and no-match.
+difftest "constant-switch-fold" \
+    "int main(void){ int r = 0;
+       switch (1) { case 1: r += 1; break; case 2: r += 100; break; default: r += 100; }
+       switch (2) { case 1: r += 100; case 2: r += 20; case 3: r += 40; break; default: r += 100; }
+       switch (9) { case 1: r += 100; break; default: r += 3; }
+       switch (5) { case 4: case 5: r += 5; break; default: r += 100; }
+       switch (7) { case 1: r += 100; break; }
+       return r - (1+60+3+5); }"
 # The # stringize operator (C17 6.10.3.2) keeps adjacent tokens adjacent: a
 # single space appears only where the source had whitespace, none between tokens
 # written together like `a.b` or `.section`.  The kernel's EXPORT_SYMBOL builds

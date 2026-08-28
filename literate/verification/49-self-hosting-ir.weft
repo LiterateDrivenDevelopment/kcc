@@ -3428,6 +3428,26 @@ member's byte offset (via \texttt{eval\_addr}), so a bound such as
 \verb|char b[sizeof(P)-offsetof(P,tail)]| lays out at its true size rather than
 being rejected as a variable-length array.
 
+When the controlling expression is itself an integer constant expression, the
+whole dispatch is dead weight: only one arm can ever run, yet emitting every
+arm is exactly what forces kcc to lower the kernel's size-dispatched inline
+asm.  \texttt{\_\_raw\_cmpxchg} switches on a compile-time-constant
+\texttt{sizeof} and each arm carries a differently-sized \texttt{cmpxchg}; GCC
+inlines with a literal size, folds the switch, and emits only the live arm,
+whereas kcc---not inlining---would render the whole switch including the
+byte-wide \texttt{cmpxchgb} on a wider register.  So \texttt{build\_switch}
+folds a constant switch the way \texttt{build\_if} folds a constant condition:
+it evaluates the control value, finds the matching \texttt{case} (or
+\texttt{default}, or nothing), and builds only that arm as straight-line code,
+honouring fall-through into later arms and stopping at the first \texttt{break}.
+
+The fold applies only when the body is a single compound whose \texttt{case} and
+\texttt{default} labels are all direct children---\texttt{is\_flat} confirms a
+deep scan finds no label nested inside an arm---so that fall-through is a simple
+walk of the sibling list and no nested label is ever built without its
+dispatch block.  Anything more intricate falls back to the ordinary two-scan
+lowering, which is always correct.
+
 @l c
 @d Selfhost: ir control @{
 static void ir_brcond(unsigned long cond, void *tb, void *fb) {
@@ -3803,7 +3823,107 @@ void kcc_ir_sw_disp(void *stmt) {
     }
 }
 
+/* Deep count of case/default labels in a switch body, recursing exactly where
+   kcc_ir_sw_scan does (and, like it, NOT into a nested switch, whose labels
+   belong to that switch).  Used to detect labels buried inside an arm. */
+static unsigned long kcc_sw_count_labels(void *stmt) {
+    if (!stmt) return 0;
+    unsigned long tag = IL(stmt, AST_TAG);
+    if (tag == AST_CASE_STMT)
+        return 1 + kcc_sw_count_labels((void *)IL(stmt, AST_F1));
+    if (tag == AST_DEFAULT_STMT)
+        return 1 + kcc_sw_count_labels((void *)IL(stmt, AST_F0));
+    if (tag == AST_COMPOUND) {
+        unsigned long n = 0;
+        for (void *it = (void *)IL(stmt, AST_F0); it; it = (void *)IL(it, AST_F4))
+            n += kcc_sw_count_labels(it);
+        return n;
+    }
+    if (tag == AST_IF_STMT)
+        return kcc_sw_count_labels((void *)IL(stmt, AST_F1))
+             + kcc_sw_count_labels((void *)IL(stmt, AST_F2));
+    if (tag == AST_WHILE_STMT || tag == AST_LABEL_STMT)
+        return kcc_sw_count_labels((void *)IL(stmt, AST_F1));
+    if (tag == AST_DO_STMT)
+        return kcc_sw_count_labels((void *)IL(stmt, AST_F0));
+    if (tag == AST_FOR_STMT)
+        return kcc_sw_count_labels((void *)IL(stmt, AST_F3));
+    return 0;
+}
+
+/* A switch body is foldable when it is a compound whose case/default labels are
+   all top-level label chains (so fall-through is a walk of the sibling list),
+   whose first item is a label (no statement precedes the first arm), and which
+   declares no variable directly in the switch scope (only inside an arm's own
+   braces)---the last guard means skipping an earlier arm can never omit a
+   declaration a built arm relies on. */
+static int kcc_sw_foldable_body(void *body) {
+    if (!body || IL(body, AST_TAG) != AST_COMPOUND) return 0;
+    void *first = (void *)IL(body, AST_F0);
+    if (!first) return 0;
+    unsigned long ft = IL(first, AST_TAG);
+    if (ft != AST_CASE_STMT && ft != AST_DEFAULT_STMT) return 0;
+    unsigned long chain_total = 0;
+    for (void *it = first; it; it = (void *)IL(it, AST_F4)) {
+        void *node = it;
+        while (node) {
+            unsigned long nt = IL(node, AST_TAG);
+            if (nt == AST_CASE_STMT) { chain_total++; node = (void *)IL(node, AST_F1); }
+            else if (nt == AST_DEFAULT_STMT) { chain_total++; node = (void *)IL(node, AST_F0); }
+            else break;
+        }
+        if (node && IL(node, AST_TAG) == AST_VAR_DECL) return 0;  /* bare decl in switch scope */
+    }
+    return chain_total == kcc_sw_count_labels(body);  /* else a label is buried in an arm */
+}
+
+/* Fold a switch whose control value is a constant: build only the arm that
+   value selects (or default, or nothing), as straight-line code with the
+   ordinary case/default label handling---no dispatch, so the unselected arms
+   (and their differently-sized inline asm) are never emitted.  Returns 1 when
+   it folded, 0 to fall back to the general two-scan lowering. */
+static int kcc_ir_try_fold_switch(void *s) {
+    void *cond = (void *)IL(s, AST_F0);
+    if (!kcc_expr_is_ice(cond)) return 0;
+    void *body = (void *)IL(s, AST_F1);
+    if (!kcc_sw_foldable_body(body)) return 0;
+    long v = (long)kcc_eval_const_int(cond);
+    void *start = 0;
+    void *deflt = 0;
+    for (void *it = (void *)IL(body, AST_F0); it && !start; it = (void *)IL(it, AST_F4)) {
+        void *node = it;
+        while (node) {
+            unsigned long nt = IL(node, AST_TAG);
+            if (nt == AST_CASE_STMT) {
+                long lo = (long)kcc_eval_const_int((void *)IL(node, AST_F0));
+                if (IL(node, AST_F3)) {
+                    long hi = (long)kcc_eval_const_int((void *)IL(node, AST_F3));
+                    if (v >= lo && v <= hi) { start = it; break; }
+                } else if (v == lo) { start = it; break; }
+                node = (void *)IL(node, AST_F1);
+            } else if (nt == AST_DEFAULT_STMT) {
+                if (!deflt) deflt = it;
+                node = (void *)IL(node, AST_F0);
+            } else break;
+        }
+    }
+    if (!start) start = deflt;                 /* no case matched: default, or nothing */
+    void *exit_bb = kcc_ir_alloc_bb();
+    unsigned long cont = 0;
+    if (kcc_loop_depth) cont = kcc_loop_stack[(kcc_loop_depth - 1) * 2 + 1];
+    kcc_loop_push(IL(exit_bb, BB_ID), cont);    /* break targets the switch exit */
+    for (void *it = start; it; it = (void *)IL(it, AST_F4)) {
+        kcc_ir_build_stmt(it);                  /* label f2/f1 are 0: builds transparently */
+        if (IL(kcc_ir_cur_bb, BB_FLAGS) & BB_FLAG_TERMINATED) break;  /* a break/return ended the arm */
+    }
+    kcc_loop_pop();
+    kcc_ir_branch_to(exit_bb);
+    kcc_ir_set_bb(exit_bb);
+    return 1;
+}
+
 void kcc_ir_build_switch(void *s) {
+    if (kcc_ir_try_fold_switch(s)) return;
     kcc_sw_cond_vreg = kcc_ir_build_expr((void *)IL(s, AST_F0));
     void *exit_bb = kcc_ir_alloc_bb();
     kcc_sw_default_bb = 0;

@@ -451,11 +451,15 @@ instruction's source fields, the optimiser must renumber and mark them
 explicitly (see the optimiser's CSE and dead-code passes)---otherwise
 store-to-load forwarding would leave an input reading a swept load's slot.
 
-The \verb|%P| and \verb|%c| operand modifiers print an operand \emph{bare}: a
-symbol or constant without the \texttt{\$}/register decoration, so
+The \verb|%p|, \verb|%P| and \verb|%c| operand modifiers print an operand
+\emph{bare}: a symbol or constant without the \texttt{\$}/register decoration, so
 \verb|call %P[func]| becomes a direct \texttt{call func}, \verb|movq %P[var], %r8|
 loads the object's address by name, and \verb|.4byte %c[feature]| emits the bare
-feature number.  The kernel leans on it in \texttt{ALTERNATIVE} (\verb|call %P[old]| /
+feature number.  The lowercase \verb|%p| is GCC's spelling for the same
+raw-operand print and is what the kernel's RIP-relative accessors use---\verb|_ASM_RIP|
+expands to \verb|%p[sym](%%rip)|, which must render as \texttt{sym(\%rip)}, not a
+register---so it is treated identically here.  The kernel leans on these in
+\texttt{ALTERNATIVE} (\verb|call %P[old]| /
 \verb|call %P[new]|) and percpu templates, where the operand is a
 \texttt{"i"}-constrained function or a memory object, not a plain value.  kcc
 materialises every asm operand into a register or immediate and so would
@@ -721,8 +725,8 @@ static void x86_emit_asm(void *i) {
             continue;
         }
         unsigned long sz = 0;                    /* 0 = the operand's own size */
-        unsigned long raw = 0;                   /* %P/%c: render the operand bare (symbol/const) */
-        if (nx == 'P' || nx == 'c') { raw = 1; p++; nx = t[p + 1]; }
+        unsigned long raw = 0;                   /* %p/%P/%c: render the operand bare (symbol/const) */
+        if (nx == 'p' || nx == 'P' || nx == 'c') { raw = 1; p++; nx = t[p + 1]; }
         else if (nx == 'b') { sz = 1; p++; nx = t[p + 1]; }
         else if (nx == 'w') { sz = 2; p++; nx = t[p + 1]; }
         else if (nx == 'k') { sz = 4; p++; nx = t[p + 1]; }

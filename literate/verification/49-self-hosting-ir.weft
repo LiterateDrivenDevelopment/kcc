@@ -1101,6 +1101,16 @@ static unsigned long kcc_asm_cons_imm(const char *c) {
    `%P` then falls back to the operand's materialised register. */
 static const char *kcc_asm_operand_lval(void *lv);
 
+/* A string-literal inline-asm operand (through casts/parens), or 0. */
+static void *kcc_asm_operand_strlit(void *expr) {
+    if (!expr) return 0;
+    unsigned long tag = IL(expr, AST_TAG);
+    while (tag == AST_PAREN_EXPR) { expr = (void *)IL(expr, AST_F0); if (!expr) return 0; tag = IL(expr, AST_TAG); }
+    if (tag == AST_CAST_EXPR) return kcc_asm_operand_strlit((void *)IL(expr, AST_F1));
+    if (tag == AST_STR_LIT) return expr;
+    return 0;
+}
+
 /* Constant byte offset accumulated while resolving an inline-asm symbol operand
    like `&arr[3]' or `&s.field': the operand renders as `name+offset'. */
 static long kcc_asm_sym_off = 0;
@@ -1189,7 +1199,17 @@ void kcc_ir_asm_lower_operands(void *as) {
         kcc_asm_sym_off = 0;
         const char *sym = kcc_target ? kcc_asm_operand_symname(expr) : 0;
         long symoff = kcc_asm_sym_off;
-        if (kcc_target && c != '=' && c != '+' &&
+        void *strlit = kcc_target ? kcc_asm_operand_strlit(expr) : 0;
+        if (strlit && c != '=' && c != '+' && kcc_asm_cons_imm(cons)) {
+            /* string-literal `"i"'/`"s"' operand: the back end emits the string
+               to .rodata and references its label---the kernel's WARN/BUG entries
+               store `"i"(__FILE__)' as `.long %c0 - .' in __bug_table.  Stash the
+               bytes/length (COL/F3) under a string marker (F2 bit 61); no
+               register is materialised. */
+            IL(op, AST_COL) = IL(strlit, AST_F0);
+            IL(op, AST_F3) = IL(strlit, AST_F1);
+            IL(op, AST_F2) = (1UL << 61);
+        } else if (kcc_target && c != '=' && c != '+' &&
             kcc_asm_cons_imm(cons) && kcc_expr_is_ice(expr)) {
             /* x86 immediate operand: a constant input the back end renders as
                $value.  Only on x86 (ARM64's asm path materialises it in a

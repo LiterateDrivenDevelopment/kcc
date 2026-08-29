@@ -1172,7 +1172,6 @@ static const char *kcc_asm_operand_lval(void *lv) {
         return kcc_asm_operand_lval((void *)IL(lv, AST_F0));
     }
     if (tag == AST_MEMBER) {
-        if (IL(lv, AST_F2)) return 0;                 /* `p->m': base is a runtime pointer */
         void *obj = (void *)IL(lv, AST_F0);
         void *st = (void *)IL(obj, AST_F3);
         if (st && IL(st, TY_KIND) == TY_PTR) st = (void *)IL(st, TY_F0);
@@ -1181,6 +1180,10 @@ static const char *kcc_asm_operand_lval(void *lv) {
             struct kcc_member_res mr = kcc_type_find_member(st, (const char *)IL(lv, AST_F1));
             if (mr.field) kcc_asm_sym_off += (long)mr.off;
         }
+        /* `s.m': the address is &s + offset.  `p->m': the address is p (a pointer
+           value---a constant only when p is itself `&sym') + offset; the kernel's
+           static_branch takes `&(&key)->key'. */
+        if (IL(lv, AST_F2)) return kcc_asm_operand_symname(obj);
         return kcc_asm_operand_lval(obj);
     }
     return 0;

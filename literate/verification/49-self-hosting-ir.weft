@@ -4461,6 +4461,164 @@ static unsigned long kcc_ir_ffs(unsigned long val, unsigned long nbits) {
     return kcc_ir_emit_binop(IR_MUL, tp1, nz);
 }
 
+/* --- always_inline expansion ------------------------------------------------
+   An `always_inline` function is inlined at each call by building a clone of its
+   body with the parameters replaced by the call's arguments.  This is what makes
+   a constant the CALLER knows fold through the callee---the kernel's
+   `static_cpu_has(FEATURE)` needs the constant feature bit substituted into a
+   `1 << (bit & 7)` `"i"` inline-asm operand, which GCC only accepts once it is a
+   compile-time constant.  The registry is filled by the parser as each
+   always_inline definition closes (kcc_register_always_inline).  This first
+   phase handles a `{ return EXPR; }` body; the clone declines (returns 0) for
+   any construct it does not model, so an unhandled callee simply falls back to a
+   real call and can never be miscompiled. */
+static void *kcc_always_inline_fns = 0;
+void kcc_register_always_inline(const char *name, void *fndecl) {
+    if (!kcc_always_inline_fns) kcc_always_inline_fns = kcc_ht_init(64);
+    kcc_ht_put(kcc_always_inline_fns, name, kcc_strlen(name), fndecl);
+}
+
+/* Shallow node copy: same tag and all five fields, no sibling link. */
+static void *kcc_inl_dup(void *node) {
+    void *d = kcc_ast_alloc(IL(node, AST_TAG));
+    IL(d, AST_LINE) = IL(node, AST_LINE); IL(d, AST_COL) = IL(node, AST_COL);
+    IL(d, AST_F0) = IL(node, AST_F0); IL(d, AST_F1) = IL(node, AST_F1);
+    IL(d, AST_F2) = IL(node, AST_F2); IL(d, AST_F3) = IL(node, AST_F3);
+    IL(d, AST_F4) = 0;
+    return d;
+}
+
+static void *kcc_inl_clone(void *node, void *params, void *args);
+
+/* The call argument bound to parameter `nm`, or 0 if `nm` names no parameter. */
+static void *kcc_inl_arg_for(const char *nm, void *params, void *args) {
+    void *p = params, *a = args;
+    while (p && a) {
+        const char *pn = (const char *)IL(p, AST_F1);
+        if (pn && kcc_strcmp(pn, nm) == 0) return a;
+        p = (void *)IL(p, AST_F4); a = (void *)IL(a, AST_F4);
+    }
+    return 0;
+}
+
+/* Clone an f4-linked argument list; (void *)-1 signals an unclonable element. */
+static void *kcc_inl_clone_list(void *head, void *params, void *args) {
+    void *first = 0, *last = 0;
+    for (void *el = head; el; el = (void *)IL(el, AST_F4)) {
+        void *c = kcc_inl_clone(el, params, args);
+        if (!c) return (void *)-1;
+        if (!first) { first = c; last = c; }
+        else { IL(last, AST_F4) = (unsigned long)c; last = c; }
+    }
+    return first;
+}
+
+static void *kcc_inl_clone(void *node, void *params, void *args) {
+    if (!node) return 0;
+    unsigned long tag = IL(node, AST_TAG);
+    if (tag == AST_INT_LIT || tag == AST_CHAR_LIT || tag == AST_FLOAT_LIT ||
+        tag == AST_STR_LIT)
+        return kcc_inl_dup(node);
+    if (tag == AST_IDENT_EXPR) {
+        void *arg = kcc_inl_arg_for((const char *)IL(node, AST_F0), params, args);
+        if (arg) return kcc_inl_clone(arg, 0, 0);   /* substitute the argument */
+        return kcc_inl_dup(node);                   /* a global / enum reference */
+    }
+    if (tag == AST_BINARY_EXPR || tag == AST_ASSIGN_EXPR || tag == AST_COMMA_EXPR) {
+        void *l = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        void *r = kcc_inl_clone((void *)IL(node, AST_F2), params, args);
+        if (!l || !r) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F1) = (unsigned long)l; IL(d, AST_F2) = (unsigned long)r;
+        return d;
+    }
+    if (tag == AST_UNARY_EXPR || tag == AST_PAREN_EXPR) {
+        unsigned long fld = (tag == AST_UNARY_EXPR) ? AST_F1 : AST_F0;
+        void *o = kcc_inl_clone((void *)IL(node, fld), params, args);
+        if (!o) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, fld) = (unsigned long)o;
+        return d;
+    }
+    if (tag == AST_CAST_EXPR) {                     /* F0 = type (shared), F1 = expr */
+        void *o = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        if (!o) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F1) = (unsigned long)o;
+        return d;
+    }
+    if (tag == AST_COND_EXPR) {
+        void *c = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        void *t = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        void *f = kcc_inl_clone((void *)IL(node, AST_F2), params, args);
+        if (!c || !t || !f) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)c; IL(d, AST_F1) = (unsigned long)t;
+        IL(d, AST_F2) = (unsigned long)f;
+        return d;
+    }
+    if (tag == AST_SUBSCRIPT) {
+        void *b = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        void *i = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        if (!b || !i) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)b; IL(d, AST_F1) = (unsigned long)i;
+        return d;
+    }
+    if (tag == AST_MEMBER) {                        /* F0 = obj, F1 = name, F2 = arrow */
+        void *o = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        if (!o) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)o;
+        return d;
+    }
+    if (tag == AST_SIZEOF_EXPR || tag == AST_ALIGNOF_EXPR) {
+        void *d = kcc_inl_dup(node);
+        if (!IL(node, AST_F1)) {                    /* F1 set = a type operand (kept) */
+            void *o = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+            if (!o) return 0;
+            IL(d, AST_F0) = (unsigned long)o;
+        }
+        return d;
+    }
+    if (tag == AST_CALL_EXPR) {
+        void *cal = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        if (!cal) return 0;
+        void *al = kcc_inl_clone_list((void *)IL(node, AST_F1), params, args);
+        if (al == (void *)-1) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)cal; IL(d, AST_F1) = (unsigned long)al;
+        return d;
+    }
+    return 0;                                       /* unhandled: decline to inline */
+}
+
+/* If `name` is a registered always_inline function with a `{ return E; }` body
+   and a matching argument count, build E with parameters replaced by the call
+   arguments and report its value; return 0 to fall back to a real call. */
+static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
+    if (!kcc_always_inline_fns) return 0;
+    void *fn = (void *)kcc_ht_get(kcc_always_inline_fns, name, kcc_strlen(name));
+    if (!fn) return 0;
+    void *body = (void *)IL(fn, AST_F3);
+    if (!body || IL(body, AST_TAG) != AST_COMPOUND) return 0;
+    void *stmts = (void *)IL(body, AST_F0);
+    if (!stmts || IL(stmts, AST_F4)) return 0;      /* exactly one statement */
+    if (IL(stmts, AST_TAG) != AST_RETURN_STMT) return 0;
+    void *retexpr = (void *)IL(stmts, AST_F0);
+    if (!retexpr) return 0;
+    void *params = (void *)(IL(fn, AST_F2) & ~3UL); /* strip variadic + linkage flags */
+    void *args = (void *)IL(call, AST_F1);
+    unsigned long np = 0, na = 0;
+    for (void *p = params; p; p = (void *)IL(p, AST_F4)) np++;
+    for (void *a = args; a; a = (void *)IL(a, AST_F4)) na++;
+    if (np != na) return 0;
+    void *clone = kcc_inl_clone(retexpr, params, args);
+    if (!clone) return 0;
+    *out = kcc_ir_build_expr(clone);
+    return 1;
+}
+
 unsigned long kcc_ir_build_call(void *e) {
     void *callee = (void *)IL(e, AST_F0);
     if (!callee) return 0;
@@ -4528,6 +4686,12 @@ unsigned long kcc_ir_build_call(void *e) {
         else if (kcc_strcmp(name, "__builtin_strcpy") == 0) name = "strcpy";
         else if (kcc_strcmp(name, "__builtin_strcmp") == 0) name = "strcmp";
         unsigned long v = (unsigned long)kcc_ht_get(kcc_ir_locals, name, kcc_strlen(name));
+        /* An always_inline callee (not shadowed by a local of the same name) is
+           expanded in place rather than called. */
+        if (!v) {
+            unsigned long inl;
+            if (kcc_ir_try_inline(e, name, &inl)) return inl;
+        }
         if (v) indirect = 1;
         else {
             void *ct = (void *)IL(callee, AST_F3);

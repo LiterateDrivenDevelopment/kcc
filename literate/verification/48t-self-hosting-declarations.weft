@@ -75,6 +75,12 @@ unsigned long kcc_attr_weak = 0;
 const char *kcc_attr_section = 0;
 const char *kcc_attr_alias = 0;
 void *kcc_attr_ht = 0;
+/* Set when an `__attribute__((always_inline))` (kernel `__always_inline`) is
+   seen; the function-definition path hands the flagged function to the inliner
+   registry, then clears it.  Accumulated like the linkage attributes, not reset
+   per skip_attributes call. */
+unsigned long kcc_attr_always_inline = 0;
+void kcc_register_always_inline(const char *name, void *fndecl);
 /* Name of the function whose body is currently being parsed, so that a primary
    expression `__func__` (\stdref{6.4.2.2}) can materialise it as a string
    literal.  Null outside any function body. */
@@ -190,6 +196,9 @@ void kcc_parse_skip_attributes(void) {
                          (l == 11 && kcc_memcmp(txt, "__section__", 11) == 0)) want_section = 1;
                 else if ((l == 5 && kcc_memcmp(txt, "alias", 5) == 0) ||
                          (l == 9 && kcc_memcmp(txt, "__alias__", 9) == 0)) want_alias = 1;
+                else if ((l == 13 && kcc_memcmp(txt, "always_inline", 13) == 0) ||
+                         (l == 17 && kcc_memcmp(txt, "__always_inline__", 17) == 0))
+                    kcc_attr_always_inline = 1;
             } else if (tt == TOK_NUMBER) {
                 if (want_align) {
                     want_align = 0;
@@ -922,6 +931,7 @@ void *kcc_parse_decl(void) {
     if (d->f1 && (kcc_attr_weak || kcc_attr_section || kcc_attr_alias))
         kcc_attr_record((const char *)d->f1);
     kcc_attr_weak = 0; kcc_attr_section = 0; kcc_attr_alias = 0;
+    unsigned long always_inl = kcc_attr_always_inline; kcc_attr_always_inline = 0;
 
     if (d->tag == AST_FUNC_DECL) {
         if (storage == 1) {
@@ -938,6 +948,12 @@ void *kcc_parse_decl(void) {
             d->f3 = (unsigned long)kcc_parse_compound();
             kcc_cur_func_name = 0;
             if (storage == 3) d->f2 |= 2;      /* static function → local linkage */
+            /* An `always_inline` definition joins the inliner registry so its
+               callers can substitute the (constant) arguments into the body---the
+               kernel's static_cpu_has and friends need this to fold the constant
+               feature bit into an `"i"` inline-asm operand. */
+            if (always_inl && d->f1)
+                kcc_register_always_inline((const char *)d->f1, d);
             return d;
         }
         if (kcc_tok_type != TOK_COMMA) {

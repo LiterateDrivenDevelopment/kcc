@@ -843,6 +843,20 @@ difftest "local-label-declaration" \
        return ({ __label__ done; int r = 1; if (x > 0) goto done; r = 2; done: r; });
      }
      int main(void){ return (pick(5) == 1 && pick(-1) == 2) ? 0 : 1; }"
+# An always_inline function is expanded at its call site with the arguments
+# substituted for the parameters (the kernel marks static_cpu_has and many small
+# accessors this way).  A `{ return EXPR; }` body inlines to EXPR; the result
+# must match a plain call for constant and non-constant arguments alike, and a
+# nested inline call must expand too.
+difftest "always-inline-expr" \
+    "static inline __attribute__((always_inline)) int add1(int x){ return x + 1; }
+     static inline __attribute__((always_inline)) int dbl(int x){ return x + x; }
+     static inline __attribute__((always_inline)) int mix(int a,int b){ return add1(a) + dbl(b); }
+     int main(void){ int y = 20;
+       if (add1(41) != 42) return 1;
+       if (dbl(y) != 40) return 2;
+       if (mix(9, 3) != (9+1)+(3+3)) return 3;
+       return 0; }"
 # A `.name` designator may target a member promoted from an anonymous
 # struct/union (C17 6.7.2.1p13) — pervasive in kernel headers (qspinlock's
 # `union { atomic_t val; struct { u8 locked, pending; }; }` initialized by name).

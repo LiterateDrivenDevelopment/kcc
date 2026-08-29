@@ -46,6 +46,7 @@ struct StrLit { void *ptr; unsigned long len; };   /* returned in x0:x1 */
 extern unsigned long kcc_tok_type;
 extern const char *kcc_tok_start;
 extern unsigned long kcc_tok_len;
+int kcc_memcmp(const void *a, const void *b, unsigned long n);
 
 void kcc_pp_next(void);
 void kcc_parse_expect(unsigned long tok_type);
@@ -356,7 +357,11 @@ class, else a statement, and each item---which may itself be a multi-declarator
 chain---is appended by walking to its \texttt{f4} tail.  The selection and
 iteration forms are the direct grammar: each consumes its keyword and
 parenthesised parts and builds its node.  \texttt{for} accepts a declaration or
-an expression initializer and allows any of its three clauses to be empty.
+an expression initializer and allows any of its three clauses to be empty.  A
+leading GNU local label declaration (\texttt{\_\_label\_\_ a, b;}), which the
+kernel's \texttt{wait\_event}/RCU statement-expression macros use, is consumed
+and discarded---kcc scopes labels per function, so the names bind through the
+ordinary \texttt{goto} machinery.
 
 @l c
 @d Selfhost: statements compound @{
@@ -373,6 +378,22 @@ void *kcc_parse_compound(void) {
     for (;;) {
         unsigned long t = kcc_tok_type;
         if (t == TOK_RBRACE || t == TOK_EOF) break;
+        /* GNU local label declaration: `__label__ a, b;` at the head of a block
+           (the kernel's wait_event/RCU statement-expression macros open with one
+           so a nested `goto` can name a block-local target).  kcc resolves labels
+           per function, so the declaration only has to be consumed; the names
+           still bind through the normal label/goto machinery. */
+        if (t == TOK_IDENT && kcc_tok_len == 9 &&
+            kcc_memcmp(kcc_tok_start, "__label__", 9) == 0) {
+            kcc_pp_next();
+            for (;;) {
+                if (kcc_tok_type == TOK_IDENT) kcc_pp_next();
+                if (kcc_tok_type != TOK_COMMA) break;
+                kcc_pp_next();
+            }
+            kcc_parse_expect(TOK_SEMI);
+            continue;
+        }
         void *item;
         if (kcc_parse_is_type_token() || starts_decl(kcc_tok_type))
             item = kcc_parse_decl();

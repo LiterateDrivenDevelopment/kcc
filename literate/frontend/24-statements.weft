@@ -623,11 +623,22 @@ names.  When a declaration produces multiple nodes linked via
 chain to find its tail so that the next item is linked after the last
 declarator rather than overwriting the chain.
 
+A block may open with one or more GNU \emph{local label declarations}
+(\texttt{\_\_label\_\_ a, b;})---the kernel's \texttt{wait\_event} and RCU
+statement-expression macros use them so a nested \texttt{goto} can name a
+block-local target.  kcc resolves labels per function, so the loop simply
+consumes a leading \texttt{\_\_label\_\_} run (identifiers separated by commas,
+terminated by \texttt{;}) and moves on; the label names still bind through the
+ordinary label/\texttt{goto} machinery.
+
 @d Stmt: parse compound @{
 // -- kcc_parse_compound ------------------------------------------------
 // node *kcc_parse_compound(void)
 // Parses a compound statement { items... }
 // Returns AST_COMPOUND node with F0 = first item.
+.section __TEXT,__cstring,cstring_literals
+_kcc_str_label: .asciz "__label__"
+.text
 .globl _kcc_parse_compound
 .p2align 2
 _kcc_parse_compound:
@@ -660,6 +671,47 @@ _kcc_parse_compound:
     cmp x0, #TOK_RBRACE
     b.eq .Lcompound_close
     cbz x0, .Lcompound_close     // EOF
+
+    // GNU local label declaration `__label__ a, b;` at the head of a block
+    // (the kernel's wait_event/RCU statement-expression macros open with one).
+    // kcc resolves labels per function, so just consume it; the names still bind
+    // through the normal label/goto machinery.
+    cmp x0, #TOK_IDENT
+    b.ne .Lcompound_notlabel
+    adrp x1, _kcc_tok_len@@PAGE
+    add  x1, x1, _kcc_tok_len@@PAGEOFF
+    ldr  x1, [x1]
+    cmp x1, #9
+    b.ne .Lcompound_notlabel
+    adrp x0, _kcc_tok_start@@PAGE
+    add  x0, x0, _kcc_tok_start@@PAGEOFF
+    ldr  x0, [x0]
+    adrp x1, _kcc_str_label@@PAGE
+    add  x1, x1, _kcc_str_label@@PAGEOFF
+    mov x2, #9
+    bl _kcc_memcmp
+    cbnz x0, .Lcompound_notlabel
+    bl _kcc_pp_next              // consume '__label__'
+.Lcompound_label_ids:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_IDENT
+    b.ne .Lcompound_label_comma
+    bl _kcc_pp_next             // consume a label name
+.Lcompound_label_comma:
+    adrp x0, _kcc_tok_type@@PAGE
+    add  x0, x0, _kcc_tok_type@@PAGEOFF
+    ldr  x0, [x0]
+    cmp x0, #TOK_COMMA
+    b.ne .Lcompound_label_end
+    bl _kcc_pp_next             // consume ','
+    b .Lcompound_label_ids
+.Lcompound_label_end:
+    mov x0, #TOK_SEMI
+    bl _kcc_parse_expect        // consume ';'
+    b .Lcompound_loop
+.Lcompound_notlabel:
 
     // Is it a declaration or a statement?
     bl _kcc_parse_is_type_token

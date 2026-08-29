@@ -832,6 +832,17 @@ int main(void){
   if (arr[0]!=10 || arr[1]!=20 || arr[2]!=30 || arr[3]!=0) return 1;
   if (sizeof(inf)/sizeof(inf[0]) != 4 || inf[3]!=7) return 2;
   return 0; }"
+# A block may open with a GNU local label declaration `__label__ name;` so a
+# nested `goto` inside a statement-expression can name a block-local target.
+# The kernel's wait_event/RCU macros expand to exactly this shape.  kcc scopes
+# labels per function, so the declaration is consumed and the label binds
+# through the ordinary goto machinery.  Covers a `__label__` at the head of a
+# statement-expression with a forward goto to it.
+difftest "local-label-declaration" \
+    "int pick(int x){
+       return ({ __label__ done; int r = 1; if (x > 0) goto done; r = 2; done: r; });
+     }
+     int main(void){ return (pick(5) == 1 && pick(-1) == 2) ? 0 : 1; }"
 # A `.name` designator may target a member promoted from an anonymous
 # struct/union (C17 6.7.2.1p13) — pervasive in kernel headers (qspinlock's
 # `union { atomic_t val; struct { u8 locked, pending; }; }` initialized by name).

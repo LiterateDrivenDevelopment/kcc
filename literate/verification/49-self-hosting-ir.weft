@@ -4632,17 +4632,6 @@ static void *kcc_inl_dup(void *node) {
 
 static void *kcc_inl_clone(void *node, void *params, void *args);
 
-/* The call argument bound to parameter `nm`, or 0 if `nm` names no parameter. */
-static void *kcc_inl_arg_for(const char *nm, void *params, void *args) {
-    void *p = params, *a = args;
-    while (p && a) {
-        const char *pn = (const char *)IL(p, AST_F1);
-        if (pn && kcc_strcmp(pn, nm) == 0) return a;
-        p = (void *)IL(p, AST_F4); a = (void *)IL(a, AST_F4);
-    }
-    return 0;
-}
-
 /* Clone an f4-linked argument list; (void *)-1 signals an unclonable element. */
 static void *kcc_inl_clone_list(void *head, void *params, void *args) {
     void *first = 0, *last = 0;
@@ -4662,8 +4651,27 @@ static void *kcc_inl_clone(void *node, void *params, void *args) {
         tag == AST_STR_LIT)
         return kcc_inl_dup(node);
     if (tag == AST_IDENT_EXPR) {
-        void *arg = kcc_inl_arg_for((const char *)IL(node, AST_F0), params, args);
-        if (arg) return kcc_inl_clone(arg, 0, 0);   /* substitute the argument */
+        const char *nm = (const char *)IL(node, AST_F0);
+        void *p = params, *a = args;
+        while (p && a) {
+            const char *pn = (const char *)IL(p, AST_F1);
+            if (pn && kcc_strcmp(pn, nm) == 0) {
+                void *ac = kcc_inl_clone(a, 0, 0);   /* clone the argument */
+                if (!ac) return 0;
+                /* Bind through the parameter's type: an argument of a narrower
+                   type would otherwise give the operand the wrong width (a `long'
+                   bit number materialised as %r9d clashes with a `btrq').  A cast
+                   of a constant is still a constant, so this preserves folding. */
+                void *pty = (void *)IL(p, AST_F0);
+                if (!pty) return ac;
+                void *cst = kcc_ast_alloc(AST_CAST_EXPR);
+                IL(cst, AST_F0) = (unsigned long)pty;
+                IL(cst, AST_F1) = (unsigned long)ac;
+                IL(cst, AST_F3) = (unsigned long)kcc_sema_resolve_type(pty);
+                return cst;
+            }
+            p = (void *)IL(p, AST_F4); a = (void *)IL(a, AST_F4);
+        }
         return kcc_inl_dup(node);                   /* a global / enum reference */
     }
     if (tag == AST_BINARY_EXPR || tag == AST_ASSIGN_EXPR || tag == AST_COMMA_EXPR) {

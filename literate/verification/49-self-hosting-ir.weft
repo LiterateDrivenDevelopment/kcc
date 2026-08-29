@@ -1121,10 +1121,12 @@ void kcc_ir_asm_lower_operands(void *as) {
             /* x86 immediate operand: a constant input the back end renders as
                $value.  Only on x86 (ARM64's asm path materialises it in a
                register instead); a matching register alternative ("Ir") on a
-               non-constant value falls through to the register path below. */
-            IL(op, AST_F1) = (unsigned long)kcc_eval_const_int(expr);
+               non-constant value falls through to the register path below.  The
+               value goes in F3, NOT F1: F1 must stay the operand's `[name]` so a
+               `%[name]` reference (the kernel's `%[bitnum]`) still resolves---the
+               marker bit alone tells the back end this operand is a constant. */
             IL(op, AST_F2) = (1UL << 63);        /* immediate marker */
-            IL(op, AST_F3) = 0;
+            IL(op, AST_F3) = (unsigned long)kcc_eval_const_int(expr);
         } else if (cls == 'm') {
             /* memory operand ("m"/"=m"/"+m"): the asm accesses the object
                through its address, so we only need that address---no register

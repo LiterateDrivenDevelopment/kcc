@@ -568,12 +568,12 @@ static void x86_asm_label_name(void *node, const char *nm, unsigned long nlen) {
 }
 /* Resolve a symbolic operand reference %[name] to its operand index.  The
    parser stores each operand's `[name]' in the operand node's F1 (a field the
-   constraint length no longer needs, since the string is NUL-terminated);
-   immediate operands reuse F1 for their value, so they are skipped here. */
+   constraint length no longer needs, since the string is NUL-terminated).  An
+   immediate keeps its name in F1 too (its value lives in F3), so a named
+   immediate like the kernel's `%[bitnum]` resolves here just like any other. */
 static unsigned long x86_asm_opnum(void *node, const char *nm, unsigned long nlen) {
     unsigned long k = 0;
     for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4), k++) {
-        if ((IL(op, AST_F2) >> 63) & 1) continue;    /* immediate: F1 is a value */
         const char *on = (const char *)IL(op, AST_F1);
         if (!on) continue;
         unsigned long j = 0;
@@ -626,7 +626,7 @@ static void x86_emit_asm(void *i) {
            the value in AST_F1; that decision (constant vs register) already
            accounts for `Ir`-style alternatives. */
         isimm[nop] = (IL(op, AST_F2) >> 63) & 1;
-        immval[nop] = IL(op, AST_F1);
+        immval[nop] = IL(op, AST_F3);          /* the constant value (F1 stays the name) */
         issym[nop] = (IL(op, AST_F2) >> 62) & 1;    /* symbolic operand: name in COL (for %P) */
         symname[nop] = issym[nop] ? (const char *)IL(op, AST_COL) : 0;
         regof[nop] = nop;

@@ -400,11 +400,22 @@ scalar landing on a scalar sub-object, is written by
 which follows the \texttt{AST\_F2} links one sub-object at a time
 (\texttt{\_kcc\_ir\_subobj} descending both the byte offset and the type)
 to the leaf, and retargets the cursor to the first designator's position so
-plain elements that follow resume from there.  A GNU array-range designator
+plain elements that follow resume from there.  A \texttt{.name} that is not a
+direct member is looked up through the type's \emph{anonymous} members
+(\stdref{6.7.2.1p13}): \texttt{\_kcc\_ir\_field\_index} skips an unnamed member
+(its name pointer is \texttt{NULL}, so it never reaches \texttt{\_kcc\_strcmp}),
+and the resolver, guided by \texttt{\_kcc\_ir\_type\_has\_member} and
+\texttt{\_kcc\_ir\_anon\_containing}, steps into the unnamed member that promotes
+the name---adding its offset and continuing from its type---until the name is a
+direct field; the first member so entered becomes the recorded cursor position.
+A GNU array-range designator
 (\texttt{is\_field}~=~2) is handled before that chain walk: the same
 initializer value is filled into every element from the low index
 (\texttt{F0}) to the high index (\texttt{F2}) inclusive, and the cursor
-resumes just past the range.  The remaining subtlety is
+resumes just past the range.  Both bounds---like every designator index---are
+constant \emph{expression} nodes evaluated here at lowering time (so an enum
+constant, absent from the symbol table during parsing, resolves), not integers
+folded during the parse.  The remaining subtlety is
 \emph{brace elision} (\stdref{6.7.9p20}): when a plain scalar meets an
 aggregate sub-object that has no brace of its own, the scalar and those
 after it flow into that aggregate's leaves in order.
@@ -461,27 +472,36 @@ work identically at file scope.
 .globl _kcc_ir_initlist_count
 .p2align 2
 _kcc_ir_initlist_count:
-    ldr x0, [x0, #AST_F0]       // first element
-    mov x1, #0                  // running index
-    mov x2, #0                  // max slots
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    ldr x19, [x0, #AST_F0]      // first element (cursor)
+    mov x20, #0                 // running index
+    mov x21, #0                 // max slots
 .Lilc_loop:
-    cbz x0, .Lilc_done
-    ldr x3, [x0, #AST_TAG]
+    cbz x19, .Lilc_done
+    ldr x3, [x19, #AST_TAG]
     cmp x3, #AST_DESIGNATOR
     b.ne .Lilc_step
-    ldr x3, [x0, #AST_F1]       // is_field?
+    ldr x3, [x19, #AST_F1]      // is_field?
     cbnz x3, .Lilc_step         // a member designator does not move the index
-    ldr x1, [x0, #AST_F0]       // [i] = : running index becomes i
+    ldr x0, [x19, #AST_F0]      // [i] = : evaluate the index expression
+    bl _kcc_eval_const_int
+    mov x20, x0                 // running index becomes it
 .Lilc_step:
-    add x1, x1, #1              // this element consumes slot (running-1)
-    cmp x1, x2
+    add x20, x20, #1            // this element consumes slot (running-1)
+    cmp x20, x21
     b.le .Lilc_nomax
-    mov x2, x1
+    mov x21, x20
 .Lilc_nomax:
-    ldr x0, [x0, #AST_F4]
+    ldr x19, [x19, #AST_F4]
     b .Lilc_loop
 .Lilc_done:
-    mov x0, x2
+    mov x0, x21
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
     ret
 
 // -- kcc_ir_emit_indexed_store --------------------------------------------
@@ -654,9 +674,11 @@ _kcc_ir_field_index:
 .Lfi_loop:
     cbz x20, .Lfi_notfound
     ldr x0, [x20, #AST_F1]       // field name
+    cbz x0, .Lfi_skip            // anonymous member: no name to match, skip
     mov x1, x19
     bl _kcc_strcmp
     cbz x0, .Lfi_found
+.Lfi_skip:
     ldr x20, [x20, #AST_F4]      // next field
     add x21, x21, #1
     b .Lfi_loop
@@ -666,6 +688,96 @@ _kcc_ir_field_index:
 .Lfi_notfound:
     mov x0, #-1
 .Lfi_ret:
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+// -- kcc_ir_type_has_member -----------------------------------------------
+// uint64_t kcc_ir_type_has_member(type *ty, char *name)
+//   Whether `name` is a member of struct/union `ty`, directly or promoted
+//   through one of its anonymous (unnamed) struct/union members (C17
+//   6.7.2.1p13).  Recurses into each anonymous member's type.
+.p2align 2
+_kcc_ir_type_has_member:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x1                  // name
+    cbz x0, .Lthm_no
+    ldr x2, [x0, #TY_KIND]
+    cmp x2, #TY_STRUCT
+    b.eq .Lthm_ok
+    cmp x2, #TY_UNION
+    b.ne .Lthm_no
+.Lthm_ok:
+    ldr x2, [x0, #TY_F0]         // struct decl
+    cbz x2, .Lthm_no
+    ldr x20, [x2, #AST_F1]       // first field
+.Lthm_loop:
+    cbz x20, .Lthm_no
+    ldr x0, [x20, #AST_F1]       // field name
+    cbz x0, .Lthm_anon
+    mov x1, x19
+    bl _kcc_strcmp
+    cbz x0, .Lthm_yes
+    b .Lthm_cont
+.Lthm_anon:
+    ldr x0, [x20, #AST_F0]       // anonymous member's type node
+    cbz x0, .Lthm_cont
+    bl _kcc_sema_resolve_type    // x0 = resolved type
+    mov x1, x19
+    bl _kcc_ir_type_has_member   // recurse into the anonymous member
+    cbnz x0, .Lthm_yes
+.Lthm_cont:
+    ldr x20, [x20, #AST_F4]      // next field
+    b .Lthm_loop
+.Lthm_yes:
+    mov x0, #1
+    b .Lthm_ret
+.Lthm_no:
+    mov x0, #0
+.Lthm_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_ir_anon_containing -----------------------------------------------
+// int64_t kcc_ir_anon_containing(type *agg, char *name)
+//   Position of the anonymous struct/union member of `agg` through which
+//   `name` is reachable, or -1.  Used by the designator resolver to step
+//   into an unnamed member on the way to a promoted name.
+.p2align 2
+_kcc_ir_anon_containing:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    mov x19, x1                  // name
+    ldr x2, [x0, #TY_F0]         // struct decl (x0 = agg, still live)
+    cbz x2, .Lac2_no
+    ldr x20, [x2, #AST_F1]       // first field
+    mov x21, #0                  // index
+.Lac2_loop:
+    cbz x20, .Lac2_no
+    ldr x0, [x20, #AST_F1]       // field name
+    cbnz x0, .Lac2_cont          // named member: not a descent candidate
+    ldr x0, [x20, #AST_F0]       // anonymous member's type node
+    cbz x0, .Lac2_cont
+    bl _kcc_sema_resolve_type
+    mov x1, x19
+    bl _kcc_ir_type_has_member
+    cbnz x0, .Lac2_found
+.Lac2_cont:
+    ldr x20, [x20, #AST_F4]      // next field
+    add x21, x21, #1
+    b .Lac2_loop
+.Lac2_found:
+    mov x0, x21
+    b .Lac2_ret
+.Lac2_no:
+    mov x0, #-1
+.Lac2_ret:
     ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #48
@@ -791,6 +903,7 @@ _kcc_ir_resolve_designator:
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
     mov x19, x0                  // cur_type
     mov x20, x1                  // cur_off (absolute)
     mov x21, x2                  // current designator
@@ -804,9 +917,36 @@ _kcc_ir_resolve_designator:
     ldr x1, [x21, #AST_F0]       // member name
     bl _kcc_ir_field_index       // x0 = position (or -1)
     mov x24, x0                  // position
-    b .Lrd_sub
+    // Descend through anonymous members while the name is not a direct field
+    // of cur_type: step into the unnamed member that promotes it, accumulate
+    // its offset, and re-resolve there (C17 6.7.2.1p13).
+.Lrd_desc:
+    cmn x24, #1                  // position == -1 ?
+    b.ne .Lrd_sub                // resolved to a direct field: proceed
+    mov x0, x19
+    ldr x1, [x21, #AST_F0]       // name
+    bl _kcc_ir_anon_containing   // x0 = anon member index, or -1
+    cmn x0, #1
+    b.eq .Lrd_sub                // genuinely absent: fall through with pos=-1
+    mov x25, x0                  // outer anonymous member index
+    mov x0, x19
+    mov x1, x25
+    bl _kcc_ir_subobj            // x0=off, x2=sub_type
+    add x20, x20, x0             // cur_off += anonymous member offset
+    mov x19, x2                  // cur_type = anonymous member type
+    cmn x22, #1                  // first_pos still -1?
+    b.ne .Lrd_desc2
+    mov x22, x25                 // record the outer position for cursor resume
+.Lrd_desc2:
+    mov x0, x19
+    ldr x1, [x21, #AST_F0]       // name
+    bl _kcc_ir_field_index
+    mov x24, x0
+    b .Lrd_desc
 .Lrd_index:
-    ldr x24, [x21, #AST_F0]      // [i] : position = i
+    ldr x0, [x21, #AST_F0]       // [i] : evaluate the index expression
+    bl _kcc_eval_const_int
+    mov x24, x0                  // position = i
 .Lrd_sub:
     mov x0, x19
     mov x1, x24
@@ -827,6 +967,7 @@ _kcc_ir_resolve_designator:
     mov x1, x19                  // leaf type
     mov x2, x22                  // first position
     mov x3, x23                  // leaf field
+    ldp x25, x26, [sp, #64]
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
@@ -1274,12 +1415,19 @@ _kcc_ir_fill_list:
     b .Lfll_loop
 .Lfll_range:
     // GNU array range `[lo ... hi] = value`: fill every element in [lo, hi]
-    // with the same initializer.  x24 = running pos (preserved by fill_one and
-    // subobj, both callee-saving x24); the high bound is re-read from the
-    // designator node each iteration because fill_one does NOT preserve x25.
-    ldr x24, [x22, #AST_F0]      // pos = lo
+    // with the same initializer.  The bounds are now index EXPRESSIONS, so
+    // evaluate them once; the high bound is stashed on the frame at [sp,#80]
+    // (call-clobbered registers cannot hold it) and reloaded each iteration.
+    // x24 = running pos (preserved by fill_one and subobj).  Evaluate hi first
+    // so the last call is lo, leaving x24 undisturbed by any bl.
+    ldr x0, [x22, #AST_F2]       // hi expression
+    bl _kcc_eval_const_int
+    str x0, [sp, #80]            // stash evaluated hi
+    ldr x0, [x22, #AST_F0]       // lo expression
+    bl _kcc_eval_const_int
+    mov x24, x0                  // pos = lo
 .Lfll_range_loop:
-    ldr x25, [x22, #AST_F2]      // hi (re-read: not call-preserved)
+    ldr x25, [sp, #80]           // hi (reload: not call-preserved)
     cmp x24, x25
     b.hi .Lfll_range_next
     mov x0, x19                  // ty
@@ -1298,7 +1446,7 @@ _kcc_ir_fill_list:
     add x24, x24, #1
     b .Lfll_range_loop
 .Lfll_range_next:
-    ldr x25, [x22, #AST_F2]      // hi
+    ldr x25, [sp, #80]           // hi
     add x25, x25, #1
     mov x23, x25                 // cursor resumes after the range
     ldr x22, [x22, #AST_F4]
@@ -1370,6 +1518,8 @@ _kcc_ir_fill_list:
 @| _kcc_ir_emit_indexed_store
 @| _kcc_ir_elem_off_width
 @| _kcc_ir_field_index
+@| _kcc_ir_type_has_member
+@| _kcc_ir_anon_containing
 @| _kcc_ir_subobj
 @| _kcc_ir_resolve_designator
 @| _kcc_ir_agg_count

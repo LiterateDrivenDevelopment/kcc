@@ -2692,9 +2692,13 @@ is recorded on one \texttt{AST\_DESIGNATOR} whose \texttt{is\_field} field is se
 to~2 to mark it, with the low index in \texttt{F0} and the high index in
 \texttt{F2}; it is always a leaf, so the designator loop ends after it and the
 IR builder fills the run.  A designator index is a constant \emph{expression},
-not just a literal---\texttt{[NR - 1]}, \texttt{[1 << 8]}---so
-\texttt{\_kcc\_parse\_const\_index} folds it through the full integer
-constant-expression evaluator.
+not just a literal---\texttt{[NR - 1]}, \texttt{[1 << 8]}, or an enum constant
+\texttt{[NLA\_U32]}.  The parser keeps the index expression node (in \texttt{F0},
+and the range's high bound in \texttt{F2}) rather than folding it here: an enum
+constant is not in the symbol table until sema, so the index can only be
+evaluated when the initializer is lowered.  The IR builder
+(\S\ref{sec:ir-aggregates}) evaluates it there with the full integer
+constant-expression evaluator, where literals and enum constants alike resolve.
 
 @d Decl: parse init @{
 // -- kcc_parse_initializer ---------------------------------------------
@@ -2840,8 +2844,10 @@ _kcc_parse_designated_element:
 .Lde_index:
     bl _kcc_pp_next               // consume '['
     bl _kcc_parse_assign_expr     // index expression
-    bl _kcc_parse_const_index     // fold to an integer
-    mov x21, x0                   // low index value (survives ast_alloc)
+    // Keep the index EXPRESSION, not its folded value: an index may be an enum
+    // constant, which is not in the symbol table until sema, so it can only be
+    // evaluated when the initializer is lowered.
+    mov x21, x0                   // low index expr node (survives ast_alloc)
     // GNU array-range designator `[lo ... hi]`?  A range is always a leaf, so
     // after it the designator loop ends and the initializer follows.
     adrp x0, _kcc_tok_type@@PAGE
@@ -2851,8 +2857,7 @@ _kcc_parse_designated_element:
     b.ne .Lde_index_single
     bl _kcc_pp_next               // consume '...'
     bl _kcc_parse_assign_expr     // high index expression
-    bl _kcc_parse_const_index
-    mov x22, x0                   // high index (survives ast_alloc)
+    mov x22, x0                   // high index expr node (survives ast_alloc)
     mov x0, #TOK_RBRACKET
     bl _kcc_parse_expect          // consume ']'
     mov x0, #AST_DESIGNATOR
@@ -2901,18 +2906,8 @@ _kcc_parse_designated_element:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_parse_const_index ---------------------------------------------
-// uint64_t kcc_parse_const_index(node *e)
-// Folds a constant array-index designator to its integer value.  It defers to
-// the full integer constant-expression evaluator, so an index like [NR - 1] or
-// the high bound of a GNU range [0 ... (NR - 1)] resolves (the kernel's
-// atomic64.c sizes its lock table this way), not just a bare literal.
-.p2align 2
-_kcc_parse_const_index:
-    b _kcc_eval_const_int
 @| _kcc_parse_initializer
 @| _kcc_parse_designated_element
-@| _kcc_parse_const_index
 @}
 
 \section{Static Assert}

@@ -302,6 +302,8 @@ void *kcc_ir_fill(void *ty, unsigned long base, unsigned long off, void *elem);
 void kcc_ir_fill_one(void *ty, unsigned long base, unsigned long off, void *node, void *field);
 void kcc_ir_store_elem(unsigned long base, unsigned long off, unsigned long value, unsigned long width);
 long kcc_ir_field_index(void *agg, const char *name);
+unsigned long kcc_ir_type_has_member(void *ty, const char *name);
+long kcc_ir_anon_containing(void *agg, const char *name);
 struct desig_res { unsigned long off; void *sub_type; unsigned long first_pos; void *field; };
 struct desig_res kcc_ir_resolve_designator(void *agg, unsigned long base_off, void *desig);
 void *kcc_ir_subobj(void *agg, unsigned long idx, unsigned long *out_off);
@@ -3054,7 +3056,7 @@ unsigned long kcc_ir_initlist_count(void *list) {
     unsigned long idx = 0, max = 0;
     while (el) {
         if (IL(el, AST_TAG) == AST_DESIGNATOR && !IL(el, AST_F1))
-            idx = IL(el, AST_F0);                 /* [i] = : index becomes i */
+            idx = kcc_eval_const_int((void *)IL(el, AST_F0)); /* [i]= : evaluate the index expr */
         idx++;
         if (idx > max) max = idx;
         el = (void *)IL(el, AST_F4);
@@ -3085,6 +3087,26 @@ void kcc_ir_emit_indexed_store(unsigned long base, unsigned long off, unsigned l
 }
 @}
 
+A designated initializer names its target member with \texttt{kcc\_ir\_field\_index},
+which walks a struct or union's field list and returns the zero-based position
+of the named member (so the positional offset machinery of
+\texttt{kcc\_ir\_subobj} can be reused), or $-1$.  An \emph{anonymous} member---an
+unnamed \texttt{struct}/\texttt{union} whose own members are promoted into the
+enclosing type (C17 6.7.2.1p13)---carries a \texttt{NULL} name, so the
+by-name scan must skip it rather than hand \texttt{NULL} to
+\texttt{kcc\_strcmp}.  Skipping alone would lose the promoted names, so
+\texttt{kcc\_ir\_type\_has\_member} answers, recursively, whether a name is
+reachable through a type's anonymous members, and \texttt{kcc\_ir\_anon\_containing}
+returns the position of the anonymous member that holds it.
+\texttt{kcc\_ir\_resolve\_designator} uses the pair to \emph{descend}: when a
+\texttt{.name} is not a direct field it steps into the anonymous member that
+contains it---accumulating that member's byte offset and continuing from its
+type---until the name resolves to a direct field.  The first anonymous member
+entered is recorded as \texttt{first\_pos} so the positional cursor resumes at
+the right outer slot after the designated element.  A name that is genuinely
+absent still yields $-1$ and the legacy out-of-range path, unchanged.
+
+@l c
 @d Selfhost: ir aggregates @{
 long kcc_ir_field_index(void *agg, const char *name) {
     void *sd = (void *)IL(agg, TY_F0);
@@ -3092,7 +3114,47 @@ long kcc_ir_field_index(void *agg, const char *name) {
     void *field = (void *)IL(sd, AST_F1);
     long idx = 0;
     while (field) {
-        if (kcc_strcmp((const char *)IL(field, AST_F1), name) == 0) return idx;
+        const char *fn = (const char *)IL(field, AST_F1);
+        if (fn && kcc_strcmp(fn, name) == 0) return idx;
+        field = (void *)IL(field, AST_F4);
+        idx++;
+    }
+    return -1;
+}
+
+unsigned long kcc_ir_type_has_member(void *ty, const char *name) {
+    if (!ty) return 0;
+    unsigned long k = IL(ty, TY_KIND);
+    if (k != TY_STRUCT && k != TY_UNION) return 0;
+    void *sd = (void *)IL(ty, TY_F0);
+    if (!sd) return 0;
+    void *field = (void *)IL(sd, AST_F1);
+    while (field) {
+        const char *fn = (const char *)IL(field, AST_F1);
+        if (fn) {
+            if (kcc_strcmp(fn, name) == 0) return 1;
+        } else {
+            void *fts = (void *)IL(field, AST_F0);
+            void *aty = fts ? kcc_sema_resolve_type(fts) : 0;
+            if (kcc_ir_type_has_member(aty, name)) return 1;
+        }
+        field = (void *)IL(field, AST_F4);
+    }
+    return 0;
+}
+
+long kcc_ir_anon_containing(void *agg, const char *name) {
+    void *sd = (void *)IL(agg, TY_F0);
+    if (!sd) return -1;
+    void *field = (void *)IL(sd, AST_F1);
+    long idx = 0;
+    while (field) {
+        const char *fn = (const char *)IL(field, AST_F1);
+        if (!fn) {
+            void *fts = (void *)IL(field, AST_F0);
+            void *aty = fts ? kcc_sema_resolve_type(fts) : 0;
+            if (kcc_ir_type_has_member(aty, name)) return idx;
+        }
         field = (void *)IL(field, AST_F4);
         idx++;
     }
@@ -3131,16 +3193,36 @@ struct desig_res kcc_ir_resolve_designator(void *agg, unsigned long base_off, vo
     void *leaf_field = 0;
     while (desig) {
         unsigned long pos;
-        if (IL(desig, AST_F1))
-            pos = (unsigned long)kcc_ir_field_index(cur_type, (const char *)IL(desig, AST_F0));
-        else
-            pos = IL(desig, AST_F0);
+        unsigned long outer_pos;
+        if (IL(desig, AST_F1)) {
+            const char *nm = (const char *)IL(desig, AST_F0);
+            long p = kcc_ir_field_index(cur_type, nm);
+            /* A `.name` that is not a direct member of cur_type but lives inside
+               an unnamed struct/union member is reached by first stepping into
+               that member (C17 6.7.2.1p13): descend, accumulating its offset,
+               until the name resolves to a direct field. */
+            while (p < 0) {
+                long ap = kcc_ir_anon_containing(cur_type, nm);
+                if (ap < 0) break;
+                unsigned long aoff;
+                void *asub = kcc_ir_subobj(cur_type, (unsigned long)ap, &aoff);
+                cur_off += aoff;
+                cur_type = asub;
+                if (first_pos == (unsigned long)-1) first_pos = (unsigned long)ap;
+                p = kcc_ir_field_index(cur_type, nm);
+            }
+            pos = (unsigned long)p;
+            outer_pos = pos;
+        } else {
+            pos = kcc_eval_const_int((void *)IL(desig, AST_F0)); /* [i] index expr */
+            outer_pos = pos;
+        }
         unsigned long off;
         void *sub = kcc_ir_subobj(cur_type, pos, &off);
         cur_off += off;
         cur_type = sub;
         leaf_field = kcc_ir_member_field;
-        if (first_pos == (unsigned long)-1) first_pos = pos;
+        if (first_pos == (unsigned long)-1) first_pos = outer_pos;
         desig = (void *)IL(desig, AST_F2);
     }
     struct desig_res r;
@@ -3262,8 +3344,8 @@ void kcc_ir_fill_list(void *ty, unsigned long base, unsigned long base_off, void
     while (elem) {
         if (IL(elem, AST_TAG) == AST_DESIGNATOR) {
             if (IL(elem, AST_F1) == 2) {          /* GNU array range [lo ... hi] = v */
-                unsigned long lo = IL(elem, AST_F0);
-                unsigned long hi = IL(elem, AST_F2);
+                unsigned long lo = kcc_eval_const_int((void *)IL(elem, AST_F0));
+                unsigned long hi = kcc_eval_const_int((void *)IL(elem, AST_F2));
                 void *val = (void *)IL(elem, AST_F3);
                 for (unsigned long pos = lo; pos <= hi; pos++) {
                     unsigned long off;

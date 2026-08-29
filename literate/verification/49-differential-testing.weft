@@ -819,6 +819,33 @@ int main(void){ int v[4] = { [NR - 2] = 9 };
   int sum = v[2];
   for (int i = 0; i < NR; i++) sum += g[i].a + g[i].b;
   return (sum == 9 + 4*(7+3)) ? 0 : 1; }"
+# A designator index may name an ENUM CONSTANT (`[NLA_U32] = ...` fills kernel
+# validation tables).  An enum constant is not in the symbol table until sema,
+# so the index cannot be folded during the parse — it is kept as an expression
+# and evaluated when the initializer is lowered.  Covers a single enum index, an
+# enum in a range bound, and enum-index array-length inference (`arr[]`).
+difftest "enum-constant-designator-index" \
+    "enum { E0, E1, E2, E3, ELAST };
+static int arr[ELAST] = { [E0] = 10, [E2] = 30, [E1 ... E1] = 20 };
+static int inf[] = { [E3] = 7 };
+int main(void){
+  if (arr[0]!=10 || arr[1]!=20 || arr[2]!=30 || arr[3]!=0) return 1;
+  if (sizeof(inf)/sizeof(inf[0]) != 4 || inf[3]!=7) return 2;
+  return 0; }"
+# A `.name` designator may target a member promoted from an anonymous
+# struct/union (C17 6.7.2.1p13) — pervasive in kernel headers (qspinlock's
+# `union { atomic_t val; struct { u8 locked, pending; }; }` initialized by name).
+# The field-by-name search must skip the unnamed member (NULL name — never hand
+# it to strcmp) yet still descend into it to reach the promoted name, at the
+# right byte offset.  Covers a name in an anonymous union, a name nested one
+# level deeper through an anonymous struct, and overlap via the union alias.
+difftest "anonymous-member-designator" \
+    "struct S { int a; union { int x; struct { short lo, hi; }; }; int b; };
+static struct S s = { .a = 1, .hi = 0x1234, .b = 2 };
+int main(void){
+  if (s.a != 1 || s.b != 2) return 1;
+  if (s.hi != 0x1234 || s.lo != 0) return 2;
+  return (s.x == (0x1234 << 16)) ? 0 : 3; }"
 # A directive skipped inside an inactive #if group whose trailing block comment
 # spans a newline.  Skipping must consume the whole comment; otherwise the
 # cursor is left mid-comment and the apostrophe in "that's" is lexed as a char

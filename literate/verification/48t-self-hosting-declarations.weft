@@ -132,7 +132,6 @@ void *kcc_parse_initializer(void);
 void *kcc_parse_static_assert(void);
 static void *abst_splice(void *chain, void *old_base, void *new_type);
 static void *parse_designated_element(void);
-static unsigned long parse_const_index(void *e);
 
 #define F0(n) (((struct Node *)(n))->f0)
 #define F1(n) (((struct Node *)(n))->f1)
@@ -808,14 +807,6 @@ unsigned long kcc_parse_is_type_token(void) {
     return kcc_typedef_lookup(kcc_tok_start, kcc_tok_len) ? 1 : 0;
 }
 
-extern unsigned long kcc_eval_const_int(void *n);
-static unsigned long parse_const_index(void *e) {
-    /* Fold the whole constant expression, not just a bare literal, so a
-       designator index like [NR - 1] or a GNU range [0 ... (NR - 1)] resolves
-       (the kernel's atomic64.c sizes its lock table this way). */
-    return kcc_eval_const_int(e);
-}
-
 static void *parse_designated_element(void) {
     unsigned long t = kcc_tok_type;
     if (t != TOK_DOT && t != TOK_LBRACKET) return kcc_parse_initializer();
@@ -833,14 +824,18 @@ static void *parse_designated_element(void) {
         } else if (kcc_tok_type == TOK_LBRACKET) {
             kcc_pp_next();
             void *ie = kcc_parse_assign_expr();
-            unsigned long idx = parse_const_index(ie);
             struct Node *d = (struct Node *)kcc_ast_alloc(AST_DESIGNATOR);
-            d->f0 = idx;
+            /* Keep the index EXPRESSION rather than folding it now: an index may
+               name an enum constant (`[NLA_U32] = ...`), which is not in the
+               symbol table until sema runs, so it can only be evaluated later,
+               when the initializer is lowered.  Literals and macro-expanded
+               constants fold there just as well. */
+            d->f0 = (unsigned long)ie;
             d->f1 = 0;
             if (kcc_tok_type == TOK_ELLIPSIS) {   /* GNU array range [lo ... hi] */
                 kcc_pp_next();
                 void *he = kcc_parse_assign_expr();
-                d->f2 = parse_const_index(he);     /* high index (leaf: no chain) */
+                d->f2 = (unsigned long)he;         /* high index (leaf: no chain) */
                 d->f1 = 2;
             }
             kcc_parse_expect(TOK_RBRACKET);

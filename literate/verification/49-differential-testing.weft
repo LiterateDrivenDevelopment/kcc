@@ -857,6 +857,31 @@ difftest "always-inline-expr" \
        if (dbl(y) != 40) return 2;
        if (mix(9, 3) != (9+1)+(3+3)) return 3;
        return 0; }"
+# The integer constant-expression evaluator must handle relational and logical
+# operators (done signed), or a constant condition like `if ((-5) < 0)' folds to
+# false---which then broke always_inline bodies once a constant argument made the
+# condition constant.
+difftest "constant-comparison-fold" \
+    "int main(void){
+       if (((-5) < 0) ? 0 : 1) return 1;
+       if (!(3 >= 3) || (2 == 2 ? 0 : 1)) return 2;
+       int a[(1 < 2) + (5 >= 5) + (7 != 5) + 1];
+       return (sizeof(a)/sizeof(a[0]) == 4) ? 0 : 3; }"
+# An always_inline body with control flow and several returns inlines as a
+# statement-expression: each `return X' becomes an assignment plus a jump to a
+# per-instance end label, so a caller's constant argument still selects the right
+# branch.  A plain call gives the same answer, so this holds on both ports.
+difftest "always-inline-control-flow" \
+    "static inline __attribute__((always_inline)) int clamp(int x,int lo,int hi){
+       if (x < lo) return lo;
+       if (x > hi) return hi;
+       return x; }
+     int main(void){
+       if (clamp(5,0,10) != 5) return 1;
+       if (clamp(-3,0,10) != 0) return 2;
+       if (clamp(99,0,10) != 10) return 3;
+       int v = -7; if (clamp(v,0,10) != 0) return 4;
+       return 0; }"
 # A `.name` designator may target a member promoted from an anonymous
 # struct/union (C17 6.7.2.1p13) — pervasive in kernel headers (qspinlock's
 # `union { atomic_t val; struct { u8 locked, pending; }; }` initialized by name).

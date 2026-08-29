@@ -679,7 +679,9 @@ initializer folds rather than being mistaken for a run-time value.
 // int64_t kcc_eval_const_int(node *n)
 //   Evaluate an integer constant expression (\stdref{6.6}): literals,
 //   parentheses, casts, sizeof, an enum-constant identifier, and the common
-//   unary and binary integer operators.  Used both for a switch case value
+//   unary and binary integer operators---including the relational and logical
+//   operators (evaluated signed), so a constant condition such as `[(1 < 2) + 3]'
+//   folds rather than reporting 0.  Used both for a switch case value
 //   (`1 << 5`, `cJSON_True`) and for an array declarator's size
 //   (`a[MAXABITS + 1]`, or `tmname[TM_N]` where TM_N is an enumerator); a size
 //   that is not a bare AST_INT_LIT must still be folded, or the array is sized
@@ -837,6 +839,22 @@ _kcc_eval_const_int:
     b.eq .Lec_or
     cmp x20, #TOK_CARET
     b.eq .Lec_xor
+    cmp x20, #TOK_LT
+    b.eq .Lec_lt
+    cmp x20, #TOK_GT
+    b.eq .Lec_gt
+    cmp x20, #TOK_LE
+    b.eq .Lec_le
+    cmp x20, #TOK_GE
+    b.eq .Lec_ge
+    cmp x20, #TOK_EQ
+    b.eq .Lec_eq
+    cmp x20, #TOK_NE
+    b.eq .Lec_ne
+    cmp x20, #TOK_AND
+    b.eq .Lec_land
+    cmp x20, #TOK_OR
+    b.eq .Lec_lor
     b .Lec_zero
 .Lec_add:  add x0, x0, x1
     b .Lec_ret
@@ -860,6 +878,33 @@ _kcc_eval_const_int:
 .Lec_or:   orr x0, x0, x1
     b .Lec_ret
 .Lec_xor:  eor x0, x0, x1
+    b .Lec_ret
+    // Relational and logical operators yield 0/1; comparisons are signed.
+.Lec_lt:   cmp x0, x1
+    cset x0, lt
+    b .Lec_ret
+.Lec_gt:   cmp x0, x1
+    cset x0, gt
+    b .Lec_ret
+.Lec_le:   cmp x0, x1
+    cset x0, le
+    b .Lec_ret
+.Lec_ge:   cmp x0, x1
+    cset x0, ge
+    b .Lec_ret
+.Lec_eq:   cmp x0, x1
+    cset x0, eq
+    b .Lec_ret
+.Lec_ne:   cmp x0, x1
+    cset x0, ne
+    b .Lec_ret
+.Lec_land: cmp x0, #0                 // (x0 && x1)
+    ccmp x1, #0, #4, ne
+    cset x0, ne
+    b .Lec_ret
+.Lec_lor:  orr x2, x0, x1             // (x0 || x1)
+    cmp x2, #0
+    cset x0, ne
 .Lec_ret:
     ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]

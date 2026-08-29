@@ -141,6 +141,8 @@ enum {
 
 /* arena / string / io / hash / vec / sema / types --- other modules */
 void *kcc_arena_alloc(unsigned long);
+void *kcc_strtab_intern(const char *, unsigned long);
+static void *kcc_always_inline_fns = 0;   /* registry of always_inline definitions */
 unsigned long kcc_strlen(const char *);
 int kcc_strcmp(const char *, const char *);
 void *kcc_ht_init(unsigned long);
@@ -464,8 +466,16 @@ void kcc_ir_build(void *tu) {
     kcc_ir_trans_unit = tu;
     void *d = (void *)IL(tu, AST_F0);
     while (d) {
-        if (IL(d, AST_TAG) == AST_FUNC_DECL && IL(d, AST_F3))
-            kcc_ir_build_func(d);
+        if (IL(d, AST_TAG) == AST_FUNC_DECL && IL(d, AST_F3)) {
+            /* An always_inline function is expanded at each call, so it is not
+               emitted standalone---which also keeps its body AST pristine, as a
+               standalone build lowers the asm operands in place and inlining
+               needs the original operand expressions to fold constants. */
+            const char *nm = (const char *)IL(d, AST_F1);
+            if (!(kcc_always_inline_fns && nm &&
+                  kcc_ht_get(kcc_always_inline_fns, nm, kcc_strlen(nm))))
+                kcc_ir_build_func(d);
+        }
         d = (void *)IL(d, AST_F4);
     }
     /* decide whether this TU needs a module-init function: no main, but at
@@ -1042,9 +1052,13 @@ void kcc_ir_build_stmt(void *s) {
         kcc_ir_asm_lower_operands(s);
         /* `asm goto': resolve each target label (chained off AST_F3) to its
            block and stash the block in the label node's F2, so the back end
-           can expand %lN to that block's assembly label. */
+           can expand %lN to that block's assembly label.  F0 stays the name the
+           template's %l[name] matches; an inlined label carries the renamed
+           resolve-name in F1, so resolution follows F1 when present. */
         for (void *l = (void *)IL(s, AST_F3); l; l = (void *)IL(l, AST_F4)) {
-            void *bb = kcc_ir_label_bb((const char *)IL(l, AST_F0));
+            const char *rn = (const char *)IL(l, AST_F1);
+            if (!rn) rn = (const char *)IL(l, AST_F0);
+            void *bb = kcc_ir_label_bb(rn);
             IL(l, AST_F2) = (unsigned long)bb;
         }
         void *ai = kcc_ir_alloc_instr(IR_ASM);
@@ -1085,12 +1099,36 @@ static unsigned long kcc_asm_cons_imm(const char *c) {
    `call f`), which is what the kernel's ALTERNATIVE and percpu templates need.
    Returns 0 for a local or non-symbolic expression, which have no linker name;
    `%P` then falls back to the operand's materialised register. */
+static const char *kcc_asm_operand_lval(void *lv);
+
+/* Constant byte offset accumulated while resolving an inline-asm symbol operand
+   like `&arr[3]' or `&s.field': the operand renders as `name+offset'. */
+static long kcc_asm_sym_off = 0;
+
 static const char *kcc_asm_operand_symname(void *expr) {
     if (!expr) return 0;
     unsigned long tag = IL(expr, AST_TAG);
     while (tag == AST_PAREN_EXPR) { expr = (void *)IL(expr, AST_F0); if (!expr) return 0; tag = IL(expr, AST_TAG); }
+    if (tag == AST_CAST_EXPR) return kcc_asm_operand_symname((void *)IL(expr, AST_F1));
     if (tag == AST_UNARY_EXPR && IL(expr, AST_F0) == TOK_AMP)
-        return kcc_asm_operand_symname((void *)IL(expr, AST_F1));   /* &sym */
+        return kcc_asm_operand_lval((void *)IL(expr, AST_F1));      /* &lvalue */
+    if (tag == AST_BINARY_EXPR) {                                    /* sym +/- const */
+        unsigned long op = IL(expr, AST_F0);
+        void *L = (void *)IL(expr, AST_F1), *R = (void *)IL(expr, AST_F2);
+        if (op == TOK_PLUS || op == TOK_MINUS) {
+            const char *s = kcc_asm_operand_symname(L);
+            if (s && kcc_expr_is_ice(R)) {
+                long o = (long)kcc_eval_const_int(R);
+                kcc_asm_sym_off += (op == TOK_PLUS) ? o : -o;
+                return s;
+            }
+            if (op == TOK_PLUS) {
+                s = kcc_asm_operand_symname(R);
+                if (s && kcc_expr_is_ice(L)) { kcc_asm_sym_off += (long)kcc_eval_const_int(L); return s; }
+            }
+        }
+        return 0;
+    }
     if (tag != AST_IDENT_EXPR) return 0;
     char *name = (char *)IL(expr, AST_F0);
     if (!name) return 0;
@@ -1105,6 +1143,39 @@ static const char *kcc_asm_operand_symname(void *expr) {
     return name;                                                    /* file-scope function/object */
 }
 
+/* Resolve the base symbol (and add the constant byte offset) of an lvalue whose
+   address is taken: an object `x', an array element `a[k]' (k an ICE), or a
+   struct member `s.field'.  Nested forms compose---the kernel's cpu-feature byte
+   is `&((char *)boot_cpu_data.x86_capability)[bit >> 3]'. */
+static const char *kcc_asm_operand_lval(void *lv) {
+    if (!lv) return 0;
+    unsigned long tag = IL(lv, AST_TAG);
+    while (tag == AST_PAREN_EXPR) { lv = (void *)IL(lv, AST_F0); if (!lv) return 0; tag = IL(lv, AST_TAG); }
+    if (tag == AST_CAST_EXPR) return kcc_asm_operand_lval((void *)IL(lv, AST_F1));
+    if (tag == AST_IDENT_EXPR) return kcc_asm_operand_symname(lv);
+    if (tag == AST_SUBSCRIPT) {
+        void *idx = (void *)IL(lv, AST_F1);
+        if (!kcc_expr_is_ice(idx)) return 0;
+        void *et = (void *)IL(lv, AST_F3);            /* the element's (result) type */
+        unsigned long esz = et ? kcc_type_layout(et) : 1;
+        kcc_asm_sym_off += (long)kcc_eval_const_int(idx) * (long)esz;
+        return kcc_asm_operand_lval((void *)IL(lv, AST_F0));
+    }
+    if (tag == AST_MEMBER) {
+        if (IL(lv, AST_F2)) return 0;                 /* `p->m': base is a runtime pointer */
+        void *obj = (void *)IL(lv, AST_F0);
+        void *st = (void *)IL(obj, AST_F3);
+        if (st && IL(st, TY_KIND) == TY_PTR) st = (void *)IL(st, TY_F0);
+        if (st && (IL(st, TY_KIND) == TY_STRUCT || IL(st, TY_KIND) == TY_UNION)) {
+            kcc_type_layout(st);
+            struct kcc_member_res mr = kcc_type_find_member(st, (const char *)IL(lv, AST_F1));
+            if (mr.field) kcc_asm_sym_off += (long)mr.off;
+        }
+        return kcc_asm_operand_lval(obj);
+    }
+    return 0;
+}
+
 void kcc_ir_asm_lower_operands(void *as) {
     void *op = (void *)IL(as, AST_F2);
     while (op) {
@@ -1115,7 +1186,9 @@ void kcc_ir_asm_lower_operands(void *as) {
         char *cons = (char *)IL(op, AST_F0);
         char c = cons[0];
         char cls = (c == '=' || c == '+') ? cons[1] : c;
+        kcc_asm_sym_off = 0;
         const char *sym = kcc_target ? kcc_asm_operand_symname(expr) : 0;
+        long symoff = kcc_asm_sym_off;
         if (kcc_target && c != '=' && c != '+' &&
             kcc_asm_cons_imm(cons) && kcc_expr_is_ice(expr)) {
             /* x86 immediate operand: a constant input the back end renders as
@@ -1172,6 +1245,7 @@ void kcc_ir_asm_lower_operands(void *as) {
         if (sym && !((IL(op, AST_F2) >> 63) & 1)) {
             IL(op, AST_COL) = (unsigned long)sym;
             IL(op, AST_F2) = IL(op, AST_F2) | (1UL << 62);
+            IL(op, AST_F3) = (unsigned long)symoff;   /* byte offset for name+off */
         }
         op = (void *)IL(op, AST_F4);
     }
@@ -3789,6 +3863,18 @@ unsigned long kcc_eval_const_int(void *n) {
         if (op == TOK_AMP) return (unsigned long)(a & b);
         if (op == TOK_PIPE) return (unsigned long)(a | b);
         if (op == TOK_CARET) return (unsigned long)(a ^ b);
+        /* Relational and logical operators yield 0/1.  Comparisons are done
+           signed (the common `int' case, and what a constant `if (x < 0)' or a
+           GNU array-range bound relies on); without these the evaluator returned
+           0 for every comparison, folding a true constant condition to false. */
+        if (op == TOK_LT) return (long)a <  (long)b ? 1 : 0;
+        if (op == TOK_GT) return (long)a >  (long)b ? 1 : 0;
+        if (op == TOK_LE) return (long)a <= (long)b ? 1 : 0;
+        if (op == TOK_GE) return (long)a >= (long)b ? 1 : 0;
+        if (op == TOK_EQ) return a == b ? 1 : 0;
+        if (op == TOK_NE) return a != b ? 1 : 0;
+        if (op == TOK_AND) return (a && b) ? 1 : 0;
+        if (op == TOK_OR)  return (a || b) ? 1 : 0;
         return 0;
     }
     return 0;
@@ -4472,10 +4558,66 @@ static unsigned long kcc_ir_ffs(unsigned long val, unsigned long nbits) {
    phase handles a `{ return EXPR; }` body; the clone declines (returns 0) for
    any construct it does not model, so an unhandled callee simply falls back to a
    real call and can never be miscompiled. */
-static void *kcc_always_inline_fns = 0;
 void kcc_register_always_inline(const char *name, void *fndecl) {
     if (!kcc_always_inline_fns) kcc_always_inline_fns = kcc_ht_init(64);
     kcc_ht_put(kcc_always_inline_fns, name, kcc_strlen(name), fndecl);
+}
+
+/* Labels are function-scoped, so every label the inlined body defines is renamed
+   with a per-inline-instance suffix, or two expansions of the same callee in one
+   caller would collide.  The renamed name is only ever an internal hash-table key
+   (blocks emit as numbered .Lkccbb labels), so the suffix need not be a legal C
+   identifier.  The return conversion targets (`__r'/`__end') live in these two
+   globals for the duration of one body clone. */
+static unsigned long kcc_inl_inst = 0;
+static const char *kcc_inl_ret_name = 0;   /* the __r variable's name, 0 if void */
+static const char *kcc_inl_end_name = 0;   /* the __end label's name */
+
+static const char *kcc_inl_lbl(const char *name) {
+    unsigned long nl = kcc_strlen(name);
+    char *buf = (char *)kcc_arena_alloc(nl + 24);
+    unsigned long i = 0;
+    while (i < nl) { buf[i] = name[i]; i++; }
+    buf[i++] = '$';
+    unsigned long v = kcc_inl_inst;
+    char tmp[20]; unsigned long tn = 0;
+    if (v == 0) tmp[tn++] = '0';
+    while (v) { tmp[tn++] = (char)('0' + (v % 10)); v /= 10; }
+    while (tn) buf[i++] = tmp[--tn];
+    buf[i] = 0;
+    return (const char *)kcc_strtab_intern(buf, i);
+}
+
+/* An argument may be substituted into the body more than once (kept as an
+   expression so a constant folds through), so it must be free of side effects. */
+static int kcc_inl_arg_safe(void *a) {
+    if (!a) return 1;
+    unsigned long tag = IL(a, AST_TAG);
+    if (tag == AST_INT_LIT || tag == AST_CHAR_LIT || tag == AST_FLOAT_LIT ||
+        tag == AST_STR_LIT || tag == AST_IDENT_EXPR)
+        return 1;
+    if (tag == AST_PAREN_EXPR)
+        return kcc_inl_arg_safe((void *)IL(a, AST_F0));
+    if (tag == AST_CAST_EXPR)
+        return kcc_inl_arg_safe((void *)IL(a, AST_F1));
+    if (tag == AST_UNARY_EXPR) {
+        unsigned long op = IL(a, AST_F0);
+        if (op == TOK_INC || op == TOK_DEC) return 0;
+        return kcc_inl_arg_safe((void *)IL(a, AST_F1));
+    }
+    if (tag == AST_BINARY_EXPR)
+        return kcc_inl_arg_safe((void *)IL(a, AST_F1)) &&
+               kcc_inl_arg_safe((void *)IL(a, AST_F2));
+    if (tag == AST_SUBSCRIPT)
+        return kcc_inl_arg_safe((void *)IL(a, AST_F0)) &&
+               kcc_inl_arg_safe((void *)IL(a, AST_F1));
+    if (tag == AST_MEMBER)
+        return kcc_inl_arg_safe((void *)IL(a, AST_F0));
+    if (tag == AST_COND_EXPR)
+        return kcc_inl_arg_safe((void *)IL(a, AST_F0)) &&
+               kcc_inl_arg_safe((void *)IL(a, AST_F1)) &&
+               kcc_inl_arg_safe((void *)IL(a, AST_F2));
+    return 0;                                   /* calls, assignments, comma: assume unsafe */
 }
 
 /* Shallow node copy: same tag and all five fields, no sibling link. */
@@ -4590,6 +4732,135 @@ static void *kcc_inl_clone(void *node, void *params, void *args) {
         IL(d, AST_F0) = (unsigned long)cal; IL(d, AST_F1) = (unsigned long)al;
         return d;
     }
+    /* --- statements (the general body path) --- */
+    if (tag == AST_EXPR_STMT || tag == AST_STMT_EXPR) {
+        void *o = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        if (!o) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)o;
+        return d;
+    }
+    if (tag == AST_COMPOUND) {
+        void *lst = kcc_inl_clone_list((void *)IL(node, AST_F0), params, args);
+        if (lst == (void *)-1) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)lst;
+        return d;
+    }
+    if (tag == AST_RETURN_STMT) {
+        /* `return X;' -> `{ __r = X; goto __end; }' (or just the goto for void). */
+        void *g = kcc_ast_alloc(AST_GOTO_STMT);
+        IL(g, AST_F0) = (unsigned long)kcc_inl_end_name;
+        void *seq = g;
+        void *xe = (void *)IL(node, AST_F0);
+        if (xe && kcc_inl_ret_name) {
+            void *xc = kcc_inl_clone(xe, params, args);
+            if (!xc) return 0;
+            void *lhs = kcc_ast_alloc(AST_IDENT_EXPR);
+            IL(lhs, AST_F0) = (unsigned long)kcc_inl_ret_name;
+            void *asn = kcc_ast_alloc(AST_ASSIGN_EXPR);
+            IL(asn, AST_F0) = TOK_ASSIGN;
+            IL(asn, AST_F1) = (unsigned long)lhs;
+            IL(asn, AST_F2) = (unsigned long)xc;
+            void *es = kcc_ast_alloc(AST_EXPR_STMT);
+            IL(es, AST_F0) = (unsigned long)asn;
+            IL(es, AST_F4) = (unsigned long)g;
+            seq = es;
+        }
+        void *comp = kcc_ast_alloc(AST_COMPOUND);
+        IL(comp, AST_F0) = (unsigned long)seq;
+        return comp;
+    }
+    if (tag == AST_IF_STMT) {
+        void *c = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        void *t = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        if (!c || !t) return 0;
+        void *el = 0;
+        if (IL(node, AST_F2)) {
+            el = kcc_inl_clone((void *)IL(node, AST_F2), params, args);
+            if (!el) return 0;
+        }
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)c; IL(d, AST_F1) = (unsigned long)t;
+        IL(d, AST_F2) = (unsigned long)el;
+        return d;
+    }
+    if (tag == AST_WHILE_STMT || tag == AST_DO_STMT ||
+        tag == AST_SWITCH_STMT || tag == AST_CASE_STMT) {
+        void *a0 = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        void *a1 = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        if (!a0 || !a1) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)a0; IL(d, AST_F1) = (unsigned long)a1;
+        return d;
+    }
+    if (tag == AST_FOR_STMT) {
+        void *c[4]; unsigned long fld[4] = {AST_F0, AST_F1, AST_F2, AST_F3};
+        for (int k = 0; k < 4; k++) {
+            void *src = (void *)IL(node, fld[k]);
+            c[k] = src ? kcc_inl_clone(src, params, args) : 0;
+            if (src && !c[k]) return 0;
+        }
+        void *d = kcc_inl_dup(node);
+        for (int k = 0; k < 4; k++) IL(d, fld[k]) = (unsigned long)c[k];
+        return d;
+    }
+    if (tag == AST_DEFAULT_STMT) {
+        void *a1 = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        if (!a1) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F1) = (unsigned long)a1;
+        return d;
+    }
+    if (tag == AST_LABEL_STMT) {                    /* rename the label per instance */
+        void *a1 = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        if (!a1) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)kcc_inl_lbl((const char *)IL(node, AST_F0));
+        IL(d, AST_F1) = (unsigned long)a1;
+        return d;
+    }
+    if (tag == AST_GOTO_STMT) {
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)kcc_inl_lbl((const char *)IL(node, AST_F0));
+        return d;
+    }
+    if (tag == AST_BREAK_STMT || tag == AST_CONTINUE_STMT || tag == AST_NULL_STMT)
+        return kcc_inl_dup(node);
+    if (tag == AST_VAR_DECL) {                       /* a local: block-scoped, name kept */
+        void *d = kcc_inl_dup(node);
+        if (IL(node, AST_F2)) {
+            void *ini = kcc_inl_clone((void *)IL(node, AST_F2), params, args);
+            if (!ini) return 0;
+            IL(d, AST_F2) = (unsigned long)ini;
+        }
+        return d;
+    }
+    if (tag == AST_ASM_STMT) {
+        void *d = kcc_inl_dup(node);                 /* f0 template, f1 length kept */
+        void *ops = 0, *last = 0;
+        for (void *op = (void *)IL(node, AST_F2); op; op = (void *)IL(op, AST_F4)) {
+            void *ve = kcc_inl_clone((void *)IL(op, AST_F2), params, args);
+            if (!ve) return 0;
+            void *oc = kcc_inl_dup(op);              /* f0 constraint, f1 [name] kept */
+            IL(oc, AST_F2) = (unsigned long)ve;
+            if (!ops) { ops = oc; last = oc; }
+            else { IL(last, AST_F4) = (unsigned long)oc; last = oc; }
+        }
+        IL(d, AST_F2) = (unsigned long)ops;
+        /* goto labels: keep F0 (the template-match name for %l[name]) but resolve
+           through the renamed label via the F1 alias, so no template surgery. */
+        void *gls = 0; last = 0;
+        for (void *l = (void *)IL(node, AST_F3); l; l = (void *)IL(l, AST_F4)) {
+            void *lc = kcc_inl_dup(l);
+            IL(lc, AST_F1) = (unsigned long)kcc_inl_lbl((const char *)IL(l, AST_F0));
+            IL(lc, AST_F2) = 0;
+            if (!gls) { gls = lc; last = lc; }
+            else { IL(last, AST_F4) = (unsigned long)lc; last = lc; }
+        }
+        IL(d, AST_F3) = (unsigned long)gls;
+        return d;
+    }
     return 0;                                       /* unhandled: decline to inline */
 }
 
@@ -4602,20 +4873,69 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     if (!fn) return 0;
     void *body = (void *)IL(fn, AST_F3);
     if (!body || IL(body, AST_TAG) != AST_COMPOUND) return 0;
-    void *stmts = (void *)IL(body, AST_F0);
-    if (!stmts || IL(stmts, AST_F4)) return 0;      /* exactly one statement */
-    if (IL(stmts, AST_TAG) != AST_RETURN_STMT) return 0;
-    void *retexpr = (void *)IL(stmts, AST_F0);
-    if (!retexpr) return 0;
     void *params = (void *)(IL(fn, AST_F2) & ~3UL); /* strip variadic + linkage flags */
     void *args = (void *)IL(call, AST_F1);
     unsigned long np = 0, na = 0;
     for (void *p = params; p; p = (void *)IL(p, AST_F4)) np++;
     for (void *a = args; a; a = (void *)IL(a, AST_F4)) na++;
-    if (np != na) return 0;
-    void *clone = kcc_inl_clone(retexpr, params, args);
-    if (!clone) return 0;
-    *out = kcc_ir_build_expr(clone);
+    if (np != na) return 0;                          /* no variadic inlining */
+    for (void *a = args; a; a = (void *)IL(a, AST_F4))
+        if (!kcc_inl_arg_safe(a)) return 0;          /* args may re-evaluate */
+
+    kcc_inl_inst++;
+    /* Fast path: a lone `return EXPR;' body inlines to EXPR with no wrapper. */
+    void *s0 = (void *)IL(body, AST_F0);
+    if (s0 && !IL(s0, AST_F4) && IL(s0, AST_TAG) == AST_RETURN_STMT && IL(s0, AST_F0)) {
+        void *clone = kcc_inl_clone((void *)IL(s0, AST_F0), params, args);
+        if (!clone) return 0;
+        *out = kcc_ir_build_expr(clone);
+        return 1;
+    }
+
+    /* General path: clone the body, turning each `return X' into an assignment to
+       a fresh __r plus `goto __end', and evaluate it as
+       `({ RETTYPE __r; <body>; __end: ; __r; })'.  build_stmt_expr registers the
+       labels and takes the value from the trailing __r. */
+    void *rettype = (void *)IL(fn, AST_F0);
+    const char *retn = kcc_inl_lbl("__inl_r");
+    const char *endn = kcc_inl_lbl("__inl_end");
+    kcc_inl_ret_name = rettype ? retn : 0;
+    kcc_inl_end_name = endn;
+    void *bclone = kcc_inl_clone(body, params, args);
+    kcc_inl_ret_name = 0; kcc_inl_end_name = 0;
+    if (!bclone) return 0;
+
+    void *first = (void *)IL(bclone, AST_F0);
+    /* `__end: ;' followed by the value item */
+    void *lbl = kcc_ast_alloc(AST_LABEL_STMT);
+    IL(lbl, AST_F0) = (unsigned long)endn;
+    IL(lbl, AST_F1) = (unsigned long)kcc_ast_alloc(AST_NULL_STMT);
+    void *valstmt = 0;
+    if (rettype) {
+        void *rid = kcc_ast_alloc(AST_IDENT_EXPR);
+        IL(rid, AST_F0) = (unsigned long)retn;
+        valstmt = kcc_ast_alloc(AST_EXPR_STMT);
+        IL(valstmt, AST_F0) = (unsigned long)rid;
+    }
+    IL(lbl, AST_F4) = (unsigned long)valstmt;
+    if (first) {
+        void *t = first;
+        while (IL(t, AST_F4)) t = (void *)IL(t, AST_F4);
+        IL(t, AST_F4) = (unsigned long)lbl;
+    } else {
+        first = lbl;
+    }
+    if (rettype) {                                   /* prepend `RETTYPE __r;' */
+        void *rdecl = kcc_ast_alloc(AST_VAR_DECL);
+        IL(rdecl, AST_F0) = (unsigned long)rettype;
+        IL(rdecl, AST_F1) = (unsigned long)retn;
+        IL(rdecl, AST_F4) = (unsigned long)first;
+        first = rdecl;
+    }
+    IL(bclone, AST_F0) = (unsigned long)first;
+    void *se = kcc_ast_alloc(AST_STMT_EXPR);
+    IL(se, AST_F0) = (unsigned long)bclone;
+    *out = kcc_ir_build_stmt_expr(se);
     return 1;
 }
 

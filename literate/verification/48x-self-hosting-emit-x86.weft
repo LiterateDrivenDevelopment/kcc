@@ -595,6 +595,7 @@ static void x86_emit_asm(void *i) {
     unsigned long immval[6];                        /* its constant value */
     unsigned long issym[6];                         /* operand k names a symbol (for %P) */
     const char *symname[6];                         /* its emit-name */
+    long symoff[6];                                 /* +byte offset for name+off */
     unsigned long isaddr[6];                         /* operand k is an address ("p"): %P -> (%reg) */
     char spec[6];                                  /* specific-register letter or 0 */
     char isflag[6];                                /* condition-code output (=@@cc) */
@@ -629,6 +630,7 @@ static void x86_emit_asm(void *i) {
         immval[nop] = IL(op, AST_F3);          /* the constant value (F1 stays the name) */
         issym[nop] = (IL(op, AST_F2) >> 62) & 1;    /* symbolic operand: name in COL (for %P) */
         symname[nop] = issym[nop] ? (const char *)IL(op, AST_COL) : 0;
+        symoff[nop] = issym[nop] ? (long)IL(op, AST_F3) : 0;
         regof[nop] = nop;
         if (isimm[nop]) {
             /* immediate: no register of its own */
@@ -750,6 +752,11 @@ static void x86_emit_asm(void *i) {
         unsigned long owidth = sz ? sz : x86_asm_opsize(node, unum);
         if (raw && unum < nop && issym[unum]) {
             x86_sym(symname[unum]);                     /* %P[f] -> bare symbol: call f */
+            if (symoff[unum] > 0) {                     /* &arr[k] / &s.field -> name+off */
+                kcc_as_ch('+'); kcc_as_dec((unsigned long)symoff[unum]);
+            } else if (symoff[unum] < 0) {
+                kcc_as_ch('-'); kcc_as_dec((unsigned long)(-symoff[unum]));
+            }
         } else if (raw && unum < nop && isimm[unum]) {
             kcc_as_dec(immval[unum]);                   /* %P on a constant -> bare value, no $ */
         } else if (raw && unum < nop && (ismem[unum] || isaddr[unum])) {

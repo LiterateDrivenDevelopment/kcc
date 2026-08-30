@@ -1325,6 +1325,26 @@ with \texttt{-include ./include/linux/kconfig.h} (which pulls
 \texttt{-include} a \texttt{CONFIG\_64BIT}-gated type such as
 \texttt{atomic64\_t} would never be declared.
 
+A \texttt{\#include} whose first token after the directive is neither a string
+literal nor \texttt{<} is a \emph{computed} include (C17 §6.10.2p4): the
+remaining tokens are macro-expanded and the result must then read as one of the
+two header-name forms.  The kernel's tracepoint generator is the canonical user:
+\texttt{include/trace/define\_trace.h} ends with
+\verb|#include TRACE_INCLUDE(TRACE_INCLUDE_FILE)|, and with no
+\texttt{TRACE\_INCLUDE\_PATH} set \texttt{TRACE\_INCLUDE(system)} expands to
+\verb|<trace/events/|\textit{system}\verb|.h>| (otherwise to a
+\texttt{\_\_stringify}'d \verb|"..."|).  \texttt{kcc\_pp\_do\_include} handles
+this by expanding the whole rest of the directive line through
+\texttt{pp\_expand\_arg}---the same engine \texttt{\#if} uses---and then reading a
+\texttt{"\ldots"} or \texttt{<\ldots>} form out of the expansion.  For the angle
+form the header name is the concatenation of the token spellings between
+\texttt{<} and \texttt{>} with intervening whitespace stripped, because
+expansion inserts spaces at every buffer boundary (the path
+\texttt{trace\ /\ events\ /\ }\textit{system}\texttt{\ .\ h} arrives as separate
+tokens) yet none of that spacing belongs to the file name.  Without this, every
+translation unit that defines \texttt{CREATE\_TRACE\_POINTS} stalls on the
+first \texttt{define\_trace.h} computed include.
+
 @l c
 @d Selfhost: pp include @{
 static int pp_file_exists(const char *path) {
@@ -1402,9 +1422,45 @@ void kcc_pp_do_include(void) {
         nlen = (unsigned long)(p - s);
         kcc_lex_cursor = p + 1;
     } else {
-        kcc_diag_error(pp_dir_line, 1, m_include);
-        pp_skip_line();
-        return;
+        /* Computed include (C17 6.10.2p4): the directive's tokens form neither a
+           `"q-char"' nor a `<h-char>' header name, so macro-expand the rest of
+           the line and re-interpret the result.  The kernel's tracepoint
+           machinery leans on this---`#include TRACE_INCLUDE(TRACE_INCLUDE_FILE)'
+           in `include/trace/define_trace.h' expands to
+           `<trace/events/SYSTEM.h>' (or a `__stringify'd `"..."').  We expand the
+           whole remaining line (the first token was already lexed, so start from
+           its beginning) and then parse a string or angle form out of the
+           expansion; for the angle form the header name is the token spellings
+           between `<' and `>' with intervening whitespace removed, since
+           expansion separates the path's tokens (`trace' `/' `events' `/' ...)
+           with spaces that are not part of the file name. */
+        const char *ls = kcc_tok_start;
+        const char *le = kcc_lex_end;
+        const char *pe = ls;
+        while (pe < le && *pe != 0x0A) pe++;
+        unsigned long xlen;
+        const char *x = pp_expand_arg(ls, (unsigned long)(pe - ls), &xlen);
+        unsigned long i = 0;
+        while (i < xlen && (x[i] == ' ' || x[i] == 0x09)) i++;
+        if (i < xlen && x[i] == '"') {
+            i++;
+            unsigned long j = i;
+            while (j < xlen && x[j] != '"') j++;
+            system = 0; nstart = x + i; nlen = j - i;
+        } else if (i < xlen && x[i] == '<') {
+            i++;
+            char *hb = (char *)kcc_arena_alloc(xlen + 1);
+            unsigned long bl = 0;
+            while (i < xlen && x[i] != '>') {
+                if (x[i] != ' ' && x[i] != 0x09) hb[bl++] = x[i];
+                i++;
+            }
+            system = 1; nstart = hb; nlen = bl;
+        } else {
+            kcc_diag_error(pp_dir_line, 1, m_include);
+            pp_skip_line();
+            return;
+        }
     }
     char *path = (char *)kcc_arena_alloc(nlen + 1);
     kcc_memcpy(path, nstart, nlen);

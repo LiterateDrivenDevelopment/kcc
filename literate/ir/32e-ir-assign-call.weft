@@ -19,7 +19,18 @@ the builder emits \texttt{IR\_GLOBAL\_REF} to materialise the
 address.  For simple assignment the value is stored directly; for
 compound operators the same load-binop-store sequence is applied,
 loading from the global address vreg before emitting the binary
-operation and storing the result back.
+operation and storing the result back.  That reload must carry the
+lvalue type's access-size code (\texttt{IR\_SRC2}), exactly as the
+local-alloca path and the matching store do: a narrow scalar occupies
+only the low bytes of its natural width, so a hand-built
+\texttt{IR\_LOAD} that left the size code zero would read a raw 64-bit
+word and splice adjacent memory (or, for a signed global, fail to
+sign-extend) into the value.  A subsequent arithmetic \texttt{>>=} then
+shifted that un-extended pattern, turning an arithmetic right shift into
+a logical one---so \texttt{int g; g >>= 4} with \texttt{g < 0} produced
+a large positive.  Routing the reload through
+\texttt{\_kcc\_ir\_emit\_load\_t} sets both the size code and the type,
+keeping the global path identical to the local one.
 
 The three \emph{address-based} lvalues---a member \texttt{s.f}, a
 subscript \texttt{a[i]}, and a dereference \texttt{*p}---share a single
@@ -328,19 +339,21 @@ _kcc_ir_build_assign:
     cmp x20, #TOK_ASSIGN
     b.eq .Liba_global_simple
 
-    // Load current value from global, using the lvalue type so a floating
-    // global's compound update stays floating (see the local path).
-    mov x0, #IR_LOAD
-    bl _kcc_ir_alloc_instr
-    ldr x1, [sp, #64]           // lvalue (LHS) type
-    str x1, [x0, #IR_TYPE]
-    str x22, [x0, #IR_SRC1]     // global addr vreg
-    mov x19, x0
-    bl _kcc_ir_next_vreg
-    str x0, [x19, #IR_DEST]
+    // Load current value from global at the lvalue type's access width, so a
+    // narrow signed global is sign-extended (ldrsw), not read as a raw 64-bit
+    // word.  A hand-built IR_LOAD left IR_SRC2 (the access-size/sign code)
+    // zero, which codegen lowers to a 64-bit `ldr`; feeding that
+    // un-sign-extended value to a compound `>>=` made the arithmetic right
+    // shift behave like a logical one (`int g >>= 4` with g<0 yielded a huge
+    // positive).  Route through the shared load helper so the size code and
+    // lvalue type (floating globals stay floating) are both set.
+    ldr x0, [sp, #64]           // lvalue (LHS) type
+    bl _kcc_ir_load_width       // x0 = access-size/sign code
+    mov x1, x0                  // size code
+    mov x0, x22                 // global addr vreg
+    ldr x2, [sp, #64]           // lvalue type
+    bl _kcc_ir_emit_load_t
     mov x23, x0                  // x23 = current value vreg
-    mov x0, x19
-    bl _kcc_ir_emit
 
     // Map compound op to IR opcode (same table as local path)
     mov x24, #IR_ADD

@@ -741,7 +741,8 @@ void *kcc_sema_expr(void *node) {
     case AST_CAST_EXPR: t = sema_expr_cast(n); break;
     case AST_SIZEOF_EXPR: t = sema_expr_sizeof(n); break;
     case AST_ALIGNOF_EXPR:
-        kcc_sema_resolve_type((void *)n->f0);
+        if (n->f1) kcc_sema_resolve_type((void *)n->f0);  /* _Alignof(type) */
+        else kcc_sema_expr((void *)n->f0);                /* __alignof__(expr): type in F3 */
         t = kcc_type_long_u;
         break;
     case AST_COMMA_EXPR:

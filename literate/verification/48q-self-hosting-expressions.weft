@@ -205,7 +205,14 @@ void *kcc_parse_binary_expr(unsigned long min_prec) {
 \section{Unary, Cast, Postfix}
 
 Unary parses the prefix operators, \texttt{sizeof} (of a parenthesised type or of
-an expression), and \texttt{\_Alignof}.  Cast distinguishes a parenthesised type
+an expression), and \texttt{\_Alignof}.  The alignment operator takes the same
+two shapes as \texttt{sizeof}: strict C11 \texttt{\_Alignof(type-name)}, and---
+because it shares a token with the GNU \texttt{\_\_alignof\_\_}---an
+\emph{expression} operand, either parenthesised (\texttt{\_\_alignof\_\_(*p)}) or
+bare, which the kernel's \texttt{kstrtox}/\texttt{rseq} code uses; the operand's
+type is recovered in the same way \texttt{sizeof(expr)} recovers it (from the
+operand node's resolved-type field), and an \texttt{is\_type} flag in \texttt{f1}
+tells the lowering which shape it was.  Cast distinguishes a parenthesised type
 (a cast, or a compound literal on \texttt{\{}) from a parenthesised expression and
 a GNU statement expression (on \texttt{(\{}); each non-cast form runs through the
 postfix tail so suffixes can chain.  Postfix applies subscript, call (with the
@@ -259,11 +266,34 @@ void *kcc_parse_unary_expr(void) {
     }
     if (t == TOK__ALIGNOF) {
         kcc_pp_next();
-        kcc_parse_expect(TOK_LPAREN);
-        void *ty = kcc_parse_type_name();
-        kcc_parse_expect(TOK_RPAREN);
+        if (kcc_tok_type == TOK_LPAREN) {
+            kcc_pp_next();
+            if (kcc_parse_is_type_token()) {
+                void *ty = kcc_parse_type_name();
+                kcc_parse_expect(TOK_RPAREN);
+                struct Node *n = (struct Node *)kcc_ast_alloc(AST_ALIGNOF_EXPR);
+                n->f0 = (unsigned long)ty;
+                n->f1 = 1;                  /* is_type */
+                return n;
+            }
+            /* GNU `__alignof__(expr)': the operand is a parenthesised
+               expression, not a type name (C11 `_Alignof' forbids this, but the
+               kernel's kstrtox/rseq code relies on it, e.g.
+               `__alignof__(*rseq)').  Parse it like `sizeof(expr)'. */
+            void *e = kcc_parse_expr();
+            kcc_parse_expect(TOK_RPAREN);
+            struct Node *par = (struct Node *)kcc_ast_alloc(AST_PAREN_EXPR);
+            par->f0 = (unsigned long)e;
+            struct Node *n = (struct Node *)kcc_ast_alloc(AST_ALIGNOF_EXPR);
+            n->f0 = (unsigned long)par;
+            n->f1 = 0;
+            return n;
+        }
+        /* `__alignof__ expr' without parentheses (also a GNU form). */
+        void *u = kcc_parse_unary_expr();
         struct Node *n = (struct Node *)kcc_ast_alloc(AST_ALIGNOF_EXPR);
-        n->f0 = (unsigned long)ty;
+        n->f0 = (unsigned long)u;
+        n->f1 = 0;
         return n;
     }
     return kcc_parse_postfix_expr();

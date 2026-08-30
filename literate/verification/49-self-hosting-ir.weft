@@ -1601,7 +1601,11 @@ unsigned long kcc_ir_build_sizeof(void *e) {
 }
 
 unsigned long kcc_ir_build_alignof(void *e) {
-    void *ty = kcc_sema_resolve_type((void *)IL(e, AST_F0));
+    void *ty;
+    if (IL(e, AST_F1))                            /* _Alignof(type-name) */
+        ty = kcc_sema_resolve_type((void *)IL(e, AST_F0));
+    else                                          /* __alignof__ expr: operand's type */
+        ty = (void *)IL((void *)IL(e, AST_F0), AST_F3);
     kcc_type_layout(ty);
     unsigned long al = IL(ty, TY_ALIGN);
     void *inst = kcc_ir_alloc_instr(IR_CONST);

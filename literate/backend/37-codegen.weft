@@ -395,8 +395,16 @@ _kcc_preregister_globals:
     bl _kcc_emit_rodata_ptrarr
     b .Lprg_defined
 .Lprg_common:
+    // A file-scope `static' object is externally invisible: emit it as a local
+    // symbol (N_EXT cleared) so two TUs that each define a same-named static do
+    // not collide.  A non-static object stays external (a tentative definition
+    // other TUs may reference).
     mov x0, x22
     mov x1, x21
+    mov x2, #N_EXT
+    ldr x4, [x19, #AST_F3]        // storage class (3 = static)
+    cmp x4, #3
+    csel x2, xzr, x2, eq          // static → 0 (local); else N_EXT
     bl _kcc_linker_global_sym
 .Lprg_defined:
 
@@ -506,6 +514,7 @@ _kcc_cg_prereg_static:
 .Lprg_st_common:
     mov x0, x23                  // "_"+mangled name
     mov x1, x22                  // byte size
+    mov x2, #N_EXT               // mangled name is already unique per TU
     bl _kcc_linker_global_sym
 .Lprg_st_defined:
 

@@ -1854,6 +1854,19 @@ header or type.  Declaring the absence is what makes the omission
 sense without ever supplying \verb|<stdatomic.h>|, \verb|<threads.h>|,
 \verb|<complex.h>|, or \verb|<tgmath.h>|.
 
+Five more announce the target's \emph{byte order}, using gcc and clang's own
+spelling: \texttt{\_\_ORDER\_LITTLE\_ENDIAN\_\_} (1234),
+\texttt{\_\_ORDER\_BIG\_ENDIAN\_\_} (4321), \texttt{\_\_ORDER\_PDP\_ENDIAN\_\_}
+(3412), \texttt{\_\_BYTE\_ORDER\_\_} (set to the little-endian value, since both
+Apple ARM64 and Linux x86-64 are little-endian), and the older bare
+\texttt{\_\_LITTLE\_ENDIAN\_\_} flag.  Portable code selects its endian-swap
+routines with \verb|#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__| and
+\verb|#error|s when no order name resolves---\emph{doomgeneric}'s
+\texttt{i\_swap.h} is exactly this shape.  All three order names \emph{must} be
+defined together: an undefined \texttt{\_\_BYTE\_ORDER\_\_} is \texttt{0} inside a
+\verb|#if|, which would compare equal to a likewise-undefined
+\texttt{\_\_ORDER\_LITTLE\_ENDIAN\_\_} and silently pick the wrong branch.
+
 @d PP: predefined @{
 .text
 // -- _kcc_pp_predefine ----------------------------------------------
@@ -1965,6 +1978,52 @@ _kcc_pp_predefine:
     adrp x0, _kcc_pp_pre_filem@@PAGE
     add  x0, x0, _kcc_pp_pre_filem@@PAGEOFF
     mov  x1, #8                // len("__FILE__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    // Byte-order macros, exactly as gcc/clang publish them.  Real code selects
+    // its endian-swap routines with `#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__'
+    // and `#error's when none of the three order names resolve (doomgeneric's
+    // i_swap.h does this); an undefined `__BYTE_ORDER__' is 0 in a `#if', which
+    // would compare equal to a likewise-undefined `__ORDER_*' and take the wrong
+    // branch, so all must be defined.  Both kcc targets are little-endian.
+    adrp x0, _kcc_pp_pre_ord_le@@PAGE
+    add  x0, x0, _kcc_pp_pre_ord_le@@PAGEOFF
+    mov  x1, #23               // len("__ORDER_LITTLE_ENDIAN__")
+    adrp x2, _kcc_pp_pre_v1234@@PAGE
+    add  x2, x2, _kcc_pp_pre_v1234@@PAGEOFF
+    mov  x3, #4
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_ord_be@@PAGE
+    add  x0, x0, _kcc_pp_pre_ord_be@@PAGEOFF
+    mov  x1, #20               // len("__ORDER_BIG_ENDIAN__")
+    adrp x2, _kcc_pp_pre_v4321@@PAGE
+    add  x2, x2, _kcc_pp_pre_v4321@@PAGEOFF
+    mov  x3, #4
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_ord_pdp@@PAGE
+    add  x0, x0, _kcc_pp_pre_ord_pdp@@PAGEOFF
+    mov  x1, #20               // len("__ORDER_PDP_ENDIAN__")
+    adrp x2, _kcc_pp_pre_v3412@@PAGE
+    add  x2, x2, _kcc_pp_pre_v3412@@PAGEOFF
+    mov  x3, #4
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_byteord@@PAGE
+    add  x0, x0, _kcc_pp_pre_byteord@@PAGEOFF
+    mov  x1, #14               // len("__BYTE_ORDER__")
+    adrp x2, _kcc_pp_pre_v1234@@PAGE
+    add  x2, x2, _kcc_pp_pre_v1234@@PAGEOFF
+    mov  x3, #4
+    bl _kcc_pp_def_simple
+
+    adrp x0, _kcc_pp_pre_le@@PAGE
+    add  x0, x0, _kcc_pp_pre_le@@PAGEOFF
+    mov  x1, #17               // len("__LITTLE_ENDIAN__")
     adrp x2, _kcc_pp_pre_one@@PAGE
     add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
     mov  x3, #1

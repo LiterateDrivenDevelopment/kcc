@@ -1852,15 +1852,34 @@ _kcc_ir_build_member_addr:
     b .Libma_find_index
 
 .Libma_global:
-    // Global struct: emit global_ref for the address
+    // Global struct: emit global_ref for the address.  First redirect a static
+    // local onto its mangled hoisted-global symbol---it is not in kcc_ir_locals,
+    // so it reaches this global path; without the redirect `static struct S s;
+    // s.a` would reference an undefined external `_s' while the reservation sits
+    // under the mangled name (the read/compound-assign/inc paths already do this,
+    // but the member-address base did not, so struct-typed static locals failed
+    // to link).  The type-table lookup below still keys on the source name.
     ldr x0, [x19, #AST_F0]      // object ident node
-    ldr x0, [x0, #AST_F0]       // name ptr
+    ldr x24, [x0, #AST_F0]      // x24 = effective symbol name (source name default)
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    cbz x0, .Libma_global_emit
+    mov x0, x24
+    bl _kcc_strlen
+    mov x2, x0                   // keylen
+    adrp x0, _kcc_ir_statics@@PAGE
+    add  x0, x0, _kcc_ir_statics@@PAGEOFF
+    ldr x0, [x0]
+    mov x1, x24                  // key = source name
+    bl _kcc_ht_get
+    cbz x0, .Libma_global_emit
+    mov x24, x0                  // x24 = mangled hoisted-global name
+.Libma_global_emit:
     mov x0, #IR_GLOBAL_REF
     bl _kcc_ir_alloc_instr
     mov x22, x0
-    ldr x1, [x19, #AST_F0]
-    ldr x1, [x1, #AST_F0]       // name ptr
-    str x1, [x22, #IR_SRC1]     // symbol name
+    str x24, [x22, #IR_SRC1]     // symbol name (redirected for a static local)
     adrp x1, _kcc_type_int_s@@PAGE
     add  x1, x1, _kcc_type_int_s@@PAGEOFF
     ldr x1, [x1]

@@ -884,7 +884,12 @@ substituted \texttt{\_\_LINE\_\_}.  It also advertises
 \texttt{\_\_SIZEOF\_INT128\_\_} as~16, the way gcc and clang do on 64-bit
 targets, because kcc now supports the \texttt{\_\_int128} type---the Linux kernel
 gates its \texttt{u128}/\texttt{\_\_u128} typedefs on that macro, so without it
-\texttt{<asm/cmpxchg\_64.h>} would not even see the type.  Under
+\texttt{<asm/cmpxchg\_64.h>} would not even see the type.  It publishes the
+\texttt{\_\_BYTE\_ORDER\_\_}/\texttt{\_\_ORDER\_*\_ENDIAN\_\_} family (both
+targets little-endian) so endian-detecting code compiles instead of tripping its
+\verb|#error| fallback---all three order names defined together, since an
+undefined \texttt{\_\_BYTE\_ORDER\_\_} is \texttt{0} in a \verb|#if| and would
+match a likewise-undefined \texttt{\_\_ORDER\_*}.  Under
 \texttt{-{}-target=x86\_64-linux} it adds
 \texttt{\_\_linux\_\_} and \texttt{\_\_x86\_64\_\_} so headers pick their glibc
 bindings, and---so that gcc-oriented build systems (Kbuild's
@@ -918,6 +923,18 @@ static void pp_predefine(void) {
        way gcc and clang do on 64-bit targets.  The Linux kernel gates its
        u128/__u128 typedefs on this macro (include/uapi/linux/types.h). */
     pp_def_simple("__SIZEOF_INT128__", 17, "16", 2);
+    /* Byte-order macros, exactly as gcc/clang publish them.  Real code (here
+       doomgeneric's i_swap.h) selects its swap routines with
+       `#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__' and `#error's if none of
+       the three names resolve; an undefined `__BYTE_ORDER__' is 0 in a `#if',
+       which would compare equal to a likewise-undefined `__ORDER_*' and pick the
+       wrong branch, so all four must be defined.  Both kcc targets---Apple
+       ARM64 and Linux x86-64---are little-endian. */
+    pp_def_simple("__ORDER_LITTLE_ENDIAN__", 23, "1234", 4);
+    pp_def_simple("__ORDER_BIG_ENDIAN__", 20, "4321", 4);
+    pp_def_simple("__ORDER_PDP_ENDIAN__", 20, "3412", 4);
+    pp_def_simple("__BYTE_ORDER__", 14, "1234", 4);
+    pp_def_simple("__LITTLE_ENDIAN__", 17, "1", 1);
     if (kcc_x86_os) {                     /* Linux/x86-64 target: let headers pick glibc bindings */
         pp_def_simple("__linux__", 9, "1", 1);
         pp_def_simple("__x86_64__", 10, "1", 1);
@@ -960,7 +977,11 @@ static void pp_cond_push(unsigned long state) {
 
 void kcc_pp_do_ifdef(int negate) {
     kcc_lex_next();
-    if (kcc_tok_type != TOK_IDENT) {
+    /* Accept a keyword-class token as the name too (phase 4 has no keywords):
+       `#ifndef __inline__` in SDL's begin_code.h names a would-be macro whose
+       spelling the lexer tagged as a keyword; the lookup keys on the text. */
+    unsigned long tt = kcc_tok_type;
+    if (tt != TOK_IDENT && (tt - 10) >= 50) {
         kcc_diag_error(pp_dir_line, 1, m_ifdef_name);
         pp_cond_push(PP_COND_SKIP);
         pp_skip_line();

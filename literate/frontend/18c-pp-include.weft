@@ -550,6 +550,17 @@ headers rather than guarded behind a shared macro: an identical
 accepts it, so a translation unit that includes several of these headers sees
 one consistent \texttt{size\_t} with no conflict.
 
+For the same reason each header that the standard obliges to define
+\texttt{NULL}---\verb|<stdlib.h>| (\stdref{7.22}), \verb|<string.h>|
+(\stdref{7.24}), \verb|<time.h>| (\stdref{7.27}), \verb|<locale.h>|
+(\stdref{7.11}), and \verb|<wchar.h>| (\stdref{7.29}), alongside
+\verb|<stdio.h>| and \verb|<stddef.h>| which already did---opens with an
+\verb|#ifndef NULL| guard defining it as \verb|((void*)0)|.  A program that
+includes only \verb|<stdlib.h>| and writes \texttt{NULL}---as \emph{doomgeneric}'s
+\texttt{sounds.c} does in \verb|{ name, 0, NULL, NULL }|---then compiles without
+having to also pull in \verb|<stddef.h>|.  The guard makes the repetition across
+headers harmless.
+
 The standard streams \texttt{stdin}, \texttt{stdout}, and \texttt{stderr} are
 included.  They are not functions but \emph{data} objects imported from
 \texttt{libSystem} (\verb|__stdinp| and friends), which the header exposes as
@@ -727,6 +738,9 @@ int rename(char *oldp, char *newp);
 #ifndef _STDLIB_H
 #define _STDLIB_H
 typedef unsigned long size_t;
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 #define RAND_MAX 2147483647
@@ -760,6 +774,9 @@ int system(char *cmd);
 #ifndef _STRING_H
 #define _STRING_H
 typedef unsigned long size_t;
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 unsigned long strlen(char *s);
 int strcmp(char *a, char *b);
 int strncmp(char *a, char *b, unsigned long n);
@@ -878,6 +895,9 @@ tm} laid out to match the platform's, including the \texttt{tm\_gmtoff} and
 #define _TIME_H
 typedef long time_t;
 typedef long clock_t;
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 struct tm {
     int tm_sec;
     int tm_min;
@@ -1009,6 +1029,9 @@ void longjmp(jmp_buf env, int val);
 @d Header: locale @{
 #ifndef _LOCALE_H
 #define _LOCALE_H
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 struct lconv {
     char *decimal_point;
     char *thousands_sep;
@@ -1075,6 +1098,9 @@ int fesetenv(fenv_t *envp);
 #ifndef _WCHAR_H
 #define _WCHAR_H
 typedef int wchar_t;
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
 #ifndef _WINT_T
 #define _WINT_T
 typedef int wint_t;

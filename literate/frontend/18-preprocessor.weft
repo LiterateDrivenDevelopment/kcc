@@ -1211,6 +1211,15 @@ _kcc_pp_pre_filem:    .asciz "__FILE__"
 _kcc_pp_file_unknown: .asciz "<stdin>"
 _kcc_pp_pre_one:      .asciz "1"
 _kcc_pp_pre_c17val:   .asciz "201710L"
+// Byte-order macros (gcc/clang spelling).  Both kcc targets are little-endian.
+_kcc_pp_pre_ord_le:   .asciz "__ORDER_LITTLE_ENDIAN__"
+_kcc_pp_pre_ord_be:   .asciz "__ORDER_BIG_ENDIAN__"
+_kcc_pp_pre_ord_pdp:  .asciz "__ORDER_PDP_ENDIAN__"
+_kcc_pp_pre_byteord:  .asciz "__BYTE_ORDER__"
+_kcc_pp_pre_le:       .asciz "__LITTLE_ENDIAN__"
+_kcc_pp_pre_v1234:    .asciz "1234"
+_kcc_pp_pre_v4321:    .asciz "4321"
+_kcc_pp_pre_v3412:    .asciz "3412"
 
 // -- Error messages -------------------------------------------------
 _kcc_pp_err_unknown_dir:  .asciz "unknown preprocessing directive"

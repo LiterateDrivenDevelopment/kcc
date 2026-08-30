@@ -318,22 +318,27 @@ and allocate the requested number of bytes.
 
 @d Linker: global sym @{
 // -- kcc_linker_global_sym ----------------------------------------------------
-// uint64_t kcc_linker_global_sym(const char *name, uint64_t size)
+// uint64_t kcc_linker_global_sym(const char *name, uint64_t size, uint64_t extflag)
 //   x0 = null-terminated symbol name (already prefixed with '_')
 //   x1 = allocation size in bytes (typically 8 for scalars, N*8 for structs)
+//   x2 = N_EXT for an externally-visible definition, 0 for a file-local
+//        (`static') one.  A static file-scope object keeps its source name but
+//        must be local, or two translation units that each define a `static'
+//        with the same spelling (doom's `static player_t *plr;') collide at link.
 // Returns the symbol index.  If the symbol already exists as extern,
-// upgrades it to defined in section 2.  Otherwise adds new.
+// upgrades it to defined in section 2.  Otherwise adds new with N_SECT|extflag.
 .text
 .globl _kcc_linker_global_sym
 .p2align 2
 _kcc_linker_global_sym:
-    stp x29, x30, [sp, #-48]!
+    stp x29, x30, [sp, #-64]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     str x21, [sp, #32]
 
     mov x19, x0                   // save name
     str x1, [sp, #40]             // save size (x1)
+    str x2, [sp, #48]             // save external-linkage flag (N_EXT or 0)
 
     // Check if symbol already in extern hash table
     mov x0, x19
@@ -393,7 +398,8 @@ _kcc_linker_global_sym:
     mov x0, x19                   // name
     mov x1, #2                    // section = 2 (DATA)
     mov x2, x21                   // value = offset in data section
-    mov x3, #(N_SECT | N_EXT)     // flags = defined + external (so other TUs link)
+    ldr x3, [sp, #48]             // caller's linkage flag (N_EXT or 0)
+    orr x3, x3, #N_SECT           // flags = defined [+ external]
     bl _kcc_linker_add_sym
     mov x21, x0                   // sym_index
 
@@ -419,7 +425,7 @@ _kcc_linker_global_sym:
 .Llgs_done:
     ldr x21, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #48
+    ldp x29, x30, [sp], #64
     ret
 @| _kcc_linker_global_sym
 @}

@@ -2256,9 +2256,13 @@ label restores callee-saved registers and returns.
     cbz x0, .Lcgi_gref_extern
 
     // Defined here: reserve BSS storage (section 2) and address it directly
-    // with an ADRP/ADD pair, since a local symbol has an image address.
+    // with an ADRP/ADD pair, since a local symbol has an image address.  The
+    // preregister pass already minted this symbol with its correct linkage
+    // (local for a `static'), so this reference dedups to that entry and the
+    // N_EXT passed here is only used if the symbol is somehow not yet defined.
     mov x0, x25
     mov x1, #8                     // default 8 bytes per scalar global
+    mov x2, #N_EXT
     bl _kcc_linker_global_sym
     mov x25, x0                    // sym_index
 

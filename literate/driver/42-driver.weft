@@ -595,6 +595,13 @@ prefix---anything beginning \texttt{-O}, \texttt{-f}, \texttt{-W} (past the
 simplification, not full support: the flags are ignored, not implemented.
 \texttt{kcc\_driver\_skipopt} chains the code-model recogniser and this one, so a
 single call at each argument scan consumes any tuning flag wherever it appears.
+It also recognises \texttt{-w} directly: unlike the prefix no-ops, \texttt{-w}
+carries meaning---inhibit every warning (\stdref{gcc -w})---so \texttt{skipopt}
+forces \texttt{\_kcc\_warn\_all} back to~0 as it consumes the flag.  Because both
+the compile and link argument scanners route unrecognised options through
+\texttt{skipopt}, this one check makes \texttt{-w} work in every mode, so a build
+that passes \texttt{-w} (doomgeneric's \texttt{build\_ref.sh}, most autotools
+projects) compiles with \kcc{} directly, with no wrapper to strip the flag.
 
 @d Driver: compile @{
 // -- kcc_driver_xflag ---------------------------------------------------------
@@ -675,6 +682,20 @@ _kcc_driver_skipopt:
     mov x29, sp
     str x19, [sp, #16]
     mov x19, x0
+    // "-w": inhibit all warnings (\stdref{gcc -w}).  kcc keeps the -Wall family
+    // off by default, so this forces _kcc_warn_all back to 0 and consumes the
+    // flag; both the compile and link flag scanners route unrecognised options
+    // here, so one check covers every path (no wrapper needed to strip -w).
+    adrp x1, _kcc_opt_wsuppress@@PAGE
+    add  x1, x1, _kcc_opt_wsuppress@@PAGEOFF
+    bl _kcc_strcmp
+    cbnz x0, .Lso_chk_m
+    adrp x0, _kcc_warn_all@@PAGE
+    add  x0, x0, _kcc_warn_all@@PAGEOFF
+    str  xzr, [x0]
+    b .Lso_yes
+.Lso_chk_m:
+    mov x0, x19
     bl _kcc_driver_mflag
     cbnz x0, .Lso_yes
     mov x0, x19
@@ -1574,6 +1595,8 @@ _kcc_opt_o:
     .asciz "-o"
 _kcc_opt_wall:
     .asciz "-Wall"
+_kcc_opt_wsuppress:
+    .asciz "-w"
 _kcc_opt_g:
     .asciz "-g"
 _kcc_opt_incdir:

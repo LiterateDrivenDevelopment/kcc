@@ -10,6 +10,15 @@ The conditional directives \texttt{\#ifdef}, \texttt{\#ifndef},
 \texttt{\#if}, \texttt{\#elif}, \texttt{\#else}, and
 \texttt{\#endif} control which sections of the source are processed.
 
+The name following \texttt{\#ifdef}/\texttt{\#ifndef} is any identifier
+\emph{or keyword-class} token.  In phase-4 translation no keywords exist
+yet---they are recognised only later, in the parser---so a header that
+tests a spelling the lexer happens to tag as a keyword, such as SDL's
+\texttt{\#ifndef __inline__} in \texttt{begin\_code.h}, still names a
+macro.  Because the macro lookup keys on the token's source text, the
+directive treats the whole identifier-or-keyword range uniformly, exactly
+as \texttt{\#define} does when it accepts such a spelling as a macro name.
+
 A conditional stack records the state of each nested group.  States
 are \texttt{ACTIVE} (processing tokens), \texttt{SKIP} (discarding
 tokens), and \texttt{DONE} (active branch already seen, skip rest).
@@ -26,13 +35,21 @@ _kcc_pp_do_ifdef:
 
     mov x19, x0               // x19 = negate flag
 
-    // Read macro name
+    // Read macro name.  Accept keyword-class tokens too: in phase-4 translation
+    // no keywords exist yet, so `#ifndef __inline__` (SDL's begin_code.h) names a
+    // would-be macro whose spelling the lexer eagerly tagged as a keyword.  The
+    // lookup below keys on the source text, so any identifier-or-keyword token
+    // resolves correctly.
     bl _kcc_lex_next
     adrp x0, _kcc_tok_type@@PAGE
     add  x0, x0, _kcc_tok_type@@PAGEOFF
     ldr  x0, [x0]
     cmp  x0, #TOK_IDENT
-    b.ne .Lifdef_err
+    b.eq .Lifdef_name_ok
+    sub  x1, x0, #10          // keyword-class tokens occupy [10, 60)
+    cmp  x1, #50              // 60-10; hs → neither identifier nor keyword
+    b.hs .Lifdef_err
+.Lifdef_name_ok:
 
     // Look up in macro table
     adrp x0, _kcc_pp_macros@@PAGE

@@ -564,7 +564,7 @@ _kcc_pp_try_expand:
     tst  x0, #PP_FLAG_BUILTIN
     b.eq .Lexp_not_dyn
     cmp  x20, #8              // "__LINE__" and "__FILE__" are both length 8
-    b.ne .Lexp_not_dyn
+    b.ne .Lexp_chk_counter
     mov  x0, x19
     adrp x1, _kcc_pp_pre_linem@@PAGE
     add  x1, x1, _kcc_pp_pre_linem@@PAGEOFF
@@ -577,6 +577,17 @@ _kcc_pp_try_expand:
     mov  x2, #8
     bl _kcc_memcmp
     cbz  x0, .Lexp_file_dyn
+    b .Lexp_not_dyn
+.Lexp_chk_counter:
+    // __COUNTER__ (length 11): a fresh sequential integer at each use.
+    cmp  x20, #11
+    b.ne .Lexp_not_dyn
+    mov  x0, x19
+    adrp x1, _kcc_pp_pre_counterm@@PAGE
+    add  x1, x1, _kcc_pp_pre_counterm@@PAGEOFF
+    mov  x2, #11
+    bl _kcc_memcmp
+    cbz  x0, .Lexp_counter_dyn
 .Lexp_not_dyn:
 
     // Check if function-like
@@ -626,6 +637,17 @@ _kcc_pp_try_expand:
     ldp x29, x30, [sp], #64
     ret
 
+.Lexp_counter_dyn:
+    // __COUNTER__ — expand to the current value of a monotonic counter, then
+    // increment it so the next use sees the successor (\stdref{gcc __COUNTER__}).
+    // The value is formatted through the same decimal path as __LINE__.
+    adrp x0, _kcc_pp_counter@@PAGE
+    add  x0, x0, _kcc_pp_counter@@PAGEOFF
+    ldr  x22, [x0]               // value to emit = current counter
+    add  x1, x22, #1
+    str  x1, [x0]                // counter++ for the next expansion
+    b .Lexp_num_format
+
 .Lexp_line_dyn:
     // Format the current line number as a decimal token and push it as the
     // expansion.  Digits are written from the end of a small arena buffer.
@@ -637,6 +659,7 @@ _kcc_pp_try_expand:
     add  x0, x0, _kcc_line_delta@@PAGEOFF
     ldr  x0, [x0]
     add  x22, x22, x0            // presumed line = physical + #line delta
+.Lexp_num_format:
     mov  x0, #24
     bl _kcc_arena_alloc
     mov  x24, x0                 // buffer
@@ -1838,7 +1861,13 @@ token, rather than expanding a fixed body.  Registering it still lets
 restores per file, so it names the header when used inside one) wrapped in
 double quotes as a fresh string-literal token.  The kernel reaches
 \texttt{\_\_FILE\_\_} through \texttt{WARN()}/\texttt{BUG()}/\texttt{pr\_*} in
-roughly half of all source files.
+roughly half of all source files.  \texttt{\_\_COUNTER\_\_} is dynamic in the
+same family, but its value depends on nothing in the source: each expansion
+yields the next integer of a monotonically increasing counter
+(\texttt{\_kcc\_pp\_counter}, starting at~0), which \texttt{\_kcc\_pp\_try\_expand}
+formats through the very decimal path \texttt{\_\_LINE\_\_} uses and then
+increments.  The kernel builds unique identifiers with it
+(\texttt{\_\_UNIQUE\_ID}, lockdep key names).
 
 Four further macros advertise the \emph{conditional features}
 (\stdref{6.10.8.3}) kcc does not implement.  Atomics, threads, complex
@@ -1978,6 +2007,18 @@ _kcc_pp_predefine:
     adrp x0, _kcc_pp_pre_filem@@PAGE
     add  x0, x0, _kcc_pp_pre_filem@@PAGEOFF
     mov  x1, #8                // len("__FILE__")
+    adrp x2, _kcc_pp_pre_one@@PAGE
+    add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
+    mov  x3, #1
+    bl _kcc_pp_def_simple
+
+    // __COUNTER__ — like __LINE__, registered so `#ifdef __COUNTER__` sees it and
+    // it cannot be #undef'd; _kcc_pp_try_expand substitutes a fresh incrementing
+    // integer at each use.  The kernel's `unique id` idioms (e.g. lock names,
+    // __UNIQUE_ID) rely on it.
+    adrp x0, _kcc_pp_pre_counterm@@PAGE
+    add  x0, x0, _kcc_pp_pre_counterm@@PAGEOFF
+    mov  x1, #11               // len("__COUNTER__")
     adrp x2, _kcc_pp_pre_one@@PAGE
     add  x2, x2, _kcc_pp_pre_one@@PAGEOFF
     mov  x3, #1

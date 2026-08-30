@@ -1160,6 +1160,7 @@ _kcc_pp_macro_stack: .quad 0     // head of the #pragma push_macro save stack
 _kcc_pp_eval_depth:  .quad 0     // #if-expression macro recursion guard
 .globl _kcc_line_delta
 _kcc_line_delta:     .quad 0     // #line adjustment: __LINE__ = _kcc_lex_line + this
+_kcc_pp_counter:     .quad 0     // __COUNTER__: next value to emit, incremented per use
 _kcc_pp_drain_floor: .quad 0     // >0: pp_next stops when the ctx stack drops below it (argument prescan)
 .globl _kcc_pp_ctx_depth
 _kcc_pp_ctx_depth:   .quad 0     // context stack depth
@@ -1208,6 +1209,7 @@ _kcc_pp_pre_lp64b:    .asciz "_LP64"
 _kcc_pp_va_args_str:  .asciz "__VA_ARGS__"
 _kcc_pp_pre_linem:    .asciz "__LINE__"
 _kcc_pp_pre_filem:    .asciz "__FILE__"
+_kcc_pp_pre_counterm: .asciz "__COUNTER__"
 _kcc_pp_file_unknown: .asciz "<stdin>"
 _kcc_pp_pre_one:      .asciz "1"
 _kcc_pp_pre_c17val:   .asciz "201710L"

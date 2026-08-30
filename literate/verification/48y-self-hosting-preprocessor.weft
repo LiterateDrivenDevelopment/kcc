@@ -102,6 +102,7 @@ void kcc_source_splice(void);
 /* exported state (driver/other modules reference these) */
 void *kcc_pp_macros = 0;
 long kcc_line_delta = 0;
+unsigned long kcc_pp_counter = 0;                /* __COUNTER__: next value to emit */
 unsigned long kcc_pp_ctx_depth = 0;
 /* internal state */
 static struct PPSave *pp_macro_stack = 0;
@@ -600,6 +601,17 @@ int kcc_pp_try_expand(void) {
         pp_ctx_push_expand(m, buf, pl + 2);
         return 1;
     }
+    /* dynamic __COUNTER__ → a fresh incrementing integer at each use. */
+    if ((m->flags & PP_FLAG_BUILTIN) && namelen == 11 && kcc_memcmp(name, "__COUNTER__", 11) == 0) {
+        unsigned long v = kcc_pp_counter++;
+        char *buf = (char *)kcc_arena_alloc(24);
+        char *e = buf + 24;
+        if (v == 0) { *--e = '0'; }
+        else while (v) { *--e = '0' + (v % 10); v /= 10; }
+        m->flags |= PP_FLAG_EXPANDING;
+        pp_ctx_push_expand(m, e, (unsigned long)((buf + 24) - e));
+        return 1;
+    }
     if (!(m->flags & PP_FLAG_FUNCLIKE)) {
         /* object-like */
         unsigned long bl = m->bodylen;
@@ -919,6 +931,7 @@ static void pp_predefine(void) {
     pp_def_simple("_LP64", 5, "1", 1);
     pp_def_simple("__LINE__", 8, "1", 1);
     pp_def_simple("__FILE__", 8, "1", 1);   /* substituted dynamically in kcc_pp_try_expand */
+    pp_def_simple("__COUNTER__", 11, "1", 1);
     /* kcc supports the GNU 128-bit integer type (16 bytes), so advertise it the
        way gcc and clang do on 64-bit targets.  The Linux kernel gates its
        u128/__u128 typedefs on this macro (include/uapi/linux/types.h). */

@@ -672,6 +672,7 @@ int kcc_pp_try_expand(void) {
        `aprev' is the source end of the last token folded into it. */
     char *abuf = 0; unsigned long acap = 0, alen = 0;
     const char *aprev = args[0].start;
+    int any_buf = 0;                 /* any argument rebuilt in a buffer? */
     for (;;) {
         kcc_lex_next();
         unsigned long tt = kcc_tok_type;
@@ -681,7 +682,7 @@ int kcc_pp_try_expand(void) {
            the live text collected so far into a buffer, evaluate the directive so
            the conditional stack tracks which branch is taken, and continue. */
         if (tt == TOK_HASH && tl > pp_prev_line) {
-            if (!abuf) { acap = 256; abuf = (char *)kcc_arena_alloc(acap); alen = 0; }
+            if (!abuf) { acap = 256; abuf = (char *)kcc_arena_alloc(acap); alen = 0; any_buf = 1; }
             pp_arg_append(&abuf, &acap, &alen, aprev, (unsigned long)(kcc_tok_start - aprev));
             pp_prev_line = tl;
             if (pp_cond_depth && pp_cond_stack[pp_cond_depth - 1] != PP_COND_ACTIVE)
@@ -732,9 +733,22 @@ int kcc_pp_try_expand(void) {
        the macro was defined. */
     if (m->flags & PP_FLAG_VARIADIC) {
         if (argc > nparams) {
-            const char *first = args[nparams].start;
-            const char *last_end = args[argc - 1].start + args[argc - 1].len;
-            args[nparams].len = (unsigned long)(last_end - first);
+            if (any_buf) {
+                /* Some trailing argument was rebuilt in its own buffer, so the
+                   arguments are no longer one contiguous source run and the
+                   pointer span below would be meaningless; join them---with the
+                   separating commas---into a fresh buffer instead. */
+                char *vb = 0; unsigned long vc = 0, vl = 0;
+                for (unsigned long i = nparams; i < argc; i++) {
+                    if (i > nparams) pp_arg_append(&vb, &vc, &vl, ",", 1);
+                    pp_arg_append(&vb, &vc, &vl, args[i].start, args[i].len);
+                }
+                args[nparams].start = vb; args[nparams].len = vl;
+            } else {
+                const char *first = args[nparams].start;
+                const char *last_end = args[argc - 1].start + args[argc - 1].len;
+                args[nparams].len = (unsigned long)(last_end - first);
+            }
         } else {
             args[nparams].start = args[0].start;
             args[nparams].len = 0;

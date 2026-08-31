@@ -298,6 +298,8 @@ the kernel's \texttt{DEFINE\_LOCK\_GUARD\_0} expansion
     mov x0, x22                  // name
     bl _kcc_typedef_add
 .Ldecl_var_td_tag:
+    mov x0, x25
+    bl _kcc_parse_typedef_funcfix     // typedef of function type keeps TY_FUNC
     mov x0, #AST_TYPEDEF_DECL
     str x0, [x25, #AST_TAG]
 .Ldecl_var_td_skip:
@@ -357,6 +359,8 @@ recovery with synchronisation to the next semicolon.
     bl _kcc_typedef_add
 
 .Ldecl_typedef_done:
+    mov x0, x21
+    bl _kcc_parse_typedef_funcfix     // typedef of function type keeps TY_FUNC
     // Change tag to TYPEDEF_DECL
     mov x0, #AST_TYPEDEF_DECL
     str x0, [x21, #AST_TAG]
@@ -1214,6 +1218,53 @@ _kcc_parse_declarator:
     ldp x29, x30, [sp], #48
     ret
 @| _kcc_parse_declarator
+@}
+
+A typedef (or any object declaration) whose declarator is a bare function ---
+\texttt{typedef int filler\_t(struct file *, struct folio *)} (the kernel's
+\texttt{filler\_t}) or \texttt{int f(int)} used as a type --- parses into an
+\texttt{AST\_FUNC\_DECL} node (\texttt{F0}~=~return type, \texttt{F2}~=~params).
+When the declaration path re-tags that node to \texttt{AST\_TYPEDEF\_DECL}, sema
+reads \texttt{F0} as the whole type and the function-ness is lost: the typedef
+collapses to the \emph{return} type, so \texttt{filler\_t~x; x(\ldots)} fails
+with ``called object is not a function''.  This fixup rebuilds \texttt{F0} as an
+\texttt{AST\_TYPE\_FUNC} carrying the return type and the parameter list, so the
+typedef resolves to a genuine \texttt{TY\_FUNC} --- which a parameter then
+adjusts to pointer-to-function (\stdref{6.7.6.3}) and which is directly callable
+as a function designator.
+
+@d Decl: parse declaration @{
+// -- kcc_parse_typedef_funcfix ----------------------------------------------
+// void kcc_parse_typedef_funcfix(node *decl)
+//   If decl is an AST_FUNC_DECL, replace its F0 (currently the bare return
+//   type) with an AST_TYPE_FUNC type node built from the return type and the
+//   parameter list, so a typedef/object of function type keeps its function
+//   type instead of decaying to the return type.  Any other node is untouched.
+.text
+.p2align 2
+_kcc_parse_typedef_funcfix:
+    ldr x1, [x0, #AST_TAG]
+    cmp x1, #AST_FUNC_DECL
+    b.ne .Ltff_ret
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x19, [sp, #16]
+    mov x19, x0                   // the AST_FUNC_DECL node
+    mov x0, #AST_TYPE_FUNC
+    bl _kcc_ast_alloc             // x0 = new type node
+    ldr x1, [x19, #AST_F0]        // return type
+    str x1, [x0, #AST_F0]
+    ldr x1, [x19, #AST_F2]        // params | variadic (bit 0)
+    and x2, x1, #1                // variadic flag
+    bic x1, x1, #1                // params list
+    str x1, [x0, #AST_F1]         // params
+    str x2, [x0, #AST_F2]         // variadic
+    str x0, [x19, #AST_F0]        // decl's type is now the function type
+    ldr x19, [sp, #16]
+    ldp x29, x30, [sp], #32
+.Ltff_ret:
+    ret
+@| _kcc_parse_typedef_funcfix
 @}
 
 \section{Direct Declarator}

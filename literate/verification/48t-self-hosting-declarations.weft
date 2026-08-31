@@ -939,6 +939,14 @@ void *kcc_parse_decl(void) {
                parenthesised `typedef int (f)(int);`): register the name, not a
                function.  The FuncDecl carries the name in f1 like a VarDecl. */
             if (d->f1) kcc_typedef_add((const char *)d->f1, kcc_strlen((const char *)d->f1));
+            /* Rebuild f0 as an AST_TYPE_FUNC so the typedef keeps its function
+               type (return + params) instead of collapsing to the return type,
+               which made `filler_t x; x(...)' fail as "not a function". */
+            { struct Node *ft = (struct Node *)kcc_ast_alloc(AST_TYPE_FUNC);
+              ft->f0 = d->f0;                 /* return type */
+              ft->f1 = d->f2 & ~1UL;          /* params (mask variadic bit) */
+              ft->f2 = d->f2 & 1UL;           /* variadic */
+              d->f0 = (unsigned long)ft; }
             d->tag = AST_TYPEDEF_DECL;
             kcc_parse_expect(TOK_SEMI);
             return d;

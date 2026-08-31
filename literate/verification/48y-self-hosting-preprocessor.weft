@@ -1467,21 +1467,31 @@ static int pp_file_exists(const char *path) {
     return 1;
 }
 
-static const char *pp_resolve_include(const char *name) {
+static const char *pp_resolve_include(const char *name, int system) {
     unsigned long namelen = kcc_strlen(name);
-    const char *sp = kcc_src_path;
-    if (sp) {
-        unsigned long dirlen = 0;
-        for (unsigned long i = 0; sp[i]; i++) if (sp[i] == '/') dirlen = i + 1;
-        if (dirlen) {
-            char *cand = (char *)kcc_arena_alloc(dirlen + namelen + 1);
-            kcc_memcpy(cand, sp, dirlen);
-            kcc_memcpy(cand + dirlen, name, namelen);
-            cand[dirlen + namelen] = 0;
-            if (pp_file_exists(cand)) return cand;
+    /* A quote include (`"..."') is looked up first in the directory of the file
+       that holds the directive, then relative to the working directory, before
+       the -I path (\stdref{6.10.2p3}).  An angle include (`<...>') searches ONLY
+       the -I / system directories (\stdref{6.10.2p2})---never the working
+       directory: a kernel tree has a top-level `crypto/hash.h' (a small internal
+       shim) that must not shadow the public `include/crypto/hash.h' that
+       `#include <crypto/hash.h>' means, or the wrong header quietly omits
+       `struct crypto_istat_hash' and every reference to it fails to type-check. */
+    if (!system) {
+        const char *sp = kcc_src_path;
+        if (sp) {
+            unsigned long dirlen = 0;
+            for (unsigned long i = 0; sp[i]; i++) if (sp[i] == '/') dirlen = i + 1;
+            if (dirlen) {
+                char *cand = (char *)kcc_arena_alloc(dirlen + namelen + 1);
+                kcc_memcpy(cand, sp, dirlen);
+                kcc_memcpy(cand + dirlen, name, namelen);
+                cand[dirlen + namelen] = 0;
+                if (pp_file_exists(cand)) return cand;
+            }
         }
+        if (pp_file_exists(name)) return name;
     }
-    if (pp_file_exists(name)) return name;
     for (unsigned long i = 0; i < pp_inc_ndirs; i++) {
         const char *dir = pp_inc_dirs[i];
         unsigned long dl = kcc_strlen(dir);
@@ -1591,7 +1601,7 @@ void kcc_pp_do_include(void) {
         pp_prev_line = 0;
         return;
     }
-    const char *rp = pp_resolve_include(path);
+    const char *rp = pp_resolve_include(path, system);
     if (!rp) {
         if (!system) kcc_diag_error(pp_dir_line, 1, m_notfound);
         return;
@@ -1625,7 +1635,7 @@ void kcc_pp_force_include(const char *path) {
         pp_prev_line = 0;
         return;
     }
-    const char *rp = pp_resolve_include(path);
+    const char *rp = pp_resolve_include(path, 0);
     if (!rp) { kcc_diag_error(1, 1, m_notfound); return; }
     kcc_dep_add(rp);
     pp_ctx_push(PP_CTX_INCLUDE);

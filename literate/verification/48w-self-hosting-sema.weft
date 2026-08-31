@@ -1066,11 +1066,42 @@ static void *sema_expr_assign(struct Node *n) {
 
 \paragraph{Calls, member access, casts, and sizeof.}
 
+The call handler intercepts \texttt{\_\_builtin\_choose\_expr(cond, a, b)} before
+anything else: it is not a real call but a compile-time selection, so the handler
+folds \texttt{cond} to a constant and rewrites the node into the chosen argument,
+keeping this node's sibling link so it stays correctly placed in an enclosing
+argument list.  The whole compiler then sees the selected expression---crucially
+its \emph{type}, which the kernel's \texttt{\_\_inttype} builds a get\_user
+operand's width from; treating the builtin as an ordinary (implicit-int) call
+would size that operand at four bytes and emit \texttt{movq \dots,\%r8d}.
+
 @l c
 @d Selfhost: sema callmembercast @{
 static void *sema_expr_call(struct Node *n) {
-    sema_callee_implicit = 0;
     struct Node *callee = (struct Node *)n->f0;
+    /* __builtin_choose_expr(cond, a, b): a compile-time selection whose type AND
+       value are the chosen argument's; the unchosen arg is not evaluated
+       (GCC extension).  The kernel forms `__inttype(x)' ---and hence the width of
+       a get_user output operand--- from it, so its type must be the selected
+       operand's, not a default int.  Rewrite the call node in place to become the
+       chosen argument, preserving this node's own position in any containing list
+       (its f4 sibling link), so sizeof, __typeof__, constant folding, and code
+       generation all see straight through it. */
+    if (callee && callee->tag == AST_IDENT_EXPR && callee->f0 &&
+        kcc_strcmp((const char *)callee->f0, "__builtin_choose_expr") == 0) {
+        struct Node *a0 = (struct Node *)n->f1;
+        struct Node *a1 = a0 ? (struct Node *)a0->f4 : 0;
+        struct Node *a2 = a1 ? (struct Node *)a1->f4 : 0;
+        if (a0) kcc_sema_expr(a0);
+        struct Node *pick = (a0 && kcc_eval_const_int(a0)) ? a1 : a2;
+        if (pick) {
+            unsigned long sib = n->f4;      /* keep our slot in the arg/sibling list */
+            *n = *pick;
+            n->f4 = sib;
+            return kcc_sema_expr(n);
+        }
+    }
+    sema_callee_implicit = 0;
     sema_callee_ctx = (callee->tag == AST_IDENT_EXPR);
     struct Type *ct = (struct Type *)kcc_sema_expr(callee);
     sema_callee_ctx = 0;

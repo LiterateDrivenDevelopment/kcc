@@ -382,7 +382,11 @@ fields at all but encoded (register+1 in the low half, byte width in the high)
 in the operand list hung off the AST node, so the canonicaliser walks that list
 and renumbers each encoded register in place.  Without it, store-to-load
 forwarding would map an asm input's load to the stored value yet leave the asm
-still naming the swept load---reading an uninitialised slot at run time.
+still naming the swept load---reading an uninitialised slot at run time.  It must
+renumber \emph{only} the encoded registers, though: an operand flagged immediate,
+symbolic, or string (a marker bit in F2) carries a constant, a byte offset, or a
+length in F3 rather than a register, and renumbering that value silently corrupts
+it when it happens to equal a coalesced vreg number.
 
 @l c
 @d Selfhost: opt cse @{
@@ -400,6 +404,15 @@ static void opt_asm_canon(void *node, unsigned long n, unsigned long *map) {
             OPTL(op, OPT_AST_F2) =
                 ((opt_canon((v & 0xffffffffUL) - 1, n, map) + 1) |
                  (v & 0xffffffff00000000UL));
+        /* An immediate (F2 bit 63), symbolic (bit 62), or string (bit 61)
+           operand keeps a constant value, byte offset, or length in F3---not a
+           register+1---so it must never be renumbered.  Only a plain input's
+           register (F2) or a memory/output/read-write address (F3, register+1 in
+           the low half) is an encoded vreg.  Without this guard CSE remaps such a
+           constant through the vreg map whenever it collides with a live vreg
+           number: the kernel's `.org 2b+%c3' with `"i"(sizeof(struct bug_entry))'
+           had its 12 rewritten to 6 in functions where vreg 11 was coalesced. */
+        if (v >> 61) continue;
         unsigned long a = OPTL(op, OPT_AST_F3);
         if (a & 0xffffffffUL)
             OPTL(op, OPT_AST_F3) =

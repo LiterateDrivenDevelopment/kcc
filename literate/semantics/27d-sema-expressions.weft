@@ -2030,7 +2030,14 @@ _kcc_sema_expr_call:
 
 Member access handles both dot (\texttt{s.m}) and arrow
 (\texttt{p->m}) forms.  For arrow access the object type must be a
-pointer, which is dereferenced first.  The resulting type must be
+pointer, which is dereferenced first.  An \emph{array} operand is
+equally valid: array-to-pointer decay (C \S6.3.2.1) makes
+\texttt{(a)->m} mean \texttt{(*a).m}, so we accept \texttt{TY\_ARRAY}
+alongside \texttt{TY\_PTR} and read the element type from the same
+\texttt{TY\_F0} slot.  This is exactly how the kernel's
+\texttt{cpumask\_bits(mask)} macro---\texttt{(mask)->bits} where
+\texttt{mask} is a \texttt{cpumask\_var\_t} array---reaches the
+compiler.  The resulting type must be
 \texttt{TY\_STRUCT} or \texttt{TY\_UNION}; if not, the checker falls
 back to \texttt{int}.  The lookup is factored into a shared helper,
 \texttt{kcc\_type\_find\_member}, which walks the aggregate's field
@@ -2134,11 +2141,16 @@ _kcc_sema_expr_member:
     // If arrow: dereference pointer first
     ldr x1, [x19, #AST_F2]
     cbz x1, .Lsem_dot
-    // Arrow: type should be pointer to struct/union
+    // Arrow: type should be pointer to struct/union.  An array operand is
+    // valid too: array-to-pointer decay (C 6.3.2.1) yields pointer-to-element,
+    // and both TY_PTR and TY_ARRAY carry that element type in TY_F0.
     ldr x1, [x20, #TY_KIND]
     cmp x1, #TY_PTR
+    b.eq .Lsem_arrow_deref
+    cmp x1, #TY_ARRAY
     b.ne .Lsem_fallback
-    ldr x20, [x20, #TY_F0]         // dereference
+.Lsem_arrow_deref:
+    ldr x20, [x20, #TY_F0]         // dereference / decay
 
 .Lsem_dot:
     // Type should be struct or union

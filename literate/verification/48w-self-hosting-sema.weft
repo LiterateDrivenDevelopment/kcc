@@ -1088,6 +1088,16 @@ its \emph{type}, which the kernel's \texttt{\_\_inttype} builds a get\_user
 operand's width from; treating the builtin as an ordinary (implicit-int) call
 would size that operand at four bytes and emit \texttt{movq \dots,\%r8d}.
 
+Member access dereferences the object for an arrow (\texttt{p->m}) and then
+requires a struct or union.  An \emph{array} object is accepted here too:
+array-to-pointer decay (C \S6.3.2.1) makes \texttt{(a)->m} equivalent to
+\texttt{(*a).m}, and since \texttt{TY\_ARRAY} stores its element type in the
+same \texttt{f0} slot as a pointer's pointee, one extra kind test lets the
+element type flow straight through.  This is what the kernel's
+\texttt{cpumask\_bits(mask)} macro needs---it expands to \texttt{(mask)->bits}
+where \texttt{mask} is a \texttt{cpumask\_var\_t} array---so \texttt{smp.c}'s
+\texttt{for\_each\_cpu(cpu, cfd->cpumask)} loop now type-checks.
+
 @l c
 @d Selfhost: sema callmembercast @{
 static void *sema_expr_call(struct Node *n) {
@@ -1172,8 +1182,8 @@ struct FindResult kcc_type_find_member(void *sty, const char *name) {
 
 static void *sema_expr_member(struct Node *n) {
     struct Type *ot = (struct Type *)kcc_sema_expr((void *)n->f0);
-    if (n->f2) {                                  /* arrow: deref pointer */
-        if (ot->kind != TY_PTR) goto fallback;
+    if (n->f2) {                                  /* arrow: deref pointer (or decay array) */
+        if (ot->kind != TY_PTR && ot->kind != TY_ARRAY) goto fallback;
         ot = (struct Type *)ot->f0;
     }
     if (ot->kind != TY_STRUCT && ot->kind != TY_UNION) goto fallback;

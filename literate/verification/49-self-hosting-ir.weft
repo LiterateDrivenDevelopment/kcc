@@ -2721,13 +2721,33 @@ static unsigned long kcc_ir_i128_lo(unsigned long addr) { return kcc_ir_emit_loa
 static unsigned long kcc_ir_i128_hi(unsigned long addr) {
     return kcc_ir_emit_load(kcc_ir_emit_gep_const(addr, 8), 0);
 }
+/* The 128-bit slot address of a value already typed __int128.  An lvalue (an
+   identifier, member, subscript, or dereference---possibly parenthesised) is its
+   own slot, so we take its address; only an rvalue (a cast, or a 128-bit
+   arithmetic result) is built directly, since those already yield a slot address
+   and building `kcc_ir_build_expr' on an lvalue would instead load its low half
+   as a scalar and then dereference that value as if it were the slot pointer. */
+static unsigned long kcc_ir_i128_addr(void *node) {
+    void *n = node;
+    while (n && IL(n, AST_TAG) == AST_PAREN_EXPR) n = (void *)IL(n, AST_F0);
+    unsigned long tag = n ? IL(n, AST_TAG) : 0;
+    if (tag == AST_IDENT_EXPR || tag == AST_MEMBER || tag == AST_SUBSCRIPT ||
+        (tag == AST_UNARY_EXPR && IL(n, AST_F0) == TOK_STAR)) {
+        void *u = kcc_ast_alloc(AST_UNARY_EXPR);
+        IL(u, AST_F0) = TOK_AMP;
+        IL(u, AST_F1) = (unsigned long)n;
+        IL(u, AST_F2) = 1;
+        return kcc_ir_build_expr(u);
+    }
+    return kcc_ir_build_expr(node);
+}
 /* Build a subexpression as a 128-bit slot address: a value already typed
    __int128 yields the slot directly; a narrower integer is widened (zero- or
    sign-filled high half) into a fresh slot. */
 static unsigned long kcc_ir_i128_operand(void *node) {
     void *ty = (void *)IL(node, AST_F3);
     if (ty && (unsigned long)ty >= 0x1000 && IL(ty, TY_KIND) == TY_INT128)
-        return kcc_ir_build_expr(node);
+        return kcc_ir_i128_addr(node);
     unsigned long v = kcc_ir_build_expr(node);
     unsigned long slot = kcc_ir_i128_slot();
     unsigned long hi = kcc_ir_emit_const(0);
@@ -2814,12 +2834,34 @@ static unsigned long kcc_ir_i128_binary(void *e) {
     unsigned long B = kcc_ir_i128_operand((void *)IL(e, AST_F2));
     return kcc_ir_i128_mul(A, B);
 }
+/* Equality of two 128-bit values: both halves must match.  The result is an
+   ordinary `int' (0/1), so the caller dispatches on the operands' type, not the
+   result's.  `!=' is the complement. */
+static unsigned long kcc_ir_i128_cmp(void *e, unsigned long op_tok) {
+    unsigned long A = kcc_ir_i128_operand((void *)IL(e, AST_F1));
+    unsigned long B = kcc_ir_i128_operand((void *)IL(e, AST_F2));
+    unsigned long lo_eq = kcc_ir_emit_binop(IR_CMP_EQ, kcc_ir_i128_lo(A), kcc_ir_i128_lo(B));
+    unsigned long hi_eq = kcc_ir_emit_binop(IR_CMP_EQ, kcc_ir_i128_hi(A), kcc_ir_i128_hi(B));
+    unsigned long eq = kcc_ir_emit_binop(IR_AND, lo_eq, hi_eq);
+    if (op_tok == TOK_NE) return kcc_ir_emit_binop(IR_XOR, eq, kcc_ir_emit_const(1));
+    return eq;
+}
+/* Whether an expression node's static type is __int128. */
+static unsigned long kcc_ir_is_i128(void *node) {
+    void *ty = (void *)IL(node, AST_F3);
+    return ty && (unsigned long)ty >= 0x1000 && IL(ty, TY_KIND) == TY_INT128;
+}
 
 unsigned long kcc_ir_build_binary(void *e) {
     unsigned long op_tok = IL(e, AST_F0);
     { void *rty0 = (void *)IL(e, AST_F3);
       if (rty0 && (unsigned long)rty0 >= 0x1000 && IL(rty0, TY_KIND) == TY_INT128)
           return kcc_ir_i128_binary(e); }
+    /* A 128-bit equality test yields a plain int, so it is not caught above;
+       detect it from the operands (the kernel's try_cmpxchg128). */
+    if ((op_tok == TOK_EQ || op_tok == TOK_NE) &&
+        (kcc_ir_is_i128((void *)IL(e, AST_F1)) || kcc_ir_is_i128((void *)IL(e, AST_F2))))
+        return kcc_ir_i128_cmp(e, op_tok);
     if (op_tok == TOK_AND) return bin_short_and(e);
     if (op_tok == TOK_OR) return bin_short_or(e);
     unsigned long a = kcc_ir_build_expr((void *)IL(e, AST_F1));

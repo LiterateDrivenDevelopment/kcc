@@ -3996,7 +3996,13 @@ unsigned long kcc_eval_const_int(void *n) {
         if (op == TOK_STAR) return (unsigned long)(a * b);
         if (op == TOK_SLASH) return b ? (unsigned long)(a / b) : 0;
         if (op == TOK_PERCENT) return b ? (unsigned long)(a % b) : 0;
-        if (op == TOK_SHL) return (unsigned long)(a << b);
+        /* Left-shift in the unsigned domain: a left shift of a negative signed
+           value is undefined behaviour (\stdref{6.5.7}), and computing on the
+           two's-complement bit pattern yields the value every target actually
+           wants without tripping a sanitiser or inviting a miscompile.  The
+           right shift stays signed---an arithmetic shift is well defined and is
+           what a constant like `x >> 1' on a negative bound intends. */
+        if (op == TOK_SHL) return (unsigned long)a << (b & 63);
         if (op == TOK_SHR) return (unsigned long)(a >> b);
         if (op == TOK_AMP) return (unsigned long)(a & b);
         if (op == TOK_PIPE) return (unsigned long)(a | b);

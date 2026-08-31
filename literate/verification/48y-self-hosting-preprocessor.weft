@@ -559,6 +559,17 @@ value is the current source path (\texttt{kcc\_src\_path}, which the include
 machinery saves and restores per file); it is emitted as a freshly-quoted
 string-literal token at each use.
 
+Argument collection normally records each argument as a contiguous source span,
+but the kernel drives a conditional \emph{through} a macro call---\verb|malloc(flush ? a() :|
+\verb|#ifdef X ... #else sizeof(...) #endif )|---so a \verb|#| directive can
+interrupt an argument.  A bare span would swallow the directive keywords and both
+branches; instead, when a directive is seen at line start during collection it is
+evaluated with the ordinary conditional machinery (\texttt{pp\_dispatch} when the
+enclosing branch is live, \texttt{pp\_skip\_directive} otherwise), tokens inside a
+dead branch are dropped, and---because the surviving tokens are no longer
+contiguous---the argument is rebuilt token-by-token in an arena buffer via
+\texttt{pp\_arg\_append}.  Arguments with no directive keep the fast span path.
+
 @l c
 @d Selfhost: pp expand @{
 static const char *pp_line_digits(unsigned long *lo) {
@@ -572,6 +583,21 @@ static const char *pp_line_digits(unsigned long *lo) {
 }
 
 static const char *pp_expand_arg(const char *text, unsigned long len, unsigned long *lo);
+
+/* Append s[0..n) to an arena-backed, geometrically-grown buffer.  Used to
+   rebuild a macro argument whose token run a conditional directive interrupts. */
+static void pp_arg_append(char **buf, unsigned long *cap, unsigned long *len,
+                          const char *s, unsigned long n) {
+    if (*len + n > *cap) {
+        unsigned long nc = *cap ? *cap : 256;
+        while (nc < *len + n) nc = nc * 2;
+        char *nb = (char *)kcc_arena_alloc(nc);
+        kcc_memcpy(nb, *buf, *len);
+        *buf = nb; *cap = nc;
+    }
+    kcc_memcpy(*buf + *len, s, n);
+    *len = *len + n;
+}
 
 int kcc_pp_try_expand(void) {
     const char *name = kcc_tok_start;
@@ -641,25 +667,64 @@ int kcc_pp_try_expand(void) {
     long depth = 1;
     args[0].start = kcc_lex_cursor;
     args[0].len = 0;
+    /* Buffer state for an argument a conditional directive interrupts: `abuf' is
+       non-null once this argument switched from span to rebuilt-buffer mode, and
+       `aprev' is the source end of the last token folded into it. */
+    char *abuf = 0; unsigned long acap = 0, alen = 0;
+    const char *aprev = args[0].start;
     for (;;) {
         kcc_lex_next();
         unsigned long tt = kcc_tok_type;
+        unsigned long tl = kcc_tok_line;
         if (tt == TOK_EOF) { kcc_diag_error(pp_dir_line, 1, m_unterm_args); return 0; }
+        /* A directive at line start interrupts the argument (GNU extension): fold
+           the live text collected so far into a buffer, evaluate the directive so
+           the conditional stack tracks which branch is taken, and continue. */
+        if (tt == TOK_HASH && tl > pp_prev_line) {
+            if (!abuf) { acap = 256; abuf = (char *)kcc_arena_alloc(acap); alen = 0; }
+            pp_arg_append(&abuf, &acap, &alen, aprev, (unsigned long)(kcc_tok_start - aprev));
+            pp_prev_line = tl;
+            if (pp_cond_depth && pp_cond_stack[pp_cond_depth - 1] != PP_COND_ACTIVE)
+                pp_skip_directive();
+            else
+                pp_dispatch();
+            aprev = kcc_lex_cursor;
+            continue;
+        }
+        /* Tokens inside a dead conditional branch are dropped from the argument. */
+        if (pp_cond_depth && pp_cond_stack[pp_cond_depth - 1] != PP_COND_ACTIVE) {
+            pp_prev_line = tl;
+            aprev = kcc_lex_cursor;
+            continue;
+        }
+        pp_prev_line = tl;
         if (tt == TOK_LPAREN) { depth++; continue; }
         if (tt == TOK_RPAREN) {
             depth--;
             if (depth == 0) {
-                args[argc].len = (unsigned long)(kcc_tok_start - args[argc].start);
+                if (abuf) {
+                    pp_arg_append(&abuf, &acap, &alen, aprev, (unsigned long)(kcc_tok_start - aprev));
+                    args[argc].start = abuf; args[argc].len = alen;
+                } else {
+                    args[argc].len = (unsigned long)(kcc_tok_start - args[argc].start);
+                }
                 argc++;
                 break;
             }
             continue;
         }
         if (tt == TOK_COMMA && depth == 1) {
-            args[argc].len = (unsigned long)(kcc_tok_start - args[argc].start);
+            if (abuf) {
+                pp_arg_append(&abuf, &acap, &alen, aprev, (unsigned long)(kcc_tok_start - aprev));
+                args[argc].start = abuf; args[argc].len = alen;
+            } else {
+                args[argc].len = (unsigned long)(kcc_tok_start - args[argc].start);
+            }
             argc++;
             args[argc].start = kcc_lex_cursor;
             args[argc].len = 0;
+            abuf = 0; acap = 0; alen = 0;
+            aprev = kcc_lex_cursor;
         }
     }
     /* variadic: collapse trailing args into the variadic slot params[nparams],

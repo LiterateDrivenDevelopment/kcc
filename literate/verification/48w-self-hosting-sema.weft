@@ -271,8 +271,18 @@ void *kcc_sema_resolve_type(void *node) {
             if (!name) return (tag == AST_TYPE_STRUCT) ? kcc_type_struct(decl)
                                                        : kcc_type_union(decl);
             void *sym = kcc_symtab_lookup_tag(name, kcc_strlen(name));
-            if (!sym) return kcc_type_int_s;
-            return (void *)SL(sym, SYM_TYPE);
+            if (sym) return (void *)SL(sym, SYM_TYPE);
+            /* An as-yet-undeclared struct/union tag names an INCOMPLETE type
+               (\stdref{6.7.2.3}), not int: register it now so a pointer to it is a
+               real struct pointer and a later `struct T { ... };' completes this
+               same descriptor in place.  The kernel needs this for a forward
+               reference through a function's return type---`skb_dst()' returns
+               `struct dst_entry *' whose definition follows the inline, so
+               `skb_dst(skb)->input' must still see a struct. */
+            void *desc = (tag == AST_TYPE_STRUCT) ? kcc_type_struct(decl)
+                                                  : kcc_type_union(decl);
+            kcc_symtab_declare_tag(name, kcc_strlen(name), desc);
+            return desc;
         }
         /* body present: reuse the registered descriptor iff same definition */
         void *name = (void *)decl->f0;

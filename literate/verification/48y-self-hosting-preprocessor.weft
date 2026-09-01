@@ -570,6 +570,14 @@ dead branch are dropped, and---because the surviving tokens are no longer
 contiguous---the argument is rebuilt token-by-token in an arena buffer via
 \texttt{pp\_arg\_append}.  Arguments with no directive keep the fast span path.
 
+\texttt{try\_expand} also intercepts the \texttt{\_Pragma("\dots")} operator here,
+before the macro lookup: it is not a macro but a destringized \texttt{\#pragma},
+which the kernel plants through \texttt{\_\_diag\_ignore\_all} to toggle GCC
+diagnostics kcc does not act on.  Recognised by name, it consumes its
+parenthesised argument---balancing the nested parens of the \texttt{\_\_diag\_str}
+that constructs the string---and expands to nothing, locating its \texttt{(}
+exactly as a function-like macro does.
+
 @l c
 @d Selfhost: pp expand @{
 static const char *pp_line_digits(unsigned long *lo) {
@@ -603,6 +611,33 @@ int kcc_pp_try_expand(void) {
     const char *name = kcc_tok_start;
     unsigned long namelen = kcc_tok_len;
     struct PPMacro *m = (struct PPMacro *)kcc_ht_get(kcc_pp_macros, name, namelen);
+    /* The `_Pragma("...")' operator is a destringized #pragma, not a macro.  The
+       kernel plants it through __diag_ignore_all (compiler-gcc.h) to toggle GCC
+       diagnostics; kcc honours none of those, so consume the parenthesised
+       string-literal argument (balancing nested parens, e.g. the __diag_str(...)
+       that builds it) and expand to nothing.  The `(' is located exactly as a
+       function-like macro's is, dropping only exhausted expansion contexts. */
+    if (namelen == 7 && kcc_memcmp(name, "_Pragma", 7) == 0) {
+        for (;;) {
+            if (kcc_lex_cursor < kcc_lex_end) break;
+            if (kcc_pp_ctx_depth == 0) break;
+            if (kcc_pp_ctx_depth <= pp_drain_floor) break;
+            pp_ctx_pop();
+        }
+        const char *p = kcc_lex_cursor;
+        while (p < kcc_lex_end && (*p == ' ' || *p == 0x09 || *p == 0x0A || *p == 0x0D)) p++;
+        if (p >= kcc_lex_end || *p != '(') return 0;   /* bare `_Pragma' → leave as ident */
+        kcc_lex_next();                                 /* '(' */
+        long pdepth = 1;
+        for (;;) {
+            kcc_lex_next();
+            unsigned long tt = kcc_tok_type;
+            if (tt == TOK_EOF) return 1;
+            if (tt == TOK_LPAREN) pdepth++;
+            else if (tt == TOK_RPAREN) { pdepth--; if (pdepth == 0) break; }
+        }
+        return 1;                                       /* expands to nothing */
+    }
     if (!m) return 0;
     if (m->flags & PP_FLAG_EXPANDING) return 0;
     /* dynamic __LINE__ */

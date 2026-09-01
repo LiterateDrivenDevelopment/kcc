@@ -71,7 +71,7 @@ enum {
     TOK_EXTERN = 21, TOK_FOR = 23, TOK_GOTO = 24, TOK_IF = 25,
     TOK_REGISTER = 29, TOK_RETURN = 31, TOK_STATIC = 35, TOK_SWITCH = 37,
     TOK_TYPEDEF = 38, TOK_WHILE = 43, TOK_STATIC_ASSERT = 52, TOK_ASM = 56,
-    TOK_AUTO = 10,
+    TOK_AUTO = 10, TOK_ATTRIBUTE = 54,
     TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62, TOK_RBRACE = 63,
     TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66, TOK_COMMA = 67,
     TOK_QUESTION = 92, TOK_COLON = 93,
@@ -91,6 +91,7 @@ enum {
 };
 
 /* Forward declarations for the module's own functions. */
+void kcc_parse_skip_attributes(void);
 void *kcc_parse_stmt(void);
 void *kcc_parse_compound(void);
 void *kcc_parse_if(void);
@@ -118,7 +119,11 @@ form.  An identifier needs one-token lookahead---interned in case it is a label,
 then consumed to see whether a colon follows.  If it does, the statement is a
 label; otherwise the identifier is the start of an expression statement, and
 parsing resumes from the already-built identifier node through
-\texttt{postfix\_tail} and \texttt{expr\_rest}.
+\texttt{postfix\_tail} and \texttt{expr\_rest}.  A label may carry a GNU
+attribute between its colon and its statement---\texttt{done:
+\_\_attribute\_\_((unused));}, which the kernel's cleanup/guard machinery emits
+on exit labels that a given path never reaches---so any \texttt{\_\_attribute\_\_}
+run is skipped before the labelled statement is parsed.
 
 @l c
 @d Selfhost: statements dispatch @{
@@ -162,6 +167,10 @@ void *kcc_parse_stmt(void) {
         kcc_pp_next();                         /* consume identifier */
         if (kcc_tok_type == TOK_COLON) {
             kcc_pp_next();                     /* consume ':' */
+            /* A label may carry a GNU attribute before its statement, e.g.
+               `done: __attribute__((unused));' (the kernel's cleanup/guard
+               macros emit exactly this on an unreachable exit label). */
+            while (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
             void *inner = kcc_parse_stmt();
             struct Node *n = (struct Node *)kcc_ast_alloc(AST_LABEL_STMT);
             n->f0 = (unsigned long)name;

@@ -104,8 +104,14 @@ extern const char *kcc_tok_start;
    label must not split, and `\texttt{\%rax}' must stay joined.  Line markers are
    omitted (matching gcc's -P).  Defined here, in the driver, so it depends only
    on kcc_pp_next (present in either preprocessor port). */
+static int kcc_word_char(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
 static void kcc_pp_emit_text(void) {
     unsigned long prev_line = 0;
+    char prev_last = 0;
     for (;;) {
         kcc_pp_next();
         if (kcc_tok_type == 0) break;             /* TOK_EOF */
@@ -122,10 +128,25 @@ static void kcc_pp_emit_text(void) {
             prev_line = line;
         }
         else {
+            /* A space is emitted where the source separated the tokens (the byte
+               before the token is whitespace).  That byte lives in whatever
+               buffer the token came from, so across a macro-expansion boundary
+               it cannot see the source gap---and a maximal-munch lexer only ever
+               yields two SEPARATE word tokens (or a word then a `%'/`$'/`('
+               operand starter) when a separator was there, so fusing them would
+               forge a wrong token (`.balign'+`16'->`.balign16', a mnemonic and
+               its `%reg').  Insert a space in that case too; it can never wrongly
+               split a single token, since that would have lexed as one. */
             const char *s = kcc_tok_start;
-            if (s[-1] == ' ' || s[-1] == 0x09) kcc_io_puts(" ");
+            char b = s[0];
+            int space = (s[-1] == ' ' || s[-1] == 0x09);
+            if (!space && kcc_word_char(prev_last) &&
+                (kcc_word_char(b) || b == '%' || b == '$' || b == '('))
+                space = 1;
+            if (space) kcc_io_puts(" ");
         }
         kcc_io_write(kcc_tok_start, kcc_tok_len);
+        prev_last = kcc_tok_start[kcc_tok_len - 1];
     }
     kcc_io_puts("\n");
     kcc_io_flush();

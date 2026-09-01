@@ -718,7 +718,14 @@ node's \texttt{AST\_F3}.  Simple forms are inline; identifiers, literals, binary
 unary, assignment, calls, member access, casts, and \texttt{sizeof} are
 delegated.  \texttt{\_Generic} is resolved here---the controlling expression is
 typed but not evaluated, and the first compatible association (or the default)
-is chosen and stashed for the IR builder.
+is chosen and stashed for the IR builder.  A compound literal
+\texttt{(T)\{\dots\}} resolves \texttt{T} \emph{and} type-checks its brace
+initializer eagerly: the initializer must be walked while the enclosing
+function's parameters are still in scope, because a \texttt{typeof(expr)} nested
+in it (the shape the kernel's \texttt{min()} macro plants through
+\texttt{\_\_cmp\_once}) would otherwise be resolved only later by the IR
+builder, after those parameters have gone out of scope, and every identifier the
+\texttt{typeof} names would read as undeclared.
 
 @l c
 @d Selfhost: sema expr @{
@@ -766,6 +773,12 @@ void *kcc_sema_expr(void *node) {
     case AST_COMPOUND_LIT:
         if (!n->f0) t = kcc_type_int_s;
         else t = kcc_sema_resolve_type((void *)n->f0);
+        /* Type-check the brace initializer now, while the enclosing function's
+           scope is still live.  If we skip it, any `typeof(expr)` buried in the
+           initializer (as the kernel's min() macro plants via __cmp_once) is
+           left for the IR builder to resolve later, by which point the params
+           it names are out of scope and read as undeclared identifiers. */
+        if (n->f1) kcc_sema_expr((void *)n->f1);
         break;
     case AST_VA_ARG:
         if (n->f0) kcc_sema_expr((void *)n->f0);

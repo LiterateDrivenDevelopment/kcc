@@ -95,9 +95,14 @@ extern const char *kcc_tok_start;
 
 /* gcc-style -E: emit the preprocessed token stream as C source TEXT (not kcc's
    token dump).  Each token's spelling is written verbatim; a newline is emitted
-   whenever the source line advances, a space separates same-line tokens so they
-   do not fuse.  Line markers are omitted (matching gcc's -P)---the form build-
-   system compiler probes read.  Defined here, in the driver, so it depends only
+   whenever the source line advances.  On the same line a space is written only
+   where the source \emph{separated} the tokens---the byte just before the token
+   is whitespace exactly when there was a gap (a comment already became one space
+   in phase~3, so that gap is preserved too).  Reproducing the source spacing,
+   rather than forcing a space between every pair, is what lets the output feed an
+   assembler: \texttt{.macro} must not become `\texttt{. macro}', a `\texttt{672:}'
+   label must not split, and `\texttt{\%rax}' must stay joined.  Line markers are
+   omitted (matching gcc's -P).  Defined here, in the driver, so it depends only
    on kcc_pp_next (present in either preprocessor port). */
 static void kcc_pp_emit_text(void) {
     unsigned long prev_line = 0;
@@ -106,8 +111,20 @@ static void kcc_pp_emit_text(void) {
         if (kcc_tok_type == 0) break;             /* TOK_EOF */
         unsigned long line = kcc_tok_line;
         if (prev_line == 0) prev_line = line;
-        else if (line > prev_line) { while (prev_line < line) { kcc_io_puts("\n"); prev_line++; } }
-        else kcc_io_puts(" ");
+        else if (line != prev_line) {
+            /* One newline on any line change.  Line numbers are NOT globally
+               monotonic---each #include resets to~1, so catching up by count
+               (`while prev<line') would merge every header's tail into the
+               includer's line and, for a .S file, swallow a `.macro's `.endm'.
+               A single newline per change puts every source line on its own
+               output line, which is all the assembler (or a C re-parse) needs. */
+            kcc_io_puts("\n");
+            prev_line = line;
+        }
+        else {
+            const char *s = kcc_tok_start;
+            if (s[-1] == ' ' || s[-1] == 0x09) kcc_io_puts(" ");
+        }
         kcc_io_write(kcc_tok_start, kcc_tok_len);
     }
     kcc_io_puts("\n");

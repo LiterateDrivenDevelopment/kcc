@@ -46,7 +46,11 @@ stream back as C \emph{source text}---token spellings with line-preserving
 newlines and no line markers---rather than kcc's token dump, because that is the
 form a build system's compiler probe (Kbuild's \texttt{cc-version.sh}) reads.
 Second, the startup banner is written to \texttt{stderr}, keeping \texttt{stdout}
-clean for that probe.
+clean for that probe.  The same faithful emission also drives
+\texttt{kcc\_assemble\_source}: an assembly input (\texttt{.S}/\texttt{.s}) named
+on a \texttt{-c} line is preprocessed straight into \texttt{<out>.s}---by pointing
+\texttt{kcc\_io\_fd} at the file for the duration---and handed to the system
+assembler, so kcc builds the kernel's hand-written assembly, not only its C.
 
 @l c
 @d Selfhost: main @{
@@ -89,6 +93,13 @@ extern char **kcc_envp;                          /* defined by the driver */
 extern unsigned long kcc_target;                 /* set by --target=x86_64[-linux] */
 extern unsigned long kcc_x86_os;
 void kcc_pp_next(void);
+/* For assembling `.S'/`.s' sources: preprocess-to-file then spawn the system as. */
+unsigned long kcc_strlen(const char *);
+void *kcc_arena_alloc(long);
+long kcc_sys_open(const char *path, long flags, long mode);
+long kcc_sys_close(long fd);
+int kcc_driver_spawn(const char *path, char *const argv[]);
+extern long kcc_io_fd;                           /* 1 (stdout) unless redirected */
 void kcc_io_write(const char *buf, unsigned long len);
 extern unsigned long kcc_tok_type, kcc_tok_len, kcc_tok_line;
 extern const char *kcc_tok_start;
@@ -183,6 +194,47 @@ static void kcc_run_preprocess(int argc, char **argv) {
     kcc_driver_apply_force_includes();
     kcc_pp_emit_text();
     finish();
+}
+
+/* Assemble a `.S'/`.s' source into an object, the way `gcc -c foo.S' does: a
+   `.S' is run through the C preprocessor (emitting faithful assembler text into
+   <out>.s), a `.s' is already preprocessed; either is handed to the system
+   assembler.  Called from the compile loop for every assembly input, so a
+   Kbuild line naming head_64.S resolves its headers and macros exactly as a C
+   compile would.  Flags (-I/-D/-include) are already registered by the caller;
+   we mirror the compile path's pp setup (init then force-includes).  Output is
+   redirected to <out>.s by pointing kcc_io_fd at it for the duration. */
+int kcc_assemble_source(const char *src, const char *out) {
+    unsigned long ls = kcc_strlen(src);
+    const char *asmpath = src;
+    if (src[ls - 1] == 'S') {                     /* .S: preprocess first */
+        unsigned long lo = kcc_strlen(out);
+        char *tmp = (char *)kcc_arena_alloc((long)(lo + 3));
+        unsigned long j = 0;
+        for (; j < lo; j++) tmp[j] = out[j];
+        tmp[lo] = '.'; tmp[lo + 1] = 's'; tmp[lo + 2] = 0;
+        long fd = kcc_sys_open(tmp, 0x601, 0x1a4); /* O_WRONLY|O_CREAT|O_TRUNC, 0644 */
+        if (fd < 0) { kcc_io_err("kcc: error: cannot create assembler output\n"); return 1; }
+        kcc_io_flush();                            /* flush any pending stdout */
+        long saved = kcc_io_fd;
+        kcc_io_fd = fd;
+        open_lex_path(src);
+        kcc_pp_init();
+        kcc_driver_apply_force_includes();
+        kcc_pp_emit_text();                        /* writes preprocessed text to fd */
+        kcc_io_fd = saved;
+        kcc_sys_close(fd);
+        if (kcc_diag_had_errors()) return 1;
+        asmpath = tmp;
+    }
+    char *av[6];
+    av[0] = (char *)"as";
+    av[1] = (char *)"--64";
+    av[2] = (char *)"-o";
+    av[3] = (char *)out;
+    av[4] = (char *)asmpath;
+    av[5] = 0;
+    return kcc_driver_spawn("/usr/bin/as", av) ? 1 : 0;
 }
 
 int main(int argc, char **argv) {

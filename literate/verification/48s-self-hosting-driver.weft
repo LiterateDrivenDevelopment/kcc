@@ -165,6 +165,7 @@ char *kcc_getenv(const char *name, unsigned long namelen);
 int kcc_driver_x86_object(const char *out);
 int kcc_driver_emit_asm_object(const char *out);
 int kcc_driver_spawn(const char *path, char *const argv[]);
+int kcc_assemble_source(const char *src, const char *out);  /* .S/.s → as (defined in main) */
 char *kcc_driver_obj_name(const char *src);
 unsigned long kcc_driver_I(const char *arg, const char *next, unsigned long reg);
 unsigned long kcc_driver_D(const char *arg, const char *next, unsigned long reg);
@@ -323,7 +324,13 @@ char *kcc_driver_obj_name(const char *src) {
 (\texttt{-Wall}, \texttt{-g}, \texttt{--emit-asm}, \texttt{--target}), registers
 include dirs and macros, and finds an explicit \texttt{-o} and the source count;
 a second pass compiles each source, honouring \texttt{-o} only for a single
-input.  It exits with the combined status.
+input.  It exits with the combined status.  A source whose name ends in
+\texttt{.S} or \texttt{.s} is not a C file: it is routed to
+\texttt{kcc\_assemble\_source} instead of the front end---a \texttt{.S} is
+preprocessed (the faithful \texttt{-E} text) into \texttt{<out>.s} and a
+\texttt{.s} is taken as-is, then the system assembler produces the object.  This
+is what lets kcc stand in as \texttt{CC=} for the kernel's hand-written entry and
+library assembly (\texttt{head\_64.S}, \texttt{getuser.S}, \ldots), not just its C.
 
 Both passes scan from \texttt{argv[1]} and are \emph{gcc-compatible enough to be
 a drop-in \texttt{CC=}} for a real Kbuild command line, which leads with dozens
@@ -459,7 +466,14 @@ void kcc_driver_compile_all(long argc, char **argv) {
         const char *out;
         if (src_count == 1 && explicit_out) out = explicit_out;
         else out = kcc_driver_obj_name(a);
-        err |= kcc_driver_compile(a, out);
+        /* An assembly input (`.S'/`.s') is preprocessed-and-assembled, not run
+           through the C front end---this is what lets kcc build the kernel's
+           hand-written entry/lib assembly (head_64.S, getuser.S, ...). */
+        unsigned long la = kcc_strlen(a);
+        if (la >= 2 && a[la - 2] == '.' && (a[la - 1] == 'S' || a[la - 1] == 's'))
+            err |= kcc_assemble_source(a, out);
+        else
+            err |= kcc_driver_compile(a, out);
         i++;
     }
     kcc_io_flush();

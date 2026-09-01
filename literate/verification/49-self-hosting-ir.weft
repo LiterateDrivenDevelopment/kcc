@@ -3827,6 +3827,22 @@ walk of the sibling list and no nested label is ever built without its
 dispatch block.  Anything more intricate falls back to the ordinary two-scan
 lowering, which is always correct.
 
+Dropping the untaken \texttt{if} arm has one exception: a label inside it may be
+the target of an \texttt{asm goto} (or an ordinary \texttt{goto}) from live code.
+The kernel's atomic \texttt{\_\_GEN\_RMWcc} plants precisely
+\verb|if (0) { cc_label: c = true; }| and jumps to \texttt{cc\_label} out of the
+\texttt{asm} on the condition flag---the label is reachable \emph{only} through
+that jump, never through normal control.  Labels are pre-allocated blocks
+(\texttt{prescan\_labels}), but a block is emitted only once
+\texttt{set\_bb} appends it to the function's block list, and that happens when
+its label statement is \emph{built}.  Silently dropping the arm therefore leaves
+the block referenced by the \texttt{asm} but never placed, so the assembler sees
+an undefined \texttt{.Lkccbb} target.  \texttt{build\_if} guards against this: if
+the dropped arm contains any label (\texttt{kcc\_stmt\_has\_label}, the same
+traversal \texttt{prescan\_labels} uses), it is lowered into an unreachable
+block---entered only by the jump, falling through to the continuation---so the
+label is placed and its code emitted while normal flow steps straight past it.
+
 @l c
 @d Selfhost: ir control @{
 static void ir_brcond(unsigned long cond, void *tb, void *fb) {
@@ -3838,6 +3854,32 @@ static void ir_brcond(unsigned long cond, void *tb, void *fb) {
     IL(kcc_ir_cur_bb, BB_FLAGS) = IL(kcc_ir_cur_bb, BB_FLAGS) | BB_FLAG_TERMINATED;
 }
 
+/* Does a statement subtree contain a label?  Mirrors kcc_ir_prescan_labels'
+   traversal.  A constant-folded `if' drops its untaken branch, but a goto or
+   asm-goto elsewhere can still target a label buried in that branch --- the
+   kernel's __GEN_RMWcc plants exactly `if (0) { cc_label: c = 1; }` --- so such
+   a branch must still be lowered even though normal control never enters it. */
+static int kcc_stmt_has_label(void *s) {
+    if (!s) return 0;
+    unsigned long tag = IL(s, AST_TAG);
+    if (tag == AST_LABEL_STMT) return 1;
+    if (tag == AST_COMPOUND) {
+        for (void *it = (void *)IL(s, AST_F0); it; it = (void *)IL(it, AST_F4))
+            if (kcc_stmt_has_label(it)) return 1;
+        return 0;
+    }
+    if (tag == AST_IF_STMT)
+        return kcc_stmt_has_label((void *)IL(s, AST_F1)) ||
+               kcc_stmt_has_label((void *)IL(s, AST_F2));
+    if (tag == AST_WHILE_STMT || tag == AST_SWITCH_STMT || tag == AST_CASE_STMT)
+        return kcc_stmt_has_label((void *)IL(s, AST_F1));
+    if (tag == AST_DO_STMT || tag == AST_DEFAULT_STMT)
+        return kcc_stmt_has_label((void *)IL(s, AST_F0));
+    if (tag == AST_FOR_STMT)
+        return kcc_stmt_has_label((void *)IL(s, AST_F3));
+    return 0;
+}
+
 void kcc_ir_build_if(void *s) {
     /* A compile-time-constant condition selects one branch; build only that
        one and drop the other entirely.  The kernel's size-dispatched inline
@@ -3846,9 +3888,24 @@ void kcc_ir_build_if(void *s) {
        error even though it can never run. */
     void *cond_e = (void *)IL(s, AST_F0);
     if (kcc_expr_is_ice(cond_e)) {
-        void *taken = kcc_eval_const_int(cond_e) ? (void *)IL(s, AST_F1)
-                                                 : (void *)IL(s, AST_F2);
-        if (taken) kcc_ir_build_stmt(taken);
+        unsigned long v = kcc_eval_const_int(cond_e);
+        void *taken   = v ? (void *)IL(s, AST_F1) : (void *)IL(s, AST_F2);
+        void *dropped = v ? (void *)IL(s, AST_F2) : (void *)IL(s, AST_F1);
+        if (dropped && kcc_stmt_has_label(dropped)) {
+            /* The untaken branch is unreachable by normal flow but holds a label
+               an asm-goto (or goto) targets.  Lower it into an unreachable block
+               so the label is placed (kcc_ir_set_bb appends it to the emit list)
+               and its code emitted; normal flow jumps straight past it. */
+            void *cont_bb = kcc_ir_alloc_bb();
+            if (taken) kcc_ir_build_stmt(taken);
+            kcc_ir_branch_to(cont_bb);
+            kcc_ir_set_bb(kcc_ir_alloc_bb());   /* only the label's jump enters here */
+            kcc_ir_build_stmt(dropped);
+            kcc_ir_branch_to(cont_bb);
+            kcc_ir_set_bb(cont_bb);
+        } else if (taken) {
+            kcc_ir_build_stmt(taken);
+        }
         return;
     }
     unsigned long cond = kcc_ir_build_expr(cond_e);

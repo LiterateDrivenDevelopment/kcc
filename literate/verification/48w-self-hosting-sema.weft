@@ -362,7 +362,13 @@ void kcc_sema_check_stmt(void *node) {
         return;
     case AST_FOR_STMT:
         kcc_symtab_push_scope();
-        if (s->f0) kcc_sema_check_stmt((void *)s->f0);
+        /* A for-init declaration may declare several objects sharing one type
+           (`for (T a, *b = ...; ...)`, as the kernel's scoped_guard plants via
+           `CLASS(...)(args), *done = NULL'); parse_decl chains the extra
+           declarators on f4 exactly as a block does, so walk that chain --- the
+           head node alone would leave the siblings undeclared. */
+        for (struct Node *it = (struct Node *)s->f0; it; it = (struct Node *)it->f4)
+            kcc_sema_check_stmt(it);
         if (s->f1) kcc_sema_expr((void *)s->f1);
         if (s->f2) kcc_sema_expr((void *)s->f2);
         if (s->f3) kcc_sema_check_stmt((void *)s->f3);

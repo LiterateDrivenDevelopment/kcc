@@ -3843,6 +3843,16 @@ traversal \texttt{prescan\_labels} uses), it is lowered into an unreachable
 block---entered only by the jump, falling through to the continuation---so the
 label is placed and its code emitted while normal flow steps straight past it.
 
+\texttt{build\_for} lowers the three clauses in the obvious order, with one
+subtlety in the initialiser: a for-init declaration may bind several objects at
+once (\texttt{for (T a, *b = \dots; \dots)}), and \texttt{parse\_decl} chains the
+extra declarators on \texttt{f4} exactly as it does inside a block.  Building
+only the head node would give the siblings no storage, so the initialiser is
+walked as an \texttt{f4} chain (a plain expression init has no chain and runs the
+loop once).  The type checker walks the same chain for the same reason; the
+kernel's \texttt{scoped\_guard} relies on it, expanding to
+\texttt{for (CLASS(\dots)(args), *done = NULL; !done; \dots)}.
+
 @l c
 @d Selfhost: ir control @{
 static void ir_brcond(unsigned long cond, void *tb, void *fb) {
@@ -3965,8 +3975,11 @@ void kcc_ir_build_do(void *s) {
 }
 
 void kcc_ir_build_for(void *s) {
-    void *init = (void *)IL(s, AST_F0);
-    if (init) kcc_ir_build_stmt(init);
+    /* Walk the init's f4 chain: a for-init declaration may bind several objects
+       (`for (T a, *b = ...; ...)'), chained as a block's declarators are.
+       Building only the head would leave the siblings without storage. */
+    for (void *init = (void *)IL(s, AST_F0); init; init = (void *)IL(init, AST_F4))
+        kcc_ir_build_stmt(init);
     void *cond_bb = kcc_ir_alloc_bb();
     void *body_bb = kcc_ir_alloc_bb();
     void *incr_bb = kcc_ir_alloc_bb();

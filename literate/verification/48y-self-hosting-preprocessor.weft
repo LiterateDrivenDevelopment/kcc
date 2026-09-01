@@ -166,7 +166,7 @@ void kcc_pp_do_pragma(void);
 void kcc_pp_add_cmdline_define(const char *payload);
 void kcc_pp_add_default_includes(const char *argv0);
 const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *pp,
-                          unsigned long np, void *aa, unsigned long ac, unsigned long *lo);
+                          unsigned long np, void *aa, void *raa, unsigned long ac, unsigned long *lo);
 @}
 
 \section{Initialization, the Main Loop, and Contexts}
@@ -791,6 +791,13 @@ int kcc_pp_try_expand(void) {
         nparams++;
         argc = nparams;
     }
+    /* Preserve each argument's raw (pre-prescan) span: a parameter that is an
+       operand of `#' (stringise, 6.10.3.2) or `##' (paste, 6.10.3.1) uses its
+       argument UNexpanded, whereas an ordinary parameter uses the prescan
+       expansion.  The kernel's ftrace_eval_map generator relies on this ---
+       `__##TRACE_SYSTEM##_##a' must paste the enum's spelling, not its value. */
+    struct PPArg *rawargs = (struct PPArg *)kcc_arena_alloc(PP_MAX_ARGS * 16);
+    for (unsigned long i = 0; i < argc; i++) rawargs[i] = args[i];
     /* argument prescan (6.10.3.1) */
     for (unsigned long i = 0; i < argc; i++) {
         unsigned long el;
@@ -800,7 +807,7 @@ int kcc_pp_try_expand(void) {
     }
     /* substitute */
     unsigned long rl;
-    const char *rbuf = pp_substitute(m->body, m->bodylen, params, nparams, args, argc, &rl);
+    const char *rbuf = pp_substitute(m->body, m->bodylen, params, nparams, args, rawargs, argc, &rl);
     if (!rl) return 1;
     m->flags |= PP_FLAG_EXPANDING;
     pp_ctx_push_expand(m, rbuf, rl);
@@ -813,8 +820,18 @@ int kcc_pp_try_expand(void) {
 \texttt{pp\_expand\_arg} drives \texttt{kcc\_pp\_next} over an argument's text
 behind a \emph{drain floor}, so expansion stops at the argument boundary rather
 than reading into the enclosing text.  \texttt{pp\_substitute} walks the body,
-replacing parameter names with (prescan-expanded) argument text and honouring
-the \texttt{\#} (stringise) and \texttt{\#\#} (paste) operators.  It also
+replacing parameter names with argument text and honouring the \texttt{\#}
+(stringise) and \texttt{\#\#} (paste) operators.  The choice of \emph{which}
+argument text is the crux of \stdref{6.10.3.1}: an ordinary parameter takes the
+prescan expansion, but a parameter that is an operand of \texttt{\#} or
+\texttt{\#\#} takes its \emph{raw}, unexpanded argument.  Both spans are kept
+(the prescan overwrites the argument array, so the raw spans are copied aside
+first); \texttt{prev\_paste} flags that the previous body token was \texttt{\#\#}
+so the following parameter is its right operand, and a one-token look-ahead
+catches a parameter that is a \emph{left} \texttt{\#\#} operand.  Without this the
+kernel's ftrace eval-map generator misfires: \texttt{\_\_\#\#TRACE\_SYSTEM\#\#\_\#\#a}
+would paste an enum's \emph{value} (\texttt{(1 << \dots)}) instead of its spelling,
+because the argument would have been expanded before the paste.  It also
 implements the GNU comma-elision special case \texttt{,\,\#\#\,\_\_VA\_ARGS\_\_}:
 when the right operand of \texttt{\#\#} is a parameter whose argument is empty,
 the paste deletes both the operand and a preceding comma---the mechanism behind
@@ -874,11 +891,15 @@ static unsigned long pp_emit_string(const char *src, unsigned long len, char *ds
     char *d = dst;
     *d++ = '"';
     unsigned long i = 0;
-    while (i < len && (src[i] == ' ' || src[i] == 0x09)) i++;
+    /* Each whitespace SEQUENCE (spaces, tabs, and the newlines of a multi-line
+       argument such as a BUILD_BUG_ON condition) collapses to one space, and
+       leading/trailing whitespace is dropped (\stdref{6.10.3.2}); an embedded
+       newline copied verbatim would close the string prematurely. */
+    while (i < len && (src[i] == ' ' || src[i] == 0x09 || src[i] == 0x0A || src[i] == 0x0D)) i++;
     int pending = 0;
     for (; i < len; i++) {
         char c = src[i];
-        if (c == ' ' || c == 0x09) { pending = 1; continue; }
+        if (c == ' ' || c == 0x09 || c == 0x0A || c == 0x0D) { pending = 1; continue; }
         if (pending) { *d++ = ' '; pending = 0; }
         if (c == '"' || c == 0x5C) *d++ = 0x5C;
         *d++ = c;
@@ -888,9 +909,13 @@ static unsigned long pp_emit_string(const char *src, unsigned long len, char *ds
 }
 
 const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *params,
-                          unsigned long np, void *aa, unsigned long ac, unsigned long *lo) {
+                          unsigned long np, void *aa, void *raa, unsigned long ac, unsigned long *lo) {
     struct PPArg *args = (struct PPArg *)aa;
+    struct PPArg *rawargs = (struct PPArg *)raa;
     (void)ac;
+    /* Set once a `##' operator was just emitted, so the next parameter is its
+       right operand and must substitute its RAW argument (6.10.3.1). */
+    int after_paste = 0;
     /* The output buffer must grow: a macro like the kernel's `pr_alert(fmt,
        data_race(x), data_race(y), ...)` substitutes several arguments that are
        themselves large _Generic expansions, easily exceeding any fixed size (a
@@ -907,6 +932,7 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
     unsigned long op = 0;
     unsigned long i = 0;
     while (i < blen) {
+        int prev_paste = after_paste; after_paste = 0;
         if (op + guard > cap) {
             unsigned long nc = cap * 2;
             while (nc < op + guard) nc *= 2;
@@ -945,16 +971,19 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
                 long ppi = -1;
                 for (unsigned long k = 0; k < np; k++)
                     if (params[k].len == plen && kcc_memcmp(body + ps, params[k].name, plen) == 0) { ppi = (long)k; break; }
-                if (ppi >= 0 && args[ppi].len == 0) {
+                if (ppi >= 0 && rawargs[ppi].len == 0) {
                     while (op && (out[op - 1] == ' ' || out[op - 1] == 0x09)) op--;
                     if (op && out[op - 1] == ',') op--;     /* drop the dangling comma */
                     i = pj;                                  /* consume ## and the empty operand */
                     continue;
                 }
-                /* ## paste: trim emitted whitespace, skip operator + whitespace */
+                /* ## paste: trim emitted whitespace, skip operator + whitespace.
+                   Mark that a paste just happened so the next parameter, its
+                   right operand, substitutes its raw (unexpanded) argument. */
                 while (op && (out[op - 1] == ' ' || out[op - 1] == 0x09)) op--;
                 i += 2;
                 while (i < blen && (body[i] == ' ' || body[i] == 0x09)) i++;
+                after_paste = 1;
                 continue;
             }
             /* # stringise */
@@ -967,7 +996,8 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
             for (unsigned long k = 0; k < np; k++)
                 if (params[k].len == idlen && kcc_memcmp(body + s, params[k].name, idlen) == 0) { pi = (long)k; break; }
             if (pi >= 0) {
-                op += pp_emit_string(args[pi].start, args[pi].len, out + op);
+                /* # stringises the RAW argument, before prescan (6.10.3.2). */
+                op += pp_emit_string(rawargs[pi].start, rawargs[pi].len, out + op);
                 i = j;
             } else {
                 out[op++] = '#';
@@ -985,8 +1015,28 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
             for (unsigned long k = 0; k < np; k++)
                 if (params[k].len == idlen && kcc_memcmp(body + s, params[k].name, idlen) == 0) { pi = (long)k; break; }
             if (pi >= 0) {
-                kcc_memcpy(out + op, args[pi].start, args[pi].len);
-                op += args[pi].len;
+                /* A parameter that is an operand of `##' --- preceded by a paste
+                   (prev_paste) or immediately followed by one --- substitutes its
+                   raw argument; otherwise the prescan-expanded one (6.10.3.1). */
+                int use_raw = prev_paste;
+                if (!use_raw) {
+                    unsigned long pk = i;
+                    while (pk < blen && (body[pk] == ' ' || body[pk] == 0x09)) pk++;
+                    if (pk + 1 < blen && body[pk] == '#' && body[pk + 1] == '#') use_raw = 1;
+                }
+                const char *as = args[pi].start;
+                unsigned long al = args[pi].len;
+                if (use_raw) {
+                    /* The raw span keeps the call's surrounding whitespace (`, 3'
+                       -> " 3"); a paste juxtaposes tokens, so trim it --- the
+                       prescan-expanded span is already trimmed. */
+                    as = rawargs[pi].start; al = rawargs[pi].len;
+                    while (al && (*as == ' ' || *as == 0x09 || *as == 0x0A || *as == 0x0D)) { as++; al--; }
+                    while (al && (as[al - 1] == ' ' || as[al - 1] == 0x09 ||
+                                  as[al - 1] == 0x0A || as[al - 1] == 0x0D)) al--;
+                }
+                kcc_memcpy(out + op, as, al);
+                op += al;
             } else {
                 kcc_memcpy(out + op, body + s, idlen);
                 op += idlen;

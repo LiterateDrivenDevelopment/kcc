@@ -262,6 +262,7 @@ void kcc_ir_scope_leave(void);
 void kcc_ir_asm_addr_of(void *lvalue);
 void kcc_ir_asm_lower_operands(void *as);
 void kcc_ir_emit_global_inits(void);
+static int kcc_ir_section_discarded(const char *name);
 void kcc_ir_emit_modinit(void);
 void kcc_ir_emit_aggregate_init(void *init_list, void *agg, unsigned long base);
 void kcc_ir_emit_init_stores(void *decl, unsigned long base_vreg);
@@ -463,6 +464,17 @@ emission that seeds file-scope and \texttt{static}-local storage at startup, the
 per-function driver, parameter lowering, the label/goto helpers, the block-scope
 shadowing journal, the statement dispatcher, and \texttt{return}.
 
+One object never gets a run-time initializer: a global whose \texttt{section}
+attribute names a \emph{discarded} section (prefix \verb|.discard|).  The kernel
+throws those away in its linker script, so an initializer lowered into the
+module-init function would leave a live relocation from the kept \verb|.text|
+into a section that vanishes.  This is the \texttt{\_\_ADDRESSABLE(sym)} idiom---a
+\verb|.discard.addressable| pointer set to \texttt{\&sym}, used to keep a symbol
+referenced; \texttt{gcc} emits it as a data relocation in the discarded section
+with no code, and \texttt{kcc\_ir\_section\_discarded} makes the builder skip the
+initializer (and the module-init trigger) so no such dangling \verb|.text|
+reference is forged.
+
 Alongside the shadowing journal the spine keeps a second, x86-only table of
 \emph{const-initialised locals}.  A kernel \texttt{WARN}/\texttt{BUG} entry
 passes its flags word to an \verb|"i"| (immediate) inline-asm operand, but
@@ -531,7 +543,8 @@ void kcc_ir_build(void *tu) {
                 if (name && kcc_strcmp((const char *)name, "main") == 0) has_main = 1;
             }
         } else if (tag == AST_VAR_DECL) {
-            if (IL(d, AST_F2)) has_ginit = 1;
+            if (IL(d, AST_F2) && !kcc_ir_section_discarded((const char *)IL(d, AST_F1)))
+                has_ginit = 1;
         }
         d = (void *)IL(d, AST_F4);
     }
@@ -678,6 +691,27 @@ unsigned long kcc_global_const_ptrarr(void *decl) {
     return 1;
 }
 
+/* A file-scope object placed in a discarded section --- one the kernel's
+   linker script throws away, `/DISCARD/ : { *(.discard) *(.discard.*) }' ---
+   has no run-time existence, so running its initializer as module-init code
+   would forge a relocation from the kept `.text' into a section that vanishes.
+   That is exactly the `__ADDRESSABLE(sym)' pattern: a `.discard.addressable'
+   pointer holding `&sym', whose store kcc lowers into `kcc.module_init' and so
+   fails the vmlinux link with ".discard.addressable referenced in .text ...
+   defined in discarded section".  gcc emits the pointer as a data relocation in
+   the discarded section with no code; kcc simply skips the initializer, since
+   the storage is discarded either way. */
+struct AttrRec { unsigned long weak; const char *section; const char *alias; };
+extern void *kcc_attr_ht;
+static int kcc_ir_section_discarded(const char *name) {
+    if (!name || !kcc_attr_ht) return 0;
+    struct AttrRec *ar = (struct AttrRec *)kcc_ht_get(kcc_attr_ht, name, kcc_strlen(name));
+    if (!ar || !ar->section) return 0;
+    const char *s = ar->section, *p = ".discard";
+    for (unsigned long i = 0; i < 8; i++) if (s[i] != p[i]) return 0;
+    return 1;
+}
+
 /* -- global-initializer emission at the top of main / a module-init fn -- */
 void kcc_ir_emit_global_inits(void) {
     void *tu = kcc_ir_trans_unit;
@@ -686,7 +720,8 @@ void kcc_ir_emit_global_inits(void) {
     while (d) {
         if (IL(d, AST_TAG) == AST_VAR_DECL && IL(d, AST_F2) && IL(d, AST_F1)) {
             void *name = (void *)IL(d, AST_F1);
-            if (!kcc_global_const_rodata(d) && !kcc_global_const_ptrarr(d)) {
+            if (!kcc_global_const_rodata(d) && !kcc_global_const_ptrarr(d) &&
+                !kcc_ir_section_discarded((const char *)name)) {
                 void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);
                 IL(g, IR_SRC1) = (unsigned long)name;
                 IL(g, IR_TYPE) = (unsigned long)kcc_type_int_s;
@@ -729,7 +764,8 @@ void kcc_ir_emit_global_inits(void) {
                 while (s) {
                     if (IL(s, AST_TAG) == AST_VAR_DECL && IL(s, AST_F3) == 3 &&
                         IL(s, AST_F2) &&
-                        !kcc_global_const_rodata(s) && !kcc_global_const_ptrarr(s)) {
+                        !kcc_global_const_rodata(s) && !kcc_global_const_ptrarr(s) &&
+                        !kcc_ir_section_discarded((const char *)IL(s, AST_F1))) {
                         const char *mangled = kcc_ir_static_name(s);
                         void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);
                         IL(g, IR_SRC1) = (unsigned long)mangled;

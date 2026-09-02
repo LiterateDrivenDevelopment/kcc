@@ -323,6 +323,7 @@ void kcc_ir_sw_disp(void *stmt);
 unsigned long kcc_eval_const_int(void *n);
 unsigned long kcc_expr_is_ice(void *n);
 unsigned long kcc_call_is_bcp(void *n);
+unsigned long kcc_call_is_choose_expr(void *n);
 unsigned long kcc_eval_addr(void *n);
 unsigned long kcc_addr_is_iconst(void *n);
 unsigned long kcc_rodata_binop_ok(unsigned long op);
@@ -4127,6 +4128,12 @@ unsigned long kcc_eval_const_int(void *n) {
         return kcc_expr_is_ice((void *)IL(n, AST_F1)) ? 1 : 0;   /* __builtin_constant_p(x) */
     if (tag == AST_CALL_EXPR && kcc_call_foldable_builtin(n))
         return kcc_call_builtin_value(n);                        /* __builtin_clz/ctz/popcount/ffs */
+    if (tag == AST_CALL_EXPR && kcc_call_is_choose_expr(n)) {
+        void *a0 = (void *)IL(n, AST_F1);
+        void *a1 = a0 ? (void *)IL(a0, AST_F4) : 0;
+        void *a2 = a1 ? (void *)IL(a1, AST_F4) : 0;
+        return kcc_eval_const_int(a0) ? kcc_eval_const_int(a1) : kcc_eval_const_int(a2);
+    }
     if (tag == AST_COND_EXPR)
         return kcc_eval_const_int((void *)IL(n, AST_F0))
                ? kcc_eval_const_int((void *)IL(n, AST_F1))
@@ -4286,6 +4293,16 @@ unsigned long kcc_expr_is_ice(void *n) {
        argument is (the kernel's ilog2/BITS_TO_LONGS array bounds). */
     if (tag == AST_CALL_EXPR && kcc_call_foldable_builtin(n))
         return kcc_expr_is_ice((void *)IL(n, AST_F1));
+    /* __builtin_choose_expr(cond, a, b): an ICE when the (ICE) condition selects
+       an operand that is itself an ICE; the unchosen operand is not examined. */
+    if (tag == AST_CALL_EXPR && kcc_call_is_choose_expr(n)) {
+        void *a0 = (void *)IL(n, AST_F1);
+        void *a1 = a0 ? (void *)IL(a0, AST_F4) : 0;
+        void *a2 = a1 ? (void *)IL(a1, AST_F4) : 0;
+        if (!a0 || !kcc_expr_is_ice(a0)) return 0;
+        void *pick = kcc_eval_const_int(a0) ? a1 : a2;
+        return pick ? kcc_expr_is_ice(pick) : 0;
+    }
     return 0;
 }
 
@@ -4295,6 +4312,20 @@ unsigned long kcc_call_is_bcp(void *n) {
     if (!callee || IL(callee, AST_TAG) != AST_IDENT_EXPR) return 0;
     char *cn = (char *)IL(callee, AST_F0);
     return cn && kcc_strcmp(cn, "__builtin_constant_p") == 0;
+}
+
+/* __builtin_choose_expr(cond, a, b) is a compile-time selection: the result is
+   the chosen argument and the unchosen one is not evaluated.  Sema rewrites the
+   call node into its pick, but a constant array size is resolved before that
+   runs, so the constant-expression predicates recognise it directly too---the
+   kernel's `max_t(...)' (behind e.g. TCPUDP_MIB_MAX, the size of proc.c's
+   snmp buffer) expands to one, and without this the fixed array is wrongly
+   rejected as a VLA. */
+unsigned long kcc_call_is_choose_expr(void *n) {
+    void *callee = (void *)IL(n, AST_F0);
+    if (!callee || IL(callee, AST_TAG) != AST_IDENT_EXPR) return 0;
+    char *cn = (char *)IL(callee, AST_F0);
+    return cn && kcc_strcmp(cn, "__builtin_choose_expr") == 0;
 }
 
 /* Allocate a block for every case/default label reachable in a switch body. */

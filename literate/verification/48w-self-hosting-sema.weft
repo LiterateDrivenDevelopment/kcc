@@ -747,11 +747,24 @@ void *kcc_sema_expr(void *node) {
     case AST_BINARY_EXPR: t = sema_expr_binary(n); break;
     case AST_UNARY_EXPR: t = sema_expr_unary(n); break;
     case AST_ASSIGN_EXPR: t = sema_expr_assign(n); break;
-    case AST_COND_EXPR:
+    case AST_COND_EXPR: {
         kcc_sema_expr((void *)n->f0);
-        t = kcc_sema_expr((void *)n->f1);       /* result = then type */
-        kcc_sema_expr((void *)n->f2);
+        struct Type *tt = (struct Type *)kcc_sema_expr((void *)n->f1);   /* then */
+        struct Type *et = (struct Type *)kcc_sema_expr((void *)n->f2);   /* else */
+        t = tt;                                  /* result = then type, usually */
+        /* \stdref{6.5.15}p6: when one operand is a null pointer constant, the
+           result has the OTHER operand's type.  The kernel's __is_constexpr(x)
+           leans on this: `8 ? (void *)((long)(x) * 0l) : (int *)8' is `int *'
+           exactly when x is an integer constant expression (its void* arm is
+           then a null pointer constant), so `sizeof(*that)' is 4 and the min/max
+           macros pick their constant branch---kcc previously always took the then
+           (void*) type, gave sizeof 0, and rejected the fixed array as a VLA. */
+        if (tt && et && tt->kind == TY_PTR && et->kind == TY_PTR) {
+            if (kcc_expr_is_ice((void *)n->f1) && kcc_eval_const_int((void *)n->f1) == 0) t = et;
+            else if (kcc_expr_is_ice((void *)n->f2) && kcc_eval_const_int((void *)n->f2) == 0) t = tt;
+        }
         break;
+    }
     case AST_CALL_EXPR: t = sema_expr_call(n); break;
     case AST_SUBSCRIPT: {
         struct Type *at = (struct Type *)kcc_sema_expr((void *)n->f0);

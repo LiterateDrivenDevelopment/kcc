@@ -158,7 +158,13 @@ declaration's leading and trailing attribute lists.  When the top-level parser
 finishes a declaration and knows its name, \texttt{kcc\_attr\_record} copies those
 three into the \texttt{kcc\_attr\_ht} side table (keyed by symbol name), then
 clears them---the AST node has no free field to carry linkage on, and the code
-emitter reads the table back when it lays each symbol down.  \texttt{typeof}
+emitter reads the table back when it lays each symbol down.  The name inside a
+\texttt{section}/\texttt{alias} may be written as several adjacent string
+literals, which \stdref{6.4.5} concatenates into one; the parser folds every
+consecutive literal rather than keeping only the first, so the kernel's
+\texttt{DEFINE\_PER\_CPU\_FIRST}---whose section is
+\verb|".data..percpu" "..first"|---places \texttt{fixed\_percpu\_data} in
+\verb|.data..percpu..first| and not the base \verb|.data..percpu|.  \texttt{typeof}
 wraps its parenthesised type-name or expression in a \texttt{TYPE\_TYPEOF} node.
 
 @l c
@@ -205,11 +211,33 @@ void kcc_parse_skip_attributes(void) {
                     kcc_attr_align = kcc_pp_atoi(kcc_tok_start, kcc_tok_len);
                 }
             } else if (tt == TOK_STRING_LIT && (want_section || want_alias)) {
-                /* strip the surrounding quotes of e.g. section(".init.text") */
-                const char *s = (const char *)kcc_strtab_intern(
-                    kcc_tok_start + 1, kcc_tok_len >= 2 ? kcc_tok_len - 2 : 0);
+                /* A section or alias name may be several adjacent string literals
+                   that translation phase~6 concatenates (\stdref{6.4.5}): the
+                   kernel spells DEFINE_PER_CPU_FIRST's section as
+                   `".data..percpu" "..first"'.  Fold every consecutive literal
+                   (each stripped of its quotes) into one interned name; taking
+                   only the first would drop `..first' and mis-place
+                   fixed_percpu_data out of `.data..percpu..first', which
+                   vmlinux.lds requires at offset~0 of the per-cpu area. */
+                unsigned long cap = 64, len = 0;
+                char *buf = (char *)kcc_arena_alloc(cap);
+                while (kcc_tok_type == TOK_STRING_LIT) {
+                    unsigned long inner = kcc_tok_len >= 2 ? kcc_tok_len - 2 : 0;
+                    if (len + inner >= cap) {
+                        unsigned long nc = cap * 2;
+                        while (nc <= len + inner) nc *= 2;
+                        char *nb = (char *)kcc_arena_alloc(nc);
+                        kcc_memcpy(nb, buf, len);
+                        buf = nb; cap = nc;
+                    }
+                    kcc_memcpy(buf + len, kcc_tok_start + 1, inner);
+                    len += inner;
+                    kcc_pp_next();
+                }
+                const char *s = (const char *)kcc_strtab_intern(buf, len);
                 if (want_section) { kcc_attr_section = s; want_section = 0; }
                 else { kcc_attr_alias = s; want_alias = 0; }
+                continue;                         /* already advanced past the literals */
             }
             kcc_pp_next();
             if (depth == 0) break;

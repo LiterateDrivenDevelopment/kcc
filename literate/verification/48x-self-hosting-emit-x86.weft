@@ -83,6 +83,7 @@ extern unsigned long kcc_modinit_present;
 #define TY_VOID 1
 #define TY_STRUCT 14
 #define TY_ARRAY 12
+#define TY_FUNC 13
 #define TY_PTR 11
 #define TY_FLOAT 8
 #define TY_DOUBLE 9
@@ -1353,7 +1354,12 @@ static void x86_render_text(void) {
 Mutable file-scope globals become zeroed common storage (their initialisers run
 as code); \texttt{const} scalars, arrays of scalars, structs of scalars, and
 arrays of such structs become read-only value directives; static locals are
-recovered by walking every function body.
+recovered by walking every function body.  A declarator whose type resolves to a
+\emph{function} type is not an object at all---it declares a function and gets no
+storage---so the data pass skips it: the kernel's
+\texttt{INDIRECT\_CALLABLE\_DECLARE} spells a prototype as
+\verb|inet_ehashfn_t udp_ehashfn;| through a function-type typedef, and a
+\verb|.comm| for that name would collide with the real definition.
 
 A common symbol emitted with \verb|.comm| has \emph{external} linkage: the
 linker coalesces same-named commons from different objects into one.  A
@@ -1447,6 +1453,13 @@ void kcc_x86_emit_data(void) {
         if (kcc_global_const_ptrarr(d)) { x86_emit_rodata_ptrarr(d, name); continue; }
         void *ty = kcc_sema_resolve_type((void *)d->f0);
         if (!ty) continue;
+        /* A declarator whose type is a function type declares a function, not an
+           object---`fntype name;' through a function-type typedef is a prototype
+           with no storage, exactly like `u32 name(args);'.  The kernel writes
+           these through INDIRECT_CALLABLE_DECLARE (under CONFIG_RETPOLINE it is a
+           bare `inet_ehashfn_t udp_ehashfn;'); emitting a `.comm' for it would
+           collide with the real function definition---"symbol already defined". */
+        if (IL(ty, TY_KIND) == TY_FUNC) continue;
         unsigned long size = round8_min8(kcc_type_layout(ty));
         x86_emit_zerofill(name, size, sc == 3);
     }

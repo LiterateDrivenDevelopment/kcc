@@ -2369,7 +2369,16 @@ Loading a variable resolves local (alloca), static-local (mangled global), and
 file-scope cases, with arrays and functions decaying to their address rather
 than loading.  Binary operators scale pointer arithmetic, remap signed opcodes
 to unsigned by the operands' common type, take an FP path when any operand is
-floating, and short-circuit \texttt{\&\&}/\texttt{||} through fresh blocks.
+floating, and short-circuit \texttt{\&\&}/\texttt{||} through fresh blocks.  When
+the \emph{left} operand of a \texttt{\&\&}/\texttt{||} is an integer constant
+expression, the fold happens at build time instead---\texttt{0 \&\& X} yields a
+constant~0 and never builds \texttt{X}, \texttt{1 || X} a constant~1---so a dead
+right operand is dropped rather than emitted behind a run-time branch.  This
+matters because the kernel guards asm-bearing idioms this way:
+\texttt{nf\_hook}'s \verb|__builtin_constant_p(pf) && __builtin_constant_p(hook) && static_key_false(&nf_hooks_needed[pf][hook])|
+must vanish when \texttt{pf}/\texttt{hook} are run-time, or the static-key jump
+table would emit \verb|.quad %reg| against the array-indexed key and the
+assembler would reject the register relocation.
 Unary handles negation, complement, logical-not, address-of (dispatched by
 operand shape), and dereference.  Logical-not lowers to a compare against zero
 typed at the operand's own width---\texttt{double} for a floating operand, a
@@ -2631,6 +2640,19 @@ static unsigned long bin_fp_emit(void *e, unsigned long op, unsigned long a, uns
 }
 
 static unsigned long bin_short_and(void *e) {
+    /* Fold a compile-time-constant left operand at build time, exactly as gcc
+       evaluates the guard: `0 && X' is 0 with X never built; `k && X' (k!=0) is
+       `(X != 0)'.  This is what lets the kernel drop a
+       `__builtin_constant_p(n) && static_key_false(...)' branch when n is a
+       run-time value.  Without it the dead static-key asm still reaches the
+       assembler, and with the key an array element `&nf_hooks_needed[pf][hook]'
+       (nf_hook, netfilter) it emits `.quad %reg' into __jump_table --- which as
+       rejects: "invalid R_X86_64_64 relocation against register". */
+    void *lhs_e = (void *)IL(e, AST_F1);
+    if (kcc_expr_is_ice(lhs_e)) {
+        if (kcc_eval_const_int(lhs_e) == 0) return kcc_ir_emit_const(0);
+        return kcc_ir_emit_bool_norm(kcc_ir_build_expr((void *)IL(e, AST_F2)));
+    }
     void *tmp = kcc_ir_alloc_instr(IR_ALLOCA);
     IL(tmp, IR_TYPE) = (unsigned long)kcc_type_int_s;
     unsigned long tmpv = kcc_ir_next_vreg();
@@ -2683,6 +2705,13 @@ static unsigned long bin_short_and(void *e) {
 }
 
 static unsigned long bin_short_or(void *e) {
+    /* Symmetric compile-time fold: `k || X' (k!=0) is 1 with X never built;
+       `0 || X' is `(X != 0)'. */
+    void *lhs_e = (void *)IL(e, AST_F1);
+    if (kcc_expr_is_ice(lhs_e)) {
+        if (kcc_eval_const_int(lhs_e) != 0) return kcc_ir_emit_const(1);
+        return kcc_ir_emit_bool_norm(kcc_ir_build_expr((void *)IL(e, AST_F2)));
+    }
     void *tmp = kcc_ir_alloc_instr(IR_ALLOCA);
     IL(tmp, IR_TYPE) = (unsigned long)kcc_type_int_s;
     unsigned long tmpv = kcc_ir_next_vreg();

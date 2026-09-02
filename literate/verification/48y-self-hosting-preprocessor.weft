@@ -838,6 +838,17 @@ the paste deletes both the operand and a preceding comma---the mechanism behind
 the kernel's \texttt{static\_assert(expr,\,...)} wrapper, and thus a hard
 prerequisite for the \texttt{<linux/bitops.h>} sanity assertions.
 
+Stringisation itself, in \texttt{pp\_emit\_string}, must honour \stdref{6.10.3.2}p2
+precisely: a \texttt{\textbackslash} or \texttt{"} is escaped \emph{only} when it
+belongs to a character constant or string literal in the argument.  A backslash
+that stands outside any literal passes through untouched.  This is what lets the
+entry code assemble: \texttt{<asm/nospec-branch.h>}'s \texttt{FILL\_RETURN\_BUFFER}
+stringises a GAS \texttt{.macro} body through \texttt{\_\_stringify}, and its
+\texttt{\textbackslash reg}/\texttt{\textbackslash nr} parameter references are
+bare backslashes, not literal contents; escaping them to \texttt{\textbackslash\textbackslash reg}
+would make the assembler reject the operand.  The scan therefore tracks
+string- and char-literal state and only doubles a backslash inside one.
+
 @l c
 @d Selfhost: pp substitute @{
 static int is_id(int c) {
@@ -922,7 +933,8 @@ static const char *pp_expand_arg(const char *text, unsigned long len, unsigned l
     return out;
 }
 
-/* Emit a "..." literal of src with whitespace collapsed and " / \ escaped. */
+/* Emit a "..." literal of src with whitespace collapsed and the " / \ of any
+   embedded string or character literal escaped. */
 static unsigned long pp_emit_string(const char *src, unsigned long len, char *dst) {
     char *d = dst;
     *d++ = '"';
@@ -933,12 +945,35 @@ static unsigned long pp_emit_string(const char *src, unsigned long len, char *ds
        newline copied verbatim would close the string prematurely. */
     while (i < len && (src[i] == ' ' || src[i] == 0x09 || src[i] == 0x0A || src[i] == 0x0D)) i++;
     int pending = 0;
+    /* \stdref{6.10.3.2}p2 escapes a `\' or `"' only when it belongs to a
+       character constant or string literal in the argument; a bare backslash
+       outside any literal --- e.g. the `\reg'/`\nr' parameter references in a
+       GAS `.macro' body stringised through `__stringify' (nospec-branch.h's
+       FILL_RETURN_BUFFER) --- passes through verbatim.  Escaping it too would
+       emit `\\reg', which the assembler rejects as an invalid operand. */
+    int in_str = 0, in_chr = 0;
     for (; i < len; i++) {
         char c = src[i];
-        if (c == ' ' || c == 0x09 || c == 0x0A || c == 0x0D) { pending = 1; continue; }
+        if (!in_str && !in_chr && (c == ' ' || c == 0x09 || c == 0x0A || c == 0x0D)) { pending = 1; continue; }
         if (pending) { *d++ = ' '; pending = 0; }
-        if (c == '"' || c == 0x5C) *d++ = 0x5C;
-        *d++ = c;
+        if (in_str || in_chr) {
+            if (c == 0x5C) {                     /* escape sequence within a literal */
+                *d++ = 0x5C; *d++ = 0x5C;        /* the backslash itself is escaped */
+                if (i + 1 < len) {
+                    char n = src[++i];
+                    if (n == '"' || n == 0x5C) *d++ = 0x5C;
+                    *d++ = n;
+                }
+                continue;
+            }
+            if (c == '"') { *d++ = 0x5C; *d++ = '"'; if (in_str) in_str = 0; continue; }
+            if (c == '\'') { *d++ = c; if (in_chr) in_chr = 0; continue; }
+            *d++ = c;
+            continue;
+        }
+        if (c == '"') { *d++ = 0x5C; *d++ = '"'; in_str = 1; continue; }   /* opening delimiter */
+        if (c == '\'') { *d++ = c; in_chr = 1; continue; }
+        *d++ = c;                                /* bare backslash / other: verbatim */
     }
     *d++ = '"';
     return (unsigned long)(d - dst);
@@ -1107,11 +1142,19 @@ match a likewise-undefined \texttt{\_\_ORDER\_*}.  Under
 bindings, and---so that gcc-oriented build systems (Kbuild's
 \texttt{scripts/cc-version.sh}) recognise kcc as a supported compiler, exactly as
 clang and icc do---the GCC identity macros \texttt{\_\_GNUC\_\_} /
-\texttt{\_\_GNUC\_MINOR\_\_} / \texttt{\_\_GNUC\_PATCHLEVEL\_\_}.  Finally it
+\texttt{\_\_GNUC\_MINOR\_\_} / \texttt{\_\_GNUC\_PATCHLEVEL\_\_}.  For an assembly
+input---a \texttt{.S}/\texttt{.s} file, flagged by \texttt{kcc\_lex\_asm}---it also
+predefines \texttt{\_\_ASSEMBLER\_\_}, the language macro every C compiler sets
+when preprocessing assembler (distinct from the kernel's hand-passed
+\texttt{-D\_\_ASSEMBLY\_\_}); headers such as \texttt{<linux/elfnote.h>} include
+their C-only companions (here \texttt{<uapi/linux/elf.h>} with its
+\texttt{Elf32\_Addr} typedefs) only when it is \emph{absent}, so predefining it
+keeps those typedefs out of the assembler stream.  Finally it
 replays any \texttt{-D} command-line macros on top.
 
 @l c
 @d Selfhost: pp predefined @{
+extern unsigned long kcc_lex_asm;            /* set for a .S/.s input (assembler-with-cpp) */
 static void pp_def_simple(const char *name, unsigned long nl, const char *body, unsigned long bl) {
     struct PPMacro *m = (struct PPMacro *)kcc_arena_alloc(sizeof(struct PPMacro));
     m->name = name; m->namelen = nl; m->flags = PP_FLAG_BUILTIN; m->nparams = 0;
@@ -1157,6 +1200,14 @@ static void pp_predefine(void) {
         pp_def_simple("__GNUC_MINOR__", 14, "2", 1);
         pp_def_simple("__GNUC_PATCHLEVEL__", 19, "0", 1);
     }
+    /* The compiler predefines __ASSEMBLER__ when the input language is assembly
+       (a .S/.s file), exactly as gcc and clang do; it is distinct from the
+       kernel's own -D__ASSEMBLY__.  Headers gate their C-only halves on it:
+       <linux/elfnote.h> pulls in <uapi/linux/elf.h> --- and its Elf32_Addr and
+       kin typedefs --- only in the `#else' of `#ifdef __ASSEMBLER__', so without
+       this a stringised .S (vdso-note.S) would drag C typedefs into the
+       assembler and fail with `no such instruction: typedef ...'. */
+    if (kcc_lex_asm) pp_def_simple("__ASSEMBLER__", 13, "1", 1);
     kcc_pp_apply_cmdline_defines();
 }
 

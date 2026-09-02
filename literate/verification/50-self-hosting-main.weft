@@ -113,8 +113,11 @@ extern const char *kcc_tok_start;
    in phase~3, so that gap is preserved too).  Reproducing the source spacing,
    rather than forcing a space between every pair, is what lets the output feed an
    assembler: \texttt{.macro} must not become `\texttt{. macro}', a `\texttt{672:}'
-   label must not split, and `\texttt{\%rax}' must stay joined.  Line markers are
-   omitted (matching gcc's -P).  Defined here, in the driver, so it depends only
+   label must not split, and `\texttt{\%rax}' must stay joined.  Across a
+   macro-expansion boundary the source gap is invisible, so a small set of
+   would-fuse pairs (two word tokens, a word then a \texttt{\%}/\texttt{\$}/\texttt{(}
+   operand starter, or---in asm mode---a symbol then a string/char literal) get a
+   synthesised space.  Line markers are omitted (matching gcc's -P).  Defined here, in the driver, so it depends only
    on kcc_pp_next (present in either preprocessor port). */
 static int kcc_word_char(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
@@ -154,6 +157,16 @@ static void kcc_pp_emit_text(void) {
             int space = (s[-1] == ' ' || s[-1] == 0x09);
             if (!space && kcc_word_char(prev_last) &&
                 (kcc_word_char(b) || b == '%' || b == '$' || b == '('))
+                space = 1;
+            /* In assembly a directive or symbol abutting a string/char operand
+               must stay separated: ELFNOTE's `.asciz CONFIG_BUILD_SALT' with an
+               empty build salt expands to `.asciz ""', and glued to `.asciz""'
+               the assembler reads an unterminated string and loses the note's
+               `4484' label.  A C encoding-prefixed literal (L"..", u8"..") is a
+               single token that never arrives here split, so gate this on asm
+               mode to leave C output byte-for-byte unchanged. */
+            if (!space && kcc_lex_asm && kcc_word_char(prev_last) &&
+                (b == '"' || b == '\''))
                 space = 1;
             if (space) kcc_io_puts(" ");
         }

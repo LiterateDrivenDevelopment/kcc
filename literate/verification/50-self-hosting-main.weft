@@ -100,6 +100,7 @@ long kcc_sys_open(const char *path, long flags, long mode);
 long kcc_sys_close(long fd);
 int kcc_driver_spawn(const char *path, char *const argv[]);
 extern long kcc_io_fd;                           /* 1 (stdout) unless redirected */
+extern unsigned long kcc_lex_asm;                /* relax `'' for .S/.s inputs */
 void kcc_io_write(const char *buf, unsigned long len);
 extern unsigned long kcc_tok_type, kcc_tok_len, kcc_tok_line;
 extern const char *kcc_tok_start;
@@ -171,8 +172,14 @@ static void finish(void) {
     kcc_io_flush(); kcc_sys_exit(0);
 }
 
-/* Translation phases 1-2 then lexer init on the source at a given path. */
+/* Translation phases 1-2 then lexer init on the source at a given path.  An
+   assembly input (`.S'/`.s') puts the lexer in relaxed mode so a stray `'' in a
+   GAS `#'/`;' comment or a bare `'a' char does not read as an unterminated
+   character constant. */
 static void open_lex_path(const char *path) {
+    unsigned long lp = kcc_strlen(path);
+    kcc_lex_asm = (lp >= 2 && path[lp - 2] == '.' &&
+                   (path[lp - 1] == 'S' || path[lp - 1] == 's')) ? 1 : 0;
     kcc_source_open(path);
     kcc_source_encode();                          /* phase 1: trigraphs */
     kcc_source_splice();                          /* phase 2: line splicing */

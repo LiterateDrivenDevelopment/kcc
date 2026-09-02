@@ -27,6 +27,17 @@ token type directly.
 
 \section{State, Init, and the Scanners}
 
+One piece of state is set by the driver, not the scanners: \texttt{kcc\_lex\_asm}
+marks the current input as assembly (a \texttt{.S}/\texttt{.s} file being
+preprocessed for \texttt{as}).  In that mode the character scanner does not treat
+a \texttt{'} as necessarily opening a constant---GAS writes a bare \texttt{'a}
+and, far more often, an apostrophe rides inside a \texttt{\#}/\texttt{;} line
+comment (\texttt{arch/x86/kernel/head\_64.S}'s \texttt{\# don't loop})---so an
+otherwise unterminated \texttt{'} is emitted as a lone one-byte token and lexing
+resumes at the next character, leaving the assembler's comment intact instead of
+raising ``unterminated character constant''.  For a \texttt{.c} compile the flag
+is~0 and the strict C rule stands.
+
 @l c
 @d Selfhost: lexcore @{
 /* token type codes the lexer itself emits (keyword codes 10-59 come from the
@@ -66,6 +77,7 @@ unsigned long kcc_tok_len = 0;
 unsigned long kcc_tok_line = 0;
 unsigned long kcc_tok_col = 0;
 void *kcc_kw_table = 0;                           /* filled by lexer_tables */
+unsigned long kcc_lex_asm = 0;                    /* input is `.S'/`.s': relax `'' */
 
 static int is_id_start(unsigned c) {
     return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
@@ -167,6 +179,19 @@ static void kcc_lex_scan_char(void) {
         if (c == '\\') { p += 2; continue; }
         if (c == '\n') { unterm = 1; break; }
         p++;
+    }
+    /* Preprocessing a `.S' source (kcc_lex_asm): a `'' need not open a character
+       constant.  GAS writes a bare `'a' char and, more commonly, `#'/`;' line
+       comments carry apostrophes (`# don't loop').  A C lexer would scan the rest
+       of the line as an unterminated constant; instead emit the lone `'' as a
+       one-byte token and resume at the next character, so the assembler (which
+       owns the comment) sees the line intact. */
+    if (unterm && kcc_lex_asm) {
+        kcc_lex_cursor = start + 1;
+        kcc_tok_start = start;
+        kcc_tok_len = 1;
+        kcc_tok_type = TOK_UNKNOWN;
+        return;
     }
     kcc_lex_cursor = p;
     if (unterm) kcc_diag_error(kcc_tok_line, kcc_tok_col, "unterminated character constant");

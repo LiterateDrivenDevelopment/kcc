@@ -380,6 +380,15 @@ left-to-right (the first bracket is outermost); a function suffix builds a
 0 of the params pointer.  A grouped declarator such as \texttt{int (*fp)(int)}
 parses the inner \texttt{*fp}, then splices the trailing function or array type in
 place of the base within the inner declarator's type chain---C's inside-out rule.
+A parameter is parsed the same way, with one adjustment (\stdref{6.7.6.3}p8): a
+parameter whose declarator is itself a function---\texttt{int getfrag(void *,
+int)}, as ip\_output's \texttt{\_\_ip\_append\_data} spells its callback---has
+function type, which decays to a pointer to function.  The declarator returns a
+\texttt{FUNC\_DECL} whose \texttt{f0} is only the \emph{return} type, so
+\texttt{kcc\_parse\_param\_decl} rebuilds the \texttt{TYPE\_FUNC} from it (return
+type plus the params-and-variadic word) and lets \texttt{kcc\_type\_param\_adjust}
+turn it into a pointer; without this the parameter would keep just its return
+type and a later call through it would be rejected as a non-function.
 
 @l c
 @d Selfhost: declarations declarator @{
@@ -550,6 +559,24 @@ void *kcc_parse_param_decl(void) {
     struct Node *d = (struct Node *)kcc_parse_declarator(type);
     kcc_parse_skip_attributes();
     struct Node *p = (struct Node *)kcc_ast_alloc(AST_PARAM_DECL);
+    if (d->tag == AST_FUNC_DECL) {
+        /* A parameter written with function-declarator syntax---the kernel's
+           `int getfrag(void *from, ...)' in ip_output's __ip_append_data---has
+           function type, which \stdref{6.7.6.3}p8 adjusts to a pointer to
+           function.  kcc_parse_declarator hands back a FuncDecl whose f0 is the
+           \emph{return} type and f2 is `params | variadic-bit'; taking f0 as the
+           parameter type would silently keep only the return type (so a later
+           call `getfrag(...)' fails "called object is not a function").  Rebuild
+           the function type so sema sees TY_FUNC and kcc_type_param_adjust turns
+           it into a function pointer. */
+        struct Node *ft = (struct Node *)kcc_ast_alloc(AST_TYPE_FUNC);
+        ft->f0 = F0(d);                            /* return type */
+        ft->f1 = F2(d);                            /* params (variadic bit masked on resolve) */
+        ft->f2 = F2(d) & 1UL;                      /* variadic flag */
+        p->f0 = (unsigned long)ft;
+        p->f1 = F1(d);
+        return p;
+    }
     p->f0 = F0(d);
     p->f1 = F1(d);
     return p;

@@ -845,6 +845,30 @@ static int is_id(int c) {
 }
 static int is_idn(int c) { return is_id(c) || (c >= '0' && c <= '9'); }
 
+/* Would a token ending in `a' and one starting with `b', written adjacent, lex
+   as a single longer pp-token?  Exactly the two-character C punctuators (plus a
+   `.'`.' that could open `...'): `--', `<<', `->', `+=' and friends must not
+   fuse across a macro-expansion boundary.  Crucially `/'`/' is NOT here---after
+   phase 3 it is two `/' tokens, never a comment---so a computed include path
+   like `asm/trace//x86_fpu.h' keeps its `//' rather than gaining a stray space. */
+static int pp_pastes(char a, char b) {
+    switch (a) {
+    case '+': return b == '+' || b == '=';
+    case '-': return b == '-' || b == '>' || b == '=';
+    case '<': return b == '<' || b == '=' || b == ':' || b == '%';
+    case '>': return b == '>' || b == '=';
+    case '=': return b == '=';
+    case '!': return b == '=';
+    case '&': return b == '&' || b == '=';
+    case '|': return b == '|' || b == '=';
+    case '*': case '/': case '%': case '^': return b == '=';
+    case '#': return b == '#';
+    case ':': return b == '>';
+    case '.': return b == '.';
+    default:  return 0;
+    }
+}
+
 static const char *pp_expand_arg(const char *text, unsigned long len, unsigned long *lo) {
     if (!len) { *lo = 0; return text; }
     unsigned long base_depth = kcc_pp_ctx_depth;
@@ -869,13 +893,25 @@ static const char *pp_expand_arg(const char *text, unsigned long len, unsigned l
             kcc_memcpy(nb, out, outlen);
             out = nb; cap = ncap;
         }
-        /* Separate tokens with a single space ONLY where the source had
-           whitespace: two tokens adjacent in the same buffer (`.` then `section`
-           in `.section`) must stay joined, or `#`-stringify would produce
-           `. section` and break asm templates like EXPORT_SYMBOL's `.section`.
-           A buffer change (macro-expansion boundary) leaves ts != prev_end, so a
-           space is inserted there, which also prevents accidental token paste. */
-        if (outlen && ts != prev_end) out[outlen++] = ' ';
+        /* Separate tokens with a single space only where the source had
+           whitespace (the byte before the token is whitespace, so `#'-stringify
+           reproduces `a > b' and `.section' stays joined), or---across a bare
+           macro-expansion boundary, where that byte lives in another buffer---
+           only where the two tokens would otherwise fuse into one: two word
+           tokens (`FOO'`bar') or a real two-character punctuator (`-'`-'->`--',
+           `<'`<'->`<<') per pp_pastes.  A non-pasting punctuation boundary stays
+           joined: `TRACE_INCLUDE_PATH' (->`asm/trace/') abutting `/system.h'
+           keeps `asm/trace//x86_fpu.h', a valid computed #include path, not
+           `asm/trace/ /x86_fpu.h' which no header search resolves. */
+        if (outlen && ts != prev_end) {
+            char before = ts[-1];
+            char a = out[outlen - 1], b = ts[0];
+            int fuse = (is_idn((unsigned char)a) && is_idn((unsigned char)b)) ||
+                       pp_pastes(a, b);
+            if (before == ' ' || before == 0x09 || before == 0x0A ||
+                before == 0x0D || fuse)
+                out[outlen++] = ' ';
+        }
         kcc_memcpy(out + outlen, ts, tl);
         outlen += tl;
         prev_end = ts + tl;

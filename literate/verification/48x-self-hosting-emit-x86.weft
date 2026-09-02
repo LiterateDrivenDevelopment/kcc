@@ -124,7 +124,7 @@ static unsigned long kcc_x86_rsa_top = 0;   /* rbp-relative top of the variadic 
 #define S(name, str) static const char name[] = str
 S(s_text, ".text\n"); S(s_globl, ".globl "); S(s_us, "_");
 S(s_weak, ".weak "); S(s_section, ".section "); S(s_set, "\t.set "); S(s_prev, "\t.previous\n");
-S(s_bss, ".bss\n"); S(s_ax, ",\"ax\",@@progbits\n");
+S(s_bss, ".bss\n"); S(s_ax, ",\"ax\",@@progbits\n"); S(s_aw, ",\"aw\"\n");
 S(s_rodata, ".section .rodata\n"); S(s_comm, "\t.comm "); S(s_comm_a8, ",8\n");
 S(s_local, "\t.local ");
 S(s_modinit_d, ".section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad ");
@@ -1363,6 +1363,20 @@ Without it two units that each name a static the same---say both back ends'
 \texttt{s\_globl}---would share one storage cell and their initialisers would
 overwrite each other.
 
+A \texttt{\_\_attribute\_\_((section("...")))} on a defining declaration is the
+one case where a zero-storage global must \emph{not} become a common symbol.  A
+common lives in \texttt{.bss}; the section attribute demands the cell appear in a
+\emph{specific} named section instead.  The kernel's per-cpu machinery depends on
+this: \texttt{DEFINE\_PER\_CPU\_FIRST} lands \texttt{fixed\_percpu\_data} in
+\verb|.data..percpu..first|, which \texttt{vmlinux.lds} orders first in the
+per-cpu output and then asserts sits at offset~0.  Emitted as a \verb|.comm| the
+symbol would drift into \texttt{.bss} and the link would fail the assert, so a
+section-attributed definition is written out longhand---\verb|.section name,"aw"|,
+the label, and a \verb|.zero| of its size---exactly as \texttt{gcc} does.  (The
+attribute record carries no alignment, so the cell takes the default 8-byte
+\texttt{.p2align}; being the sole and first symbol of its section it still resolves
+to offset~0.)
+
 @l c
 @d Selfhost: emit_x86 data @{
 /* A single file-scope object may be spelled by both a tentative declaration
@@ -1380,8 +1394,21 @@ static void x86_emit_zerofill(const char *name, unsigned long size, int is_stati
     }
     struct AttrRec *ar = x86_attr(name);
     int weak = !is_static && ar && ar->weak;     /* __weak global */
+    const char *sec = ar ? ar->section : 0;      /* __attribute__((section("..."))) */
     if (!is_static) { kcc_as_str(weak ? s_weak : s_globl); x86_sym(name); kcc_as_ch('\n'); }
-    if (weak && kcc_x86_os) {
+    if (sec && kcc_x86_os) {
+        /* A section attribute on a definition forces a real, zero-filled cell
+           in the named section --- never a common symbol. This matters for the
+           kernel per-cpu area: DEFINE_PER_CPU_FIRST places fixed_percpu_data in
+           .data..percpu..first, and vmlinux.lds asserts it sits at offset 0 of
+           the per-cpu output. Emitted as a `.comm`, it would land in .bss and
+           never reach the per-cpu section, tripping that assert. */
+        kcc_as_str(s_section); kcc_as_str(sec); kcc_as_str(s_aw);
+        kcc_as_str(s_p2align3);
+        x86_sym(name); kcc_as_str(s_colon_nl);
+        kcc_as_str(s_zerodir); kcc_as_dec(size); kcc_as_ch('\n');
+        kcc_as_str(s_text);
+    } else if (weak && kcc_x86_os) {
         /* a common symbol cannot also be weak; give it a real weak definition
            in .bss instead of a `.comm`. */
         kcc_as_str(s_bss); kcc_as_str(s_p2align3);

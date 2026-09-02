@@ -748,8 +748,12 @@ void *kcc_sema_expr(void *node) {
     case AST_UNARY_EXPR: t = sema_expr_unary(n); break;
     case AST_ASSIGN_EXPR: t = sema_expr_assign(n); break;
     case AST_COND_EXPR: {
-        kcc_sema_expr((void *)n->f0);
-        struct Type *tt = (struct Type *)kcc_sema_expr((void *)n->f1);   /* then */
+        struct Type *ct = (struct Type *)kcc_sema_expr((void *)n->f0);
+        /* GNU `a ?: b': the middle operand is omitted (f1 == 0) and the result's
+           then-value is the condition itself, so the then-type is the condition's
+           type---the kernel's `(nalg ?: alg)->cra_flags' in crypto/algapi.c needs
+           this or the `->' lands on a null type ("member access on non-struct"). */
+        struct Type *tt = n->f1 ? (struct Type *)kcc_sema_expr((void *)n->f1) : ct;
         struct Type *et = (struct Type *)kcc_sema_expr((void *)n->f2);   /* else */
         t = tt;                                  /* result = then type, usually */
         /* \stdref{6.5.15}p6: when one operand is a null pointer constant, the
@@ -759,7 +763,7 @@ void *kcc_sema_expr(void *node) {
            then a null pointer constant), so `sizeof(*that)' is 4 and the min/max
            macros pick their constant branch---kcc previously always took the then
            (void*) type, gave sizeof 0, and rejected the fixed array as a VLA. */
-        if (tt && et && tt->kind == TY_PTR && et->kind == TY_PTR) {
+        if (n->f1 && tt && et && tt->kind == TY_PTR && et->kind == TY_PTR) {
             if (kcc_expr_is_ice((void *)n->f1) && kcc_eval_const_int((void *)n->f1) == 0) t = et;
             else if (kcc_expr_is_ice((void *)n->f2) && kcc_eval_const_int((void *)n->f2) == 0) t = tt;
         }

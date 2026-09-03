@@ -143,6 +143,7 @@ enum {
 void *kcc_arena_alloc(unsigned long);
 void *kcc_strtab_intern(const char *, unsigned long);
 static void *kcc_always_inline_fns = 0;   /* registry of always_inline definitions */
+static void *kcc_inl_need_out = 0;        /* always_inline fns a call could NOT inline */
 unsigned long kcc_strlen(const char *);
 int kcc_strcmp(const char *, const char *);
 void *kcc_ht_init(unsigned long);
@@ -507,8 +508,62 @@ register alternative.
 @l c
 @d Selfhost: ir spine @{
 /* -- entry point: walk the translation unit, build every function body -- */
+/* True if an AST subtree (statements AND expressions) contains inline asm.  The
+   recursion touches only the child-POINTER fields of each node---the exact set
+   kcc_inl_clone walks---so it never dereferences an operator token or literal
+   value.  Reaching into expressions matters because the kernel hides asm inside
+   statement-expressions: `arch_atomic_add_return' is `return i + xadd(...)' and
+   `xadd' expands to `({ ...; asm volatile(...); ...; })'.  Such a function must
+   NOT be emitted out-of-line---its asm needs the caller's operands---so a
+   statement-spine-only check would miss the asm and crash codegen on it. */
+static int kcc_ast_has_asm(void *n);
+static int kcc_ast_has_asm_seq(void *s) {
+    for (; s; s = (void *)IL(s, AST_F4))
+        if (kcc_ast_has_asm(s)) return 1;
+    return 0;
+}
+static int kcc_ast_has_asm(void *n) {
+    if (!n) return 0;
+    unsigned long tag = IL(n, AST_TAG);
+    switch (tag) {
+    case AST_ASM_STMT: return 1;
+    case AST_COMPOUND: return kcc_ast_has_asm_seq((void *)IL(n, AST_F0));
+    case AST_CALL_EXPR:
+        return kcc_ast_has_asm((void *)IL(n, AST_F0)) ||
+               kcc_ast_has_asm_seq((void *)IL(n, AST_F1));
+    case AST_PAREN_EXPR: case AST_EXPR_STMT: case AST_STMT_EXPR:
+    case AST_MEMBER: case AST_RETURN_STMT:
+        return kcc_ast_has_asm((void *)IL(n, AST_F0));
+    case AST_UNARY_EXPR: case AST_CAST_EXPR:
+    case AST_LABEL_STMT: case AST_DEFAULT_STMT:
+        return kcc_ast_has_asm((void *)IL(n, AST_F1));
+    case AST_VAR_DECL:
+        return kcc_ast_has_asm((void *)IL(n, AST_F2));
+    case AST_BINARY_EXPR: case AST_ASSIGN_EXPR: case AST_COMMA_EXPR:
+        return kcc_ast_has_asm((void *)IL(n, AST_F1)) ||
+               kcc_ast_has_asm((void *)IL(n, AST_F2));
+    case AST_SUBSCRIPT: case AST_WHILE_STMT: case AST_DO_STMT:
+    case AST_SWITCH_STMT: case AST_CASE_STMT:
+        return kcc_ast_has_asm((void *)IL(n, AST_F0)) ||
+               kcc_ast_has_asm((void *)IL(n, AST_F1));
+    case AST_COND_EXPR: case AST_IF_STMT:
+        return kcc_ast_has_asm((void *)IL(n, AST_F0)) ||
+               kcc_ast_has_asm((void *)IL(n, AST_F1)) ||
+               kcc_ast_has_asm((void *)IL(n, AST_F2));
+    case AST_FOR_STMT:
+        return kcc_ast_has_asm((void *)IL(n, AST_F0)) ||
+               kcc_ast_has_asm((void *)IL(n, AST_F1)) ||
+               kcc_ast_has_asm((void *)IL(n, AST_F2)) ||
+               kcc_ast_has_asm((void *)IL(n, AST_F3));
+    case AST_SIZEOF_EXPR: case AST_ALIGNOF_EXPR:
+        return IL(n, AST_F1) ? 0 : kcc_ast_has_asm((void *)IL(n, AST_F0));
+    default: return 0;               /* leaves: identifiers, literals, goto, ... */
+    }
+}
+
 void kcc_ir_build(void *tu) {
     kcc_ir_trans_unit = tu;
+    kcc_inl_need_out = 0;
     void *d = (void *)IL(tu, AST_F0);
     while (d) {
         if (IL(d, AST_TAG) == AST_FUNC_DECL && IL(d, AST_F3)) {
@@ -550,6 +605,22 @@ void kcc_ir_build(void *tu) {
         d = (void *)IL(d, AST_F4);
     }
     if (!has_main && has_ginit) kcc_ir_emit_modinit();
+    /* Out-of-line pass: emit a standalone body for any always_inline function a
+       call could not inline (asm-bearing ones excluded---their `"i"' operands
+       need the caller's constant). Runs last so in-place lowering can't disturb
+       an inline expansion. */
+    if (kcc_inl_need_out) {
+        d = (void *)IL(tu, AST_F0);
+        while (d) {
+            if (IL(d, AST_TAG) == AST_FUNC_DECL && IL(d, AST_F3)) {
+                const char *nm = (const char *)IL(d, AST_F1);
+                if (nm && kcc_ht_get(kcc_inl_need_out, nm, kcc_strlen(nm)) &&
+                    !kcc_ast_has_asm((void *)IL((void *)IL(d, AST_F3), AST_F0)))
+                    kcc_ir_build_func(d);
+            }
+            d = (void *)IL(d, AST_F4);
+        }
+    }
 }
 
 /* -- read-only const-global predicates (\S\ref{sec:global-inits}) -- */
@@ -5372,6 +5443,14 @@ unsigned long kcc_ir_build_call(void *e) {
         if (!v) {
             unsigned long inl;
             if (kcc_ir_try_inline(e, name, &inl)) return inl;
+            /* A registered always_inline callee we could NOT inline falls through
+               to a plain `call name'; since it is never emitted standalone and is
+               usually static, record it for the out-of-line pass. */
+            if (kcc_always_inline_fns &&
+                kcc_ht_get(kcc_always_inline_fns, name, kcc_strlen(name))) {
+                if (!kcc_inl_need_out) kcc_inl_need_out = kcc_ht_init(32);
+                kcc_ht_put(kcc_inl_need_out, name, kcc_strlen(name), (void *)1);
+            }
         }
         if (v) indirect = 1;
         else {

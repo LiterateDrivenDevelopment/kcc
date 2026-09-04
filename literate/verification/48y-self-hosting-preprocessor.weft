@@ -650,8 +650,13 @@ int kcc_pp_try_expand(void) {
     }
     /* dynamic __FILE__ → the current source path as a string literal.  The
      * include machinery saves/restores kcc_src_path, so this is the header's
-     * own name inside a header (C17 6.10.8.1). */
-    if ((m->flags & PP_FLAG_BUILTIN) && namelen == 8 && kcc_memcmp(name, "__FILE__", 8) == 0) {
+     * own name inside a header (C17 6.10.8.1).  GCC's __BASE_FILE__ is the
+     * primary source rather than the current header; kcc approximates it with
+     * the same current path---exact for the usual case (it is expanded in the
+     * .c itself, e.g. sound/core/seq's ALSA logging) and harmless otherwise. */
+    if ((m->flags & PP_FLAG_BUILTIN) &&
+        ((namelen == 8 && kcc_memcmp(name, "__FILE__", 8) == 0) ||
+         (namelen == 13 && kcc_memcmp(name, "__BASE_FILE__", 13) == 0))) {
         const char *p = kcc_src_path ? kcc_src_path : "<stdin>";
         unsigned long pl = kcc_strlen(p);
         char *buf = (char *)kcc_arena_alloc(pl + 3);
@@ -1174,6 +1179,7 @@ static void pp_predefine(void) {
     pp_def_simple("_LP64", 5, "1", 1);
     pp_def_simple("__LINE__", 8, "1", 1);
     pp_def_simple("__FILE__", 8, "1", 1);   /* substituted dynamically in kcc_pp_try_expand */
+    pp_def_simple("__BASE_FILE__", 13, "1", 1); /* approximated as __FILE__ (current path) */
     pp_def_simple("__COUNTER__", 11, "1", 1);
     /* kcc supports the GNU 128-bit integer type (16 bytes), so advertise it the
        way gcc and clang do on 64-bit targets.  The Linux kernel gates its

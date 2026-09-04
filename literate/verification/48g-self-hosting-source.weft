@@ -45,6 +45,7 @@ void *kcc_arena_alloc(long size);
 void *kcc_src_base = 0;
 unsigned long kcc_src_size = 0;
 const char *kcc_src_path = 0;
+extern unsigned long kcc_lex_asm;    /* .S/.s input: skip phase-3 comment removal */
 @}
 
 @l c
@@ -148,12 +149,27 @@ void kcc_source_encode(void) {
 }
 @}
 
-\section{Phase 2: Line Splicing}
+\section{Phases 2 and 3: Line Splicing and Comment Removal}
 
-\texttt{kcc\_source\_splice} rewrites the (now writable) buffer in place,
-dropping every backslash immediately followed by a newline and copying
-everything else; a backslash at the very end is kept.  The surviving length
-updates \texttt{kcc\_src\_size}.
+\texttt{kcc\_source\_splice} rewrites the (now writable) buffer in place.  It
+performs \stdref{5.1.1.2} phase~2---dropping every backslash immediately followed
+by a newline---and phase~3, replacing each comment with a single space.  Doing
+comment removal \emph{here}, up front, rather than in the lexer is what keeps a
+comment inside a macro argument from surviving into the expansion: a macro
+argument is recorded as a raw span of this buffer, so a comment left in the text
+would resurface when the argument is stringised (\texttt{\#}), pasted
+(\texttt{\#\#}), or forwarded through \texttt{\_\_VA\_ARGS\_\_}---the kernel's
+\texttt{dev\_err(dev, fmt, (int) /* note */ 0)} would otherwise carry the
+\texttt{/* note */} into the call and parse its words as code.  A block comment
+keeps the newlines it spans so downstream line numbers stay accurate; a string or
+character literal is copied verbatim so a \texttt{/*} or \texttt{//} inside it is
+not mistaken for a comment.  The surviving length updates \texttt{kcc\_src\_size}.
+
+The lexer still strips comments as a fallback (the built-in headers are lexed
+without passing through here), and its \texttt{kcc\_lex\_no\_comments} guard still
+matters: a \texttt{//} \emph{formed} by token pasting during expansion never
+reaches this phase-3 pass, so only that guard keeps it from being read as a
+comment.
 
 @l c
 @d Selfhost: source splice @{
@@ -162,9 +178,51 @@ void kcc_source_splice(void) {
     unsigned char *end = base + kcc_src_size;
     unsigned char *w = base;
     unsigned char *r = base;
+    /* Phase 3 (comment removal) runs for C only.  A `.S'/`.s' input treats `#',
+       `;', and bare `'' very differently---head_64.S's `# don''t loop' carries an
+       apostrophe in an assembler comment---so tracking string/char literals here
+       would corrupt it; there the lexer's asm-aware pass owns comments. */
+    int strip = !kcc_lex_asm;
     while (r < end) {
-        if (*r == '\\' && (r + 1) < end && r[1] == 0x0A) {
+        unsigned char c = *r;
+        if (c == '\\' && (r + 1) < end && r[1] == 0x0A) {   /* phase 2 */
             r = r + 2;
+            continue;
+        }
+        if (strip && (c == '"' || c == '\'')) {             /* literal: verbatim */
+            unsigned char q = c;
+            *w++ = *r++;
+            while (r < end) {
+                unsigned char d = *r;
+                if (d == '\\' && (r + 1) < end && r[1] == 0x0A) { r += 2; continue; }
+                if (d == '\\' && (r + 1) < end) { *w++ = *r++; *w++ = *r++; continue; }
+                *w++ = *r++;
+                if (d == q) break;
+            }
+            continue;
+        }
+        if (strip && c == '/' && (r + 1) < end && r[1] == '/') {   /* line comment */
+            *w++ = ' ';
+            r += 2;
+            while (r < end) {
+                if (*r == '\\' && (r + 1) < end && r[1] == 0x0A) { r += 2; continue; }
+                if (*r == 0x0A) break;
+                r++;
+            }
+            continue;
+        }
+        if (strip && c == '/' && (r + 1) < end && r[1] == '*') {   /* block comment */
+            *w++ = ' ';
+            r += 2;
+            while (r < end) {
+                /* A backslash-newline is a phase-2 splice even inside the comment:
+                   a multi-line block comment in a macro body joins its lines with
+                   `\', and keeping the raw newline would end the #define early. */
+                if (*r == '\\' && (r + 1) < end && r[1] == 0x0A) { r += 2; continue; }
+                if (*r == '*' && (r + 1) < end && r[1] == '/') { r += 2; break; }
+                if (*r == 0x0A) *w++ = 0x0A;                /* keep line count */
+                r++;
+            }
             continue;
         }
         *w = *r;

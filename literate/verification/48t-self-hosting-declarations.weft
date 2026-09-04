@@ -394,6 +394,13 @@ type and a later call through it would be rejected as a non-function.
 @d Selfhost: declarations declarator @{
 void *kcc_parse_declarator(void *base) {
     void *type = base;
+    /* A GNU attribute may LEAD the declarator, ahead of the pointer stars---a
+       calling-convention attribute bound to a function pointer, as in
+       `(__attribute__((ms_abi)) *handler)(...)' (the kernel's
+       efi_call_acpi_prm_handler).  The post-star skip below only catches an
+       attribute between the last `*' and the name, so a leading one would strand
+       the `*' unconsumed and derail the enclosing `)'. */
+    while (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
     while (kcc_tok_type == TOK_STAR) {
         kcc_pp_next();
         unsigned long q = 0;

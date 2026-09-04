@@ -59,6 +59,7 @@ void *kcc_parse_postfix_tail(void *lhs);
 unsigned long kcc_prec_lookup(unsigned long op);
 void *kcc_parse_decl(void);
 unsigned long kcc_parse_is_type_token(void);
+static int starts_decl(unsigned long t);
 struct StrLit kcc_strlit_gather(void);
 void *kcc_strtab_intern(const void *ptr, unsigned long len);
 void kcc_typedef_push_scope(void);
@@ -125,12 +126,38 @@ attribute between its colon and its statement---\texttt{done:
 on exit labels that a given path never reaches---so any \texttt{\_\_attribute\_\_}
 run is skipped before the labelled statement is parsed.
 
+A GNU attribute may also \emph{begin} a statement.  The dominant case is
+\texttt{\_\_attribute\_\_((\_\_fallthrough\_\_));}---the kernel's
+\texttt{fallthrough;} placed between \texttt{switch} cases (it appears in the
+byte-size-dispatched \texttt{\_\_memcpy}/page-clearing helpers pulled in through
+\texttt{efi.h}).  It is advisory only, so once the attribute run is consumed a
+trailing semicolon makes it a null statement.  The same leading position can
+prefix a declaration (\texttt{\_\_attribute\_\_((unused)) int x;}); the compound
+loop cannot distinguish the two without first consuming the run---\texttt{starts\_decl}
+does not fire on \texttt{\_\_attribute\_\_}---so it routes both here, and after
+skipping the attributes we hand a declaration off to the declaration parser and
+anything else back to the statement dispatcher.
+
 @l c
 @d Selfhost: statements dispatch @{
 void *kcc_parse_stmt(void) {
     unsigned long t = kcc_tok_type;
     if (t == TOK_LBRACE) return kcc_parse_compound();
     if (t == TOK_SEMI) { kcc_pp_next(); return kcc_ast_alloc(AST_NULL_STMT); }
+    if (t == TOK_ATTRIBUTE) {
+        /* A GNU attribute at statement position.  `__attribute__((__fallthrough__));'
+           is the kernel's `fallthrough;' between switch cases---advisory only (kcc
+           does not warn on implicit fallthrough), so it becomes a null statement.
+           An attribute that instead prefixes a declaration
+           (`__attribute__((unused)) int x;') hands off to the declaration parser
+           once the attributes are consumed---the compound loop routes a leading
+           attribute here, not to the declaration path, because `starts_decl'
+           cannot tell the two apart without consuming the run first. */
+        while (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
+        if (kcc_tok_type == TOK_SEMI) { kcc_pp_next(); return kcc_ast_alloc(AST_NULL_STMT); }
+        if (kcc_parse_is_type_token() || starts_decl(kcc_tok_type)) return kcc_parse_decl();
+        return kcc_parse_stmt();
+    }
     if (t == TOK_IF) return kcc_parse_if();
     if (t == TOK_SWITCH) return kcc_parse_switch();
     if (t == TOK_WHILE) return kcc_parse_while();

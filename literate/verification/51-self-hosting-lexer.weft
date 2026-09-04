@@ -25,6 +25,18 @@ symbols.  A keyword identifier is recognised by looking its text up in the
 keyword table (populated by \texttt{lexer\_tables}); every other scan sets the
 token type directly.
 
+One wrinkle in classification: an identifier-start byte that is \texttt{L},
+\texttt{u}, or \texttt{U} may not begin an identifier at all---followed by a
+quote it is the encoding prefix of a character constant (\texttt{L'x'}) or a
+string literal (\texttt{L"..."}, \texttt{u"..."}, \texttt{U"..."}, and the
+two-byte \texttt{u8"..."}).  The dispatcher peeks the next byte (and the one
+after, for \texttt{u8}) and, on a quote, drops the prefix and scans the literal
+body.  kcc's byte-oriented model has no wide or UTF-16 element type, so the
+prefix is only advisory and the body lexes as an ordinary narrow literal---but
+recognising it is essential: the kernel's \texttt{efi.h} passes
+\texttt{L"SecureBoot"} to a variable getter, and lexing the \texttt{L} as a bare
+identifier splits the call apart into ``expected `)'\,''.
+
 \section{State, Init, and the Scanners}
 
 One piece of state is set by the driver, not the scanners: \texttt{kcc\_lex\_asm}
@@ -348,6 +360,25 @@ void kcc_lex_next(void) {
             kcc_lex_cursor = p + 1;
             kcc_lex_scan_char();
             return;
+        }
+        /* L"..." / u"..." / U"..." / u8"..." prefixed string literal: drop the
+           encoding prefix and lex the body as an ordinary string.  kcc's
+           byte-oriented model carries no wide/UTF-16 element type, so the prefix
+           is advisory---the kernel's efi.h passes `L"SecureBoot"' to a variable
+           getter, and without this the `L' lexes as an identifier and the string
+           as a separate token, derailing the call into "expected `)'". */
+        if ((c == 'L' || c == 'u' || c == 'U') && p + 1 < end) {
+            if ((unsigned char)p[1] == '"') {
+                kcc_lex_cursor = p + 1;
+                kcc_lex_scan_string();
+                return;
+            }
+            if (c == 'u' && (unsigned char)p[1] == '8' &&
+                p + 2 < end && (unsigned char)p[2] == '"') {
+                kcc_lex_cursor = p + 2;
+                kcc_lex_scan_string();
+                return;
+            }
         }
         kcc_lex_scan_ident();
         return;

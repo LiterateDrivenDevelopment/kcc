@@ -614,7 +614,16 @@ void kcc_ir_build(void *tu) {
         while (d) {
             if (IL(d, AST_TAG) == AST_FUNC_DECL && IL(d, AST_F3)) {
                 const char *nm = (const char *)IL(d, AST_F1);
-                if (nm && kcc_ht_get(kcc_inl_need_out, nm, kcc_strlen(nm)) &&
+                /* Only a STATIC (internal-linkage) always_inline is safe to emit
+                   out-of-line: its out-of-line copy is local, so multiple TUs each
+                   carry their own without colliding, and being static it has no
+                   definition anywhere else.  An EXTERNAL always_inline
+                   (`extern __always_inline native_save_fl', gnu-inline) already
+                   has its one out-of-line copy in a designated unit (irqflags.S);
+                   emitting kcc's own global copy would be a `multiple definition'
+                   at the vmlinux link.  (AST_F2 bit 1 = static, per IRF_STATIC.) */
+                if (nm && (IL(d, AST_F2) & 2) &&
+                    kcc_ht_get(kcc_inl_need_out, nm, kcc_strlen(nm)) &&
                     !kcc_ast_has_asm((void *)IL((void *)IL(d, AST_F3), AST_F0)))
                     kcc_ir_build_func(d);
             }

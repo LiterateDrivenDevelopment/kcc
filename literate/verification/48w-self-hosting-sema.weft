@@ -1134,6 +1134,20 @@ element type flow straight through.  This is what the kernel's
 where \texttt{mask} is a \texttt{cpumask\_var\_t} array---so \texttt{smp.c}'s
 \texttt{for\_each\_cpu(cpu, cfd->cpumask)} loop now type-checks.
 
+\texttt{sizeof} of a \emph{type} lays that type out immediately rather than
+merely resolving its descriptor.  Resolving an aggregate only builds the shell;
+its members---and therefore any \texttt{typeof(expr)} that spells a member's
+type---are walked only by \texttt{kcc\_type\_layout}.  The kernel's
+\texttt{\_\_is\_kfifo\_ptr} plants that shape inside a \texttt{sizeof}:
+\texttt{sizeof(struct\{ union\{ \dots; typeof(*(\_\_tmp)->type) *type; \dots \};
+\dots \})}, where \texttt{\_\_tmp} is a block local of the enclosing statement
+expression.  Were the layout left to the IR builder, those \texttt{typeof}
+operands would be resolved after \texttt{\_\_tmp}'s scope had been popped and
+every name in them would read as undeclared---the same late-resolution hazard
+the compound-literal handler guards against.  Forcing the layout here, while the
+scope is live, resolves them correctly; the descriptor and its size are memoised,
+so the later size query is a no-op.
+
 @l c
 @d Selfhost: sema callmembercast @{
 static void *sema_expr_call(struct Node *n) {
@@ -1259,7 +1273,17 @@ static void *sema_expr_cast(struct Node *n) {
 
 static void *sema_expr_sizeof(struct Node *n) {
     if (n->f1) {                                  /* type operand */
-        kcc_sema_resolve_type((void *)n->f0);
+        void *ty = kcc_sema_resolve_type((void *)n->f0);
+        /* Lay the type out NOW, while the enclosing scope is still live, so a
+           `typeof(expr)' buried in an anonymous struct/union member resolves
+           against the locals it names.  resolve_type only builds the aggregate
+           descriptor; its members---and thus their typeof operands---are walked
+           only by kcc_type_layout.  The kernel's __is_kfifo_ptr plants exactly
+           this shape: `sizeof(struct{ union{ ...; typeof(*(__tmp)->type) *type;
+           ... }; ... })'.  Deferring the layout to the IR builder would resolve
+           `__tmp' after its block scope has been popped, so it would read as an
+           undeclared identifier. */
+        kcc_type_layout(ty);
         return kcc_type_long_u;
     }
     kcc_sema_expr((void *)n->f0);

@@ -59,6 +59,7 @@ unsigned long kcc_strlen(const char *s);
 void *kcc_strtab_intern(const void *ptr, unsigned long len);
 unsigned long kcc_pp_atoi(const char *s, unsigned long len);
 void kcc_typedef_add(const char *name, unsigned long len);
+void kcc_typedef_shadow(const char *name, unsigned long len);
 int kcc_typedef_lookup(const char *name, unsigned long len);
 void *kcc_ht_init(unsigned long capacity);
 unsigned long kcc_ht_get(void *ht, const void *key, unsigned long keylen);
@@ -1048,6 +1049,11 @@ void *kcc_parse_decl(void) {
         }
     } else {
         d->f3 = storage;
+        /* An ordinary identifier that reuses a typedef name shadows it in this
+           scope, so a later statement reading the name is an expression, not a
+           declaration (efi libstub vsprintf's `u8 *s8' over the `s8' typedef). */
+        if (d->f1 && kcc_typedef_lookup((const char *)d->f1, kcc_strlen((const char *)d->f1)))
+            kcc_typedef_shadow((const char *)d->f1, kcc_strlen((const char *)d->f1));
         /* GNU attribute trailing the declarator, before '='/','/';' (the kernel's
            DEFINE_LOCK_GUARD_0 emits `T a, *b __attribute__((__unused__)) = &a;`). */
         if (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
@@ -1079,6 +1085,9 @@ void *kcc_parse_decl(void) {
         if (storage == 1) {                       /* typedef: register each further name */
             if (nd->f1) kcc_typedef_add((const char *)nd->f1, kcc_strlen((const char *)nd->f1));
             nd->tag = AST_TYPEDEF_DECL;
+        } else if (nd->f1 &&
+                   kcc_typedef_lookup((const char *)nd->f1, kcc_strlen((const char *)nd->f1))) {
+            kcc_typedef_shadow((const char *)nd->f1, kcc_strlen((const char *)nd->f1));
         }
         if (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
         if (kcc_tok_type == TOK_ASSIGN) {

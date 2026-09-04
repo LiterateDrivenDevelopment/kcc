@@ -185,12 +185,16 @@ void kcc_parse_sync(void) {
 The typedef stack is a vector of hash tables, one per scope.  \texttt{init} makes
 the vector and a file-scope table; \texttt{push\_scope} appends a fresh table and
 \texttt{pop\_scope} drops the top by decrementing the count (the arena reclaims
-it).  \texttt{add} inserts a name in the innermost scope; \texttt{lookup} searches
-top-down (so an inner typedef shadows an outer name) and treats \texttt{va\_list}
-and its GNU spelling \texttt{\_\_builtin\_va\_list} as built-ins.  \texttt{parse}
-reads the first token and appends external
-declarations---following each declarator group's \texttt{f4} tail---into a
-translation-unit node.
+it).  \texttt{add} inserts a name in the innermost scope as a typedef (value~1);
+\texttt{shadow} inserts it as an ordinary identifier (value~2) when a variable or
+function reuses a typedef's name, since \stdref{6.2.1}p4 hides the type-name for
+the rest of that scope.  \texttt{lookup} searches top-down (so the innermost
+binding wins): a value~2 answers ``not a type'' immediately, a value~1 answers
+``type'', and only a miss falls through to the next scope out; \texttt{va\_list}
+and its GNU spelling \texttt{\_\_builtin\_va\_list} are built-in type-names,
+checked last so a local of that name can shadow them too.  \texttt{parse} reads
+the first token and appends external declarations---following each declarator
+group's \texttt{f4} tail---into a translation-unit node.
 
 @l c
 @d Selfhost: parser typedef @{
@@ -215,16 +219,30 @@ void kcc_typedef_add(const char *name, unsigned long len) {
     kcc_ht_put(ht, name, len, 1);
 }
 
+/* Record that an ordinary identifier (a variable or function) whose name matches
+   a typedef has been declared in the innermost scope: within that scope the name
+   is no longer a type-name (\stdref{6.2.1}p4).  The kernel's efi libstub vsprintf
+   declares a `u8 *s8' local that shadows the `s8' typedef and then writes
+   `for (s8 += clen; ...)'---without this the parser reads `s8' as a type and the
+   for-init as a declaration, failing at the `+='. */
+void kcc_typedef_shadow(const char *name, unsigned long len) {
+    struct Vec *v = (struct Vec *)kcc_typedef_scopes;
+    void *ht = *(void **)kcc_vec_get(v, v->count - 1);
+    kcc_ht_put(ht, name, len, 2);   /* 2 = shadowed non-type */
+}
+
 int kcc_typedef_lookup(const char *name, unsigned long len) {
-    if (len == 7 && kcc_memcmp(name, "va_list", 7) == 0) return 1;
-    if (len == 17 && kcc_memcmp(name, "__builtin_va_list", 17) == 0) return 1;
     struct Vec *v = (struct Vec *)kcc_typedef_scopes;
     unsigned long i = v->count;
     while (i > 0) {
         i = i - 1;
         void *ht = *(void **)kcc_vec_get(v, i);
-        if (kcc_ht_get(ht, name, len)) return 1;
+        unsigned long val = (unsigned long)kcc_ht_get(ht, name, len);
+        if (val == 2) return 0;     /* shadowed by a variable here: not a type */
+        if (val) return 1;          /* a typedef in this scope */
     }
+    if (len == 7 && kcc_memcmp(name, "va_list", 7) == 0) return 1;
+    if (len == 17 && kcc_memcmp(name, "__builtin_va_list", 17) == 0) return 1;
     return 0;
 }
 

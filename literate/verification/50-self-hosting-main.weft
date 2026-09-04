@@ -119,9 +119,13 @@ extern unsigned long kcc_pp_lead_ws;             /* token had leading source whi
    `\texttt{672:}' label must not split, and `\texttt{\%rax}' must stay joined.  A few
    would-fuse pairs still get a synthesised space even when the source (or the macro
    body) had none: two word tokens (\texttt{.balign}+\texttt{16}), two punctuators that
-   would join into a longer operator (\texttt{--}/\texttt{>>}/\texttt{\&\&}), in asm
-   mode a word then a \texttt{\%}/\texttt{\$}/\texttt{(} operand starter (a mnemonic and
-   its \texttt{\%reg}) or a symbol then a string/char literal.  Line markers are omitted
+   would join into a longer operator (\texttt{--}/\texttt{>>}/\texttt{\&\&}), a pp-number
+   before a \texttt{+}/\texttt{-}/\texttt{.} that could extend it (\texttt{1e}+\texttt{+5}
+   $\to$ \texttt{1e+5}, \texttt{3}+\texttt{.5}), in asm mode a word then a
+   \texttt{\%}/\texttt{\$}/\texttt{(} operand starter (a mnemonic and its \texttt{\%reg})
+   or a symbol then a string/char literal.  The number case fires only at an expansion
+   boundary---detected by the current token not abutting the previous one's end---so a
+   body-internal \texttt{5+3} stays verbatim, as in gcc.  Line markers are omitted
    (matching gcc's -P).  Defined here, in the driver, over kcc_pp_next and the
    spacing flag it publishes. */
 static int kcc_word_char(char c) {
@@ -154,6 +158,8 @@ static int kcc_emit_pastes(char a, char b) {
 static void kcc_pp_emit_text(void) {
     unsigned long prev_line = 0;
     char prev_last = 0;
+    unsigned long prev_type = 0;
+    const char *prev_end = 0;                     /* end of the last token emitted */
     for (;;) {
         kcc_pp_next();
         if (kcc_tok_type == 0) break;             /* TOK_EOF */
@@ -196,6 +202,18 @@ static void kcc_pp_emit_text(void) {
                which a re-parse reads as a post-decrement. */
             if (!space && kcc_emit_pastes(prev_last, b))
                 space = 1;
+            /* A pp-number abutting `+'/`-'/`.' can fuse into ONE number---a
+               `.'-fraction (`3'+`.5'->`3.5'), or an exponent sign when the number
+               ends in e/E/p/P (`1e'+`+5'->`1e+5', `0x1p'+`+3').  This only happens
+               across a macro-expansion boundary: two tokens contiguous in the same
+               buffer (`5+3' in an object-like body) already lexed apart and stay
+               verbatim.  A boundary is exactly where the current token does not
+               abut the previous one's end.  gcc spaces the whole class (matching
+               its conservative PREV_WHITE avoid-paste); we do too rather than test
+               the last char, keeping `= P3+1' as `3 +1'. */
+            if (!space && kcc_tok_start != prev_end && prev_type == 2 /* TOK_NUMBER */ &&
+                (b == '+' || b == '-' || b == '.'))
+                space = 1;
             /* In assembly a directive or symbol abutting a string/char operand
                must stay separated: ELFNOTE's `.asciz CONFIG_BUILD_SALT' with an
                empty build salt expands to `.asciz ""', and glued to `.asciz""'
@@ -210,6 +228,8 @@ static void kcc_pp_emit_text(void) {
         }
         kcc_io_write(kcc_tok_start, kcc_tok_len);
         prev_last = kcc_tok_start[kcc_tok_len - 1];
+        prev_type = kcc_tok_type;
+        prev_end = kcc_tok_start + kcc_tok_len;
     }
     kcc_io_puts("\n");
     kcc_io_flush();

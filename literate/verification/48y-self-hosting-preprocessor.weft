@@ -881,6 +881,15 @@ the paste deletes both the operand and a preceding comma---the mechanism behind
 the kernel's \texttt{static\_assert(expr,\,...)} wrapper, and thus a hard
 prerequisite for the \texttt{<linux/bitops.h>} sanity assertions.
 
+Because substitution splices an argument's text directly into the body, a
+trailing pp-number in the argument can silently fuse with an adjacent body
+\texttt{+}/\texttt{-}/\texttt{.} into a single, wrong number---\texttt{F(1e)}
+through \texttt{\#define F(x) x+1} would become \texttt{1e+1}, and
+\texttt{G(3)} through \texttt{x.5} would become \texttt{3.5}.  This is a real
+token merge, not a spacing nicety: it changes what the re-lexer reads, so
+\texttt{pp\_tail\_is\_number} gates a separating space wherever the two abut
+(outside a \texttt{\#\#} paste, whose intent is exactly to join).
+
 Stringisation itself, in \texttt{pp\_emit\_string}, must honour \stdref{6.10.3.2}p2
 precisely: a \texttt{\textbackslash} or \texttt{"} is escaped \emph{only} when it
 belongs to a character constant or string literal in the argument.  A backslash
@@ -898,6 +907,24 @@ static int is_id(int c) {
     return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 static int is_idn(int c) { return is_id(c) || (c >= '0' && c <= '9'); }
+
+/* Does the text end in a pp-number token?  Scan back over the trailing run of
+   number/identifier/`.' bytes and ask whether it begins like a number (a digit,
+   or `.' then a digit).  Used when splicing a macro argument into a body: a
+   trailing pp-number abutting a body `+'/`-'/`.' would fuse into one number
+   (`1e'+`+1', `3'+`.5'), so a separating space must go in. */
+static int pp_tail_is_number(const char *s, unsigned long n) {
+    if (!n) return 0;
+    unsigned long j = n;
+    while (j > 0) {
+        unsigned char ch = (unsigned char)s[j - 1];
+        if (is_idn(ch) || ch == '.') j--; else break;
+    }
+    if (j >= n) return 0;
+    unsigned char f = (unsigned char)s[j];
+    if (f >= '0' && f <= '9') return 1;
+    return (f == '.' && j + 1 < n && s[j + 1] >= '0' && s[j + 1] <= '9');
+}
 
 /* Would a token ending in `a' and one starting with `b', written adjacent, lex
    as a single longer pp-token?  Exactly the two-character C punctuators (plus a
@@ -1151,6 +1178,15 @@ const char *pp_substitute(const char *body, unsigned long blen, struct PPParam *
                 }
                 kcc_memcpy(out + op, as, al);
                 op += al;
+                /* Keep the argument's trailing pp-number from pasting with an
+                   adjacent body `+'/`-'/`.' into one number---`F(1e)' through
+                   `x+1' must stay `1e +1', not lex as `1e+1'.  Only when they
+                   abut (no body separator) and this is not a `##' operand, whose
+                   whole intent is to paste. */
+                if (!use_raw && al && i < blen &&
+                    (body[i] == '+' || body[i] == '-' || body[i] == '.') &&
+                    pp_tail_is_number(as, al))
+                    out[op++] = ' ';
             } else {
                 kcc_memcpy(out + op, body + s, idlen);
                 op += idlen;

@@ -39,6 +39,7 @@ struct PPCtx {
     unsigned long type; const char *cursor; const char *end; unsigned long line;
     const char *lstart; const char *src_base; unsigned long src_size;
     const char *src_path; struct PPMacro *macro; unsigned long prevline;
+    unsigned long nocomments;   /* saved kcc_lex_no_comments of the buffer we left */
 };
 /* push_macro save-stack node (32 bytes) */
 struct PPSave { struct PPSave *next; const char *name; unsigned long len; void *saved; };
@@ -76,6 +77,7 @@ extern unsigned long kcc_tok_type, kcc_tok_len, kcc_tok_line;
 extern const char *kcc_tok_start;
 extern const char *kcc_lex_cursor, *kcc_lex_end, *kcc_lex_line_start;
 extern unsigned long kcc_lex_line;
+extern unsigned long kcc_lex_no_comments;
 extern const char *kcc_src_base, *kcc_src_path;
 extern unsigned long kcc_src_size;
 void kcc_lex_next(void);
@@ -204,6 +206,7 @@ static void pp_ctx_push(unsigned long type) {
     e->src_path = kcc_src_path;
     e->prevline = pp_prev_line;
     e->macro = 0;
+    e->nocomments = kcc_lex_no_comments;
     kcc_pp_ctx_depth++;
 }
 
@@ -213,6 +216,15 @@ static void pp_ctx_push_expand(struct PPMacro *m, const char *buf, unsigned long
     kcc_lex_cursor = buf;
     kcc_lex_end = buf + buflen;
     kcc_lex_line_start = buf;
+    /* A macro's expanded body/argument text (`m' non-null) is already past phase 3,
+       so a `//' or `/*' it grows by pasting tokens---the kernel's tracepoint path
+       `__stringify(TRACE_INCLUDE_PATH/system.h)' concatenates a `.../' directory
+       onto `/system.h'---must lex as two `/' operators, never a comment that would
+       eat the rest of the argument (and its closing `)') and report an
+       "unterminated macro argument list".  A raw source span replayed for its own
+       sake (`m' null: a computed #include line, an #if expression) keeps ordinary
+       comment stripping. */
+    kcc_lex_no_comments = m ? 1 : 0;
 }
 
 static void pp_ctx_pop(void) {
@@ -231,6 +243,7 @@ static void pp_ctx_pop(void) {
     kcc_lex_line = e->line;
     kcc_lex_line_start = e->lstart;
     pp_prev_line = e->prevline;
+    kcc_lex_no_comments = e->nocomments;
 }
 
 void kcc_pp_next(void) {

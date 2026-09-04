@@ -78,6 +78,9 @@ unsigned long kcc_tok_line = 0;
 unsigned long kcc_tok_col = 0;
 void *kcc_kw_table = 0;                           /* filled by lexer_tables */
 unsigned long kcc_lex_asm = 0;                    /* input is `.S'/`.s': relax `'' */
+unsigned long kcc_lex_no_comments = 0;            /* lexing a macro-expansion buffer:
+                                                     `//'/`/*' formed by phase-4 token
+                                                     pasting are operators, not comments */
 
 static int is_id_start(unsigned c) {
     return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
@@ -297,7 +300,7 @@ void kcc_lex_next(void) {
         unsigned char c = (unsigned char)*p;
         if (c == ' ' || c == '\t' || c == '\r' || c == '\v' || c == '\f') { p++; continue; }
         if (c == '\n') { p++; kcc_lex_line++; kcc_lex_line_start = p; continue; }
-        if (c == '/') {
+        if (c == '/' && !kcc_lex_no_comments) {
             if (p + 1 < end) {
                 unsigned char c2 = (unsigned char)p[1];
                 if (c2 == '/') {                   /* line comment */

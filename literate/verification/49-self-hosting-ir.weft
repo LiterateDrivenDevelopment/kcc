@@ -88,6 +88,7 @@ code generator later consults.
 #define SYM_NAME 16
 #define SYM_VALUE 32
 #define SYM_ENUM_CONST 4
+#define SYM_FUNC 2
 /* vector fields */
 #define VEC_DATA 0
 #define VEC_COUNT 8
@@ -1413,6 +1414,34 @@ static int kcc_asm_operand_local_const(void *expr, unsigned long *out) {
     return 0;
 }
 
+/* Whether an asm operand's expression is ADDRESS-like---its symbol/address is
+   the thing the asm wants, so recording a name for `%P'/plain-`%N' rendering is
+   correct: a function designator (`call %P[f]'), an `&lvalue' (`"i"(&sym)'), or a
+   symbol +/- constant.  A bare DATA object read as a value (`"Nd"(pmtmr_ioport)'
+   for `inl') is NOT address-like: its value must sit in a register (`%dx'), and
+   marking it symbolic would wrongly emit `inl pmtmr_ioport(%rip),%eax'. */
+static int kcc_asm_operand_is_addr_like(void *e) {
+    if (!e) return 0;
+    unsigned long tag = IL(e, AST_TAG);
+    while (tag == AST_PAREN_EXPR) { e = (void *)IL(e, AST_F0); if (!e) return 0; tag = IL(e, AST_TAG); }
+    if (tag == AST_CAST_EXPR) return kcc_asm_operand_is_addr_like((void *)IL(e, AST_F1));
+    if (tag == AST_UNARY_EXPR && IL(e, AST_F0) == TOK_AMP) return 1;   /* &lvalue */
+    if (tag == AST_BINARY_EXPR) {
+        unsigned long op = IL(e, AST_F0);
+        if (op == TOK_PLUS || op == TOK_MINUS)
+            return kcc_asm_operand_is_addr_like((void *)IL(e, AST_F1)) ||
+                   kcc_asm_operand_is_addr_like((void *)IL(e, AST_F2));
+        return 0;
+    }
+    if (tag == AST_IDENT_EXPR) {
+        char *name = (char *)IL(e, AST_F0);
+        if (!name) return 0;
+        void *sym = kcc_symtab_lookup(name, kcc_strlen(name));
+        return sym && IL(sym, SYM_KIND) == SYM_FUNC;  /* function designator = its address */
+    }
+    return 0;
+}
+
 void kcc_ir_asm_lower_operands(void *as) {
     void *op = (void *)IL(as, AST_F2);
     while (op) {
@@ -1500,12 +1529,19 @@ void kcc_ir_asm_lower_operands(void *as) {
             IL(op, AST_F2) = ((val + 1) | (size << 32));
             IL(op, AST_F3) = 0;
         }
-        /* Record a symbolic operand's emit-name for `%P` rendering, unless it
-           took the immediate path (F2 bit 63).  The name goes in the unused COL
-           field (the emitter never reads an operand's source column) with F2 bit
-           62 flagging its presence---F1 must stay the operand's `[name]`, which
-           the back end matches to resolve a `%[name]` reference. */
-        if (sym && !((IL(op, AST_F2) >> 63) & 1)) {
+        /* Record a symbolic operand's emit-name for `%P'/plain-`%N' rendering,
+           unless it took the immediate path (F2 bit 63).  The name goes in the
+           unused COL field (the emitter never reads an operand's source column)
+           with F2 bit 62 flagging its presence---F1 must stay the operand's
+           `[name]', which the back end matches to resolve a `%[name]' reference.
+           We do this only when the operand is genuinely used as an ADDRESS: a
+           memory operand (`cls=='m''), or an address-like expression (a function
+           designator or `&lvalue').  A bare data object read as a VALUE
+           (`"Nd"(pmtmr_ioport)' for `inl') keeps its materialised register
+           instead---marking it symbolic would emit `inl pmtmr_ioport(%rip),%eax'
+           rather than loading the port into `%dx'. */
+        if (sym && !((IL(op, AST_F2) >> 63) & 1) &&
+            (cls == 'm' || kcc_asm_operand_is_addr_like(expr))) {
             IL(op, AST_COL) = (unsigned long)sym;
             IL(op, AST_F2) = IL(op, AST_F2) | (1UL << 62);
             IL(op, AST_F3) = (unsigned long)symoff;   /* byte offset for name+off */

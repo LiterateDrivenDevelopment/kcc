@@ -116,12 +116,36 @@ extern const char *kcc_tok_start;
    label must not split, and `\texttt{\%rax}' must stay joined.  Across a
    macro-expansion boundary the source gap is invisible, so a small set of
    would-fuse pairs (two word tokens, a word then a \texttt{\%}/\texttt{\$}/\texttt{(}
-   operand starter, or---in asm mode---a symbol then a string/char literal) get a
-   synthesised space.  Line markers are omitted (matching gcc's -P).  Defined here, in the driver, so it depends only
-   on kcc_pp_next (present in either preprocessor port). */
+   operand starter, two punctuators that would join into a longer operator like
+   \texttt{--}/\texttt{>>}/\texttt{\&\&}, or---in asm mode---a symbol then a
+   string/char literal) get a synthesised space.  Line markers are omitted
+   (matching gcc's -P).  Defined here, in the driver, so it depends only on
+   kcc_pp_next (present in either preprocessor port). */
 static int kcc_word_char(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
            (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Would a token ending in `a' and one starting with `b', written adjacent, lex
+   as a single longer pp-token?  The two-character C punctuators (`--', `>>',
+   `&&', `+=', `->', ...); a mirror of the preprocessor's own paste table, kept
+   local so the emitter stays self-contained.  `/'+`/' is deliberately absent:
+   after phase 3 those are two operators, and a computed include path such as
+   `asm/trace//x86_fpu.h' must keep its `//' rather than gain a stray space. */
+static int kcc_emit_pastes(char a, char b) {
+    switch (a) {
+    case '+': return b == '+' || b == '=';
+    case '-': return b == '-' || b == '>' || b == '=';
+    case '<': return b == '<' || b == '=' || b == ':' || b == '%';
+    case '>': return b == '>' || b == '=';
+    case '=': case '!': case '*': case '/': case '%': case '^': return b == '=';
+    case '&': return b == '&' || b == '=';
+    case '|': return b == '|' || b == '=';
+    case '#': return b == '#';
+    case ':': return b == '>';
+    case '.': return b == '.';
+    default:  return 0;
+    }
 }
 
 static void kcc_pp_emit_text(void) {
@@ -157,6 +181,15 @@ static void kcc_pp_emit_text(void) {
             int space = (s[-1] == ' ' || s[-1] == 0x09);
             if (!space && kcc_word_char(prev_last) &&
                 (kcc_word_char(b) || b == '%' || b == '$' || b == '('))
+                space = 1;
+            /* Two punctuators that would fuse into one longer token if abutted
+               (`-'+`-'->`--', `>'+`>'->`>>', `&'+`&'->`&&') must stay apart
+               across a macro-expansion boundary, where the source gap that kept
+               them separate lives in another buffer and s[-1] cannot see it.
+               The kernel plants exactly this: `MAX_NICE - MIN_NICE' with
+               `MIN_NICE' expanding to `-20' would otherwise print `19 --20',
+               which a re-parse reads as a post-decrement. */
+            if (!space && kcc_emit_pastes(prev_last, b))
                 space = 1;
             /* In assembly a directive or symbol abutting a string/char operand
                must stay separated: ELFNOTE's `.asciz CONFIG_BUILD_SALT' with an

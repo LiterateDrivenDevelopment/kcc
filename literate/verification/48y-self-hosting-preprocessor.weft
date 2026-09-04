@@ -114,6 +114,15 @@ static unsigned long pp_cond_depth = 0;
 static unsigned long pp_prev_line = 0;
 static unsigned long pp_has_pending = 0;
 static unsigned long pp_dir_line = 0;
+/* Whether the token kcc_pp_next just produced was preceded by whitespace in the
+   effective source---1/0---for the -E text emitter to reproduce spacing across a
+   macro-expansion boundary, where the byte before the token lives in a macro
+   buffer and cannot be inspected directly.  `pp_pending_lead_ws' carries the
+   leading whitespace of a macro invocation forward to the FIRST token of its
+   expansion (and, unset until consumed, through nested expansions so the
+   outermost invocation's spacing wins), mirroring gcc's PREV_WHITE flag. */
+unsigned long kcc_pp_lead_ws = 0;
+static long pp_pending_lead_ws = -1;
 static struct PPCtx pp_ctx_stack[PP_MAX_CTX_DEPTH];
 static unsigned char pp_cond_stack[PP_MAX_COND];
 static const char *pp_inc_dirs[64];
@@ -279,9 +288,25 @@ void kcc_pp_next(void) {
         }
         /* macro expansion: IDENT or keyword-class [10,60) */
         if (tt == TOK_IDENT || (tt - 10) < 50) {
-            if (kcc_pp_try_expand()) continue;
+            /* Capture the macro name's own leading whitespace before expanding;
+               if the expansion fires and no outer invocation's spacing is already
+               pending, it becomes the first expanded token's leading whitespace. */
+            long namews = (kcc_tok_start[-1] == ' ' || kcc_tok_start[-1] == 0x09) ? 1 : 0;
+            if (kcc_pp_try_expand()) {
+                if (pp_pending_lead_ws < 0) pp_pending_lead_ws = namews;
+                continue;
+            }
         }
         pp_prev_line = tl;
+        /* Publish the leading-whitespace flag for the -E emitter: a pending value
+           from a macro invocation overrides (and is consumed), otherwise it is the
+           byte just before this token in its own buffer. */
+        if (pp_pending_lead_ws >= 0) {
+            kcc_pp_lead_ws = (unsigned long)pp_pending_lead_ws;
+            pp_pending_lead_ws = -1;
+        } else {
+            kcc_pp_lead_ws = (kcc_tok_start[-1] == ' ' || kcc_tok_start[-1] == 0x09) ? 1 : 0;
+        }
         return;
     }
 }

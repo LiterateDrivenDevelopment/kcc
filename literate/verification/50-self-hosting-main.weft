@@ -104,23 +104,26 @@ extern unsigned long kcc_lex_asm;                /* relax `'' for .S/.s inputs *
 void kcc_io_write(const char *buf, unsigned long len);
 extern unsigned long kcc_tok_type, kcc_tok_len, kcc_tok_line;
 extern const char *kcc_tok_start;
+extern unsigned long kcc_pp_lead_ws;             /* token had leading source whitespace */
 
 /* gcc-style -E: emit the preprocessed token stream as C source TEXT (not kcc's
    token dump).  Each token's spelling is written verbatim; a newline is emitted
    whenever the source line advances.  On the same line a space is written only
-   where the source \emph{separated} the tokens---the byte just before the token
-   is whitespace exactly when there was a gap (a comment already became one space
-   in phase~3, so that gap is preserved too).  Reproducing the source spacing,
-   rather than forcing a space between every pair, is what lets the output feed an
-   assembler: \texttt{.macro} must not become `\texttt{. macro}', a `\texttt{672:}'
-   label must not split, and `\texttt{\%rax}' must stay joined.  Across a
-   macro-expansion boundary the source gap is invisible, so a small set of
-   would-fuse pairs (two word tokens, a word then a \texttt{\%}/\texttt{\$}/\texttt{(}
-   operand starter, two punctuators that would join into a longer operator like
-   \texttt{--}/\texttt{>>}/\texttt{\&\&}, or---in asm mode---a symbol then a
-   string/char literal) get a synthesised space.  Line markers are omitted
-   (matching gcc's -P).  Defined here, in the driver, so it depends only on
-   kcc_pp_next (present in either preprocessor port). */
+   where the source \emph{separated} the tokens.  The preprocessor reports that per
+   token as \texttt{kcc\_pp\_lead\_ws}: normally the byte before the token, but at a
+   macro-expansion boundary---where that byte lives in a macro buffer and the source
+   gap is invisible---the leading whitespace of the invocation, carried through so
+   \texttt{= VAL} prints \texttt{= 42}, matching gcc's PREV\_WHITE flag.  Reproducing
+   the spacing rather than forcing a space between every pair is what lets the output
+   feed an assembler: \texttt{.macro} must not become `\texttt{. macro}', a
+   `\texttt{672:}' label must not split, and `\texttt{\%rax}' must stay joined.  A few
+   would-fuse pairs still get a synthesised space even when the source (or the macro
+   body) had none: two word tokens (\texttt{.balign}+\texttt{16}), two punctuators that
+   would join into a longer operator (\texttt{--}/\texttt{>>}/\texttt{\&\&}), in asm
+   mode a word then a \texttt{\%}/\texttt{\$}/\texttt{(} operand starter (a mnemonic and
+   its \texttt{\%reg}) or a symbol then a string/char literal.  Line markers are omitted
+   (matching gcc's -P).  Defined here, in the driver, over kcc_pp_next and the
+   spacing flag it publishes. */
 static int kcc_word_char(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
            (c >= '0' && c <= '9') || c == '_';
@@ -167,20 +170,22 @@ static void kcc_pp_emit_text(void) {
             prev_line = line;
         }
         else {
-            /* A space is emitted where the source separated the tokens (the byte
-               before the token is whitespace).  That byte lives in whatever
-               buffer the token came from, so across a macro-expansion boundary
-               it cannot see the source gap---and a maximal-munch lexer only ever
-               yields two SEPARATE word tokens (or a word then a `%'/`$'/`('
-               operand starter) when a separator was there, so fusing them would
-               forge a wrong token (`.balign'+`16'->`.balign16', a mnemonic and
-               its `%reg').  Insert a space in that case too; it can never wrongly
-               split a single token, since that would have lexed as one. */
+            /* A space is emitted where the source separated the tokens.  The
+               preprocessor publishes that as kcc_pp_lead_ws: for a plain token it
+               is the byte before it, but across a macro-expansion boundary---where
+               that byte lives in a macro buffer---it is the leading whitespace of
+               the invocation, carried through so `= VAL' prints `= 42' and not
+               `=42'.  Two adjacent word tokens still get a forced space even when
+               the source had none, since fusing them would forge a wrong token
+               (`.balign'+`16'->`.balign16'); a word then a `%'/`$'/`(' operand
+               starter needs the same only in assembly (a mnemonic and its `%reg',
+               `$imm', or `('), never in C where they are always distinct tokens. */
             const char *s = kcc_tok_start;
             char b = s[0];
-            int space = (s[-1] == ' ' || s[-1] == 0x09);
+            int space = (int)kcc_pp_lead_ws;
             if (!space && kcc_word_char(prev_last) &&
-                (kcc_word_char(b) || b == '%' || b == '$' || b == '('))
+                (kcc_word_char(b) ||
+                 (kcc_lex_asm && (b == '%' || b == '$' || b == '('))))
                 space = 1;
             /* Two punctuators that would fuse into one longer token if abutted
                (`-'+`-'->`--', `>'+`>'->`>>', `&'+`&'->`&&') must stay apart

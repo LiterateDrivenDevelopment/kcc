@@ -531,6 +531,22 @@ unsigned long kcc_type_layout(void *ty_) {
 
 \paragraph{The declaration dispatcher.}
 
+Both a variable declaration and a function definition first run
+\texttt{decl\_pretag} over their leading type, so that a struct, union, or enum
+\emph{defined} in a declaration-specifier position enters the tag namespace.
+Resolving a type only manufactures its descriptor; the tag is entered into the
+symbol table by the struct/union/enum declaration handler, which
+\texttt{decl\_pretag} reaches by peeling the type's array, qualifier, and
+(toward a bodied definition) pointer wrappers.  A function's return type needs
+this as much as a variable's type: the kernel's i915 helper is written
+\texttt{static \_\_always\_inline struct sgt\_iter \{ \dots \} \_\_sgt\_iter(\dots)},
+defining \texttt{struct sgt\_iter} where the return type goes.  Without
+pre-tagging, that definition builds a descriptor but registers no tag, so every
+later bodyless \texttt{struct sgt\_iter}---the field in \texttt{i915\_mm.c}'s
+\texttt{struct remap\_pfn}, the locals in the iterator macros---resolves to an
+opaque type and each \texttt{.sgp}/\texttt{.curr} access is rejected as
+``no member named''.
+
 @l c
 @d Selfhost: sema declarations @{
 /* Peel array/qual (and pointer only toward a bodied struct/union def) wrappers,
@@ -589,6 +605,15 @@ void kcc_sema_check_decl(void *node) {
         return;
     }
     if (tag == AST_FUNC_DECL) {
+        /* Register any struct/union/enum tag the return type DEFINES, exactly as
+           a variable declaration does---resolve_type alone builds the aggregate
+           descriptor but never enters the tag in the symtab, so a later bodyless
+           `struct T' reference would find no members.  The kernel's i915
+           `static __always_inline struct sgt_iter { ... } __sgt_iter(...)' defines
+           its struct in the return-type position; without this, `struct sgt_iter'
+           used elsewhere resolves to an opaque type and every `.sgp'/`.curr'
+           member access is rejected as "no member named". */
+        if (d->f0) decl_pretag((struct Node *)d->f0);
         void *ret = kcc_sema_resolve_type((void *)d->f0);
         void *params = (void *)(d->f2 & ~3UL);
         struct Type *ft = (struct Type *)kcc_type_func(ret, params);

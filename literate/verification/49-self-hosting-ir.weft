@@ -111,7 +111,7 @@ enum {
     IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
     IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_VA_START=56, IR_FPROUND=57,
     IR_UITOFP=58, IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64,
-    IR_ASM=65
+    IR_ASM=65, IR_LADDR=66, IR_BR_IND=67
 };
 /* AST tags */
 enum {
@@ -126,7 +126,7 @@ enum {
     AST_SIZEOF_EXPR=62, AST_ALIGNOF_EXPR=63, AST_COMMA_EXPR=64, AST_INIT_LIST=65,
     AST_DESIGNATOR=66, AST_COMPOUND_LIT=67, AST_PAREN_EXPR=68, AST_GENERIC=69,
     AST_FLOAT_LIT=71, AST_VA_ARG=72, AST_STMT_EXPR=73, AST_ASM_STMT=74,
-    AST_TYPES_COMPAT=76,
+    AST_TYPES_COMPAT=76, AST_LABEL_ADDR=77,
     AST_TYPE_PTR=22, AST_TYPE_ARRAY=23, AST_TYPE_FUNC=24, AST_TYPE_QUALS=28
 };
 /* token kinds (operators) */
@@ -1206,8 +1206,22 @@ void kcc_ir_build_stmt(void *s) {
         if (bb) { kcc_ir_branch_to(bb); kcc_ir_set_bb(bb); }
         kcc_ir_build_stmt((void *)IL(s, AST_F1));
     } else if (tag == AST_GOTO_STMT) {
-        void *bb = kcc_ir_label_bb((const char *)IL(s, AST_F0));
-        if (bb) { kcc_ir_branch_to(bb); kcc_ir_set_bb(kcc_ir_alloc_bb()); }
+        if (IL(s, AST_F1)) {
+            /* computed `goto *expr': jump to a label address in a register. */
+            unsigned long v = kcc_ir_build_expr((void *)IL(s, AST_F0));
+            void *cur = kcc_ir_cur_bb;
+            if (cur && !(IL(cur, BB_FLAGS) & BB_FLAG_TERMINATED)) {
+                void *br = kcc_ir_alloc_instr(IR_BR_IND);
+                IL(br, IR_SRC1) = v;
+                kcc_ir_emit(br);
+                cur = kcc_ir_cur_bb;
+                IL(cur, BB_FLAGS) = IL(cur, BB_FLAGS) | BB_FLAG_TERMINATED;
+            }
+            kcc_ir_set_bb(kcc_ir_alloc_bb());
+        } else {
+            void *bb = kcc_ir_label_bb((const char *)IL(s, AST_F0));
+            if (bb) { kcc_ir_branch_to(bb); kcc_ir_set_bb(kcc_ir_alloc_bb()); }
+        }
     } else if (tag == AST_CASE_STMT) {
         void *bb = (void *)IL(s, AST_F2);
         if (bb) { kcc_ir_branch_to(bb); kcc_ir_set_bb(bb); }
@@ -1668,6 +1682,22 @@ unsigned long kcc_ir_build_expr(void *e) {
             return kcc_ir_emit_load(addr, sz);
         }
         return addr;
+    }
+    if (tag == AST_LABEL_ADDR) {
+        /* GNU `&&label': materialise the address of the label's basic block.
+           f2 set means the target BB was pre-resolved and stashed in f1 while
+           its function was built (a static jumptable initialised elsewhere
+           references labels this function owns); otherwise the label is in the
+           function being built now, so resolve it through the live label map. */
+        void *bb = IL(e, AST_F2) ? (void *)IL(e, AST_F1)
+                                 : kcc_ir_label_bb((const char *)IL(e, AST_F0));
+        void *g = kcc_ir_alloc_instr(IR_LADDR);
+        IL(g, IR_SRC1) = bb ? IL(bb, BB_ID) : 0;
+        IL(g, IR_TYPE) = (unsigned long)kcc_type_long_u;
+        unsigned long rv = kcc_ir_next_vreg();
+        IL(g, IR_DEST) = rv;
+        kcc_ir_emit(g);
+        return rv;
     }
     if (tag == AST_STMT_EXPR) return kcc_ir_build_stmt_expr(e);
     return 0;
@@ -3888,6 +3918,29 @@ const char *kcc_ir_static_name(void *decl) {
     return b;
 }
 
+/* Resolve every `&&label' buried in an initializer to its label's basic block
+   NOW, while this function's label map is live, stashing the BB in the node
+   (f1) with f2 as a resolved-flag.  A static jumptable's initialiser runs later
+   as module-init code, in another function's context where the label map has
+   been reset---the stashed BB lets IR_LADDR still name the right block. */
+static void kcc_ir_stash_label_addrs(void *n) {
+    if (!n) return;
+    unsigned long tag = IL(n, AST_TAG);
+    if (tag == AST_LABEL_ADDR) {
+        void *bb = kcc_ir_label_bb((const char *)IL(n, AST_F0));
+        if (bb) { IL(n, AST_F1) = (unsigned long)bb; IL(n, AST_F2) = 1; }
+    } else if (tag == AST_INIT_LIST) {
+        for (void *e = (void *)IL(n, AST_F0); e; e = (void *)IL(e, AST_F4))
+            kcc_ir_stash_label_addrs(e);
+    } else if (tag == AST_DESIGNATOR) {
+        kcc_ir_stash_label_addrs((void *)IL(n, AST_F3));
+    } else if (tag == AST_PAREN_EXPR) {
+        kcc_ir_stash_label_addrs((void *)IL(n, AST_F0));
+    } else if (tag == AST_CAST_EXPR) {
+        kcc_ir_stash_label_addrs((void *)IL(n, AST_F1));
+    }
+}
+
 void kcc_ir_build_var_decl(void *decl) {
     void *name = (void *)IL(decl, AST_F1);
     if (!name) return;
@@ -3896,6 +3949,7 @@ void kcc_ir_build_var_decl(void *decl) {
     if (sc == 3) {                                /* static: hoist to a global */
         const char *mangled = kcc_ir_static_name(decl);
         kcc_ht_put(kcc_ir_statics, name, keylen, (void *)mangled);
+        if (IL(decl, AST_F2)) kcc_ir_stash_label_addrs((void *)IL(decl, AST_F2));
         void *tn = (void *)IL(decl, AST_F0);
         if (!tn) return;
         void *rt = kcc_sema_resolve_type(tn);
@@ -6091,7 +6145,7 @@ unsigned long kcc_ir_validate(void) {
                 cnt++;
                 if (cnt > 0x100000) { msg = "kcc: internal error: cyclic instruction list in function "; break; }
                 unsigned long op = IL(ins, IR_OP);
-                if (op == 0 || op > IR_ASM) { msg = "kcc: internal error: invalid IR opcode in function "; break; }
+                if (op == 0 || op > IR_BR_IND) { msg = "kcc: internal error: invalid IR opcode in function "; break; }
                 ins = (void *)IL(ins, IR_NEXT);
             }
             if (!msg && IL(bb, BB_FIRST) && !(IL(bb, BB_FLAGS) & BB_FLAG_TERMINATED))

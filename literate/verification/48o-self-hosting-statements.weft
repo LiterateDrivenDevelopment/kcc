@@ -75,7 +75,7 @@ enum {
     TOK_AUTO = 10, TOK_ATTRIBUTE = 54,
     TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62, TOK_RBRACE = 63,
     TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_SEMI = 66, TOK_COMMA = 67,
-    TOK_QUESTION = 92, TOK_COLON = 93,
+    TOK_STAR = 73, TOK_QUESTION = 92, TOK_COLON = 93,
     TOK_ASSIGN = 94, TOK_OR_ASSIGN = 104, TOK_ELLIPSIS = 107
 };
 
@@ -540,10 +540,29 @@ colon and \texttt{default} none, each labeling the statement that follows.  A
 GNU case range \texttt{case LO\,\ldots\,HI:} is recognised when an ellipsis
 follows the first constant; the high bound is stored in the label's \texttt{f3}.
 
+\texttt{goto} also accepts the GNU \emph{computed} form \texttt{goto *expr},
+which jumps to a label address produced by \texttt{\&\&label} (see the unary
+parser).  A leading \texttt{*} switches it: \texttt{f1} flags the indirect goto
+and \texttt{f0} then holds the target expression instead of an interned name.
+The Linux bpf interpreter dispatches its opcode loop this way, through a static
+jumptable of \texttt{\&\&label} addresses.
+
 @l c
 @d Selfhost: statements jumps @{
 void *kcc_parse_goto(void) {
     kcc_pp_next();
+    /* GNU computed goto: `goto *expr' jumps to a label address (an `&&label'
+       value).  f1 marks the indirect form; f0 then holds the target expression
+       instead of a label name.  The bpf interpreter dispatches this way. */
+    if (kcc_tok_type == TOK_STAR) {
+        kcc_pp_next();
+        void *e = kcc_parse_expr();
+        kcc_parse_expect(TOK_SEMI);
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_GOTO_STMT);
+        n->f0 = (unsigned long)e;
+        n->f1 = 1;                             /* indirect */
+        return n;
+    }
     void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
     kcc_pp_next();                             /* consume identifier */
     kcc_parse_expect(TOK_SEMI);

@@ -75,7 +75,7 @@ enum {
     AST_SIZEOF_EXPR=62, AST_ALIGNOF_EXPR=63, AST_COMMA_EXPR=64, AST_INIT_LIST=65,
     AST_DESIGNATOR=66, AST_COMPOUND_LIT=67, AST_PAREN_EXPR=68, AST_GENERIC=69,
     AST_FLOAT_LIT=71, AST_VA_ARG=72, AST_STMT_EXPR=73, AST_ASM_STMT=74,
-    AST_TYPES_COMPAT=76
+    AST_TYPES_COMPAT=76, AST_LABEL_ADDR=77
 };
 
 /* tokens (operators) */
@@ -413,13 +413,18 @@ void kcc_sema_check_stmt(void *node) {
         }
         return;
     }
+    case AST_GOTO_STMT:
+        /* A direct goto carries a label name in f0; a computed `goto *expr'
+           (f1 set) carries a target expression that must be type-checked. */
+        if (s->f1 && s->f0) kcc_sema_expr((void *)s->f0);
+        return;
     case AST_VAR_DECL: case AST_TYPEDEF_DECL: case AST_STRUCT_DECL:
     case AST_UNION_DECL: case AST_ENUM_DECL: case AST_TYPE_ENUM:
     case AST_TYPE_STRUCT: case AST_TYPE_UNION:
         kcc_sema_check_decl(s);
         return;
     default:
-        return;                                /* goto/break/continue/null/static_assert */
+        return;                                /* break/continue/null/static_assert */
     }
 }
 @}
@@ -838,6 +843,10 @@ void *kcc_sema_expr(void *node) {
         if (n->f0) kcc_sema_resolve_type((void *)n->f0);
         if (n->f1) kcc_sema_resolve_type((void *)n->f1);
         t = kcc_type_int_s;
+        break;
+    case AST_LABEL_ADDR:
+        /* GNU `&&label': the address of a label, typed `void *' (\stdref{J.5.8}). */
+        t = kcc_type_ptr(kcc_type_void);
         break;
     case AST_INIT_LIST: {
         struct Node *el = (struct Node *)n->f0;

@@ -67,7 +67,7 @@ enum {
     TOK_LPAREN = 60, TOK_RPAREN = 61, TOK_LBRACE = 62,
     TOK_LBRACKET = 64, TOK_RBRACKET = 65, TOK_COMMA = 67, TOK_DOT = 68,
     TOK_ARROW = 69, TOK_INC = 70, TOK_DEC = 71, TOK_AMP = 72, TOK_STAR = 73,
-    TOK_PLUS = 74, TOK_MINUS = 75, TOK_TILDE = 76, TOK_BANG = 77,
+    TOK_PLUS = 74, TOK_MINUS = 75, TOK_TILDE = 76, TOK_BANG = 77, TOK_AND = 90,
     TOK_QUESTION = 92, TOK_COLON = 93, TOK_ASSIGN = 94, TOK_OR_ASSIGN = 104
 };
 
@@ -78,7 +78,7 @@ enum {
     AST_COMMA_EXPR = 64, AST_COMPOUND_LIT = 67, AST_PAREN_EXPR = 68,
     AST_GENERIC = 69, AST_GENERIC_ASSOC = 70, AST_IDENT_EXPR = 50,
     AST_INT_LIT = 51, AST_STR_LIT = 52, AST_CHAR_LIT = 53, AST_FLOAT_LIT = 71,
-    AST_VA_ARG = 72, AST_STMT_EXPR = 73, AST_TYPES_COMPAT = 76,
+    AST_VA_ARG = 72, AST_STMT_EXPR = 73, AST_TYPES_COMPAT = 76, AST_LABEL_ADDR = 77,
     AST_TYPE_BUILTIN = 20, AST_TYPE_PTR = 22
 };
 
@@ -204,7 +204,11 @@ void *kcc_parse_binary_expr(unsigned long min_prec) {
 
 \section{Unary, Cast, Postfix}
 
-Unary parses the prefix operators, \texttt{sizeof} (of a parenthesised type or of
+Unary first recognises the GNU labels-as-values form \texttt{\&\&label}: an
+\texttt{\&\&} where a unary expression is expected cannot be the logical-and
+operator (which needs a left operand), so it is the address of a label, parsed
+into an \texttt{AST\_LABEL\_ADDR} node carrying the label name.  It then parses
+the prefix operators, \texttt{sizeof} (of a parenthesised type or of
 an expression), and \texttt{\_Alignof}.  The alignment operator takes the same
 two shapes as \texttt{sizeof}: strict C11 \texttt{\_Alignof(type-name)}, and---
 because it shares a token with the GNU \texttt{\_\_alignof\_\_}---an
@@ -226,6 +230,18 @@ member access, and postfix \texttt{++}/\texttt{--}.
 @d Selfhost: expressions unary @{
 void *kcc_parse_unary_expr(void) {
     unsigned long t = kcc_tok_type;
+    /* GNU labels-as-values: `&&label' in operand position is the address of a
+       label (a `void *'), not a logical-and.  Since `&&' as a binary operator
+       needs a left operand, seeing it where a unary expression is expected is
+       unambiguously the address-of-label form (the bpf interpreter's jumptable). */
+    if (t == TOK_AND) {
+        kcc_pp_next();
+        void *name = kcc_strtab_intern(kcc_tok_start, kcc_tok_len);
+        kcc_pp_next();                          /* consume the label identifier */
+        struct Node *n = (struct Node *)kcc_ast_alloc(AST_LABEL_ADDR);
+        n->f0 = (unsigned long)name;
+        return n;
+    }
     if (t == TOK_INC || t == TOK_DEC || t == TOK_AMP || t == TOK_STAR ||
         t == TOK_PLUS || t == TOK_MINUS || t == TOK_TILDE || t == TOK_BANG) {
         unsigned long op = t;

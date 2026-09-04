@@ -104,7 +104,8 @@ enum {
     IR_LOAD=30, IR_STORE=31, IR_ALLOCA=32, IR_GEP=33, IR_BR=40, IR_BR_COND=41,
     IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
     IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_VA_START=56, IR_FPROUND=57, IR_UITOFP=58,
-    IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64, IR_ASM=65
+    IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64, IR_ASM=65,
+    IR_LADDR=66, IR_BR_IND=67
 };
 /* AST tags used by the data/static walks */
 enum {
@@ -166,6 +167,7 @@ S(s_setne, "\tsetne\t%al\n"); S(s_setl, "\tsetl\t%al\n"); S(s_setle, "\tsetle\t%
 S(s_setg, "\tsetg\t%al\n"); S(s_setge, "\tsetge\t%al\n"); S(s_setb, "\tsetb\t%al\n");
 S(s_setbe, "\tsetbe\t%al\n"); S(s_bb, ".Lkccbb"); S(s_label_nl, ":\n");
 S(s_jmp, "\tjmp\t"); S(s_jne, "\tjne\t"); S(s_test_r10, "\ttestq\t%r10, %r10\n");
+S(s_jmp_ind_r10, "\tjmp\t*%r10\n");
 S(s_rdi, "%rdi"); S(s_rsi, "%rsi"); S(s_r8, "%r8"); S(s_r9, "%r9");
 S(s_call, "\tcall\t"); S(s_call_r11, "\tcall\t*%r11\n"); S(s_zero_al, "\tmovb\t$0, %al\n");
 S(s_movb_d, "\tmovb\t$"); S(s_al_nl, ", %al\n");
@@ -1029,6 +1031,14 @@ void kcc_x86_sel(void *i) {
     case IR_CMP_ULE: x86_cmp(i, s_setbe); return;
     case IR_BR:
         kcc_as_str(s_jmp); x86_bblabel(IL(i, IR_SRC1)); kcc_as_ch('\n');
+        return;
+    case IR_LADDR:                               /* &&label → leaq .LkccbbN(%rip) */
+        kcc_as_str(s_leaq); x86_bblabel(IL(i, IR_SRC1)); kcc_as_str(s_rip_r10);
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    case IR_BR_IND:                              /* goto *reg → jmp *%r10 */
+        x86_load(IL(i, IR_SRC1), s_r10);
+        kcc_as_str(s_jmp_ind_r10);
         return;
     case IR_BR_COND:
         x86_load(IL(i, IR_DEST), s_r10);

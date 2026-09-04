@@ -1260,6 +1260,33 @@ static unsigned long kcc_asm_cons_imm(const char *c) {
     return 0;
 }
 
+/* Whether a constant VALUE fits one of the constraint's immediate classes.  The
+   x86 letters bound the range: a plain `i'/`n'/`g'/`e' is the ALU's
+   sign-extended 32-bit field; `I'-`O' name the narrow ranges the shift/bit and
+   in/out forms need (`I' 0-31 for `bts', `N' 0-255 for `in $imm').  When a
+   constant falls outside every immediate class the constraint allows but the
+   constraint also admits a register, it must go to the register alternative---
+   emitting `btsq $330' (an `"Ir"' bit number the compiler would otherwise put in
+   a register) is rejected by the assembler as an operand-type mismatch. */
+static int kcc_asm_imm_fits(const char *c, long v) {
+    for (const char *s = c; *s; s++) {
+        switch (*s) {
+        case 'i': case 'n': case 'g': case 'e':
+            if (v >= (long)0xFFFFFFFF80000000UL && v <= (long)0x7FFFFFFFL) return 1; break;
+        case 'Z': if (v >= 0 && v <= (long)0xFFFFFFFFL) return 1; break;
+        case 'I': if (v >= 0 && v <= 31) return 1; break;
+        case 'J': if (v >= 0 && v <= 63) return 1; break;
+        case 'K': if (v >= -128 && v <= 127) return 1; break;
+        case 'L': if (v == 0xFF || v == 0xFFFF || v == (long)0xFFFFFFFFL) return 1; break;
+        case 'M': if (v >= 0 && v <= 3) return 1; break;
+        case 'N': if (v >= 0 && v <= 255) return 1; break;
+        case 'O': if (v >= 0 && v <= 127) return 1; break;
+        default: break;
+        }
+    }
+    return 0;
+}
+
 /* Whether the constraint also admits a general or specific integer register, so
    a constant that will not fit an x86 ALU instruction's 32-bit immediate field
    can be materialised there instead---the register alternative of `"re"'/`"ri"'. */
@@ -1409,16 +1436,14 @@ void kcc_ir_asm_lower_operands(void *as) {
             if (kcc_expr_is_ice(expr)) { asm_imm = kcc_eval_const_int(expr); asm_is_imm = 1; }
             else if (kcc_asm_operand_local_const(expr, &asm_imm)) asm_is_imm = 1;
         }
-        /* An x86 ALU immediate encodes at most a sign-extended 32-bit field.  A
-           wider constant---the percpu refcount's PERCPU_COUNT_BIAS = 1UL<<63 fed
-           to `addq $val,mem'---does not fit; when the constraint also allows a
-           register (`"re"'/`"ri"'), hand it to the register path so it is loaded
-           with `movabsq' first, exactly as GCC picks the register alternative. */
-        if (asm_is_imm && kcc_asm_cons_reg(cons)) {
-            long sv = (long)asm_imm;
-            if (sv < (long)0xFFFFFFFF80000000UL || sv > (long)0x7FFFFFFFUL)
-                asm_is_imm = 0;
-        }
+        /* A constant that fits none of the constraint's immediate classes but
+           could sit in a register (the percpu refcount's PERCPU_COUNT_BIAS =
+           1UL<<63 fed to `addq $val,mem' overflowing the 32-bit ALU field; an
+           `"Ir"' bit number > 31 fed to `bts') is handed to the register path so
+           it is loaded first, exactly as GCC picks the register alternative. */
+        if (asm_is_imm && kcc_asm_cons_reg(cons) &&
+            !kcc_asm_imm_fits(cons, (long)asm_imm))
+            asm_is_imm = 0;
         if (strlit && c != '=' && c != '+' && kcc_asm_cons_imm(cons)) {
             /* string-literal `"i"'/`"s"' operand: the back end emits the string
                to .rodata and references its label---the kernel's WARN/BUG entries

@@ -4477,7 +4477,8 @@ unsigned long kcc_expr_is_ice(void *n) {
     if (!n) return 1;
     unsigned long tag = IL(n, AST_TAG);
     if (tag == AST_INT_LIT || tag == AST_CHAR_LIT ||
-        tag == AST_SIZEOF_EXPR || tag == AST_ALIGNOF_EXPR) return 1;
+        tag == AST_SIZEOF_EXPR || tag == AST_ALIGNOF_EXPR ||
+        tag == AST_TYPES_COMPAT) return 1;   /* __builtin_types_compatible_p → 0/1 */
     if (tag == AST_PAREN_EXPR) return kcc_expr_is_ice((void *)IL(n, AST_F0));
     if (tag == AST_CAST_EXPR) return kcc_expr_is_ice((void *)IL(n, AST_F1));
     if (tag == AST_UNARY_EXPR) {

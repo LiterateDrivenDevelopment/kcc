@@ -1763,7 +1763,12 @@ static void kcc_x86_emit_aliases(void) {
         const char *name = (const char *)d->f1;
         struct AttrRec *ar = x86_attr(name);
         if (!ar || !ar->alias) continue;
-        kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n');
+        /* A `weak, alias(...)' pair---the kernel's CPU_SHOW_VULN_FALLBACK
+           defaults are `__weak' aliases of cpu_show_not_affected---must head the
+           alias with `.weak', not `.globl'.  Emitted global, the fallback would
+           be a strong second definition and collide at the vmlinux link with the
+           arch's real cpu_show_* override. */
+        kcc_as_str(ar->weak ? s_weak : s_globl); x86_sym(name); kcc_as_ch('\n');
         kcc_as_str(s_set); x86_sym(name); kcc_as_str(s_comma);
         x86_sym(ar->alias); kcc_as_ch('\n');
     }

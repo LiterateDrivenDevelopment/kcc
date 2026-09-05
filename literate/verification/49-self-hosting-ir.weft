@@ -5555,6 +5555,59 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     return 1;
 }
 
+/* __builtin_{mul,add,sub}_overflow(a, b, *res): compute a OP b at the result
+   type, store it through *res, and return whether the true result did not fit.
+   The kernel uses these for size arithmetic, almost always with same-typed
+   operands, so the operation is done at the result type's width.  Multiply
+   overflow is the reliable divide-back identity res/a != b (exact for unsigned;
+   the a==0 case is folded in by dividing by a+(a==0) so the division is never by
+   zero and the a!=0 guard zeroes the result anyway).  Add/subtract use the
+   classic wrap (unsigned) and sign-agreement (signed) tests. */
+static unsigned long kcc_ir_build_ovf_builtin(void *e, unsigned long aop) {
+    void *a0 = (void *)IL(e, AST_F1);
+    void *a1 = a0 ? (void *)IL(a0, AST_F4) : 0;
+    void *a2 = a1 ? (void *)IL(a1, AST_F4) : 0;
+    if (!a2) return kcc_ir_emit_const(0);
+    void *pty = (void *)IL(a2, AST_F3);              /* pointer to the result */
+    void *rT = (pty && IL(pty, TY_KIND) == TY_PTR) ? (void *)IL(pty, TY_F0) : 0;
+    if (!rT || IL(rT, TY_KIND) < TY_BOOL || IL(rT, TY_KIND) > TY_LLONG)
+        rT = kcc_type_long_u;
+    unsigned long av = kcc_ir_build_expr(a0);
+    unsigned long bv = kcc_ir_build_expr(a1);
+    unsigned long raddr = kcc_ir_build_expr(a2);
+    av = kcc_ir_convert(av, (void *)IL(a0, AST_F3), rT);
+    bv = kcc_ir_convert(bv, (void *)IL(a1, AST_F3), rT);
+    unsigned long signd = IL(rT, TY_F0) ? 1 : 0;
+    unsigned long prod = kcc_ir_emit_binop_typed(aop, av, bv, rT);
+    /* Force the result to the destination width: a narrower multiply leaves the
+       full product in the register, and the divide-back check would then never
+       see the overflow.  Truncating (via convert from 64-bit) also sign-extends
+       for a signed destination, which the signed divide/compares below need. */
+    prod = kcc_ir_convert(prod, kcc_type_long_u, rT);
+    kcc_ir_emit_store_t(prod, raddr, kcc_ir_load_width(rT), rT);
+    unsigned long zero = kcc_ir_emit_const(0);
+    if (aop == IR_MUL) {
+        unsigned long aeqz = kcc_ir_emit_binop_typed(IR_CMP_EQ, av, zero, rT);
+        unsigned long d = kcc_ir_emit_binop_typed(IR_ADD, av, aeqz, rT);
+        unsigned long q = kcc_ir_emit_binop_typed(signd ? IR_SDIV : IR_UDIV, prod, d, rT);
+        unsigned long qneb = kcc_ir_emit_binop_typed(IR_CMP_NE, q, bv, rT);
+        unsigned long anz = kcc_ir_emit_binop_typed(IR_CMP_NE, av, zero, rT);
+        return kcc_ir_emit_binop(IR_AND, anz, qneb);
+    }
+    if (!signd)                                      /* add: res<a; sub: a<b */
+        return (aop == IR_ADD)
+            ? kcc_ir_emit_binop_typed(IR_CMP_ULT, prod, av, rT)
+            : kcc_ir_emit_binop_typed(IR_CMP_ULT, av, bv, rT);
+    unsigned long x1 = (aop == IR_ADD)               /* add: (a^res)&(b^res)<0 */
+        ? kcc_ir_emit_binop_typed(IR_XOR, av, prod, rT)   /* sub: (a^b)&(a^res)<0 */
+        : kcc_ir_emit_binop_typed(IR_XOR, av, bv, rT);
+    unsigned long x2 = (aop == IR_ADD)
+        ? kcc_ir_emit_binop_typed(IR_XOR, bv, prod, rT)
+        : kcc_ir_emit_binop_typed(IR_XOR, av, prod, rT);
+    unsigned long ad = kcc_ir_emit_binop_typed(IR_AND, x1, x2, rT);
+    return kcc_ir_emit_binop_typed(IR_CMP_SLT, ad, zero, rT);
+}
+
 unsigned long kcc_ir_build_call(void *e) {
     void *callee = (void *)IL(e, AST_F0);
     if (!callee) return 0;
@@ -5608,6 +5661,14 @@ unsigned long kcc_ir_build_call(void *e) {
         if (kcc_strcmp(name, "__builtin_ffsl") == 0 ||
             kcc_strcmp(name, "__builtin_ffsll") == 0)
             return kcc_ir_ffs(kcc_ir_build_expr((void *)IL(e, AST_F1)), 64);
+        /* Overflow-checked arithmetic: store the result through the third
+           argument and yield whether it overflowed. */
+        if (kcc_strcmp(name, "__builtin_mul_overflow") == 0)
+            return kcc_ir_build_ovf_builtin(e, IR_MUL);
+        if (kcc_strcmp(name, "__builtin_add_overflow") == 0)
+            return kcc_ir_build_ovf_builtin(e, IR_ADD);
+        if (kcc_strcmp(name, "__builtin_sub_overflow") == 0)
+            return kcc_ir_build_ovf_builtin(e, IR_SUB);
         /* __builtin_trap() must terminate; lower it to a call to abort. */
         if (kcc_strcmp(name, "__builtin_trap") == 0) name = "abort";
         /* abs family has an exact libc counterpart (valid while the milestone

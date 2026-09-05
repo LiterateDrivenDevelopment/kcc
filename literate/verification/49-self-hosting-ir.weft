@@ -546,9 +546,10 @@ static int kcc_ast_has_asm(void *n) {
                kcc_ast_has_asm_seq((void *)IL(n, AST_F1));
     case AST_PAREN_EXPR: case AST_EXPR_STMT: case AST_STMT_EXPR:
     case AST_MEMBER: case AST_RETURN_STMT:
+    case AST_DEFAULT_STMT:                        /* body in F0 (kcc_parse_default) */
         return kcc_ast_has_asm((void *)IL(n, AST_F0));
     case AST_UNARY_EXPR: case AST_CAST_EXPR:
-    case AST_LABEL_STMT: case AST_DEFAULT_STMT:
+    case AST_LABEL_STMT:
         return kcc_ast_has_asm((void *)IL(n, AST_F1));
     case AST_VAR_DECL:
         return kcc_ast_has_asm((void *)IL(n, AST_F2));
@@ -5368,8 +5369,15 @@ static void *kcc_inl_clone(void *node, void *params, void *args) {
         IL(d, AST_F2) = (unsigned long)el;
         return d;
     }
-    if (tag == AST_WHILE_STMT || tag == AST_DO_STMT ||
-        tag == AST_SWITCH_STMT || tag == AST_CASE_STMT) {
+    if (tag == AST_WHILE_STMT || tag == AST_DO_STMT || tag == AST_SWITCH_STMT) {
+        void *a0 = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        void *a1 = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
+        if (!a0 || !a1) return 0;
+        void *d = kcc_inl_dup(node);
+        IL(d, AST_F0) = (unsigned long)a0; IL(d, AST_F1) = (unsigned long)a1;
+        return d;
+    }
+    if (tag == AST_CASE_STMT) {                      /* F0 = value, F1 = body */
         void *a0 = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
         void *a1 = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
         if (!a0 || !a1) return 0;
@@ -5388,11 +5396,16 @@ static void *kcc_inl_clone(void *node, void *params, void *args) {
         for (int k = 0; k < 4; k++) IL(d, fld[k]) = (unsigned long)c[k];
         return d;
     }
-    if (tag == AST_DEFAULT_STMT) {
-        void *a1 = kcc_inl_clone((void *)IL(node, AST_F1), params, args);
-        if (!a1) return 0;
+    if (tag == AST_DEFAULT_STMT) {                   /* F0 = labelled statement */
+        /* A `default:' carries its statement in F0 (kcc_parse_default), not F1.
+           Cloning F1 left F0 as kcc_inl_dup's shallow copy---the ORIGINAL body
+           node, shared with the un-inlined AST---and building that shared node
+           corrupted state and crashed (kernel switch(sizeof) fallbacks spell
+           `default: __bad(); break;').  Clone the real body in F0. */
+        void *a0 = kcc_inl_clone((void *)IL(node, AST_F0), params, args);
+        if (!a0) return 0;
         void *d = kcc_inl_dup(node);
-        IL(d, AST_F1) = (unsigned long)a1;
+        IL(d, AST_F0) = (unsigned long)a0;
         return d;
     }
     if (tag == AST_LABEL_STMT) {                    /* rename the label per instance */
@@ -5450,12 +5463,19 @@ static void *kcc_inl_clone(void *node, void *params, void *args) {
 /* If `name` is a registered always_inline function with a `{ return E; }` body
    and a matching argument count, build E with parameters replaced by the call
    arguments and report its value; return 0 to fall back to a real call. */
+static unsigned long kcc_inl_depth = 0;         /* live inline-expansion nesting */
 static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     if (!kcc_always_inline_fns) return 0;
     void *fn = (void *)kcc_ht_get(kcc_always_inline_fns, name, kcc_strlen(name));
     if (!fn) return 0;
     void *body = (void *)IL(fn, AST_F3);
     if (!body || IL(body, AST_TAG) != AST_COMPOUND) return 0;
+    /* Bound the expansion: building an inlined body recursively inlines the
+       always_inline calls inside it, and the kernel's tracing macros nest these
+       deeply enough (or mutually) to overflow the compiler's own stack.  Beyond
+       a generous depth fall back to a real call---the outer levels are already
+       inlined, so a rare deep call is harmless. */
+    if (kcc_inl_depth >= 40) return 0;
     void *params = (void *)(IL(fn, AST_F2) & ~3UL); /* strip variadic + linkage flags */
     /* A `(void)' parameter list is a single void-typed placeholder, not a real
        parameter; drop it so a no-argument callee (get_current, rep_nop,
@@ -5480,7 +5500,9 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     if (s0 && !IL(s0, AST_F4) && IL(s0, AST_TAG) == AST_RETURN_STMT && IL(s0, AST_F0)) {
         void *clone = kcc_inl_clone((void *)IL(s0, AST_F0), params, args);
         if (!clone) return 0;
+        kcc_inl_depth++;
         *out = kcc_ir_build_expr(clone);
+        kcc_inl_depth--;
         return 1;
     }
 
@@ -5527,7 +5549,9 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     IL(bclone, AST_F0) = (unsigned long)first;
     void *se = kcc_ast_alloc(AST_STMT_EXPR);
     IL(se, AST_F0) = (unsigned long)bclone;
+    kcc_inl_depth++;
     *out = kcc_ir_build_stmt_expr(se);
+    kcc_inl_depth--;
     return 1;
 }
 

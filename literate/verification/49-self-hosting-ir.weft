@@ -619,9 +619,9 @@ void kcc_ir_build(void *tu) {
     }
     if (!has_main && has_ginit) kcc_ir_emit_modinit();
     /* Out-of-line pass: emit a standalone body for any always_inline function a
-       call could not inline (asm-bearing ones excluded---their `"i"' operands
-       need the caller's constant). Runs last so in-place lowering can't disturb
-       an inline expansion. */
+       call could not inline, or whose address was taken as a value (asm-bearing
+       ones excluded---their `"i"' operands need the caller's constant). Runs last
+       so in-place lowering can't disturb an inline expansion. */
     if (kcc_inl_need_out) {
         d = (void *)IL(tu, AST_F0);
         while (d) {
@@ -2664,6 +2664,17 @@ unsigned long kcc_ir_build_ident(void *e) {
                 if (k == TY_ARRAY || k == TY_FUNC) is_array = 1;
             }
         }
+    }
+    /* Using an always_inline function's name as a value---never calling it, only
+       taking its address, as in `.less = mod_tree_less' in a latch_tree_ops
+       table---cannot be inlined, so the function must be emitted out-of-line.
+       The call path records non-inlinable calls the same way; a bare reference
+       reaches here instead (a call extracts the callee name directly and never
+       builds the designator as an ident). */
+    if (kcc_always_inline_fns &&
+        kcc_ht_get(kcc_always_inline_fns, name, keylen)) {
+        if (!kcc_inl_need_out) kcc_inl_need_out = kcc_ht_init(32);
+        kcc_ht_put(kcc_inl_need_out, name, keylen, (void *)1);
     }
     if (is_array) {
         void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);

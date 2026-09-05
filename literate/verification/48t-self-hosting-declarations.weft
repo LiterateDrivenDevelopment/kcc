@@ -422,7 +422,13 @@ void *kcc_parse_declarator(void *base) {
     /* A GNU attribute may precede the direct declarator's name (a no-op here
        when absent): `T __attribute__((...)) x`. */
     if (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
-    return kcc_parse_direct_declarator(type);
+    void *d = kcc_parse_direct_declarator(type);
+    /* ...and one may TRAIL the whole declarator, before the `='/`,'/`;' or a
+       function body: `bool x __read_mostly;' (a kernel section attribute) or
+       `int f(void) __weak'.  Route it through the same side table so linkage
+       attributes still bind to this declaration. */
+    while (kcc_tok_type == TOK_ATTRIBUTE) kcc_parse_skip_attributes();
+    return d;
 }
 
 /* Parse array [ ... ] suffixes into a chain whose element is `base`; returns the

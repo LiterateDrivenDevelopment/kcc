@@ -111,7 +111,7 @@ enum {
     IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
     IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_VA_START=56, IR_FPROUND=57,
     IR_UITOFP=58, IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64,
-    IR_ASM=65, IR_LADDR=66, IR_BR_IND=67
+    IR_ASM=65, IR_LADDR=66, IR_BR_IND=67, IR_FRAME_ADDR=68, IR_RET_ADDR=69
 };
 /* AST tags */
 enum {
@@ -5675,6 +5675,26 @@ unsigned long kcc_ir_build_call(void *e) {
             unsigned long ost = sz1 ? kcc_eval_const_int(sz1) : 0;
             return kcc_ir_emit_const((ost & 2) ? 0 : (unsigned long)-1);
         }
+        /* On x86 a return address needs no demangling, so these are identity. */
+        if (kcc_strcmp(name, "__builtin_extract_return_addr") == 0 ||
+            kcc_strcmp(name, "__builtin_frob_return_addr") == 0)
+            return kcc_ir_build_expr((void *)IL(e, AST_F1));
+        /* __builtin_frame_address(n) / __builtin_return_address(n): the frame
+           pointer of the n-th enclosing frame, and the return address saved in
+           it.  The level is a constant; codegen walks the saved-rbp chain. */
+        if (kcc_strcmp(name, "__builtin_frame_address") == 0 ||
+            kcc_strcmp(name, "__builtin_return_address") == 0) {
+            void *lv = (void *)IL(e, AST_F1);
+            unsigned long lvl = lv ? kcc_eval_const_int(lv) : 0;
+            unsigned long fop = (name[10] == 'f') ? IR_FRAME_ADDR : IR_RET_ADDR;
+            void *inst = kcc_ir_alloc_instr(fop);
+            IL(inst, IR_SRC1) = lvl;
+            IL(inst, IR_TYPE) = (unsigned long)kcc_type_long_u;
+            unsigned long v = kcc_ir_next_vreg();
+            IL(inst, IR_DEST) = v;
+            kcc_ir_emit(inst);
+            return v;
+        }
         /* Overflow-checked arithmetic: store the result through the third
            argument and yield whether it overflowed. */
         if (kcc_strcmp(name, "__builtin_mul_overflow") == 0)
@@ -6280,7 +6300,7 @@ unsigned long kcc_ir_validate(void) {
                 cnt++;
                 if (cnt > 0x100000) { msg = "kcc: internal error: cyclic instruction list in function "; break; }
                 unsigned long op = IL(ins, IR_OP);
-                if (op == 0 || op > IR_BR_IND) { msg = "kcc: internal error: invalid IR opcode in function "; break; }
+                if (op == 0 || op > IR_RET_ADDR) { msg = "kcc: internal error: invalid IR opcode in function "; break; }
                 ins = (void *)IL(ins, IR_NEXT);
             }
             if (!msg && IL(bb, BB_FIRST) && !(IL(bb, BB_FLAGS) & BB_FLAG_TERMINATED))

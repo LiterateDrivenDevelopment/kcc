@@ -106,7 +106,7 @@ enum {
     IR_RET=42, IR_CALL=43, IR_CALL_IND=44, IR_SEXT=50, IR_ZEXT=51, IR_TRUNC=52,
     IR_BITCAST=53, IR_SITOFP=54, IR_FPTOSI=55, IR_VA_START=56, IR_FPROUND=57, IR_UITOFP=58,
     IR_CONST=60, IR_NOP=61, IR_GLOBAL_REF=63, IR_STRING_LIT=64, IR_ASM=65,
-    IR_LADDR=66, IR_BR_IND=67
+    IR_LADDR=66, IR_BR_IND=67, IR_FRAME_ADDR=68, IR_RET_ADDR=69
 };
 /* AST tags used by the data/static walks */
 enum {
@@ -174,6 +174,9 @@ S(s_call, "\tcall\t"); S(s_call_r11, "\tcall\t*%r11\n"); S(s_zero_al, "\tmovb\t$
 S(s_movb_d, "\tmovb\t$"); S(s_al_nl, ", %al\n");
 S(s_add_rsp, "\taddq\t$"); S(s_paren_rsp, "(%rsp)"); S(s_rip_r10, "(%rip), %r10\n");
 S(s_rip, "(%rip)");
+S(s_mov_rbp_r10, "\tmovq\t%rbp, %r10\n");          /* frame_address(0) seed */
+S(s_mov_r10ind_r10, "\tmovq\t(%r10), %r10\n");     /* walk to the caller's frame */
+S(s_mov_8r10_r10, "\tmovq\t8(%r10), %r10\n");      /* return address in that frame */
 S(s_got_r10, "@@GOTPCREL(%rip), %r10\n");
 S(s_zerofill, "\t.zerofill __DATA,__common,_"); S(s_zf_a3, ",3\n"); S(s_comma1, ",");
 S(s_unsup, "kcc: --target=x86_64: unsupported operation (floating point, inline asm, or by-value aggregate not yet implemented for the x86-64 back end)\n");
@@ -1041,6 +1044,19 @@ void kcc_x86_sel(void *i) {
         x86_load(IL(i, IR_SRC1), s_r10);
         kcc_as_str(s_jmp_ind_r10);
         return;
+    case IR_FRAME_ADDR: {                        /* __builtin_frame_address(n) */
+        kcc_as_str(s_mov_rbp_r10);
+        for (unsigned long l = IL(i, IR_SRC1); l; l--) kcc_as_str(s_mov_r10ind_r10);
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    }
+    case IR_RET_ADDR: {                          /* __builtin_return_address(n) */
+        kcc_as_str(s_mov_rbp_r10);               /* frame n, then its saved return */
+        for (unsigned long l = IL(i, IR_SRC1); l; l--) kcc_as_str(s_mov_r10ind_r10);
+        kcc_as_str(s_mov_8r10_r10);
+        x86_store(IL(i, IR_DEST), s_r10);
+        return;
+    }
     case IR_BR_COND:
         x86_load(IL(i, IR_DEST), s_r10);
         kcc_as_str(s_test_r10);

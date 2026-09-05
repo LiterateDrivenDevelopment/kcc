@@ -5457,6 +5457,15 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     void *body = (void *)IL(fn, AST_F3);
     if (!body || IL(body, AST_TAG) != AST_COMPOUND) return 0;
     void *params = (void *)(IL(fn, AST_F2) & ~3UL); /* strip variadic + linkage flags */
+    /* A `(void)' parameter list is a single void-typed placeholder, not a real
+       parameter; drop it so a no-argument callee (get_current, rep_nop,
+       native_irq_enable, ... --- the pervasive inline-asm kernel primitives)
+       matches its zero-argument call instead of failing the np==na test. */
+    if (params && !IL(params, AST_F4)) {
+        void *pt = (void *)IL(params, AST_F0);
+        void *rt = pt ? kcc_sema_resolve_type(pt) : 0;
+        if (rt && IL(rt, TY_KIND) == TY_VOID) params = 0;
+    }
     void *args = (void *)IL(call, AST_F1);
     unsigned long np = 0, na = 0;
     for (void *p = params; p; p = (void *)IL(p, AST_F4)) np++;

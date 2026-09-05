@@ -1758,11 +1758,20 @@ static void kcc_x86_emit_toplevel_asm(void) {
 static void kcc_x86_emit_aliases(void) {
     struct Node *tu = (struct Node *)kcc_x86_tu;
     if (!tu) return;
+    void *seen = kcc_ht_init(16);          /* alias names already emitted */
     for (struct Node *d = (struct Node *)tu->f0; d; d = (struct Node *)d->f4) {
         if (d->tag != AST_FUNC_DECL && d->tag != AST_VAR_DECL) continue;
         const char *name = (const char *)d->f1;
         struct AttrRec *ar = x86_attr(name);
         if (!ar || !ar->alias) continue;
+        /* Attributes are keyed by name, so a prototype and the defining
+           declaration of the same alias (mm/hugetlb.c both prototypes and
+           defines the weak alias alloc_bootmem_huge_page) each reach here and
+           would emit the `.set' twice---a redefinition gas rejects the moment
+           the symbol is reloc-referenced.  Emit each alias name once. */
+        unsigned long nl = kcc_strlen(name);
+        if (kcc_ht_get(seen, name, nl)) continue;
+        kcc_ht_put(seen, name, nl, 1);
         /* A `weak, alias(...)' pair---the kernel's CPU_SHOW_VULN_FALLBACK
            defaults are `__weak' aliases of cpu_show_not_affected---must head the
            alias with `.weak', not `.globl'.  Emitted global, the fallback would

@@ -84,6 +84,7 @@ void kcc_dep_reset(void);
 void kcc_dep_write(const char *obj, const char *src);
 extern void *kcc_x86_tu;
 extern unsigned long kcc_warn_all;
+extern unsigned long kcc_tu_salt;                /* per-file static-name salt (ir.c) */
 extern unsigned long kcc_dwarf_enabled;
 
 void *kcc_envp = 0;
@@ -188,6 +189,12 @@ void kcc_driver_apply_force_includes(void) {
 }
 
 int kcc_driver_compile(const char *src, const char *out) {
+    {                                            /* per-file static-name salt */
+        unsigned long h = 5381;
+        const char *p = src;
+        while (*p) { h = h * 33 + (unsigned char)(*p); p++; }
+        kcc_tu_salt = h;
+    }
     kcc_dep_reset();
     kcc_source_open(src);
     kcc_source_encode();

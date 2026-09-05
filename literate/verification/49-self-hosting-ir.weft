@@ -184,6 +184,8 @@ void *kcc_ir_locals = 0;
 void *kcc_ir_local_consts = 0;
 void *kcc_ir_statics = 0;
 void *kcc_ir_static_types = 0;
+void *kcc_ir_static_decls = 0;             /* every static-local decl, for storage */
+unsigned long kcc_tu_salt = 0;             /* per-file salt, mixed into static names */
 void *kcc_ir_labels = 0;
 void *kcc_ir_loop_stack = 0;
 unsigned long kcc_ir_bb_counter = 0;
@@ -370,6 +372,16 @@ void kcc_ir_init(void) {
     kcc_ir_loop_stack = v;
     IL(v, VEC_ELEMSIZE) = 16;
     IL(v, VEC_CAP) = 8;
+    IL(v, VEC_COUNT) = 0;
+    IL(v, VEC_DATA) = (unsigned long)kcc_arena_alloc(128);
+    /* static-local decl list: 8-byte pointer elements.  Every static local the
+       IR builder registers is recorded here so the back end can emit storage
+       for it, including statics hidden inside statement-expressions that no
+       statement-spine walk would reach. */
+    v = kcc_arena_alloc(VEC_SIZE);
+    kcc_ir_static_decls = v;
+    IL(v, VEC_ELEMSIZE) = 8;
+    IL(v, VEC_CAP) = 16;
     IL(v, VEC_COUNT) = 0;
     IL(v, VEC_DATA) = (unsigned long)kcc_arena_alloc(128);
     kcc_ir_bb_counter = 0;
@@ -3905,7 +3917,10 @@ unsigned long kcc_ir_build_compound_lit(void *cl) {
 const char *kcc_ir_static_name(void *decl) {
     char *b = kcc_arena_alloc(24);
     b[0] = 's'; b[1] = 'l'; b[2] = '_';
-    unsigned long v = (unsigned long)decl;
+    /* The decl address is an arena offset that resets each compilation, so two
+       files' statics can collide; xor in the per-file salt to make the name
+       unique across a whole-kernel link yet stable within this unit. */
+    unsigned long v = (unsigned long)decl ^ kcc_tu_salt;
     char *p = b + 3;
     long shift = 60;
     while (shift >= 0) {
@@ -3949,6 +3964,7 @@ void kcc_ir_build_var_decl(void *decl) {
     if (sc == 3) {                                /* static: hoist to a global */
         const char *mangled = kcc_ir_static_name(decl);
         kcc_ht_put(kcc_ir_statics, name, keylen, (void *)mangled);
+        kcc_vec_push(kcc_ir_static_decls, &decl);
         if (IL(decl, AST_F2)) kcc_ir_stash_label_addrs((void *)IL(decl, AST_F2));
         void *tn = (void *)IL(decl, AST_F0);
         if (!tn) return;

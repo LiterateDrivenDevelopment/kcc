@@ -42,6 +42,7 @@ void kcc_io_flush(void);
 void kcc_sys_exit(long code);
 int kcc_global_const_rodata(void *decl);
 int kcc_global_const_ptrarr(void *decl);
+extern void *kcc_ir_static_decls;      /* every static-local decl (ir.c) */
 unsigned long kcc_rodata_leaf_bits(void *node, unsigned long kind);
 const char *kcc_ir_static_name(void *decl);
 void *kcc_ht_init(unsigned long capacity);
@@ -1364,7 +1365,8 @@ static void x86_render_text(void) {
 Mutable file-scope globals become zeroed common storage (their initialisers run
 as code); \texttt{const} scalars, arrays of scalars, structs of scalars, and
 arrays of such structs become read-only value directives; static locals are
-recovered by walking every function body.  A declarator whose type resolves to a
+recovered by walking every function body---and, for those a spine walk cannot
+reach, by a decl list the IR builder keeps (below).  A declarator whose type resolves to a
 \emph{function} type is not an object at all---it declares a function and gets no
 storage---so the data pass skips it: the kernel's
 \texttt{INDIRECT\_CALLABLE\_DECLARE} spells a prototype as
@@ -1478,11 +1480,21 @@ void kcc_x86_emit_data(void) {
 static void x86_emit_one_static(void *decl) {
     struct Node *d = (struct Node *)decl;
     const char *name = kcc_ir_static_name(d);
+    /* Emit each static's storage once.  Check only here---do NOT claim the name,
+       or x86_emit_zerofill's own guard would see it already taken and emit
+       nothing.  The rodata paths have no such guard, so they are marked below. */
+    unsigned long kl = name ? kcc_strlen(name) : 0;
+    if (kcc_x86_emitted && name && kcc_ht_get(kcc_x86_emitted, name, kl)) return;
     if (kcc_global_const_rodata(d)) {
         x86_emit_rodata_global(d, name);
+        if (kcc_x86_emitted && name) kcc_ht_put(kcc_x86_emitted, name, kl, 1);
         return;
     }
-    if (kcc_global_const_ptrarr(d)) { x86_emit_rodata_ptrarr(d, name); return; }
+    if (kcc_global_const_ptrarr(d)) {
+        x86_emit_rodata_ptrarr(d, name);
+        if (kcc_x86_emitted && name) kcc_ht_put(kcc_x86_emitted, name, kl, 1);
+        return;
+    }
     void *ty = kcc_sema_resolve_type((void *)d->f0);
     if (!ty) return;
     unsigned long size = round8_min8(kcc_type_layout(ty));
@@ -1523,6 +1535,50 @@ void kcc_x86_emit_statics(void) {
     for (; d; d = (struct Node *)d->f4)
         if (d->tag == AST_FUNC_DECL && d->f3)
             x86_prereg_stmt((void *)d->f3);
+    @<Selfhost: emit_x86 stmt-expr static storage@>
+}
+@}
+
+The function-body walk finds every static local that sits on a statement spine,
+but a static declared inside a GNU statement-expression \verb|({ ... })| hides
+from it: the \texttt{printk\_once}/\texttt{WARN\_ONCE}/\texttt{DO\_ONCE} family
+each expands to \verb|({ static bool __c; ... })|, and the once-flag lives in an
+expression the spine walk never descends into.  The IR builder does reach it---it
+registers the static and its references resolve to an \verb|sl_| name---but the
+name's storage was never emitted, so a whole-kernel link left thousands of
+\verb|sl_| symbols undefined.  The remedy is a belt-and-braces list: the builder
+records \emph{every} static-local declaration it registers in
+\texttt{kcc\_ir\_static\_decls}, and after the spine walk we emit storage for any
+entry not already given a cell.  The shared \texttt{kcc\_x86\_emitted} guard (now
+consulted at the top of \texttt{x86\_emit\_one\_static} as well) means a static
+found by both routes is emitted once; a stmt-expr static, found only by the list,
+still gets its definition.  This gives every stmt-expr static a \emph{storage}
+cell, which is what the whole-kernel link needs.  Its \emph{initialiser} is a
+separate matter: the once-flag families initialise to zero, and a common lands in
+zeroed \texttt{.bss}, so no init code is required and the value is already
+correct.  A stmt-expr static with a \emph{non-zero} initialiser would need that
+initialiser hoisted to module-init code, which the spine-only
+\texttt{kcc\_ir\_emit\_global\_inits} does not do for statics nested in
+expressions---a documented limitation the kernel's zero-valued once-flags never
+exercise.
+
+One hazard remains.  \texttt{kcc\_ir\_static\_name} mangles a static to
+\verb|sl_| plus the hex of its declaration node's address---an arena offset that
+\emph{resets} every compilation, so two unrelated files' statics can mangle to
+the same name.  While those names were undefined this was invisible; once we
+define them, the linker sees two objects each defining \verb|sl_0000...| and
+rejects the second.  The driver therefore seeds a per-file salt
+(\texttt{kcc\_tu\_salt}, a hash of the source path) that
+\texttt{kcc\_ir\_static\_name} exclusive-ors into the address before hex, making
+the name unique across the tree yet stable within one file---so the reference and
+its definition still agree.
+
+@l c
+@d Selfhost: emit_x86 stmt-expr static storage @{
+if (kcc_ir_static_decls) {
+    unsigned long n = IL(kcc_ir_static_decls, VEC_COUNT);
+    for (unsigned long i = 0; i < n; i++)
+        x86_emit_one_static(*(void **)kcc_vec_get(kcc_ir_static_decls, i));
 }
 @}
 

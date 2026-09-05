@@ -5661,6 +5661,20 @@ unsigned long kcc_ir_build_call(void *e) {
         if (kcc_strcmp(name, "__builtin_ffsl") == 0 ||
             kcc_strcmp(name, "__builtin_ffsll") == 0)
             return kcc_ir_ffs(kcc_ir_build_expr((void *)IL(e, AST_F1)), 64);
+        /* __builtin_object_size(ptr, type): the number of bytes from ptr to the
+           end of its object, as a compile-time constant, or---when that cannot
+           be determined, which is always so here since kcc does no object-size
+           analysis (matching gcc at -O0)---the "unknown" answer: (size_t)-1 for
+           the maximizing types 0/1, 0 for the minimizing types 2/3.  The pointer
+           argument is never evaluated for side effects.  The kernel's
+           FORTIFY_SOURCE checks read exactly this fallback. */
+        if (kcc_strcmp(name, "__builtin_object_size") == 0 ||
+            kcc_strcmp(name, "__builtin_dynamic_object_size") == 0) {
+            void *sz0 = (void *)IL(e, AST_F1);
+            void *sz1 = sz0 ? (void *)IL(sz0, AST_F4) : 0;
+            unsigned long ost = sz1 ? kcc_eval_const_int(sz1) : 0;
+            return kcc_ir_emit_const((ost & 2) ? 0 : (unsigned long)-1);
+        }
         /* Overflow-checked arithmetic: store the result through the third
            argument and yield whether it overflowed. */
         if (kcc_strcmp(name, "__builtin_mul_overflow") == 0)

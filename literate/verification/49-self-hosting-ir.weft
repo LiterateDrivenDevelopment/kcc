@@ -622,26 +622,37 @@ void kcc_ir_build(void *tu) {
     /* Out-of-line pass: emit a standalone body for any always_inline function a
        call could not inline, or whose address was taken as a value (asm-bearing
        ones excluded---their `"i"' operands need the caller's constant). Runs last
-       so in-place lowering can't disturb an inline expansion. */
+       so in-place lowering can't disturb an inline expansion.  Emission is
+       TRANSITIVE---building one out-of-line body may itself call another
+       always_inline that could not inline (the kernel reaches folio_test_anon
+       only through such a chain)---so iterate to a fixpoint, tracking the ones
+       already emitted, until a full sweep adds nothing new. */
     if (kcc_inl_need_out) {
-        d = (void *)IL(tu, AST_F0);
-        while (d) {
-            if (IL(d, AST_TAG) == AST_FUNC_DECL && IL(d, AST_F3)) {
-                const char *nm = (const char *)IL(d, AST_F1);
-                /* Only a STATIC (internal-linkage) always_inline is safe to emit
-                   out-of-line: its out-of-line copy is local, so multiple TUs each
-                   carry their own without colliding, and being static it has no
-                   definition anywhere else.  An EXTERNAL always_inline
-                   (`extern __always_inline native_save_fl', gnu-inline) already
-                   has its one out-of-line copy in a designated unit (irqflags.S);
-                   emitting kcc's own global copy would be a `multiple definition'
-                   at the vmlinux link.  (AST_F2 bit 1 = static, per IRF_STATIC.) */
-                if (nm && (IL(d, AST_F2) & 2) &&
-                    kcc_ht_get(kcc_inl_need_out, nm, kcc_strlen(nm)) &&
-                    !kcc_ast_has_asm((void *)IL((void *)IL(d, AST_F3), AST_F0)))
-                    kcc_ir_build_func(d);
+        void *ool_done = kcc_ht_init(32);
+        unsigned long progress = 1;
+        while (progress) {
+            progress = 0;
+            d = (void *)IL(tu, AST_F0);
+            while (d) {
+                if (IL(d, AST_TAG) == AST_FUNC_DECL && IL(d, AST_F3)) {
+                    const char *nm = (const char *)IL(d, AST_F1);
+                    unsigned long nl = nm ? kcc_strlen(nm) : 0;
+                    /* Only a STATIC (internal-linkage) always_inline is safe to
+                       emit out-of-line: its copy is local so multiple TUs each
+                       carry their own without colliding.  An EXTERNAL gnu-inline
+                       already has its one copy in a designated unit; emitting
+                       kcc's own would be a `multiple definition' at the link. */
+                    if (nm && (IL(d, AST_F2) & 2) &&
+                        kcc_ht_get(kcc_inl_need_out, nm, nl) &&
+                        !kcc_ht_get(ool_done, nm, nl) &&
+                        !kcc_ast_has_asm((void *)IL((void *)IL(d, AST_F3), AST_F0))) {
+                        kcc_ht_put(ool_done, nm, nl, (void *)1);
+                        kcc_ir_build_func(d);   /* may mark further callees */
+                        progress = 1;
+                    }
+                }
+                d = (void *)IL(d, AST_F4);
             }
-            d = (void *)IL(d, AST_F4);
         }
     }
 }
@@ -5675,6 +5686,13 @@ unsigned long kcc_ir_build_call(void *e) {
             void *sz1 = sz0 ? (void *)IL(sz0, AST_F4) : 0;
             unsigned long ost = sz1 ? kcc_eval_const_int(sz1) : 0;
             return kcc_ir_emit_const((ost & 2) ? 0 : (unsigned long)-1);
+        }
+        /* __builtin_prefetch(addr, ...) is a cache hint with no observable
+           effect; evaluate the address (for any side effects) and yield nothing. */
+        if (kcc_strcmp(name, "__builtin_prefetch") == 0) {
+            void *pa = (void *)IL(e, AST_F1);
+            if (pa) kcc_ir_build_expr(pa);
+            return kcc_ir_emit_const(0);
         }
         /* On x86 a return address needs no demangling, so these are identity. */
         if (kcc_strcmp(name, "__builtin_extract_return_addr") == 0 ||

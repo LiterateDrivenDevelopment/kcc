@@ -1224,9 +1224,12 @@ dropped-but-needed function would surface only at final link, which the
 per-object sweep never reaches.  A name is referenced if it appears as the
 callee of an \texttt{IR\_CALL} or the target of an \texttt{IR\_GLOBAL\_REF}
 anywhere in \emph{any} function's IR (this captures both direct calls and
-address-of-function), or as an identifier inside any file-scope initializer, or
-as the target of an \texttt{alias} attribute.  A function is additionally kept
-whenever it carries any linkage attribute (\texttt{section}, \texttt{weak},
+address-of-function), or as an identifier inside any file-scope initializer, as
+the target of an \texttt{alias} attribute, or as a token in a file-scope
+\texttt{asm} template---the last is how an \texttt{\_\_initcall} or
+\texttt{DECLARE\_PCI\_FIXUP} names its \texttt{static} hook on x86-64, through a
+\verb|.long fn - .| the IR never sees.  A function is additionally kept whenever
+it carries any linkage attribute (\texttt{section}, \texttt{weak},
 \texttt{alias}), since such a function is placed or exported deliberately.  The
 compiler's own self-host is the correctness gate: it uses many static helpers
 and function-pointer tables, so the three-way byte-identical fixpoint would
@@ -1317,6 +1320,33 @@ static void x86_ref_scan_init(struct Node *n) {
             x86_ref_scan_init(e);
     }
 }
+/* Mark every identifier-like token in a file-scope asm template as referenced.
+   On x86-64 (PREL32 relocations) an __initcall and a DECLARE_PCI_FIXUP place a
+   function's address into a `.initcall'/`.pci_fixup' table through a
+   `.long fn - .' emitted by a raw file-scope `asm(...)', so `fn' is a static
+   function referenced only from inside that template string---invisible to the
+   IR and initializer walks.  Marking every token is a safe over-approximation:
+   the extra words (`section', `long', `previous', ...) name nothing the drop
+   would ever consider, while the real hook/stub/initcall names are kept.  The
+   token is marked by its (pointer, length) into the stable template, so no copy
+   is needed---the refset compares keys by content. */
+static void x86_ref_scan_asm(const char *t, unsigned long n) {
+    if (!t || !kcc_x86_refset) return;
+    unsigned long i = 0;
+    while (i < n) {
+        char c = t[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
+            unsigned long s = i;
+            while (i < n) {
+                char d = t[i];
+                if ((d >= 'A' && d <= 'Z') || (d >= 'a' && d <= 'z') ||
+                    (d >= '0' && d <= '9') || d == '_') i++;
+                else break;
+            }
+            kcc_ht_put(kcc_x86_refset, t + s, i - s, 1);
+        } else i++;
+    }
+}
 static void x86_build_refset(void) {
     kcc_x86_refset = kcc_ht_init(256);
     void *funcs = kcc_ir_funcs;
@@ -1341,9 +1371,15 @@ static void x86_build_refset(void) {
     struct Node *tu = (struct Node *)kcc_x86_tu;
     if (tu) {
         for (struct Node *d = (struct Node *)tu->f0; d; d = (struct Node *)d->f4) {
-            /* Only VAR_DECL/FUNC_DECL carry a name pointer in f1; other decls
-               (e.g. a file-scope asm statement) store unrelated data there, so
-               reading it as a string would fault. */
+            /* A file-scope asm statement's f0/f1 are its template and length, not
+               a name; scan the template for the symbols its `.long fn - .'
+               directives reference (initcall/pci-fixup tables). */
+            if (d->tag == AST_ASM_STMT) {
+                x86_ref_scan_asm((const char *)d->f0, d->f1);
+                continue;
+            }
+            /* Only VAR_DECL/FUNC_DECL carry a name pointer in f1; reading it as a
+               string on any other decl would fault. */
             if (d->tag != AST_VAR_DECL && d->tag != AST_FUNC_DECL) continue;
             if (d->tag == AST_VAR_DECL && d->f2)   /* f2 = initializer */
                 x86_ref_scan_init((struct Node *)d->f2);

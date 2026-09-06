@@ -2183,9 +2183,19 @@ unsigned long kcc_ir_build_member_addr(void *m) {
             }
             goto find_index;
         }
-        /* global struct */
+        /* global or STATIC-LOCAL struct: a static local's storage is emitted
+           under its mangled `sl_' name, so the address reference must use that
+           name too---otherwise `sp.x' on a `static struct P sp' emits a
+           relocation against the raw `sp' that nothing defines (the kernel's
+           `static const struct printf_spec str_spec', `static struct tk_read_base
+           tkr_dummy', ...). */
+        char *symname = name;
+        if (kcc_ir_statics) {
+            void *mangled = kcc_ht_get(kcc_ir_statics, name, kcc_strlen(name));
+            if (mangled) symname = (char *)mangled;
+        }
         void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);
-        IL(g, IR_SRC1) = (unsigned long)name;
+        IL(g, IR_SRC1) = (unsigned long)symname;
         IL(g, IR_TYPE) = (unsigned long)kcc_type_int_s;
         base_addr = kcc_ir_next_vreg();
         IL(g, IR_DEST) = base_addr;

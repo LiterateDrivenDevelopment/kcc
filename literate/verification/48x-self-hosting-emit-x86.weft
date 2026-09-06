@@ -1215,33 +1215,22 @@ $0$ because \texttt{nr} is not itself constant, so the ternary folds to the
 \emph{variable} arm and no call to \texttt{constant\_test\_bit} is emitted.
 \texttt{constant\_test\_bit} thereby becomes unreferenced---and, being
 \texttt{static}, GCC would never emit it either.  We match that: before the
-function walk we compute the set of \emph{referenced} names and skip an
-unreferenced \texttt{static} function, so its offending \verb|testb| is never
-rendered.
+function walk we compute the set of \emph{referenced} names and skip any
+\texttt{static} function whose name is absent from it, so its offending
+\verb|testb| is never rendered.
 
-The skip, however, applies \emph{only to a function that bears inline asm}.  The
-reason the drop was ever needed is exactly the unsatisfiable-operand case above;
-a plain \texttt{static} carries no such hazard.  And the reference set cannot see
-every kind of reference: on x86-64 an \texttt{\_\_initcall} or a
-\texttt{DECLARE\_PCI\_FIXUP} places a function's address into a
-\texttt{.initcall}/\texttt{.pci\_fixup} table through a \verb|.long fn - .|
-file-scope \emph{asm}, or through a cast inside a section initializer---neither of
-which the initializer scanner walks.  Dropping such a function would leave the
-table pointing at an undefined symbol (\texttt{deferred\_probe\_initcall},
-\texttt{nvidia\_force\_enable\_hpet}, \dots, surfacing only at the final vmlinux
-link).  So a non-asm static is kept unconditionally: emitting an unused one is
-merely dead bytes, whereas dropping a live one breaks the link.
-
-A name is referenced if it appears as the callee of an \texttt{IR\_CALL} or the
-target of an \texttt{IR\_GLOBAL\_REF} anywhere in \emph{any} function's IR (this
-captures both direct calls and address-of-function), or as an identifier inside
-any file-scope initializer, or as the target of an \texttt{alias} attribute.  A
-function is additionally kept whenever it carries any linkage attribute
-(\texttt{section}, \texttt{weak}, \texttt{alias}), since such a function is placed
-or exported deliberately.  The compiler's own self-host is the correctness gate:
-it uses many static helpers and function-pointer tables, so the three-way
-byte-identical fixpoint would break instantly if the analysis dropped a live
-function.
+The reference set is deliberately over-approximated for safety, because a
+dropped-but-needed function would surface only at final link, which the
+per-object sweep never reaches.  A name is referenced if it appears as the
+callee of an \texttt{IR\_CALL} or the target of an \texttt{IR\_GLOBAL\_REF}
+anywhere in \emph{any} function's IR (this captures both direct calls and
+address-of-function), or as an identifier inside any file-scope initializer, or
+as the target of an \texttt{alias} attribute.  A function is additionally kept
+whenever it carries any linkage attribute (\texttt{section}, \texttt{weak},
+\texttt{alias}), since such a function is placed or exported deliberately.  The
+compiler's own self-host is the correctness gate: it uses many static helpers
+and function-pointer tables, so the three-way byte-identical fixpoint would
+break instantly if the analysis dropped a live function.
 
 @l c
 @d Selfhost: emit_x86 frame @{
@@ -1364,20 +1353,6 @@ static void x86_build_refset(void) {
     }
 }
 
-/* True if any instruction in the function is inline asm.  Dropping an
-   unreferenced static is only *needed* for an asm-bearing one, whose operands
-   may be unsatisfiable standalone (the constant_test_bit `testb' case). */
-static int x86_func_has_asm(void *f) {
-    void *blocks = (void *)IL(f, IRF_BLOCKS);
-    if (!blocks) return 0;
-    unsigned long nbb = IL(blocks, VEC_COUNT);
-    for (unsigned long b = 0; b < nbb; b++) {
-        void *bb = *(void **)kcc_vec_get(blocks, b);
-        for (void *ins = (void *)IL(bb, BB_FIRST); ins; ins = (void *)IL(ins, IR_NEXT))
-            if (IL(ins, IR_OP) == IR_ASM) return 1;
-    }
-    return 0;
-}
 static void x86_render_text(void) {
     kcc_as_str(s_text);
     void *funcs = kcc_ir_funcs;
@@ -1388,17 +1363,9 @@ static void x86_render_text(void) {
         void *f = *(void **)kcc_vec_get(funcs, fi);
         const char *name = (const char *)IL(f, IRF_NAME);
         struct AttrRec *ar = x86_attr(name);
-        /* Drop a static function unreferenced across all IR and initializers---
-           but only if it bears inline asm.  The refset cannot see every kind of
-           reference (a function's address reaches a `.initcall'/`.pci_fixup'
-           table through a `.long fn - .' file-scope asm, or through a cast in a
-           section initializer, neither of which the scanner walks), so a
-           non-asm static is kept unconditionally: emitting an unused one is
-           harmless, whereas dropping a section-referenced one leaves the table
-           pointing at nothing.  An asm-bearing static keeps the old behaviour,
-           since that is the only case the drop was ever needed for. */
+        /* Drop a static function unreferenced across all IR and initializers,
+           unless it carries a placement/export attribute. */
         if (IL(f, IRF_STATIC) && !x86_is_referenced(name)
-            && x86_func_has_asm(f)
             && kcc_strcmp(name, kcc_str_modinit) != 0
             && !(ar && (ar->section || ar->weak || ar->alias)))
             continue;

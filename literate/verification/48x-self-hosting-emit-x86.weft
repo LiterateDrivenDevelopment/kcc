@@ -226,11 +226,28 @@ static void x86_disp(unsigned long d) {
     kcc_as_str(s_minus); kcc_as_dec(d); kcc_as_str(s_rbp);
 }
 static void x86_slot(unsigned long v) { x86_disp((v + 1) * 8); }
+/* All-spill leaves every value in a stack slot, so a dependent chain emits
+   `movq %r10, SLOT' immediately followed by `movq SLOT, %r10' --- a store then a
+   reload of a value that is already in the register.  x86_r10_slot names the vreg
+   whose current value provably sits in %r10 (or -1 for "unknown"), so a reload of
+   that same slot into %r10 can be skipped.  Only %r10 is tracked; %r11 is the
+   address scratch and turns over too fast to cache.  The invariant is that at
+   every x86_load entry %r10 holds x86_r10_slot's value: it is set whenever %r10 is
+   loaded from or stored to a slot, cleared when a slot it names is overwritten
+   from another register, and reset at every block entry and across every %r10
+   clobber (calls, inline asm, va_start). */
+static long x86_r10_slot = -1;
 static void x86_load(unsigned long v, const char *reg) {
+    if (reg == s_r10) {
+        if (x86_r10_slot == (long)v) return;         /* already in %r10 */
+        x86_r10_slot = (long)v;
+    }
     kcc_as_str(s_movq); x86_slot(v); kcc_as_str(s_comma); kcc_as_str(reg); kcc_as_ch('\n');
 }
 static void x86_store(unsigned long v, const char *reg) {
     kcc_as_str(s_movq); kcc_as_str(reg); kcc_as_str(s_comma); x86_slot(v); kcc_as_ch('\n');
+    if (reg == s_r10) x86_r10_slot = (long)v;        /* %r10 and slot v now equal */
+    else if (x86_r10_slot == (long)v) x86_r10_slot = -1;  /* slot v changed; %r10 stale */
 }
 @}
 
@@ -239,6 +256,23 @@ static void x86_store(unsigned long v, const char *reg) {
 The ALU, shift, division, conversion, memory, comparison, and call shapes each
 lower one IR instruction to its x86-64 form, leaving the result in
 \texttt{DEST}'s slot.
+
+Because the frame is all-spill, a dependent chain such as \texttt{a = b + c;
+d = a + e;} lowers to a store of \texttt{a} to its slot immediately followed by a
+reload of that same slot into \texttt{\%r10}---the value is already in the
+register.  \texttt{x86\_load}/\texttt{x86\_store} therefore carry a one-entry
+cache, \texttt{x86\_r10\_slot}, naming the vreg whose value provably occupies
+\texttt{\%r10}; a reload of that slot into \texttt{\%r10} is elided.  The invariant
+holds because every shape ends either by storing \texttt{\%r10} to \texttt{DEST}
+(which re-establishes the cache) or without touching \texttt{\%r10} at all (the
+divide and the floating shapes), so the intermediate scratch writes inside a shape
+are always resealed before the next shape's first load.  It is reset at every
+block entry---a block is reachable from several predecessors, so \texttt{\%r10}'s
+contents are unknown there---and across every genuine \texttt{\%r10} clobber: a
+call, an inline-asm body, or the \texttt{va\_start} sequence.  Only \texttt{\%r10}
+is tracked; \texttt{\%r11}, the address scratch, turns over on nearly every memory
+shape and is not worth caching.  This removes about a fifth of all stores' matching
+reloads---the single densest redundancy in \texttt{-O0}-class all-spill code.
 
 @l c
 @d Selfhost: emit_x86 shapes @{
@@ -1082,9 +1116,11 @@ void kcc_x86_sel(void *i) {
         return;
     }
     case IR_CALL: {
+        x86_r10_slot = -1;                           /* argument marshalling and the call clobber %r10 */
         unsigned long adj = x86_call_args((unsigned long *)IL(i, IR_SRC2));
         x86_set_al();
         kcc_as_str(s_call); x86_sym((const char *)IL(i, IR_SRC1)); kcc_as_ch('\n');
+        x86_r10_slot = -1;
         if (adj) { kcc_as_str(s_add_rsp); kcc_as_dec(adj); kcc_as_str(s_sp_nl); }
         {
             struct Type *ty = (struct Type *)IL(i, IR_TYPE);
@@ -1094,10 +1130,12 @@ void kcc_x86_sel(void *i) {
         return;
     }
     case IR_CALL_IND: {
+        x86_r10_slot = -1;                           /* argument marshalling and the call clobber %r10 */
         unsigned long adj = x86_call_args((unsigned long *)IL(i, IR_SRC2));
         x86_load(IL(i, IR_SRC1), s_r11);
         x86_set_al();
         kcc_as_str(s_call_r11);
+        x86_r10_slot = -1;
         if (adj) { kcc_as_str(s_add_rsp); kcc_as_dec(adj); kcc_as_str(s_sp_nl); }
         {
             struct Type *ty = (struct Type *)IL(i, IR_TYPE);
@@ -1122,10 +1160,12 @@ void kcc_x86_sel(void *i) {
         kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma); kcc_as_dec(16); kcc_as_str(s_pr11); kcc_as_ch('\n');
         kcc_as_str(s_leaq); x86_disp(kcc_x86_rsa_top); kcc_as_str(s_c_r10);           /* reg_save = rbp-rsa_top */
         kcc_as_str(s_movq); kcc_as_str(s_r10); kcc_as_str(s_comma); kcc_as_dec(24); kcc_as_str(s_pr11); kcc_as_ch('\n');
+        x86_r10_slot = -1;                           /* built the struct through raw %r10 writes */
         return;
     }
     case IR_ASM:
         x86_emit_asm(i);
+        x86_r10_slot = -1;                           /* the asm body may clobber %r10 */
         return;
     case IR_NOP:
         return;
@@ -1367,6 +1407,7 @@ static void x86_render_text(void) {
             for (unsigned long b = 0; b < nbb; b++) {
                 void *bb = *(void **)kcc_vec_get(blocks, b);
                 x86_bblabel(IL(bb, BB_ID)); kcc_as_str(s_label_nl);
+                x86_r10_slot = -1;                   /* a block is entered from many preds: %r10 unknown */
                 void *ins = (void *)IL(bb, BB_FIRST);
                 while (ins) { kcc_x86_sel(ins); ins = (void *)IL(ins, IR_NEXT); }
             }

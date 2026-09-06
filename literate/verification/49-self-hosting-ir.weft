@@ -246,6 +246,7 @@ unsigned long kcc_ir_build_member_addr(void *e);
 unsigned long kcc_ir_build_struct_addr(void *e);
 unsigned long kcc_ir_build_va_arg(void *e);
 unsigned long kcc_ir_build_va_start(void *e);
+unsigned long kcc_ir_build_va_copy(void *e);
 unsigned long kcc_ir_build_compound_lit(void *e);
 void kcc_ir_build_if(void *s);
 void kcc_ir_build_while(void *s);
@@ -4887,6 +4888,18 @@ type governs which bank to read, \texttt{va\_arg} resolves the unresolved
 type-name node to a \texttt{Type} first, so a \texttt{double} takes the
 vector-bank path rather than being misread from the integer save area.
 
+\texttt{va\_copy(dst, src)} must hand the destination an \emph{independent}
+snapshot so that draining one list leaves the other untouched.  The two targets
+diverge here because they mutate different memory.  On ARM64 the \texttt{va\_list}
+object \emph{is} the cursor---\texttt{va\_arg} writes the bumped pointer back into
+the variable, never into what it points at---so copying the eight-byte cursor
+value already yields two lists that advance separately.  On x86-64 the object is a
+pointer to the four-field save-area struct that \texttt{va\_arg} rewrites in place;
+duplicating just the pointer would alias the counters.  So the x86-64 path
+allocates a fresh four-slot struct, copies the four fields across, and stores the
+new struct's address into the destination---the kernel's \texttt{va\_copy} in its
+\texttt{vsnprintf} bounds pass then walks its private copy.
+
 @l c
 @d Selfhost: ir assigncall @{
 unsigned long kcc_ir_build_assign(void *e) {
@@ -5641,6 +5654,8 @@ unsigned long kcc_ir_build_call(void *e) {
             kcc_strcmp(name, "__builtin_va_start") == 0) return kcc_ir_build_va_start(e);
         if (kcc_strcmp(name, "va_end") == 0 ||
             kcc_strcmp(name, "__builtin_va_end") == 0) return 0;
+        if (kcc_strcmp(name, "va_copy") == 0 ||
+            kcc_strcmp(name, "__builtin_va_copy") == 0) return kcc_ir_build_va_copy(e);
         /* Common GNU builtins the kernel leans on pervasively:
            __builtin_expect(x,c) is a branch hint -> just x; constant_p is a
            compile-time predicate; the mem* builtins are the libc entry points. */
@@ -5991,6 +6006,31 @@ unsigned long kcc_ir_build_va_start(void *call) {
     IL(st, IR_SRC2) = ap;
     kcc_ir_emit(st);
     return base;
+}
+
+unsigned long kcc_ir_build_va_copy(void *call) {
+    void *dst = (void *)IL(call, AST_F1);
+    void *src = dst ? (void *)IL(dst, AST_F4) : 0;
+    unsigned long ap_dst = kcc_ir_ident_alloca(dst);
+    unsigned long ap_src = kcc_ir_ident_alloca(src);
+    unsigned long S_src = ir_vload(ap_src, kcc_type_long_s);
+    if (kcc_target) {                    /* x86-64: deep-copy the four-field struct */
+        void *a = kcc_ir_alloc_instr(IR_ALLOCA);
+        IL(a, IR_TYPE) = (unsigned long)kcc_type_long_s;
+        IL(a, IR_SRC1) = 4;
+        unsigned long S_dst = kcc_ir_next_vreg();
+        IL(a, IR_DEST) = S_dst;
+        kcc_ir_emit(a);
+        for (unsigned long k = 0; k < 4; k++) {
+            unsigned long off = ir_vc(k * 8);
+            unsigned long v = ir_vload(ir_v2(IR_ADD, S_src, off), kcc_type_long_s);
+            ir_vstore(v, ir_v2(IR_ADD, S_dst, off), kcc_type_long_s);
+        }
+        ir_vstore(S_dst, ap_dst, kcc_type_long_s);
+        return 0;
+    }
+    ir_vstore(S_src, ap_dst, kcc_type_long_s);   /* ARM64: the cursor is the whole state */
+    return 0;
 }
 
 unsigned long kcc_ir_build_va_arg(void *va) {

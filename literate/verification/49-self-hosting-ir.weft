@@ -3492,9 +3492,15 @@ unsigned long kcc_ir_build_inc_dec(void *e) {
 
 Struct copies walk the object in descending power-of-two chunks for exactly
 \texttt{TY\_SIZE} bytes; \texttt{build\_struct\_addr} yields the address of a
-struct-valued expression for by-value passing and return.  The recursive
-initializer descends nested aggregates, honouring designator chains and brace
-elision, over a zero-filled region.
+struct-valued expression for by-value passing and return.  When that
+expression is a bare identifier naming a \emph{static-local} aggregate, its
+address must resolve through the same mangled \texttt{sl\_} name that its
+storage is emitted under---the member-access path already does this, and the
+by-value argument path must match it, or passing such a struct whole (the
+kernel's \texttt{str\_spec} handed to \texttt{string\_nocheck}) relocates
+against a raw name that nothing defines.  The recursive initializer descends
+nested aggregates, honouring designator chains and brace elision, over a
+zero-filled region.
 
 @l c
 @d Selfhost: ir aggregates @{
@@ -3555,8 +3561,18 @@ unsigned long kcc_ir_build_struct_addr(void *e) {
         char *name = (char *)IL(e, AST_F0);
         unsigned long v = (unsigned long)kcc_ht_get(kcc_ir_locals, name, kcc_strlen(name));
         if (v) return (v & ~0x8000000000000000UL) - 1;
+        /* a static-local aggregate passed whole (by value) reaches its storage
+           through the same mangled `sl_' name as a member access does, so the
+           argument's address must map through kcc_ir_statics too---otherwise
+           `string_nocheck(..., str_spec)' on a `static const struct printf_spec
+           str_spec' relocates against the raw `str_spec' that nothing defines. */
+        char *symname = name;
+        if (kcc_ir_statics) {
+            void *mangled = kcc_ht_get(kcc_ir_statics, name, kcc_strlen(name));
+            if (mangled) symname = (char *)mangled;
+        }
         void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);
-        IL(g, IR_SRC1) = (unsigned long)name;
+        IL(g, IR_SRC1) = (unsigned long)symname;
         IL(g, IR_TYPE) = (unsigned long)kcc_type_int_s;
         unsigned long rv = kcc_ir_next_vreg();
         IL(g, IR_DEST) = rv;

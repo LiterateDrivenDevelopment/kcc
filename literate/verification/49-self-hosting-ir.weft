@@ -5184,7 +5184,18 @@ static unsigned long kcc_ir_ffs(unsigned long val, unsigned long nbits) {
    always_inline definition closes (kcc_register_always_inline).  This first
    phase handles a `{ return EXPR; }` body; the clone declines (returns 0) for
    any construct it does not model, so an unhandled callee simply falls back to a
-   real call and can never be miscompiled. */
+   real call and can never be miscompiled.
+
+   Because substitution is textual, an argument that carries a side effect (a
+   function call, `p++`, an assignment) can NOT be pasted in directly---it might
+   be evaluated twice or, if a folded branch drops the parameter, not at all.
+   try_inline binds each such argument to a one-shot temporary declared at the top
+   of the expansion and substitutes the temporary instead; only plain identifiers
+   and constants stay textual, so a constant a `__builtin_constant_p` guard needs
+   still folds.  This is precisely what lets the size-dispatched bit ops
+   (arch_set_bit / arch_clear_bit) inline over a `per_cpu` address expression
+   rather than degrade to an out-of-line call whose asm body can never be emitted
+   standalone. */
 void kcc_register_always_inline(const char *name, void *fndecl) {
     if (!kcc_always_inline_fns) kcc_always_inline_fns = kcc_ht_init(64);
     kcc_ht_put(kcc_always_inline_fns, name, kcc_strlen(name), fndecl);
@@ -5215,8 +5226,11 @@ static const char *kcc_inl_lbl(const char *name) {
     return (const char *)kcc_strtab_intern(buf, i);
 }
 
-/* An argument may be substituted into the body more than once (kept as an
-   expression so a constant folds through), so it must be free of side effects. */
+/* Classifies whether an argument is safe to substitute TEXTUALLY: it may be
+   copied into the body more than once (or dropped by a folded branch), so a
+   textual argument must be free of side effects.  A `safe' one is kept as an
+   expression, letting a constant fold through `__builtin_constant_p'; an unsafe
+   one is instead bound once to a temporary by the caller (kcc_ir_try_inline). */
 static int kcc_inl_arg_safe(void *a) {
     if (!a) return 1;
     unsigned long tag = IL(a, AST_TAG);
@@ -5542,13 +5556,56 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     for (void *p = params; p; p = (void *)IL(p, AST_F4)) np++;
     for (void *a = args; a; a = (void *)IL(a, AST_F4)) na++;
     if (np != na) return 0;                          /* no variadic inlining */
+
+    /* An argument with a side effect (a call, an increment, an assignment) cannot
+       be substituted textually: kcc_inl_clone copies it to every use of the
+       parameter, so a body mentioning the parameter twice would evaluate it twice,
+       and one dropping it (a folded-away branch) would lose its effect.  Bind each
+       such argument to a fresh temporary, evaluated exactly once at the top of the
+       expansion, and substitute a reference to that temporary.  Plain identifiers
+       and constants stay textual so `__builtin_constant_p(nr)' still sees the
+       literal and selects the constant-immediate asm branch --- the whole point of
+       the bit-op helpers.  This is what lets arch_set_bit / arch_clear_bit inline
+       when the address is a `per_cpu' pointer expression (a call) rather than a
+       bare variable, instead of falling back to an out-of-line call that the asm
+       body can never satisfy standalone. */
+    void *sargs = args;
+    void *tmpdecls = 0, *tmplast = 0;
+    unsigned long any_unsafe = 0;
     for (void *a = args; a; a = (void *)IL(a, AST_F4))
-        if (!kcc_inl_arg_safe(a)) return 0;          /* args may re-evaluate */
+        if (!kcc_inl_arg_safe(a)) { any_unsafe = 1; break; }
+    if (any_unsafe) {
+        void *sfirst = 0, *slast = 0, *p = params, *a = args;
+        while (p && a) {
+            void *use;
+            if (!kcc_inl_arg_safe(a)) {
+                void *ac = kcc_inl_clone(a, 0, 0);   /* the argument, in caller scope */
+                if (!ac) return 0;
+                const char *tn = kcc_inl_lbl("__inl_a");
+                void *vd = kcc_ast_alloc(AST_VAR_DECL);
+                IL(vd, AST_F0) = IL(p, AST_F0);      /* the parameter's type node */
+                IL(vd, AST_F1) = (unsigned long)tn;
+                IL(vd, AST_F2) = (unsigned long)ac;  /* PTYPE __inl_aN = <arg>; */
+                if (!tmpdecls) { tmpdecls = vd; tmplast = vd; }
+                else { IL(tmplast, AST_F4) = (unsigned long)vd; tmplast = vd; }
+                use = kcc_ast_alloc(AST_IDENT_EXPR);
+                IL(use, AST_F0) = (unsigned long)tn;
+            } else {
+                use = kcc_inl_dup(a);                /* textual, sibling link cleared */
+            }
+            if (!sfirst) { sfirst = use; slast = use; }
+            else { IL(slast, AST_F4) = (unsigned long)use; slast = use; }
+            p = (void *)IL(p, AST_F4); a = (void *)IL(a, AST_F4);
+        }
+        sargs = sfirst;
+    }
 
     kcc_inl_inst++;
-    /* Fast path: a lone `return EXPR;' body inlines to EXPR with no wrapper. */
+    /* Fast path: a lone `return EXPR;' body inlines to EXPR with no wrapper---only
+       when no argument needed a temporary, since a bare expression has nowhere to
+       declare one. */
     void *s0 = (void *)IL(body, AST_F0);
-    if (s0 && !IL(s0, AST_F4) && IL(s0, AST_TAG) == AST_RETURN_STMT && IL(s0, AST_F0)) {
+    if (!any_unsafe && s0 && !IL(s0, AST_F4) && IL(s0, AST_TAG) == AST_RETURN_STMT && IL(s0, AST_F0)) {
         void *clone = kcc_inl_clone((void *)IL(s0, AST_F0), params, args);
         if (!clone) return 0;
         kcc_inl_depth++;
@@ -5566,7 +5623,7 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
     const char *endn = kcc_inl_lbl("__inl_end");
     kcc_inl_ret_name = rettype ? retn : 0;
     kcc_inl_end_name = endn;
-    void *bclone = kcc_inl_clone(body, params, args);
+    void *bclone = kcc_inl_clone(body, params, sargs);
     kcc_inl_ret_name = 0; kcc_inl_end_name = 0;
     if (!bclone) return 0;
 
@@ -5596,6 +5653,10 @@ static int kcc_ir_try_inline(void *call, const char *name, unsigned long *out) {
         IL(rdecl, AST_F1) = (unsigned long)retn;
         IL(rdecl, AST_F4) = (unsigned long)first;
         first = rdecl;
+    }
+    if (tmpdecls) {                                  /* declare the arg temporaries first */
+        IL(tmplast, AST_F4) = (unsigned long)first;
+        first = tmpdecls;
     }
     IL(bclone, AST_F0) = (unsigned long)first;
     void *se = kcc_ast_alloc(AST_STMT_EXPR);

@@ -42,6 +42,8 @@ void kcc_io_flush(void);
 void kcc_sys_exit(long code);
 int kcc_global_const_rodata(void *decl);
 int kcc_global_const_ptrarr(void *decl);
+int kcc_global_sym_data(void *decl);
+const char *kcc_ir_const_symaddr(void *n, long *off);
 extern void *kcc_ir_static_decls;      /* every static-local decl (ir.c) */
 unsigned long kcc_rodata_leaf_bits(void *node, unsigned long kind);
 const char *kcc_ir_static_name(void *decl);
@@ -128,6 +130,7 @@ static unsigned long kcc_x86_rsa_top = 0;   /* rbp-relative top of the variadic 
 S(s_text, ".text\n"); S(s_globl, ".globl "); S(s_us, "_");
 S(s_weak, ".weak "); S(s_section, ".section "); S(s_set, "\t.set "); S(s_prev, "\t.previous\n");
 S(s_bss, ".bss\n"); S(s_ax, ",\"ax\",@@progbits\n"); S(s_aw, ",\"aw\"\n");
+S(s_data, ".data\n"); S(s_plus, "+");
 S(s_rodata, ".section .rodata\n"); S(s_comm, "\t.comm "); S(s_comm_a8, ",8\n");
 S(s_local, "\t.local ");
 S(s_modinit_d, ".section __DATA,__mod_init_func,mod_init_funcs\n\t.p2align 3\n\t.quad ");
@@ -204,6 +207,7 @@ struct Node { unsigned long tag, line, col, f0, f1, f2, f3, f4; };
 /* forward decls */
 static void x86_emit_rodata_global(void *decl, const char *name);
 static void x86_emit_rodata_ptrarr(void *decl, const char *name);
+static void x86_emit_sym_data(void *decl, const char *name);
 static void x86_emit_zero(unsigned long n);
 static void x86_emit_value(unsigned long bits, unsigned long size);
 static void x86_prereg_stmt(void *stmt);
@@ -1556,6 +1560,7 @@ void kcc_x86_emit_data(void) {
             continue;
         }
         if (kcc_global_const_ptrarr(d)) { x86_emit_rodata_ptrarr(d, name); continue; }
+        if (kcc_global_sym_data(d)) { x86_emit_sym_data(d, name); continue; }
         void *ty = kcc_sema_resolve_type((void *)d->f0);
         if (!ty) continue;
         /* A declarator whose type is a function type declares a function, not an
@@ -1585,6 +1590,11 @@ static void x86_emit_one_static(void *decl) {
     }
     if (kcc_global_const_ptrarr(d)) {
         x86_emit_rodata_ptrarr(d, name);
+        if (kcc_x86_emitted && name) kcc_ht_put(kcc_x86_emitted, name, kl, 1);
+        return;
+    }
+    if (kcc_global_sym_data(d)) {
+        x86_emit_sym_data(d, name);
         if (kcc_x86_emitted && name) kcc_ht_put(kcc_x86_emitted, name, kl, 1);
         return;
     }
@@ -1711,6 +1721,71 @@ static void x86_emit_struct_bytes(void *sty, void *init, unsigned long total) {
     if (cursor < total) x86_emit_zero(total - cursor);
 }
 
+/* Emit one initializer leaf as data: a symbol address becomes a `.quad sym+off'
+   relocation, a string literal a `.quad .Lx86str<id>' (registered for the render
+   pass), anything else its integer/float bits at the field's width. */
+static void x86_emit_data_leaf(struct Node *e, unsigned long fkind, unsigned long fsize) {
+    long off = 0;
+    const char *s = e ? kcc_ir_const_symaddr(e, &off) : 0;
+    if (s) {
+        kcc_as_str(s_d_quad); x86_sym(s);
+        if (off > 0) { kcc_as_str(s_plus); kcc_as_dec((unsigned long)off); }
+        else if (off < 0) { kcc_as_str(s_minus); kcc_as_dec((unsigned long)(-off)); }
+        kcc_as_ch('\n');
+    } else if (e && e->tag == AST_STR_LIT) {
+        unsigned long id = IL(kcc_x86_strs, VEC_COUNT);
+        unsigned long entry[2]; entry[0] = e->f0; entry[1] = e->f1;
+        kcc_vec_push(kcc_x86_strs, entry);
+        kcc_as_str(s_d_quad); kcc_as_str(s_strlbl); kcc_as_dec(id); kcc_as_ch('\n');
+    } else {
+        x86_emit_value(e ? kcc_rodata_leaf_bits((void *)e, fkind) : 0, fsize);
+    }
+}
+/* Struct data with symbol-aware leaves (mirrors x86_emit_struct_bytes, but a
+   pointer field initialised to `&sym'/`fn' emits a relocation). */
+static void x86_emit_struct_syms(void *sty, void *init, unsigned long total) {
+    struct Node *decl = (struct Node *)((struct Type *)sty)->f0;
+    struct Node *field = (struct Node *)decl->f1;
+    struct Node *elem = init ? (struct Node *)((struct Node *)init)->f0 : 0;
+    unsigned long cursor = 0;
+    while (field) {
+        struct Type *ft = (struct Type *)kcc_sema_resolve_type((void *)field->f0);
+        if (!ft) break;
+        unsigned long fsize = ft->size, fkind = ft->kind, foff = field->f3;
+        if (foff > cursor) { x86_emit_zero(foff - cursor); cursor = foff; }
+        x86_emit_data_leaf(elem, fkind, fsize);
+        if (elem) elem = (struct Node *)elem->f4;
+        cursor += fsize;
+        field = (struct Node *)field->f4;
+    }
+    if (cursor < total) x86_emit_zero(total - cursor);
+}
+/* A global whose initializer names a symbol address (a scalar pointer, or a
+   struct mixing literals and function/object pointers): emit it as static DATA
+   with relocations, in its attributed section (or `.data'), the way gcc does ---
+   instead of a run-time store from kcc.module_init that a kernel never runs.
+   This is what puts the exitcall / __setup / PCI-fixup tables' function pointers
+   in place at link time. */
+static void x86_emit_sym_data(void *decl, const char *name) {
+    struct Node *d = (struct Node *)decl;
+    if (!name) return;
+    struct Type *ty = (struct Type *)kcc_sema_resolve_type((void *)d->f0);
+    if (!ty) return;
+    struct AttrRec *ar = x86_attr(name);
+    const char *sec = ar ? ar->section : 0;
+    unsigned long is_static = (d->f3 == 3);
+    if (sec) { kcc_as_str(s_section); kcc_as_str(sec); kcc_as_str(s_aw); }
+    else kcc_as_str(s_data);
+    kcc_as_str(s_p2align3);
+    if (!is_static) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
+    else if (kcc_x86_os) { kcc_as_str(s_local); kcc_as_str(name); kcc_as_ch('\n'); }
+    x86_sym(name); kcc_as_str(s_colon_nl);
+    if (ty->kind == TY_STRUCT)
+        x86_emit_struct_syms(ty, (void *)d->f2, kcc_type_layout(ty));
+    else
+        x86_emit_data_leaf((struct Node *)d->f2, ty->kind, 8);
+    if (sec) kcc_as_str(s_text);
+}
 static void x86_emit_rodata_global(void *decl, const char *name) {
     struct Node *d = (struct Node *)decl;
     if (!name) return;

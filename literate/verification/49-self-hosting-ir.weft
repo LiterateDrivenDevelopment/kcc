@@ -338,6 +338,8 @@ unsigned long kcc_rodata_struct_ok(void *sty, void *init);
 unsigned long kcc_rodata_aos_ok(void *sty, void *outer);
 unsigned long kcc_global_const_rodata(void *decl);
 unsigned long kcc_global_const_ptrarr(void *decl);
+unsigned long kcc_global_sym_data(void *decl);
+const char *kcc_ir_const_symaddr(void *n, long *off);
 void kcc_ir_dump(void);
 void kcc_ir_dump_instr(void *instr);
 void kcc_ir_dump_type_short(void *ty);
@@ -798,6 +800,75 @@ unsigned long kcc_global_const_ptrarr(void *decl) {
     return 1;
 }
 
+/* If `n' is a compile-time symbol-address constant --- a function or file-scope
+   object named directly (its name is its address), or `&lvalue', through casts,
+   parens and a trailing `+/- integer' --- return the symbol name and add any
+   integer displacement into *off; else 0.  This is exactly the `&sym'/`fn'
+   initializer gcc lowers to a `.quad sym+off' data relocation, where kcc instead
+   stores at run time from `kcc.module_init' (never called in a kernel, so the
+   initcall/exitcall/pci-fixup/__setup tables end up zero at boot). */
+const char *kcc_ir_const_symaddr(void *n, long *off) {
+    if (!n) return 0;
+    unsigned long tag = IL(n, AST_TAG);
+    if (tag == AST_PAREN_EXPR) return kcc_ir_const_symaddr((void *)IL(n, AST_F0), off);
+    if (tag == AST_CAST_EXPR)  return kcc_ir_const_symaddr((void *)IL(n, AST_F1), off);
+    if (tag == AST_UNARY_EXPR && IL(n, AST_F0) == TOK_AMP)
+        return kcc_ir_const_symaddr((void *)IL(n, AST_F1), off);      /* &X */
+    if (tag == AST_BINARY_EXPR) {
+        unsigned long op = IL(n, AST_F0);
+        if (op == TOK_PLUS || op == TOK_MINUS) {
+            void *l = (void *)IL(n, AST_F1), *r = (void *)IL(n, AST_F2);
+            if (kcc_expr_is_ice(r)) {
+                const char *s = kcc_ir_const_symaddr(l, off);
+                if (s) { long c = (long)kcc_eval_const_int(r);
+                         *off += (op == TOK_PLUS) ? c : -c; return s; }
+            }
+            if (op == TOK_PLUS && kcc_expr_is_ice(l)) {
+                const char *s = kcc_ir_const_symaddr(r, off);
+                if (s) { *off += (long)kcc_eval_const_int(l); return s; }
+            }
+        }
+        return 0;
+    }
+    if (tag == AST_IDENT_EXPR) {
+        char *name = (char *)IL(n, AST_F0);
+        if (!name) return 0;
+        void *sym = kcc_symtab_lookup(name, kcc_strlen(name));
+        if (!sym || IL(sym, SYM_KIND) == SYM_ENUM_CONST) return 0;   /* enum = a value */
+        return name;                    /* a function/array/object name IS its address */
+    }
+    return 0;
+}
+
+/* True when a global's initializer must be emitted as static DATA carrying symbol
+   relocations rather than a run-time store: a scalar pointer set to a symbol
+   address, or a (non-array) struct whose leaves are all integer/float/string
+   literals or symbol addresses, with at least one symbol (a pure-literal struct
+   stays on the existing const-rodata path). */
+unsigned long kcc_global_sym_data(void *decl) {
+    void *init = (void *)IL(decl, AST_F2);
+    if (!init) return 0;
+    void *ty = kcc_sema_resolve_type((void *)IL(decl, AST_F0));
+    if (!ty) return 0;
+    unsigned long k = IL(ty, TY_KIND);
+    long off;
+    if (k == TY_PTR) return kcc_ir_const_symaddr(init, &off) != 0;
+    if (k == TY_STRUCT) {
+        if (IL(init, AST_TAG) != AST_INIT_LIST) return 0;
+        unsigned long anysym = 0;
+        for (void *e = (void *)IL(init, AST_F0); e; e = (void *)IL(e, AST_F4)) {
+            unsigned long et = IL(e, AST_TAG);
+            if (et == AST_DESIGNATOR || et == AST_INIT_LIST) return 0;  /* keep it flat */
+            if (kcc_ir_const_symaddr(e, &off)) { anysym = 1; continue; }
+            if (et == AST_STR_LIT) continue;
+            if (kcc_rodata_is_lit(e, 0) || kcc_rodata_is_lit(e, 1)) continue;
+            return 0;
+        }
+        return anysym;
+    }
+    return 0;
+}
+
 /* A file-scope object placed in a discarded section --- one the kernel's
    linker script throws away --- has no run-time existence, so running its
    initializer as module-init code would forge a relocation from the kept
@@ -834,6 +905,7 @@ void kcc_ir_emit_global_inits(void) {
         if (IL(d, AST_TAG) == AST_VAR_DECL && IL(d, AST_F2) && IL(d, AST_F1)) {
             void *name = (void *)IL(d, AST_F1);
             if (!kcc_global_const_rodata(d) && !kcc_global_const_ptrarr(d) &&
+                !kcc_global_sym_data(d) &&
                 !kcc_ir_section_discarded((const char *)name)) {
                 void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);
                 IL(g, IR_SRC1) = (unsigned long)name;

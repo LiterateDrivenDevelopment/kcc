@@ -717,7 +717,10 @@ unsigned long kcc_rodata_struct_ok(void *sty, void *init) {
     void *field = (void *)IL(sd, AST_F1);
     while (elem) {
         if (!field) return 0;                     /* more inits than fields */
-        if (IL(field, AST_F2)) return 0;          /* reject bit-fields */
+        /* bit-fields are accepted: x86_emit_struct_bytes packs each into the
+           container bytes (the early GDT `startup_gdt' is a const desc_struct[]
+           whose entries are all bit-fields; rejecting them left it in .bss, so
+           the GDT was zero at boot and the first `mov %ds' #GP'd). */
         if (IL(elem, AST_TAG) == AST_DESIGNATOR) return 0;
         void *ft = (void *)IL(field, AST_F0);
         if (!ft) return 0;

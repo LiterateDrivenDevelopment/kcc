@@ -1700,25 +1700,41 @@ static void x86_emit_value(unsigned long bits, unsigned long size) {
     else { kcc_as_str(s_d_long); bits &= 0xffffffff; }
     kcc_as_dec(bits); kcc_as_ch('\n');
 }
+/* Emit a struct's bytes by first painting the whole object into a byte image at
+   each field's offset --- little-endian for a plain field, bit-packed for a
+   bit-field (F2 = (bitoff<<16)|width, F3 = the container's byte offset) --- then
+   laying it down as `.byte's.  Building the image (rather than emitting field by
+   field) is what lets adjacent bit-fields share their container, so a
+   `const desc_struct[]' GDT lands with its real descriptor bits instead of the
+   zero it used to get for containing bit-fields at all. */
 static void x86_emit_struct_bytes(void *sty, void *init, unsigned long total) {
     struct Node *decl = (struct Node *)((struct Type *)sty)->f0;
     struct Node *field = (struct Node *)decl->f1;
     struct Node *elem = init ? (struct Node *)((struct Node *)init)->f0 : 0;
-    unsigned long cursor = 0;
+    unsigned char buf[1024];
+    if (total > 1024) total = 1024;
+    for (unsigned long i = 0; i < total; i++) buf[i] = 0;
     while (field) {
         struct Type *ft = (struct Type *)kcc_sema_resolve_type((void *)field->f0);
         if (!ft) break;
-        unsigned long fsize = ft->size, fkind = ft->kind;
+        unsigned long bf = field->f2;              /* (bitoff<<16)|width; 0 = plain */
         unsigned long foff = field->f3;
-        if (foff > cursor) { x86_emit_zero(foff - cursor); cursor = foff; }
-        unsigned long bits;
-        if (elem) { bits = kcc_rodata_leaf_bits(elem, fkind); elem = (struct Node *)elem->f4; }
-        else bits = 0;
-        x86_emit_value(bits, fsize);
-        cursor += fsize;
+        unsigned long bits = elem ? kcc_rodata_leaf_bits((void *)elem, ft->kind) : 0;
+        if (bf) {
+            unsigned long bitoff = (bf >> 16) & 0xffff, width = bf & 0xffff;
+            for (unsigned long b = 0; b < width; b++)
+                if ((bits >> b) & 1UL) {
+                    unsigned long bit = bitoff + b, by = foff + (bit >> 3);
+                    if (by < total) buf[by] |= (unsigned char)(1u << (bit & 7));
+                }
+        } else {
+            for (unsigned long b = 0; b < ft->size; b++)
+                if (foff + b < total) buf[foff + b] = (unsigned char)((bits >> (8 * b)) & 0xff);
+        }
+        if (elem) elem = (struct Node *)elem->f4;
         field = (struct Node *)field->f4;
     }
-    if (cursor < total) x86_emit_zero(total - cursor);
+    for (unsigned long i = 0; i < total; i++) { kcc_as_str(s_d_byte); kcc_as_dec(buf[i]); kcc_as_ch('\n'); }
 }
 
 /* Emit one initializer leaf as data: a symbol address becomes a `.quad sym+off'

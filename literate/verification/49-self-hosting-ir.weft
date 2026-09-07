@@ -674,6 +674,11 @@ unsigned long kcc_rodata_const_intexpr(void *n) {
     unsigned long tag = IL(n, AST_TAG);
     if (tag == AST_INT_LIT || tag == AST_CHAR_LIT) return 1;
     if (tag == AST_TYPES_COMPAT) return 1;   /* folds to 0/1 */
+    /* sizeof/alignof are integer constant expressions; kcc_rodata_leaf_bits
+       evaluates them through kcc_eval_const_int.  `startup_gdt_descr.len =
+       sizeof(startup_gdt) - 1' needs this, or the descriptor is left zero and
+       lgdt loads a zero-length GDT. */
+    if (tag == AST_SIZEOF_EXPR || tag == AST_ALIGNOF_EXPR) return 1;
     if (tag == AST_PAREN_EXPR) return kcc_rodata_const_intexpr((void *)IL(n, AST_F0));
     if (tag == AST_CAST_EXPR) return kcc_rodata_const_intexpr((void *)IL(n, AST_F1));
     if (tag == AST_UNARY_EXPR) {

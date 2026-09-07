@@ -340,6 +340,9 @@ unsigned long kcc_global_const_rodata(void *decl);
 unsigned long kcc_global_const_ptrarr(void *decl);
 unsigned long kcc_global_writable(void *decl);
 unsigned long kcc_global_sym_data(void *decl);
+unsigned long kcc_static_leaf_ok(void *e);
+unsigned long kcc_static_init_ok(void *ty, void *init);
+unsigned long kcc_global_static_ok(void *decl);
 const char *kcc_ir_const_symaddr(void *n, long *off);
 void kcc_ir_dump(void);
 void kcc_ir_dump_instr(void *instr);
@@ -846,12 +849,18 @@ unsigned long kcc_global_const_ptrarr(void *decl) {
 }
 
 /* If `n' is a compile-time symbol-address constant --- a function or file-scope
-   object named directly (its name is its address), or `&lvalue', through casts,
-   parens and a trailing `+/- integer' --- return the symbol name and add any
-   integer displacement into *off; else 0.  This is exactly the `&sym'/`fn'
-   initializer gcc lowers to a `.quad sym+off' data relocation, where kcc instead
-   stores at run time from `kcc.module_init' (never called in a kernel, so the
-   initcall/exitcall/pci-fixup/__setup tables end up zero at boot). */
+   object named directly (its name is its address), `&lvalue', through casts,
+   parens and a trailing `+/- integer', or the address of a \emph{member} or
+   \emph{element} of such a constant (`&s.m', `p->m', `&a[i]') --- return the
+   symbol name and add any integer displacement into *off; else 0.  This is
+   exactly the `&sym'/`fn' initializer gcc lowers to a `.quad sym+off' data
+   relocation, where kcc instead stores at run time from `kcc.module_init'
+   (never called in a kernel, so the initcall/exitcall/pci-fixup/__setup tables
+   end up zero at boot).  The member/element cases are what let a self-referential
+   `LIST_HEAD_INIT(init_task.tasks)' --- `{ &init_task.tasks, &init_task.tasks }',
+   i.e. `init_task + offsetof(tasks)' --- be materialised as data; without them
+   `init_task' fell to a zero `.comm' and the kernel's initial stack pointer,
+   derived from it, was garbage (a triple fault in `startup_64'). */
 const char *kcc_ir_const_symaddr(void *n, long *off) {
     if (!n) return 0;
     unsigned long tag = IL(n, AST_TAG);
@@ -881,6 +890,43 @@ const char *kcc_ir_const_symaddr(void *n, long *off) {
         void *sym = kcc_symtab_lookup(name, kcc_strlen(name));
         if (!sym || IL(sym, SYM_KIND) == SYM_ENUM_CONST) return 0;   /* enum = a value */
         return name;                    /* a function/array/object name IS its address */
+    }
+    if (tag == AST_MEMBER) {
+        /* `s.m' = address-of(s) + offsetof(m); `p->m' = value-of(p) + offsetof(m).
+           Recursing on the base gives the base symbol either way (the base of an
+           arrow is itself an address constant like `&init_task'); the member's
+           byte offset --- resolved through the base's cached type, descending
+           anonymous struct/union members --- is added on. */
+        void *obj = (void *)IL(n, AST_F0);
+        const char *s = kcc_ir_const_symaddr(obj, off);
+        if (!s) return 0;
+        void *st = (void *)IL(obj, AST_F3);          /* the base's type, cached by sema */
+        if (!st) st = kcc_sema_expr(obj);
+        if (st && IL(st, TY_KIND) == TY_PTR) st = (void *)IL(st, TY_F0);   /* through `->' */
+        if (!st || (IL(st, TY_KIND) != TY_STRUCT && IL(st, TY_KIND) != TY_UNION)) return 0;
+        struct kcc_member_res mr = kcc_type_find_member(st, (const char *)IL(n, AST_F1));
+        if (!mr.field) return 0;
+        *off += (long)mr.off;
+        return s;
+    }
+    if (tag == AST_SUBSCRIPT) {
+        /* `a[i]' with a constant index i: address-of(a) + i*sizeof(*a). */
+        void *base = (void *)IL(n, AST_F0), *idx = (void *)IL(n, AST_F1);
+        if (!kcc_expr_is_ice(idx)) return 0;
+        const char *s = kcc_ir_const_symaddr(base, off);
+        if (!s) return 0;
+        void *bt = (void *)IL(base, AST_F3);
+        if (!bt) bt = kcc_sema_expr(base);
+        unsigned long es = 1;
+        if (bt) {
+            unsigned long bk = IL(bt, TY_KIND);
+            if (bk == TY_ARRAY || bk == TY_PTR) {
+                void *et = (void *)IL(bt, TY_F0);
+                if (et) es = IL(et, TY_SIZE);
+            }
+        }
+        *off += (long)kcc_eval_const_int(idx) * (long)es;
+        return s;
     }
     return 0;
 }
@@ -912,6 +958,102 @@ unsigned long kcc_global_sym_data(void *decl) {
         return anysym;
     }
     return 0;
+}
+
+/* A scalar initializer leaf the static emitter can lay down as bytes: a string,
+   a symbol address (`&x'/`fn'/`&s.m'), an integer constant expression, or a
+   float literal.  (Integer constants are evaluated by kcc_eval_const_int and
+   float leaves by kcc_rodata_leaf_bits, so the acceptance set matches exactly
+   what the emitter can render.) */
+unsigned long kcc_static_leaf_ok(void *e) {
+    long off;
+    if (!e) return 1;                                 /* a hole --- zero-filled */
+    if (IL(e, AST_TAG) == AST_STR_LIT) return 1;
+    if (kcc_ir_const_symaddr(e, &off)) return 1;
+    if (kcc_expr_is_ice(e)) return 1;
+    if (kcc_rodata_is_lit(e, 1)) return 1;            /* float literal, maybe negated */
+    return 0;
+}
+
+/* Whether the whole (aggregate) initializer of `ty' is a compile-time constant
+   the x86 back end can materialise as a byte image with relocations: every
+   nested struct/union/array must be a brace (or compound-literal) initializer of
+   the same, and every scalar leaf must satisfy kcc_static_leaf_ok.  This is the
+   general form the three earlier predicates (const-rodata / const-ptrarr /
+   sym-data) only handle in flat special cases; it is what lets `init_task' ---
+   deeply nested designated initializers, self-referential `&init_task.member'
+   list heads, compound literals, a `char comm[] = "swapper"' --- be emitted as
+   real `.data' instead of a zero `.comm'.  Anything not fully understood is
+   rejected so the global stays on the existing path (never worse than before). */
+unsigned long kcc_static_init_ok(void *ty, void *init) {
+    if (!ty) return 0;
+    while (init) {                                    /* peel compound-literal / paren */
+        unsigned long t = IL(init, AST_TAG);
+        if (t == AST_PAREN_EXPR) { init = (void *)IL(init, AST_F0); continue; }
+        if (t == AST_COMPOUND_LIT) { init = (void *)IL(init, AST_F1); continue; }
+        break;
+    }
+    unsigned long k = IL(ty, TY_KIND);
+    if (k == TY_STRUCT || k == TY_UNION) {
+        if (!init || IL(init, AST_TAG) != AST_INIT_LIST) return 0;
+        kcc_type_layout(ty);
+        void *decl = (void *)IL(ty, TY_F0);
+        void *field = decl ? (void *)IL(decl, AST_F1) : 0;   /* positional cursor */
+        for (void *e = (void *)IL(init, AST_F0); e; e = (void *)IL(e, AST_F4)) {
+            void *val, *fty;
+            if (IL(e, AST_TAG) == AST_DESIGNATOR) {
+                if (IL(e, AST_F1) != 1 || IL(e, AST_F2)) return 0;   /* only single `.member' */
+                struct kcc_member_res mr = kcc_type_find_member(ty, (const char *)IL(e, AST_F0));
+                if (!mr.field) return 0;
+                fty = kcc_sema_resolve_type((void *)IL(mr.field, AST_F0));
+                val = (void *)IL(e, AST_F3);
+            } else {
+                if (!field) return 0;
+                fty = kcc_sema_resolve_type((void *)IL(field, AST_F0));
+                val = e;
+                field = (void *)IL(field, AST_F4);
+            }
+            if (!fty) return 0;
+            unsigned long fk = IL(fty, TY_KIND);
+            if (fk == TY_STRUCT || fk == TY_UNION || fk == TY_ARRAY) {
+                if (!kcc_static_init_ok(fty, val)) return 0;
+            } else if (!kcc_static_leaf_ok(val)) return 0;
+        }
+        return 1;
+    }
+    if (k == TY_ARRAY) {
+        void *et = (void *)IL(ty, TY_F0);
+        if (init && IL(init, AST_TAG) == AST_STR_LIT) return 1;      /* char[] = "..." */
+        if (!init || IL(init, AST_TAG) != AST_INIT_LIST) return 0;
+        unsigned long ek = et ? IL(et, TY_KIND) : 0;
+        for (void *e = (void *)IL(init, AST_F0); e; e = (void *)IL(e, AST_F4)) {
+            void *v = e;
+            if (IL(e, AST_TAG) == AST_DESIGNATOR) {
+                if (IL(e, AST_F1) != 0 || IL(e, AST_F2)) return 0;   /* only plain `[i]' */
+                if (!kcc_expr_is_ice((void *)IL(e, AST_F0))) return 0;
+                v = (void *)IL(e, AST_F3);
+            }
+            if (ek == TY_STRUCT || ek == TY_UNION || ek == TY_ARRAY) {
+                if (!kcc_static_init_ok(et, v)) return 0;
+            } else if (!kcc_static_leaf_ok(v)) return 0;
+        }
+        return 1;
+    }
+    if (init && IL(init, AST_TAG) == AST_INIT_LIST) init = (void *)IL(init, AST_F0);
+    return kcc_static_leaf_ok(init);
+}
+
+/* Route an aggregate global with a fully-constant initializer (the three flat
+   predicates missed) through the general byte-image emitter rather than a zero
+   `.comm'.  Scalars keep their existing paths. */
+unsigned long kcc_global_static_ok(void *decl) {
+    void *init = (void *)IL(decl, AST_F2);
+    if (!init) return 0;
+    void *ty = kcc_sema_resolve_type((void *)IL(decl, AST_F0));
+    if (!ty) return 0;
+    unsigned long k = IL(ty, TY_KIND);
+    if (k != TY_STRUCT && k != TY_UNION && k != TY_ARRAY) return 0;
+    return kcc_static_init_ok(ty, init);
 }
 
 /* A file-scope object placed in a discarded section --- one the kernel's
@@ -949,8 +1091,15 @@ void kcc_ir_emit_global_inits(void) {
     while (d) {
         if (IL(d, AST_TAG) == AST_VAR_DECL && IL(d, AST_F2) && IL(d, AST_F1)) {
             void *name = (void *)IL(d, AST_F1);
+            /* On x86 an aggregate accepted by kcc_global_static_ok is materialised
+               as static `.data' by x86_emit_general, so it must NOT also get a
+               run-time store here (that would double-initialise it, and a store
+               into a const `.rodata' object faults).  The guard is gated on
+               kcc_target because only the x86 back end has the general emitter;
+               the ARM back end still fills these at run time from module-init. */
             if (!kcc_global_const_rodata(d) && !kcc_global_const_ptrarr(d) &&
                 !kcc_global_sym_data(d) &&
+                !(kcc_target && kcc_global_static_ok(d)) &&
                 !kcc_ir_section_discarded((const char *)name)) {
                 void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);
                 IL(g, IR_SRC1) = (unsigned long)name;
@@ -995,6 +1144,7 @@ void kcc_ir_emit_global_inits(void) {
                     if (IL(s, AST_TAG) == AST_VAR_DECL && IL(s, AST_F3) == 3 &&
                         IL(s, AST_F2) &&
                         !kcc_global_const_rodata(s) && !kcc_global_const_ptrarr(s) &&
+                        !(kcc_target && kcc_global_static_ok(s)) &&
                         !kcc_ir_section_discarded((const char *)IL(s, AST_F1))) {
                         const char *mangled = kcc_ir_static_name(s);
                         void *g = kcc_ir_alloc_instr(IR_GLOBAL_REF);

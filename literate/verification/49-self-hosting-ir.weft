@@ -799,24 +799,30 @@ unsigned long kcc_global_const_ptrarr(void *decl) {
 }
 
 /* A file-scope object placed in a discarded section --- one the kernel's
-   linker script throws away, `/DISCARD/ : { *(.discard) *(.discard.*) }' ---
-   has no run-time existence, so running its initializer as module-init code
-   would forge a relocation from the kept `.text' into a section that vanishes.
-   That is exactly the `__ADDRESSABLE(sym)' pattern: a `.discard.addressable'
-   pointer holding `&sym', whose store kcc lowers into `kcc.module_init' and so
-   fails the vmlinux link with ".discard.addressable referenced in .text ...
-   defined in discarded section".  gcc emits the pointer as a data relocation in
-   the discarded section with no code; kcc simply skips the initializer, since
-   the storage is discarded either way. */
+   linker script throws away --- has no run-time existence, so running its
+   initializer as module-init code would forge a relocation from the kept
+   `.text' into a section that vanishes.  Two families are discarded: the
+   `__ADDRESSABLE(sym)' pattern's `.discard.addressable' (`/DISCARD/ :
+   { *(.discard) *(.discard.*) }'), and the module teardown sections a
+   built-in kernel never runs --- `.exit.text', `.exit.data', `.exitcall.exit'
+   (`__exitcall(fn)' = `static exitcall_t = fn' in `.exitcall.exit').  kcc
+   lowers such an initializer's store into `kcc.module_init' and so fails the
+   vmlinux link with ".exitcall.exit referenced in .text ... defined in
+   discarded section".  gcc emits the pointer as a data relocation in the
+   discarded section with no code; kcc simply skips the initializer, since the
+   storage is discarded either way.  A prefix match on `.discard' or `.exit'
+   catches every one (no kept section begins with `.exit'). */
 struct AttrRec { unsigned long weak; const char *section; const char *alias; };
 extern void *kcc_attr_ht;
+static int kcc_ir_prefix(const char *s, const char *p) {
+    for (unsigned long i = 0; p[i]; i++) if (s[i] != p[i]) return 0;
+    return 1;
+}
 static int kcc_ir_section_discarded(const char *name) {
     if (!name || !kcc_attr_ht) return 0;
     struct AttrRec *ar = (struct AttrRec *)kcc_ht_get(kcc_attr_ht, name, kcc_strlen(name));
     if (!ar || !ar->section) return 0;
-    const char *s = ar->section, *p = ".discard";
-    for (unsigned long i = 0; i < 8; i++) if (s[i] != p[i]) return 0;
-    return 1;
+    return kcc_ir_prefix(ar->section, ".discard") || kcc_ir_prefix(ar->section, ".exit");
 }
 
 /* -- global-initializer emission at the top of main / a module-init fn -- */

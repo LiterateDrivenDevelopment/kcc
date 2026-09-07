@@ -43,7 +43,9 @@ void kcc_sys_exit(long code);
 int kcc_global_const_rodata(void *decl);
 int kcc_global_const_ptrarr(void *decl);
 int kcc_global_sym_data(void *decl);
+int kcc_global_writable(void *decl);
 const char *kcc_ir_const_symaddr(void *n, long *off);
+unsigned long kcc_eval_const_int(void *n);
 extern void *kcc_ir_static_decls;      /* every static-local decl (ir.c) */
 unsigned long kcc_rodata_leaf_bits(void *node, unsigned long kind);
 const char *kcc_ir_static_name(void *decl);
@@ -84,6 +86,7 @@ extern unsigned long kcc_modinit_present;
 #define TY_SIZE 8
 #define TY_F0 32
 #define TY_VOID 1
+#define TY_INT 5
 #define TY_STRUCT 14
 #define TY_ARRAY 12
 #define TY_FUNC 13
@@ -115,7 +118,7 @@ enum {
     AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_STR_LIT=52, AST_ASM_STMT=74, AST_COMPOUND=30, AST_IF_STMT=32,
     AST_SWITCH_STMT=33, AST_WHILE_STMT=34, AST_DO_STMT=35, AST_FOR_STMT=36,
     AST_CASE_STMT=42, AST_LABEL_STMT=41, AST_DEFAULT_STMT=43, AST_INIT_LIST=65,
-    AST_IDENT_EXPR=50, AST_UNARY_EXPR=55
+    AST_IDENT_EXPR=50, AST_UNARY_EXPR=55, AST_DESIGNATOR=66
 };
 
 /* exported target-selection state (the driver sets these) */
@@ -1707,32 +1710,58 @@ static void x86_emit_value(unsigned long bits, unsigned long size) {
    field) is what lets adjacent bit-fields share their container, so a
    `const desc_struct[]' GDT lands with its real descriptor bits instead of the
    zero it used to get for containing bit-fields at all. */
-static void x86_emit_struct_bytes(void *sty, void *init, unsigned long total) {
+/* Paint one field's value into the object image: bit-packed for a bit-field
+   (F2 = (bitoff<<16)|width, F3 = container byte offset), little-endian bytes for
+   a plain field (at its byte offset F3). */
+static void x86_paint_field(unsigned char *buf, unsigned long total,
+                            struct Node *field, unsigned long bits) {
+    unsigned long bf = field->f2, foff = field->f3;
+    if (bf) {
+        unsigned long bitoff = (bf >> 16) & 0xffff, width = bf & 0xffff;
+        for (unsigned long b = 0; b < width; b++)
+            if ((bits >> b) & 1UL) {
+                unsigned long bit = bitoff + b, by = foff + (bit >> 3);
+                if (by < total) buf[by] |= (unsigned char)(1u << (bit & 7));
+            }
+    } else {
+        struct Type *ft = (struct Type *)kcc_sema_resolve_type((void *)field->f0);
+        unsigned long fsz = ft ? ft->size : 8;
+        for (unsigned long b = 0; b < fsz; b++)
+            if (foff + b < total) buf[foff + b] = (unsigned char)((bits >> (8 * b)) & 0xff);
+    }
+}
+static struct Node *x86_find_field(void *sty, const char *name) {
     struct Node *decl = (struct Node *)((struct Type *)sty)->f0;
-    struct Node *field = (struct Node *)decl->f1;
+    for (struct Node *f = (struct Node *)decl->f1; f; f = (struct Node *)f->f4) {
+        const char *fn = (const char *)f->f1;
+        if (fn && name && (fn == name || kcc_strcmp(fn, name) == 0)) return f;
+    }
+    return 0;
+}
+static struct Type *x86_field_type(struct Node *field) {
+    return (struct Type *)kcc_sema_resolve_type((void *)field->f0);
+}
+static void x86_emit_struct_bytes(void *sty, void *init, unsigned long total) {
+    struct Node *sdecl = (struct Node *)((struct Type *)sty)->f0;   /* AST_STRUCT_DECL */
+    struct Node *field = (struct Node *)sdecl->f1;                  /* first field (positional cursor) */
     struct Node *elem = init ? (struct Node *)((struct Node *)init)->f0 : 0;
     unsigned char buf[1024];
     if (total > 1024) total = 1024;
     for (unsigned long i = 0; i < total; i++) buf[i] = 0;
-    while (field) {
-        struct Type *ft = (struct Type *)kcc_sema_resolve_type((void *)field->f0);
-        if (!ft) break;
-        unsigned long bf = field->f2;              /* (bitoff<<16)|width; 0 = plain */
-        unsigned long foff = field->f3;
-        unsigned long bits = elem ? kcc_rodata_leaf_bits((void *)elem, ft->kind) : 0;
-        if (bf) {
-            unsigned long bitoff = (bf >> 16) & 0xffff, width = bf & 0xffff;
-            for (unsigned long b = 0; b < width; b++)
-                if ((bits >> b) & 1UL) {
-                    unsigned long bit = bitoff + b, by = foff + (bit >> 3);
-                    if (by < total) buf[by] |= (unsigned char)(1u << (bit & 7));
-                }
-        } else {
-            for (unsigned long b = 0; b < ft->size; b++)
-                if (foff + b < total) buf[foff + b] = (unsigned char)((bits >> (8 * b)) & 0xff);
+    while (elem) {
+        struct Node *fld; void *val;
+        if (elem->tag == AST_DESIGNATOR && elem->f1 == 1) {   /* `.member = value' */
+            fld = x86_find_field(sty, (const char *)elem->f0);
+            val = (void *)elem->f3;
+        } else {                                              /* positional */
+            fld = field; val = elem;
+            if (field) field = (struct Node *)field->f4;
         }
-        if (elem) elem = (struct Node *)elem->f4;
-        field = (struct Node *)field->f4;
+        if (fld && val) {
+            struct Type *ft = x86_field_type(fld);
+            x86_paint_field(buf, total, fld, kcc_rodata_leaf_bits(val, ft ? ft->kind : TY_INT));
+        }
+        elem = (struct Node *)elem->f4;
     }
     for (unsigned long i = 0; i < total; i++) { kcc_as_str(s_d_byte); kcc_as_dec(buf[i]); kcc_as_ch('\n'); }
 }
@@ -1821,9 +1850,14 @@ static void x86_emit_rodata_global(void *decl, const char *name) {
     elemsize = elemtype->size;
     elemkind = elemtype->kind;
 
-    kcc_as_str(kcc_x86_os ? s_rodata : s_constsect);
+    struct AttrRec *ar = x86_attr(name);
+    const char *sec = ar ? ar->section : 0;      /* honour __attribute__((section)) */
+    if (sec) { kcc_as_str(s_section); kcc_as_str(sec); kcc_as_str(s_aw); }
+    else if (kcc_global_writable(d)) kcc_as_str(s_data);          /* non-const -> writable .data */
+    else kcc_as_str(kcc_x86_os ? s_rodata : s_constsect);         /* const -> .rodata */
     kcc_as_str(s_p2align3);
     if (d->f3 != 3) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
+    else if (kcc_x86_os) { kcc_as_str(s_local); kcc_as_str(name); kcc_as_ch('\n'); }
     x86_sym(name); kcc_as_str(s_colon_nl);
 
     if (shape == 2) {
@@ -1832,15 +1866,23 @@ static void x86_emit_rodata_global(void *decl, const char *name) {
         return;
     }
     if (shape == 3) {
-        unsigned long emitted = 0;
         struct Node *arr = (struct Node *)d->f2;
         struct Node *e = arr ? (struct Node *)arr->f0 : 0;
-        while (e && emitted < count) {
-            x86_emit_struct_bytes(elemtype, e, elemsize);
-            emitted++;
+        unsigned long cur = 0;                         /* next element index to emit */
+        while (e && cur < count) {
+            struct Node *sinit = e; unsigned long idx = cur;
+            if (e->tag == AST_DESIGNATOR && e->f1 == 0) {   /* `[index] = { ... }' */
+                idx = kcc_eval_const_int((void *)e->f0);
+                sinit = (struct Node *)e->f3;
+            }
+            if (idx >= cur && idx < count) {
+                if (idx > cur) { x86_emit_zero((idx - cur) * elemsize); cur = idx; }
+                x86_emit_struct_bytes(elemtype, sinit, elemsize);
+                cur++;
+            }
             e = (struct Node *)e->f4;
         }
-        if (emitted < count) x86_emit_zero((count - emitted) * elemsize);
+        if (cur < count) x86_emit_zero((count - cur) * elemsize);
         return;
     }
     /* scalar / array-of-scalar */

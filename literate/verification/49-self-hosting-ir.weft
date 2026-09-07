@@ -338,6 +338,7 @@ unsigned long kcc_rodata_struct_ok(void *sty, void *init);
 unsigned long kcc_rodata_aos_ok(void *sty, void *outer);
 unsigned long kcc_global_const_rodata(void *decl);
 unsigned long kcc_global_const_ptrarr(void *decl);
+unsigned long kcc_global_writable(void *decl);
 unsigned long kcc_global_sym_data(void *decl);
 const char *kcc_ir_const_symaddr(void *n, long *off);
 void kcc_ir_dump(void);
@@ -716,20 +717,32 @@ unsigned long kcc_rodata_struct_ok(void *sty, void *init) {
     if (!sd) return 0;
     void *field = (void *)IL(sd, AST_F1);
     while (elem) {
-        if (!field) return 0;                     /* more inits than fields */
-        /* bit-fields are accepted: x86_emit_struct_bytes packs each into the
-           container bytes (the early GDT `startup_gdt' is a const desc_struct[]
-           whose entries are all bit-fields; rejecting them left it in .bss, so
-           the GDT was zero at boot and the first `mov %ds' #GP'd). */
-        if (IL(elem, AST_TAG) == AST_DESIGNATOR) return 0;
-        void *ft = (void *)IL(field, AST_F0);
+        /* bit-fields and member designators (`.name = v') are accepted:
+           x86_emit_struct_bytes paints each field into a byte image by offset,
+           bit-packing bit-fields.  The early GDT `startup_gdt' is a const
+           desc_struct[] of all-bit-field entries written with `.limit0='-style
+           designators; rejecting either left it zero in .bss, so the GDT was
+           zero at boot and the first `mov %ds' #GP'd. */
+        void *val = elem, *ft;
+        if (IL(elem, AST_TAG) == AST_DESIGNATOR) {
+            if (IL(elem, AST_F1) != 1) return 0;   /* only `.member' inside a struct */
+            val = (void *)IL(elem, AST_F3);
+            if (!val) return 0;
+            /* the field is looked up by name in the emitter; here just require the
+               value be a literal of some width (int or float both accepted). */
+            if (!kcc_rodata_is_lit(val, 0) && !kcc_rodata_is_lit(val, 1)) return 0;
+            elem = (void *)IL(elem, AST_F4);
+            continue;
+        }
+        if (!field) return 0;                     /* more positional inits than fields */
+        ft = (void *)IL(field, AST_F0);
         if (!ft) return 0;
         ft = kcc_sema_resolve_type(ft);
         if (!ft) return 0;
         unsigned long k = IL(ft, TY_KIND);
         if (k < TY_BOOL || k > TY_DOUBLE) return 0;
         unsigned long isf = (k >= TY_FLOAT) ? 1 : 0;
-        if (!kcc_rodata_is_lit(elem, isf)) return 0;
+        if (!kcc_rodata_is_lit(val, isf)) return 0;
         field = (void *)IL(field, AST_F4);
         elem = (void *)IL(elem, AST_F4);
     }
@@ -740,8 +753,13 @@ unsigned long kcc_rodata_aos_ok(void *sty, void *outer) {
     if (IL(outer, AST_TAG) != AST_INIT_LIST) return 0;
     void *elem = (void *)IL(outer, AST_F0);
     while (elem) {
-        if (IL(elem, AST_TAG) != AST_INIT_LIST) return 0;
-        if (!kcc_rodata_struct_ok(sty, elem)) return 0;
+        void *v = elem;
+        if (IL(elem, AST_TAG) == AST_DESIGNATOR) {   /* `[index] = { ... }' */
+            if (IL(elem, AST_F1) != 0) return 0;     /* only a plain index, no range/member */
+            v = (void *)IL(elem, AST_F3);
+        }
+        if (!v || IL(v, AST_TAG) != AST_INIT_LIST) return 0;
+        if (!kcc_rodata_struct_ok(sty, v)) return 0;
         elem = (void *)IL(elem, AST_F4);
     }
     return 1;
@@ -749,17 +767,23 @@ unsigned long kcc_rodata_aos_ok(void *sty, void *outer) {
 
 unsigned long kcc_global_const_rodata(void *decl) {
     if (!IL(decl, AST_F2)) return 0;              /* needs an initializer */
+    /* Any global with a fully-constant initializer is emittable as static data,
+       const or not (a non-const one lands in .data, a const one in .rodata ---
+       the emitter chooses).  Dropping the old const-only restriction is what
+       lets a non-const table like the early GDT (`struct desc_struct
+       startup_gdt[]', writable, so .data in gcc) be materialised at link time
+       instead of left zero in .bss with a never-run kcc.module_init store. */
     void *t = (void *)IL(decl, AST_F0);           /* declared type spec */
     unsigned long wrappers = 0;
-    while (1) {
-        if (!t) return 0;
+    while (t) {
         unsigned long tg = IL(t, AST_TAG);
         if (tg == AST_TYPE_ARRAY) { wrappers++; t = (void *)IL(t, AST_F0); continue; }
-        if (tg != AST_TYPE_QUALS) return 0;
-        if (!(IL(t, AST_F1) & 1)) return 0;       /* const bit */
-        void *base = (void *)IL(t, AST_F0);
-        if (!base) return 0;
-        base = kcc_sema_resolve_type(base);
+        if (tg == AST_TYPE_QUALS) { t = (void *)IL(t, AST_F0); continue; }  /* const or not */
+        break;
+    }
+    {
+        if (!t) return 0;
+        void *base = kcc_sema_resolve_type(t);
         if (!base) return 0;
         unsigned long k = IL(base, TY_KIND);
         if (k == TY_STRUCT) {
@@ -781,6 +805,19 @@ unsigned long kcc_global_const_rodata(void *decl) {
         }
         return 1;
     }
+}
+
+/* Whether a static-data global is writable (no `const' qualifier anywhere in its
+   type) --- it then belongs in .data rather than .rodata. */
+unsigned long kcc_global_writable(void *decl) {
+    void *t = (void *)IL(decl, AST_F0);
+    while (t) {
+        unsigned long tg = IL(t, AST_TAG);
+        if (tg == AST_TYPE_ARRAY) { t = (void *)IL(t, AST_F0); continue; }
+        if (tg == AST_TYPE_QUALS) { if (IL(t, AST_F1) & 1) return 0; t = (void *)IL(t, AST_F0); continue; }
+        break;
+    }
+    return 1;
 }
 
 unsigned long kcc_global_const_ptrarr(void *decl) {

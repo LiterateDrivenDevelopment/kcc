@@ -279,7 +279,13 @@ pointer array into \texttt{\_\_DATA\_CONST,\_\_const} with per-slot relocations.
 @l c
 @d Selfhost: cg rodata @{
 unsigned long kcc_rodata_leaf_bits(void *n, unsigned long kind) {
-    if (kind < TY_FLOAT) return kcc_eval_const_int(n);   /* integer */
+    /* Only the three floating kinds take the float-bits path; a pointer or enum
+       leaf (TY_PTR, TY_ENUM --- both numerically ABOVE TY_LDOUBLE) is an integer
+       constant expression.  Treating a pointer as float returned the AST node's
+       f0 word (a garbage address) instead of the value: a `.mm = (void *)0' in
+       `init_task' became a wild pointer, so cpu_init's `BUG_ON(cur->mm)' fired
+       and the kernel panicked killing the idle task. */
+    if (kind < TY_FLOAT || kind > TY_LDOUBLE) return kcc_eval_const_int(n);
     if (IL(n, AST_TAG) == AST_UNARY_EXPR) {              /* -literal: flip sign bit */
         void *lit = (void *)IL(n, AST_F1);
         return IL(lit, AST_F0) ^ (1UL << 63);

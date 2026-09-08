@@ -44,8 +44,13 @@ int kcc_global_const_rodata(void *decl);
 int kcc_global_const_ptrarr(void *decl);
 int kcc_global_sym_data(void *decl);
 int kcc_global_writable(void *decl);
+int kcc_global_static_ok(void *decl);
 const char *kcc_ir_const_symaddr(void *n, long *off);
 unsigned long kcc_eval_const_int(void *n);
+unsigned long kcc_expr_is_ice(void *n);
+void *kcc_arena_alloc(long size);
+struct kcc_member_res { void *field; unsigned long off; };
+struct kcc_member_res kcc_type_find_member(void *sty, const char *name);
 extern void *kcc_ir_static_decls;      /* every static-local decl (ir.c) */
 unsigned long kcc_rodata_leaf_bits(void *node, unsigned long kind);
 const char *kcc_ir_static_name(void *decl);
@@ -93,6 +98,9 @@ extern unsigned long kcc_modinit_present;
 #define TY_PTR 11
 #define TY_FLOAT 8
 #define TY_DOUBLE 9
+#define TY_UNION 15
+#define AST_COMPOUND_LIT 67
+#define AST_PAREN_EXPR 68
 #define AST_TAG 0
 #define AST_COL 16
 #define AST_F0 24
@@ -211,6 +219,7 @@ struct Node { unsigned long tag, line, col, f0, f1, f2, f3, f4; };
 static void x86_emit_rodata_global(void *decl, const char *name);
 static void x86_emit_rodata_ptrarr(void *decl, const char *name);
 static void x86_emit_sym_data(void *decl, const char *name);
+static void x86_emit_general(void *decl, const char *name);
 static void x86_emit_zero(unsigned long n);
 static void x86_emit_value(unsigned long bits, unsigned long size);
 static void x86_prereg_stmt(void *stmt);
@@ -1564,6 +1573,7 @@ void kcc_x86_emit_data(void) {
         }
         if (kcc_global_const_ptrarr(d)) { x86_emit_rodata_ptrarr(d, name); continue; }
         if (kcc_global_sym_data(d)) { x86_emit_sym_data(d, name); continue; }
+        if (kcc_global_static_ok(d)) { x86_emit_general(d, name); continue; }
         void *ty = kcc_sema_resolve_type((void *)d->f0);
         if (!ty) continue;
         /* A declarator whose type is a function type declares a function, not an
@@ -1598,6 +1608,11 @@ static void x86_emit_one_static(void *decl) {
     }
     if (kcc_global_sym_data(d)) {
         x86_emit_sym_data(d, name);
+        if (kcc_x86_emitted && name) kcc_ht_put(kcc_x86_emitted, name, kl, 1);
+        return;
+    }
+    if (kcc_global_static_ok(d)) {
+        x86_emit_general(d, name);
         if (kcc_x86_emitted && name) kcc_ht_put(kcc_x86_emitted, name, kl, 1);
         return;
     }
@@ -1936,6 +1951,208 @@ static void x86_emit_rodata_ptrarr(void *decl, const char *name) {
 }
 @}
 
+\section{General Static Initializers}
+
+The three predicates above each materialise one \emph{flat} shape---a const
+array of scalars, an array of string pointers, a struct whose leaves are all
+literals or a single level of symbol addresses.  A global like the kernel's
+\texttt{init\_task}, however, is an arbitrarily nested tree: designated
+initializers inside designated initializers, unions, arrays, compound literals
+\verb|(cpumask_t){...}|, a \verb|char comm[]="swapper"|, and---crucially---%
+pointers to \emph{its own members} (\verb|LIST_HEAD_INIT(init_task.tasks)| is
+\verb|{ &init_task.tasks, &init_task.tasks }|, i.e.\ \texttt{init\_task} plus a
+member offset).  None of the flat predicates accept it, so it fell to a zero
+\verb|.comm|; the kernel derives its very first stack pointer from
+\texttt{init\_task} (\verb|initial_stack = init_thread_union + THREAD_SIZE|), so
+the zero left \texttt{\%rsp} garbage and \texttt{startup\_64} triple-faulted
+before a single boot message.
+
+The general path handles any constant initializer the way \texttt{gcc} does: it
+\emph{paints} the object into a byte image sized by \verb|kcc_arena_alloc| (no
+fixed buffer---\texttt{init\_task} is nearly 6\,KB), recursing through every
+nested aggregate and writing each scalar leaf little-endian at its byte offset,
+bit-packing bit-fields into their container.  A leaf that is a symbol address or
+a string literal cannot live in the image---it is a link-time relocation---so it
+is recorded in a side list and the eight pointer bytes are left zero.  After
+painting, the relocations are sorted by offset and the object is emitted as
+\verb|.byte| runs interrupted by a \verb|.quad sym+off| (or \verb|.quad|
+string-label) at each relocation, in the attributed section (or \texttt{.data}
+if writable, \texttt{.rodata} if const).  Because this path is tried only
+\emph{after} the three flat predicates, it changes nothing they already emit; it
+only replaces the zero \verb|.comm| that everything else used to get.
+
+@l c
+@d Selfhost: emit_x86 general-init @{
+/* A relocation found while painting a static object: at byte OFFSET place an
+   8-byte pointer to SYM+ADDEND, or --- when STRID >= 0 --- to string number STRID. */
+struct X86Reloc { unsigned long off; const char *sym; long addend; long strid; };
+
+/* Peel `(type){...}' compound literals and parentheses to the underlying init. */
+static struct Node *x86_init_peel(struct Node *e) {
+    while (e) {
+        if (e->tag == AST_PAREN_EXPR)   { e = (struct Node *)e->f0; continue; }
+        if (e->tag == AST_COMPOUND_LIT) { e = (struct Node *)e->f1; continue; }
+        break;
+    }
+    return e;
+}
+
+/* Paint one scalar/pointer leaf into buf[base..base+size): a symbol address or a
+   pointer-typed string literal becomes a relocation (the 8 bytes stay zero in the
+   image, the linker fills them); anything else its little-endian bits.  Float
+   bytes are written straight from the double bit pattern, matching the existing
+   x86 field painter (no single-precision narrowing). */
+static void x86_paint_leaf(unsigned char *buf, unsigned long total,
+                           unsigned long base, unsigned long size, unsigned long kind,
+                           struct Node *v, struct X86Reloc *rl, unsigned long *nrel,
+                           unsigned long rmax) {
+    if (!v) return;
+    long off = 0;
+    const char *s = kcc_ir_const_symaddr(v, &off);
+    if (s) {
+        if (*nrel < rmax) { rl[*nrel].off = base; rl[*nrel].sym = s;
+                            rl[*nrel].addend = off; rl[*nrel].strid = -1; (*nrel)++; }
+        return;
+    }
+    if (v->tag == AST_STR_LIT && kind == TY_PTR) {
+        unsigned long id = IL(kcc_x86_strs, VEC_COUNT);
+        unsigned long entry[2]; entry[0] = v->f0; entry[1] = v->f1;
+        kcc_vec_push(kcc_x86_strs, entry);
+        if (*nrel < rmax) { rl[*nrel].off = base; rl[*nrel].sym = 0;
+                            rl[*nrel].addend = 0; rl[*nrel].strid = (long)id; (*nrel)++; }
+        return;
+    }
+    unsigned long bits = kcc_rodata_leaf_bits(v, kind);
+    for (unsigned long b = 0; b < size; b++)
+        if (base + b < total) { buf[base + b] = (unsigned char)(bits & 0xff); bits >>= 8; }
+}
+
+/* Recursively paint `init' of type `ty' into buf at byte offset `base', collecting
+   pointer/string relocations.  Handles nested structs/unions/arrays,
+   `.member'/`[i]' designators, bit-fields, compound literals and `char[]="..."'. */
+static void x86_paint(unsigned char *buf, unsigned long total, struct Type *ty,
+                      struct Node *init, unsigned long base,
+                      struct X86Reloc *rl, unsigned long *nrel, unsigned long rmax) {
+    if (!ty) return;
+    init = x86_init_peel(init);
+    unsigned long k = ty->kind;
+    if (k == TY_STRUCT || k == TY_UNION) {
+        if (!init || init->tag != AST_INIT_LIST) return;
+        kcc_type_layout(ty);
+        struct Node *decl = (struct Node *)ty->f0;
+        struct Node *field = decl ? (struct Node *)decl->f1 : 0;   /* positional cursor */
+        for (struct Node *e = (struct Node *)init->f0; e; e = (struct Node *)e->f4) {
+            struct Node *fld; struct Node *val; unsigned long foff;
+            if (e->tag == AST_DESIGNATOR) {
+                struct kcc_member_res mr = kcc_type_find_member(ty, (const char *)e->f0);
+                fld = (struct Node *)mr.field; if (!fld) continue;
+                foff = mr.off; val = (struct Node *)e->f3;
+            } else {
+                if (!field) break;
+                fld = field; foff = field->f3; val = e;
+                field = (struct Node *)field->f4;
+            }
+            unsigned long bf = fld->f2;
+            if (bf) {                                  /* bit-field: OR bits into container */
+                unsigned long bitoff = (bf >> 16) & 0xffff, width = bf & 0xffff;
+                unsigned long bits = kcc_rodata_leaf_bits(val, TY_INT);
+                for (unsigned long b = 0; b < width; b++)
+                    if ((bits >> b) & 1UL) {
+                        unsigned long bit = bitoff + b, by = base + fld->f3 + (bit >> 3);
+                        if (by < total) buf[by] |= (unsigned char)(1u << (bit & 7));
+                    }
+                continue;
+            }
+            struct Type *fty = (struct Type *)kcc_sema_resolve_type((void *)fld->f0);
+            if (!fty) continue;
+            unsigned long fk = fty->kind;
+            if (fk == TY_STRUCT || fk == TY_UNION || fk == TY_ARRAY)
+                x86_paint(buf, total, fty, val, base + foff, rl, nrel, rmax);
+            else
+                x86_paint_leaf(buf, total, base + foff, fty->size, fk,
+                               x86_init_peel(val), rl, nrel, rmax);
+        }
+        return;
+    }
+    if (k == TY_ARRAY) {
+        struct Type *et = (struct Type *)ty->f0;
+        unsigned long es = et ? et->size : 1;
+        if (init && init->tag == AST_STR_LIT) {         /* char[] = "..." */
+            unsigned char *sd = (unsigned char *)init->f0; unsigned long sl = init->f1;
+            for (unsigned long i = 0; i < sl; i++)
+                if (base + i < total) buf[base + i] = sd[i];
+            return;
+        }
+        if (!init || init->tag != AST_INIT_LIST || !et) return;
+        unsigned long ek = et->kind, idx = 0;
+        for (struct Node *e = (struct Node *)init->f0; e; e = (struct Node *)e->f4) {
+            struct Node *v = e;
+            if (e->tag == AST_DESIGNATOR) { idx = kcc_eval_const_int((void *)e->f0);
+                                            v = (struct Node *)e->f3; }
+            if (ek == TY_STRUCT || ek == TY_UNION || ek == TY_ARRAY)
+                x86_paint(buf, total, et, v, base + idx * es, rl, nrel, rmax);
+            else
+                x86_paint_leaf(buf, total, base + idx * es, es, ek,
+                               x86_init_peel(v), rl, nrel, rmax);
+            idx++;
+        }
+        return;
+    }
+    /* scalar / pointer at top level (`T x = expr;' or brace-elided `{expr}') */
+    if (init && init->tag == AST_INIT_LIST) init = (struct Node *)init->f0;
+    x86_paint_leaf(buf, total, base, ty->size, k, x86_init_peel(init), rl, nrel, rmax);
+}
+
+static void x86_emit_general(void *decl, const char *name) {
+    struct Node *d = (struct Node *)decl;
+    if (!name) return;
+    struct Type *ty = (struct Type *)kcc_sema_resolve_type((void *)d->f0);
+    if (!ty) return;
+    unsigned long total = kcc_type_layout(ty);
+    if (!total) return;
+    unsigned char *buf = (unsigned char *)kcc_arena_alloc((long)total);
+    for (unsigned long i = 0; i < total; i++) buf[i] = 0;
+    unsigned long rmax = 1024, nrel = 0;
+    struct X86Reloc *rl =
+        (struct X86Reloc *)kcc_arena_alloc((long)(rmax * sizeof(struct X86Reloc)));
+    x86_paint(buf, total, ty, (struct Node *)d->f2, 0, rl, &nrel, rmax);
+    for (unsigned long i = 1; i < nrel; i++) {         /* sort relocations by offset */
+        struct X86Reloc t = rl[i]; unsigned long j = i;
+        while (j > 0 && rl[j - 1].off > t.off) { rl[j] = rl[j - 1]; j--; }
+        rl[j] = t;
+    }
+    struct AttrRec *ar = x86_attr(name);
+    const char *sec = ar ? ar->section : 0;
+    if (sec) { kcc_as_str(s_section); kcc_as_str(sec); kcc_as_str(s_aw); }
+    else if (kcc_global_writable(d)) kcc_as_str(s_data);
+    else kcc_as_str(kcc_x86_os ? s_rodata : s_constsect);
+    kcc_as_str(s_p2align3);
+    if (d->f3 != 3) { kcc_as_str(s_globl); x86_sym(name); kcc_as_ch('\n'); }
+    else if (kcc_x86_os) { kcc_as_str(s_local); kcc_as_str(name); kcc_as_ch('\n'); }
+    x86_sym(name); kcc_as_str(s_colon_nl);
+    unsigned long cur = 0, ri = 0;
+    while (cur < total) {
+        if (ri < nrel && rl[ri].off == cur) {
+            if (rl[ri].strid >= 0) {
+                kcc_as_str(s_d_quad); kcc_as_str(s_strlbl);
+                kcc_as_dec((unsigned long)rl[ri].strid); kcc_as_ch('\n');
+            } else {
+                kcc_as_str(s_d_quad); x86_sym(rl[ri].sym);
+                if (rl[ri].addend > 0) { kcc_as_str(s_plus); kcc_as_dec((unsigned long)rl[ri].addend); }
+                else if (rl[ri].addend < 0) { kcc_as_str(s_minus); kcc_as_dec((unsigned long)(-rl[ri].addend)); }
+                kcc_as_ch('\n');
+            }
+            cur += 8; ri++;
+        } else {
+            unsigned long next = (ri < nrel) ? rl[ri].off : total;
+            if (next > total) next = total;
+            while (cur < next) { kcc_as_str(s_d_byte); kcc_as_dec(buf[cur]); kcc_as_ch('\n'); cur++; }
+        }
+    }
+    if (sec) kcc_as_str(s_text);
+}
+@}
+
 \section{Module Init, String Literals, and the Render Entry}
 
 @l c
@@ -2031,6 +2248,7 @@ int kcc_x86_render(const char *path) {
 @<Selfhost: emit_x86 frame@>
 @<Selfhost: emit_x86 data@>
 @<Selfhost: emit_x86 rodata@>
+@<Selfhost: emit_x86 general-init@>
 @<Selfhost: emit_x86 render@>
 @}
 

@@ -467,7 +467,19 @@ unsigned long kcc_type_layout(void *ty_) {
     if (!decl) return 0;
     unsigned long layout_word = decl->f3;      /* (aligned<<1)|packed */
     struct Node *field = (struct Node *)decl->f1;
-    if (!field) return 0;                       /* opaque */
+    if (!field) {
+        /* No members: an opaque (forward-declared) tag, or a genuinely empty
+           struct.  An empty struct is size 0, but an `__attribute__((aligned(N)))'
+           on it still sets its alignment --- and that alignment must propagate to
+           where the struct is used as a member, or the member gets no padding.
+           The kernel's `struct sched_statistics' is empty under !CONFIG_SCHEDSTATS
+           yet `aligned(64)'; without honouring it here, `task_struct.stats' lost
+           its 32 bytes of leading pad, shifting every later field's offset and
+           faulting code that reads e.g. `current->signal' at the wrong offset. */
+        unsigned long req = decl->f3 >> 1;      /* aligned(N) */
+        if (req > ty->align) ty->align = req;
+        return ty->size;                        /* stays 0 */
+    }
     unsigned long cursor = 0, maxalign = 1, maxsize = 0;
     unsigned long cont_off = 0, cont_bit = 0, cont_size = 0;
     while (field) {
@@ -495,6 +507,16 @@ unsigned long kcc_type_layout(void *ty_) {
                 field->f3 = 0;
                 field->f2 = width & 0xffff;
                 if (fsize > maxsize) maxsize = fsize;
+            } else if (width == 0) {
+                /* A zero-width bit-field (`unsigned :0;') packs no bits but closes
+                   the current unit, so the next bit-field starts in a fresh
+                   container (\stdref{6.7.2.1}).  The kernel's task_struct scheduler
+                   flags use it to split two bit-field groups; without honouring it
+                   kcc coalesced them into one word, shrinking the struct by a word
+                   and skewing every later field's offset. */
+                cont_size = 0;
+                field->f3 = cursor;
+                field->f2 = 0;
             } else {
                 unsigned long cont_bits = fsize << 3;
                 if (cont_size == fsize && (cont_bit + width) <= cont_bits) {

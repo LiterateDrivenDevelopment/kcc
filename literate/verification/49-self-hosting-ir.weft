@@ -933,9 +933,21 @@ const char *kcc_ir_const_symaddr(void *n, long *off) {
 
 /* True when a global's initializer must be emitted as static DATA carrying symbol
    relocations rather than a run-time store: a scalar pointer set to a symbol
-   address, or a (non-array) struct whose leaves are all integer/float/string
-   literals or symbol addresses, with at least one symbol (a pure-literal struct
-   stays on the existing const-rodata path). */
+   address or a string literal, or a (non-array) struct whose leaves are all
+   integer/float/string literals or symbol addresses, with at least one symbol (a
+   pure-literal struct stays on the existing const-rodata path).
+
+   A file-scope \texttt{char *p = "..."} is the string-literal case: its
+   initializer is the address of a string literal, which the x86 emitter already
+   lays down as \texttt{.quad .Lx86str<id>} (registering the string for the render
+   pass).  Without this it fell to a run-time store in \texttt{kcc.module\_init} ---
+   fine on Mach-O, where the loader runs module-init, but fatal in a kernel, which
+   never runs \texttt{.init\_array}: the kernel's \texttt{ramdisk\_execute\_command
+   = "/init"} stayed a zero \texttt{.comm}, so \texttt{init\_eaccess(NULL)} ->
+   \texttt{strlen(NULL)} faulted PID~1 just after the device initcalls.  The case is
+   gated on \texttt{kcc\_target}: only the x86 back end has the string-literal data
+   emitter, and the run-time-store skip (below) is likewise ungated, so on ARM ---
+   where module-init does run --- the literal must keep its run-time store. */
 unsigned long kcc_global_sym_data(void *decl) {
     void *init = (void *)IL(decl, AST_F2);
     if (!init) return 0;
@@ -943,7 +955,8 @@ unsigned long kcc_global_sym_data(void *decl) {
     if (!ty) return 0;
     unsigned long k = IL(ty, TY_KIND);
     long off;
-    if (k == TY_PTR) return kcc_ir_const_symaddr(init, &off) != 0;
+    if (k == TY_PTR) return kcc_ir_const_symaddr(init, &off) != 0
+                            || (kcc_target && IL(init, AST_TAG) == AST_STR_LIT);
     if (k == TY_STRUCT) {
         if (IL(init, AST_TAG) != AST_INIT_LIST) return 0;
         unsigned long anysym = 0;

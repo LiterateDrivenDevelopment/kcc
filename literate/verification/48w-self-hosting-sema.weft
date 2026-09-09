@@ -439,6 +439,25 @@ definition arrives at the same scope depth.  \texttt{kcc\_type\_layout} computes
 byte-accurate size, alignment, and per-field offsets, packing consecutive
 same-type bit-fields into a container from the least-significant bit up.
 
+Laying out a struct is \emph{destructive}: each field's \texttt{f2} slot, which
+the parser fills with the bit-field width \emph{expression}, is overwritten with
+the packed \texttt{(bit-offset<<16)|width} descriptor the IR later reads --- and
+a zero-width bit-field's \texttt{f2} is cleared to nothing.  Layout must
+therefore run exactly once per tag.  The obvious memo guard,
+\texttt{if (ty->size) return}, fails for a \emph{genuinely zero-sized} struct:
+an empty struct, or one whose only members are zero-width bit-fields, has size
+\texttt{0}, indistinguishable from ``not yet laid out''.  A second layout then
+sees the already-cleared \texttt{f2}, misreads the \texttt{:0} as a plain member,
+and reserves a whole word --- so \texttt{sizeof(struct \{ int : 0; \})} comes out
+\texttt{4} instead of \texttt{0}.  That single miscount breaks the kernel's
+\texttt{BUILD\_BUG\_ON\_ZERO} (hence \texttt{ARRAY\_SIZE}): \texttt{ARRAY\_SIZE(initcall\_levels)}
+inflates from~9 to~13, \texttt{do\_initcalls} walks four levels past the table
+into the adjacent \texttt{initcall\_level\_names[]}, and calls a name string as an
+initcall --- a wild jump early in boot.  We memoise on \texttt{ty->align}
+instead: a completed layout always stamps a nonzero alignment (at least the
+alignment of some member) even when the size is~0, so the guard fires on the
+second call and the field descriptors are never re-derived.
+
 @l c
 @d Selfhost: sema layout @{
 unsigned long kcc_type_align(void *ty_) {
@@ -461,7 +480,15 @@ unsigned long kcc_type_layout(void *ty_) {
         return ty->size;
     }
     if (kind != TY_STRUCT && kind != TY_UNION) return ty->size;
-    if (ty->size) return ty->size;             /* memoised */
+    if (ty->align) return ty->size;            /* memoised: align is stamped
+                                                  after a completed layout even
+                                                  when size==0 (empty struct /
+                                                  only zero-width bit-fields);
+                                                  size==0 alone can't say
+                                                  "laid out" and re-running
+                                                  would re-derive the now
+                                                  destructively-packed field
+                                                  descriptors */
     int is_union = (kind == TY_UNION);
     struct Node *decl = (struct Node *)ty->f0;
     if (!decl) return 0;

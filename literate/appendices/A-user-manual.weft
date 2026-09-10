@@ -279,14 +279,18 @@ kcc --target=x86_64 add.c -o add
 ./add                 # runs under Rosetta; echo $? shows the exit status
 \end{verbatim}
 
-The x86-64 back end is being built up one capability at a time and today
-covers the \emph{scalar} language: integer and pointer arithmetic, the full
-set of operators and comparisons, control flow (\texttt{if}, \texttt{while},
-\texttt{for}, \texttt{?:}, \texttt{\&\&}/\texttt{||}), local variables and
-arrays, structs addressed by member, mutable file-scope global variables,
-string literals, and function calls following the System~V AMD64 calling
-convention---including recursion, calls that pass arguments on the stack, and
-calls to library functions such as \texttt{printf}.  A whole program such as
+The x86-64 back end has grown well past its scalar beginnings.  It handles
+integer, pointer, and \emph{floating-point} arithmetic, the full set of
+operators and comparisons, control flow (\texttt{if}, \texttt{while},
+\texttt{for}, \texttt{?:}, \texttt{\&\&}/\texttt{||}, and GNU computed
+\texttt{goto}), local variables and arrays, structs (addressed by member and
+passed by value in the classifiable System~V cases), file-scope globals
+including \texttt{const} and symbol-address data, block-scoped \texttt{static}
+locals, string literals emitted as static data, extended inline assembly, and
+function calls following the System~V AMD64 calling convention---recursion,
+stack-passed and floating/variadic arguments, and library calls such as
+\texttt{printf}.  It is complete enough to compile \kcc{}'s own sources, a
+Linux kernel object, and programs like SQLite and Lua.  A whole program such as
 
 \begin{verbatim}
 int printf(const char *, ...);
@@ -317,13 +321,21 @@ kcc --target=x86_64-linux -c prog.c -o prog.s   # emits ELF-dialect asm
 as -o prog.o prog.s  &&  ld -o prog prog.o ...   # assemble + link + run
 \end{verbatim}
 
-What the x86-64 back end does \emph{not} yet handle is a \texttt{const} global
-whose value lives in read-only data (a reference to one becomes an unresolved
-symbol at link time---a clean link error, never a wrong value), a
-block-scoped \texttt{static} local, floating-point arithmetic, or passing a
-struct by value.  These are planned; until then, keep such a program on the
-default ARM64 path, which supports the whole language.  The native path is
-entirely unaffected by this option---omitting \texttt{-{}-target} (or writing
+This ``emit and stop'' behaviour is a property of the \emph{host}, not the
+compiler: a \kcc{} built for and running on Linux/x86-64 has a native
+assembler and linker available and drives \texttt{as} and \texttt{ld} itself,
+finishing an executable in one command---which is exactly how the kernel-boot
+reproduction (\S\ref{sec:um-kernelboot}) builds its objects.
+
+What the x86-64 back end does \emph{not} yet do is allocate registers: it uses
+an all-spill model, where every value lives in a stack slot, which is correct
+but makes the emitted code large and slow---an x86 register allocator is the
+main piece of remaining work.  It also declines, cleanly rather than
+mis-lowering, a few by-value aggregate-argument shapes it cannot classify and
+most \texttt{\_\_int128} operations; a program that hits one of these gets a
+clear refusal, never wrong code.  Keep such a program on the default ARM64
+path, which supports the whole language.  That native path is entirely
+unaffected by this option---omitting \texttt{-{}-target} (or writing
 \texttt{-{}-target=arm64}) compiles for ARM64 exactly as before.
 
 \section{Reading Diagnostics}
@@ -367,17 +379,43 @@ external installation.  It optimizes---constant folding, dead-code
 elimination, common-subexpression elimination, and keeping locals in
 registers---and allocates both integer and floating values to registers.
 
-Its current limits are worth stating plainly so you are not surprised.  Its
-native, full-language target is Apple silicon (ARM64); a second, x86-64 target
-is under construction and today compiles the scalar subset described in
-\S\ref{sec:um-x86} (the framework behind it is Chapter~\ref{ch:retargeting}).
-One tail corner of C17 remains:
-propagating \texttt{volatile} from a qualified \emph{object} through member
-access (a member or bit-field declared \texttt{volatile} is already
+Its two targets differ in maturity, and it is worth stating this plainly so
+you are not surprised.  The native Apple-silicon (ARM64) back end supports the
+whole language.  The x86-64 back end (\S\ref{sec:um-x86}; the framework behind
+it is Chapter~\ref{ch:retargeting}) began as a scalar-only prototype but has
+outgrown that description: it now compiles \kcc{}'s own sources, the
+\texttt{init/main.o} of an unmodified Linux~6.6 kernel, and whole applications
+such as SQLite and Lua.  Floating-point arithmetic (with the System~V FP
+calling convention, including variadics), \texttt{const} globals in read-only
+data, block-scoped \texttt{static} locals, and symbol-address and string-literal
+initializers emitted as static data all work.  What it does \emph{not} yet do
+is allocate registers---it uses a simple all-spill model that is correct but
+emits verbose, slow code (an x86 register allocator is future work)---and it
+declines, rather than mis-lowers, a few by-value aggregate-argument shapes and
+most \texttt{\_\_int128} operations.  One tail corner of C17 remains on both
+targets: propagating \texttt{volatile} from a qualified \emph{object} through
+member access (a member or bit-field declared \texttt{volatile} is already
 honoured).  Nested designator chains, brace elision, and per-operation
-single-precision rounding for \texttt{float} arithmetic are now fully
-supported.  Appendix~\ref{ch:roadmap} tracks the state of every feature in
-detail.
+single-precision rounding for \texttt{float} arithmetic are fully supported.
+Appendix~\ref{ch:roadmap} tracks the state of every feature in detail.
+
+\paragraph{Cross-compilation.}  Because both back ends lower the \emph{same}
+target-neutral IR, \kcc{} on Apple silicon is a genuine cross-compiler:
+\texttt{-{}-target=x86\_64-linux} makes an ARM64/macOS \kcc{} generate
+x86-64/Linux code---a different instruction set \emph{and} a different object
+format and ABI---not a translation of one assembly into another.  The two
+targets complete the toolchain differently.  For its native ARM64/Mach-O target
+\kcc{} is self-contained: it emits machine code and links the executable itself.
+For x86-64 it follows the classic model that \texttt{gcc} itself uses---it
+generates assembly and hands it to the system \texttt{as} and \texttt{ld};
+it does not carry its own x86 assembler or ELF linker.  On macOS, whose
+assembler speaks only Mach-O, a Linux-dialect compile therefore writes the
+\texttt{.s} and stops (\S\ref{sec:um-x86}), to be finished on an x86-64 host or
+container.  This is exactly the chain \S\ref{sec:um-kernelboot} and
+\texttt{make meta-c} exercise: \kcc{} on ARM64 cross-compiles \kcc{}'s own
+source into a working Linux/x86-64 \kcc{}, which in turn compiles the kernel
+object---and, run against its own source again, reproduces itself
+byte-for-byte.
 
 \section{Booting a Linux Kernel Compiled by \kcc{}}
 \label{sec:um-kernelboot}

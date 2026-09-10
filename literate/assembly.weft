@@ -1142,3 +1142,19 @@ check that \texttt{-Wall} warns while the default build stays silent
 @o tmp/tests/warntest.sh @{
 @<Warn: tests@>
 @}
+
+\subsection*{Kernel-boot reproduction}
+
+The capstone demonstration of \S\ref{sec:um-kernelboot}---\kcc{} compiling
+\texttt{init/main.o} of a Linux~6.6 kernel that boots to a BusyBox login
+shell---tangles to a Docker build recipe and five numbered scripts under
+\texttt{tmp/repro/}, with \texttt{run-all.sh} to chain the build steps.  The
+prose for each lives with the manual section; here we only route the output.
+
+@o tmp/repro/Dockerfile @{@<Repro: Dockerfile@>@}
+@o tmp/repro/01-image.sh @{@<Repro: 01 build image@>@}
+@o tmp/repro/02-build-kcc.sh @{@<Repro: 02 build kcc@>@}
+@o tmp/repro/03-kernel.sh @{@<Repro: 03 build kernel@>@}
+@o tmp/repro/04-initramfs.sh @{@<Repro: 04 initramfs@>@}
+@o tmp/repro/05-boot.sh @{@<Repro: 05 boot@>@}
+@o tmp/repro/run-all.sh @{@<Repro: run all@>@}

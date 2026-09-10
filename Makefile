@@ -43,7 +43,7 @@ ci: build test difftest interop e2e diagtest warntest test-codegen meta-a meta-c
 
 # Tangle: extract .s files from .weft literate sources
 tangle:
-	mkdir -p tmp/src tmp/tests tmp/docs tmp/selfhost tmp/include tmp/runtime
+	mkdir -p tmp/src tmp/tests tmp/docs tmp/selfhost tmp/include tmp/runtime tmp/repro
 	weft kcc.weft
 
 # Assemble: compile each .s to .o

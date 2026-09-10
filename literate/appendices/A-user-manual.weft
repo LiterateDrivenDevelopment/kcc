@@ -379,6 +379,324 @@ single-precision rounding for \texttt{float} arithmetic are now fully
 supported.  Appendix~\ref{ch:roadmap} tracks the state of every feature in
 detail.
 
+\section{Booting a Linux Kernel Compiled by \kcc{}}
+\label{sec:um-kernelboot}
+
+This is the project's capstone demonstration: \kcc{} compiles
+\texttt{init/main.o} of a real, unmodified Linux~6.6 kernel---the file that
+holds \texttt{start\_kernel}, \texttt{do\_initcalls}, and
+\texttt{kernel\_init\_freeable}---and that kernel boots, on QEMU, all the way
+to a BusyBox \texttt{login:} prompt where you get a shell and can halt the
+machine.  Every other object is the stock \texttt{gcc} build; swapping in
+\kcc{}'s \texttt{init/main.o} isolates the compiler under test.  The boot
+exercises two fixes worth naming, because they are exactly the kind of bug a
+kernel surfaces that a test suite does not: \kcc{} must compute
+\texttt{sizeof(struct \{ int : 0; \})} as \texttt{0} (a zero-width bit-field
+adds no storage), or the kernel's \texttt{ARRAY\_SIZE} macro miscounts and
+\texttt{do\_initcalls} walks off its table; and it must emit a file-scope
+\texttt{char *p = "/init"} as \emph{static data}, not a run-time store into a
+constructor the kernel never calls, or \texttt{ramdisk\_execute\_command} stays
+\texttt{NULL} and PID~1 dereferences it.
+
+The pipeline is five small scripts under \texttt{tmp/repro/}, tangled from the
+fragments below, plus \texttt{run-all.sh} that chains them.  They drive a Docker
+image (a Debian toolchain with the Linux~6.6 tree, QEMU, and a static BusyBox
+baked in) so the build is reproducible on macOS, Linux, or Windows; a
+\emph{Native Linux} note after each step gives the Docker-free equivalent.  The
+only host prerequisites are Docker and \texttt{weft} (to tangle \kcc{}'s own
+sources).  Run the whole thing with:
+
+\begin{verbatim}
+bash tmp/repro/run-all.sh        # build image, kcc, kernel, initramfs
+bash tmp/repro/05-boot.sh        # boot to the login: prompt (root, no password)
+\end{verbatim}
+
+A note on authenticity: these scripts let \texttt{gcc} compile \kcc{}'s C
+sources into the \texttt{kcc\_linux} cross-compiler, so the demo runs on any
+x86-64 host without an Apple-silicon machine.  The \emph{pure} self-host---where
+\kcc{} itself compiles \kcc{}---is \texttt{make meta-c} on ARM64
+(\S\ref{sec:um-contributors}); the \texttt{init/main.o} produced either way is
+byte-identical.
+
+\subsection{The build image}
+
+The image bakes the slow, cacheable prerequisites: a kernel toolchain, the
+Linux~6.6 source configured for a tiny bootable kernel (serial console, ELF
+binaries, an initramfs), a first \texttt{gcc} \texttt{vmlinux} so later relinks
+are fast, the \texttt{gen\_init\_cpio} helper, and a static BusyBox.
+
+@d Repro: Dockerfile @{FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential bc bison flex libssl-dev libelf-dev cpio xz-utils \
+      wget ca-certificates file qemu-system-x86 && rm -rf /var/lib/apt/lists/*
+WORKDIR /root
+RUN wget -q --tries=3 --timeout=60 \
+      https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz \
+ && tar xf linux-6.6.tar.xz && rm linux-6.6.tar.xz
+RUN wget -q --tries=3 --timeout=60 -O /root/busybox \
+      https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox \
+ && chmod +x /root/busybox
+WORKDIR /root/linux-6.6
+RUN make tinyconfig \
+ && ./scripts/config --enable 64BIT --enable PRINTK --enable TTY \
+      --enable SERIAL_8250 --enable SERIAL_8250_CONSOLE --enable BINFMT_ELF \
+      --enable PRINTK_TIME --enable SECTION_MISMATCH_WARN_ONLY \
+      --enable BOOT_CONFIG --enable BLK_DEV_INITRD --enable RD_GZIP \
+ && make olddefconfig && make -j"$(nproc)" prepare \
+ && make -j"$(nproc)" vmlinux && make usr/gen_init_cpio
+@}
+
+@d Repro: 01 build image @{#!/usr/bin/env bash
+# Build the reproducible kernel-build image (Debian + linux-6.6 + QEMU + BusyBox).
+# ~10 min and ~2 GB the first time; cached afterwards.
+set -euo pipefail
+IMG=${KCC_IMG:-kcc-kbuild:linux66}
+here=$(cd "$(dirname "$0")" && pwd)
+echo ">> building $IMG"
+docker build --platform=linux/amd64 -t "$IMG" -f "$here/Dockerfile" "$here"
+echo ">> done: $IMG"
+@}
+
+\emph{Native Linux:} install \texttt{build-essential bc bison flex libssl-dev
+libelf-dev cpio qemu-system-x86}, unpack the Linux~6.6 source, apply the same
+\texttt{scripts/config} lines, and run \texttt{make olddefconfig prepare
+vmlinux usr/gen\_init\_cpio}; then skip the \texttt{docker run} wrappers below
+and run each inner block directly in the kernel tree.
+
+\subsection{Bootstrapping \kcc{} for Linux}
+
+The x86-64/ELF compiler that will build the kernel object, \texttt{kcc\_linux},
+can be produced two ways, and \texttt{02-build-kcc.sh} picks one by looking at
+the host.  On \textbf{Apple silicon} (\texttt{Darwin}/\texttt{arm64}) it takes
+the \emph{authentic} route: it builds the native \kcc{} (\texttt{make build})
+and has \emph{\kcc{} cross-compile its own sources} to x86-64 assembly
+(\texttt{--target=x86\_64-linux})---the same first step as \texttt{make meta-c}
+(\S\ref{sec:um-contributors})---so the compiler that builds the kernel was
+itself built by \kcc{}.  On \textbf{any other host} (a Linux x86-64 box) there
+is no native \kcc{} to run, so it takes the \emph{portable} route: \texttt{gcc}
+compiles \kcc{}'s C sources, with three freestanding \texttt{mem*} shims a
+\texttt{-ffreestanding} build needs.  Either way the modules and the Linux
+runtime (\texttt{os\_linux.s}) are assembled and linked into
+\texttt{kcc\_linux} inside the image; the \texttt{init/main.o} it later produces
+is byte-identical.
+
+@d Repro: 02 build kcc @{#!/usr/bin/env bash
+# Tangle kcc's sources and link the Linux-native compiler kcc_linux.
+# Apple silicon: kcc(ARM) cross-compiles kcc -> x86-64 (authentic self-host).
+# Other hosts:   gcc bootstraps kcc's C sources -> x86-64 (portable).
+set -euo pipefail
+IMG=${KCC_IMG:-kcc-kbuild:linux66}
+root=$(cd "$(dirname "$0")/../.." && pwd)
+work="$root/tmp/repro/work"; mkdir -p "$work"
+echo ">> tangling literate sources (needs weft)"
+( cd "$root" && make tangle >/dev/null )
+MODS="arena strings io hashtab vec strtab source lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
+
+if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
+  echo ">> host Apple silicon -- kcc(ARM) cross-compiles kcc -> x86-64 (authentic)"
+  [ -x "$root/tmp/kcc" ] || ( cd "$root" && make build >/dev/null )
+  for m in $MODS; do "$root/tmp/kcc" -c "$root/tmp/selfhost/$m.c" --target=x86_64-linux -o "$work/$m.s" >/dev/null 2>&1; done
+  "$root/tmp/kcc" -c "$root/tmp/selfhost/lexer_core.c" --target=x86_64-linux -o "$work/lexer.s" >/dev/null 2>&1
+  cp "$root/tmp/runtime/os_linux.s" "$work/os_linux.s"
+  cat > "$work/_link_kcc.sh" <<'INNER'
+set -e
+ALL="os_linux arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
+for m in $ALL; do as --64 -o $m.o $m.s; done
+OBJ=""; for m in $ALL; do [ $m = os_linux ] || OBJ="$OBJ $m.o"; done
+ld -static -nostdlib -e _start -o kcc_linux os_linux.o $OBJ
+echo "  built kcc_linux (by kcc-ARM): $(file -b kcc_linux | cut -d, -f1-2)"
+INNER
+else
+  echo ">> host $(uname -s)/$(uname -m) -- gcc bootstraps kcc -> x86-64 (portable)"
+  cp "$root"/tmp/selfhost/*.c "$work"/
+  cp "$root"/tmp/runtime/os_linux.s "$work"/os_linux.s
+  cat > "$work/memglue.c" <<'MEM'
+void *memcpy(void*d,const void*s,unsigned long n){char*a=d;const char*b=s;while(n--)*a++=*b++;return d;}
+void *memset(void*d,int c,unsigned long n){char*a=d;while(n--)*a++=c;return d;}
+void *memmove(void*d,const void*s,unsigned long n){char*a=d;const char*b=s;if(a<b)while(n--)*a++=*b++;else{a+=n;b+=n;while(n--)*--a=*--b;}return d;}
+MEM
+  cat > "$work/_link_kcc.sh" <<'INNER'
+set -e
+G="gcc -O0 -w -std=gnu99 -ffreestanding -fno-stack-protector -fno-builtin -Wno-error=implicit-function-declaration"
+as --64 -o os_linux.o os_linux.s
+$G -c memglue.c -o memglue.o
+MODS="arena strings io hashtab vec strtab source lexer_core lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
+OBJ="os_linux.o memglue.o"
+for m in $MODS; do $G -c $m.c -o $m.o; OBJ="$OBJ $m.o"; done
+ld -static -nostdlib -e _start -o kcc_linux $OBJ
+echo "  built kcc_linux (gcc bootstrap): $(file -b kcc_linux | cut -d, -f1-2)"
+INNER
+fi
+
+echo ">> assembling and linking kcc_linux inside the image"
+docker run --rm --platform=linux/amd64 -v "$work":/w -w /w "$IMG" bash /w/_link_kcc.sh
+@}
+
+\emph{Native Linux:} run \texttt{make tangle}, then the \texttt{else}-branch's
+\texttt{\_link\_kcc.sh} body in \texttt{tmp/repro/work}; the result is
+\texttt{kcc\_linux}.  (The \texttt{Darwin} branch is what an Apple-silicon
+developer gets automatically; to force the portable route anywhere, the
+detection is a plain \texttt{uname} test you can edit.)
+
+\subsection{Compiling and linking the kernel}
+
+We keep every object from the image's \texttt{gcc} build except
+\texttt{init/main.o}, which \texttt{kcc\_linux} compiles from
+\texttt{init/main.c} using \texttt{gcc}'s own flags (recovered from the recorded
+\texttt{.main.o.cmd}).  \kcc{} emits out-of-line copies of unused
+\texttt{static inline} bodies whose callees a tiny kernel lacks; they are dead,
+so each undefined symbol is stubbed to \texttt{0} and the link is retried until
+it succeeds---then \texttt{bzImage} is packed.
+
+@d Repro: 03 build kernel @{#!/usr/bin/env bash
+# Rebuild the kernel with init/main.o compiled by kcc.
+set -euo pipefail
+IMG=${KCC_IMG:-kcc-kbuild:linux66}
+work=$(cd "$(dirname "$0")/../.." && pwd)/tmp/repro/work
+cat > "$work/_build_kernel.sh" <<'INNER'
+set -e
+cd /root/linux-6.6
+make -j"$(nproc)" vmlinux >/dev/null 2>&1 || true
+make init/main.o >/dev/null 2>&1
+line=$(sed -n 's/^savedcmd_[^:]*:= //p;s/^cmd_[^:]*:= //p' init/.main.o.cmd | head -1)
+FLAGS=""; prev=""
+for tok in $line; do case "$tok" in
+  -I*|-D*|-U*|-nostdinc|-std=*) FLAGS="$FLAGS $tok";;
+  -include) FLAGS="$FLAGS -include";;
+  *) [ "$prev" = "-include" ] && FLAGS="$FLAGS $tok";; esac; prev="$tok"; done
+/w/kcc_linux --target=x86_64-linux $FLAGS -c -o init/main.o init/main.c
+touch init/main.o
+mkdir -p /w/ldwrap; : > /w/defsyms.txt
+printf '#!/bin/bash\nexec /usr/bin/ld "$@@" $(cat /w/defsyms.txt 2>/dev/null)\n' > /w/ldwrap/ld
+chmod +x /w/ldwrap/ld; export PATH=/w/ldwrap:$PATH
+for pass in 1 2 3 4 5 6; do
+  if make -j"$(nproc)" vmlinux >/tmp/vm 2>&1; then linked=1; break; fi
+  grep -oE "undefined reference to \`[^']+'" /tmp/vm | sed "s/.*to .//;s/.$//" | sort -u > /tmp/u
+  add=0; while read -r s; do grep -qx -- "--defsym $s=0" /w/defsyms.txt || { echo "--defsym $s=0" >> /w/defsyms.txt; add=$((add+1)); }; done < /tmp/u
+  [ "$add" -eq 0 ] && { echo "link stuck:"; tail -8 /tmp/vm; exit 1; }
+done
+[ "${linked:-0}" = 1 ] || { echo "did not link"; exit 1; }
+make -j2 bzImage >/dev/null 2>&1
+cp arch/x86/boot/bzImage /w/bzImage
+echo "  bzImage: $(stat -c%s /w/bzImage) bytes (init/main.o by kcc, $(wc -l </w/defsyms.txt) dead stubs)"
+INNER
+echo ">> building kernel (init/main.o = kcc)"
+docker run --rm --platform=linux/amd64 -v "$work":/w "$IMG" bash /w/_build_kernel.sh
+@}
+
+\emph{Native Linux:} run \texttt{\_build\_kernel.sh}'s body in your prepared
+\texttt{linux-6.6} tree with \texttt{/w} pointing at \texttt{tmp/repro/work}.
+
+\subsection{An initramfs with login and a shell}
+
+BusyBox is the userland: one static binary, symlinked to \texttt{init},
+\texttt{getty}, \texttt{login}, \texttt{sh}, \texttt{halt}, and the usual
+commands.  \texttt{gen\_init\_cpio} builds the archive---including the
+\texttt{/dev/console} and \texttt{/dev/ttyS0} nodes---without needing root.  An
+\texttt{/etc/inittab} spawns a serial \texttt{getty}; \texttt{/etc/passwd} gives
+\texttt{root} an empty password.
+
+@d Repro: 04 initramfs @{#!/usr/bin/env bash
+# Build a BusyBox initramfs that boots to a serial login shell.
+set -euo pipefail
+IMG=${KCC_IMG:-kcc-kbuild:linux66}
+work=$(cd "$(dirname "$0")/../.." && pwd)/tmp/repro/work
+cat > "$work/inittab" <<'T'
+::sysinit:/bin/busybox --install -s
+::sysinit:/bin/hostname kcc
+ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
+T
+echo 'root::0:0:root:/root:/bin/sh' > "$work/passwd"
+echo 'root:x:0:' > "$work/group"
+printf '\nkcc-built Linux 6.6 (init/main.o by kcc). Login: root (no password).\n\n' > "$work/issue"
+cat > "$work/cpio.list" <<'L'
+dir /bin 755 0 0
+dir /sbin 755 0 0
+dir /etc 755 0 0
+dir /dev 755 0 0
+dir /proc 755 0 0
+dir /sys 755 0 0
+dir /root 755 0 0
+file /bin/busybox /root/busybox 755 0 0
+slink /init /bin/busybox 777 0 0
+slink /sbin/init /bin/busybox 777 0 0
+slink /bin/sh busybox 777 0 0
+slink /bin/login busybox 777 0 0
+slink /sbin/getty /bin/busybox 777 0 0
+slink /sbin/halt /bin/busybox 777 0 0
+slink /sbin/poweroff /bin/busybox 777 0 0
+slink /sbin/reboot /bin/busybox 777 0 0
+slink /bin/hostname busybox 777 0 0
+slink /bin/mount busybox 777 0 0
+slink /bin/umount busybox 777 0 0
+file /etc/inittab /w/inittab 644 0 0
+file /etc/passwd /w/passwd 644 0 0
+file /etc/group /w/group 644 0 0
+file /etc/issue /w/issue 644 0 0
+nod /dev/console 600 0 0 c 5 1
+nod /dev/ttyS0 600 0 0 c 4 64
+nod /dev/null 666 0 0 c 1 3
+nod /dev/tty 666 0 0 c 5 0
+L
+echo ">> packing initramfs (BusyBox login)"
+docker run --rm --platform=linux/amd64 -v "$work":/w "$IMG" bash -c \
+  'cp /root/busybox /w/busybox; /root/linux-6.6/usr/gen_init_cpio /w/cpio.list > /w/initramfs.cpio'
+echo "  initramfs.cpio: $(stat -f%z "$work/initramfs.cpio" 2>/dev/null || stat -c%s "$work/initramfs.cpio") bytes"
+@}
+
+\subsection{Booting it}
+
+If your host has \texttt{qemu-system-x86\_64}, we boot there for speed
+(hardware acceleration: \texttt{hvf} on macOS, \texttt{kvm} on Linux);
+otherwise we boot inside the image with software emulation.  At \texttt{kcc
+login:} type \texttt{root}; the shell is \texttt{/root \#}.  Type \texttt{uname
+-a}, \texttt{ls}, \texttt{cat /etc/issue}; \texttt{poweroff -f} halts.
+\texttt{random.trust\_cpu=on} seeds the RNG so early boot never stalls waiting
+for entropy.
+
+@d Repro: 05 boot @{#!/usr/bin/env bash
+# Boot the kcc-compiled kernel to a BusyBox login shell.
+set -euo pipefail
+IMG=${KCC_IMG:-kcc-kbuild:linux66}
+work=$(cd "$(dirname "$0")/../.." && pwd)/tmp/repro/work
+APPEND="console=ttyS0,115200 earlycon=uart8250,io,0x3f8 keep_bootcon panic=-1 random.trust_cpu=on"
+if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+  # hardware acceleration only when the host arch matches the x86-64 guest
+  case "$(uname -s)/$(uname -m)" in
+    Darwin/x86_64)          ACCEL="-accel hvf";;
+    Linux/x86_64)           [ -e /dev/kvm ] && ACCEL="-enable-kvm -cpu host" || ACCEL="-accel tcg";;
+    *)                      ACCEL="-accel tcg";;   # e.g. Apple silicon: x86 guest -> software
+  esac
+  echo ">> booting on host qemu ($ACCEL) --- login: root / halt: poweroff -f"
+  exec qemu-system-x86_64 $ACCEL -m 512M -kernel "$work/bzImage" \
+    -initrd "$work/initramfs.cpio" -append "$APPEND" -nographic -no-reboot
+fi
+echo ">> no host qemu; booting in container (TCG, slower)"
+exec docker run --rm -it --platform=linux/amd64 -v "$work":/w -w /w "$IMG" \
+  qemu-system-x86_64 -accel tcg -m 512M -kernel bzImage -initrd initramfs.cpio \
+  -append "$APPEND" -nographic -no-reboot
+@}
+
+@d Repro: run all @{#!/usr/bin/env bash
+# Build everything (image, kcc, kernel, initramfs); then run 05-boot.sh yourself.
+set -euo pipefail
+d=$(cd "$(dirname "$0")" && pwd)
+bash "$d/01-image.sh"
+bash "$d/02-build-kcc.sh"
+bash "$d/03-kernel.sh"
+bash "$d/04-initramfs.sh"
+echo
+echo ">> all built. Boot the kernel with:  bash $d/05-boot.sh"
+@}
+
+\emph{On the acceleration:} \texttt{05-boot.sh} needs no configuration---on a
+Linux host it finds \texttt{/dev/kvm} and the boot is nearly instant, on macOS
+it uses \texttt{hvf}, and where neither host \texttt{qemu} nor hardware
+acceleration is available it falls back to software emulation inside the image,
+which works everywhere but takes about half a minute to reach the prompt.
+
 \section{Building This Book}
 \label{sec:um-docs}
 

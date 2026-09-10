@@ -82,4 +82,4 @@ Design: **byte-image + relocation list**, sized via `kcc_arena_alloc(total)`
 `gcc_baseline.sh` (all-gcc tinyconfig → bzImage.gcc, boots), `shrink_boot.sh`
 (FORCE_GCC subset), `inspect_inittask.sh` (kcc vs gcc `.o` symbol/section diff),
 `vga_stage.py` (QMP VGA screendump), `initramfs.cpio.gz` (static /init banner).
-Staging host: `ssh ubuntu-staging-weenjoy-com`, qemu 8.2.2 + KVM, `~/kcc-boot/`.
+Test host: any x86-64 Linux box with QEMU 8.x + KVM (work under `~/kcc-boot/`).

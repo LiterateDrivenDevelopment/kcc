@@ -521,9 +521,15 @@ is byte-identical.
 @d Repro: 02 build kcc @{#!/usr/bin/env bash
 # Tangle kcc's sources and link the Linux-native compiler kcc_linux.
 # Apple silicon: kcc(ARM) cross-compiles kcc -> x86-64 (authentic self-host).
-# Other hosts:   gcc bootstraps kcc's C sources -> x86-64 (portable).
+#   How the emitted .s becomes the ELF is chosen by the LINK mode -- the first
+#   argument, or $KCC_LINK, default "docker":
+#     docker  assemble+link in the amd64 image (no local cross-tools needed)
+#     cross   assemble+link on macOS with x86-64 cross-binutils (no container)
+#     emit    only write the .s; finish it on the destination x86-64 host
+# Other hosts: gcc bootstraps kcc's C sources -> x86-64 (portable).
 set -euo pipefail
 IMG=${KCC_IMG:-kcc-kbuild:linux66}
+LINK="${1:-${KCC_LINK:-docker}}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
 work="$root/tmp/repro/work"; mkdir -p "$work"
 echo ">> tangling literate sources (needs weft)"
@@ -531,21 +537,39 @@ echo ">> tangling literate sources (needs weft)"
 MODS="arena strings io hashtab vec strtab source lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
 
 if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
-  echo ">> host Apple silicon -- kcc(ARM) cross-compiles kcc -> x86-64 (authentic)"
+  echo ">> host Apple silicon -- kcc(ARM) cross-compiles kcc -> x86-64 (link: $LINK)"
   [ -x "$root/tmp/kcc" ] || ( cd "$root" && make build >/dev/null )
   for m in $MODS; do "$root/tmp/kcc" -c "$root/tmp/selfhost/$m.c" --target=x86_64-linux -o "$work/$m.s" >/dev/null 2>&1; done
   "$root/tmp/kcc" -c "$root/tmp/selfhost/lexer_core.c" --target=x86_64-linux -o "$work/lexer.s" >/dev/null 2>&1
   cp "$root/tmp/runtime/os_linux.s" "$work/os_linux.s"
+  # shared assemble+link step, honouring $AS/$LD (default GNU as/ld)
   cat > "$work/_link_kcc.sh" <<'INNER'
 set -e
+AS="${AS:-as}"; LD="${LD:-ld}"
 ALL="os_linux arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
-for m in $ALL; do as --64 -o $m.o $m.s; done
-OBJ=""; for m in $ALL; do [ $m = os_linux ] || OBJ="$OBJ $m.o"; done
-ld -static -nostdlib -e _start -o kcc_linux os_linux.o $OBJ
-echo "  built kcc_linux (by kcc-ARM): $(file -b kcc_linux | cut -d, -f1-2)"
+for m in $ALL; do "$AS" --64 -o "$m.o" "$m.s"; done
+OBJ=""; for m in $ALL; do [ "$m" = os_linux ] || OBJ="$OBJ $m.o"; done
+"$LD" -static -nostdlib -e _start -o kcc_linux os_linux.o $OBJ
+echo "  built kcc_linux: $(file -b kcc_linux | cut -d, -f1-2)"
 INNER
+  case "$LINK" in
+    docker)
+      docker run --rm --platform=linux/amd64 -v "$work":/w -w /w "$IMG" bash /w/_link_kcc.sh ;;
+    cross)
+      asx= ; ldx=
+      for a in x86_64-linux-gnu-as x86_64-unknown-linux-gnu-as x86_64-elf-as; do if command -v "$a" >/dev/null 2>&1; then asx=$a; break; fi; done
+      for l in x86_64-linux-gnu-ld x86_64-unknown-linux-gnu-ld x86_64-elf-ld; do if command -v "$l" >/dev/null 2>&1; then ldx=$l; break; fi; done
+      [ -n "$asx" ] && [ -n "$ldx" ] || { echo "!! no x86-64 cross-binutils on PATH; install e.g. 'brew install x86_64-elf-binutils', or use LINK=docker"; exit 1; }
+      ( cd "$work" && AS="$asx" LD="$ldx" bash _link_kcc.sh ) ;;
+    emit)
+      echo ">> wrote x86-64 assembly to $work (no local link). Finish on an x86-64 Linux host:"
+      echo "     scp $work/*.s $work/_link_kcc.sh user@@HOST:/tmp/kccx/"
+      echo "     ssh user@@HOST 'cd /tmp/kccx && bash _link_kcc.sh'   # runs as/ld -> kcc_linux"
+      exit 0 ;;
+    *) echo "!! unknown LINK mode '$LINK' (use: docker | cross | emit)"; exit 1 ;;
+  esac
 else
-  echo ">> host $(uname -s)/$(uname -m) -- gcc bootstraps kcc -> x86-64 (portable)"
+  echo ">> host $(uname -s)/$(uname -m) -- gcc bootstraps kcc -> x86-64 (portable, LINK ignored)"
   cp "$root"/tmp/selfhost/*.c "$work"/
   cp "$root"/tmp/runtime/os_linux.s "$work"/os_linux.s
   cat > "$work/memglue.c" <<'MEM'
@@ -553,7 +577,7 @@ void *memcpy(void*d,const void*s,unsigned long n){char*a=d;const char*b=s;while(
 void *memset(void*d,int c,unsigned long n){char*a=d;while(n--)*a++=c;return d;}
 void *memmove(void*d,const void*s,unsigned long n){char*a=d;const char*b=s;if(a<b)while(n--)*a++=*b++;else{a+=n;b+=n;while(n--)*--a=*--b;}return d;}
 MEM
-  cat > "$work/_link_kcc.sh" <<'INNER'
+  cat > "$work/_gcc_link.sh" <<'INNER'
 set -e
 G="gcc -O0 -w -std=gnu99 -ffreestanding -fno-stack-protector -fno-builtin -Wno-error=implicit-function-declaration"
 as --64 -o os_linux.o os_linux.s
@@ -564,17 +588,38 @@ for m in $MODS; do $G -c $m.c -o $m.o; OBJ="$OBJ $m.o"; done
 ld -static -nostdlib -e _start -o kcc_linux $OBJ
 echo "  built kcc_linux (gcc bootstrap): $(file -b kcc_linux | cut -d, -f1-2)"
 INNER
+  docker run --rm --platform=linux/amd64 -v "$work":/w -w /w "$IMG" bash /w/_gcc_link.sh
 fi
-
-echo ">> assembling and linking kcc_linux inside the image"
-docker run --rm --platform=linux/amd64 -v "$work":/w -w /w "$IMG" bash /w/_link_kcc.sh
 @}
 
+\paragraph{Choosing how the x86-64 binary is finished (\texttt{LINK}).}  On
+Apple silicon \kcc{} \emph{generates} the x86-64 assembly natively, but turning
+that \texttt{.s} into the \texttt{kcc\_linux} ELF needs an x86-64 assembler and
+linker, which macOS does not provide.  The script's first argument (or the
+\texttt{KCC\_LINK} environment variable) picks how to finish, so you can build
+a \texttt{kcc\_linux} to copy to any x86-64 Linux box:
+
+\begin{verbatim}
+bash tmp/repro/02-build-kcc.sh docker   # (default) assemble+link in the image
+bash tmp/repro/02-build-kcc.sh cross    # use x86-64 cross-binutils on macOS
+bash tmp/repro/02-build-kcc.sh emit     # only emit .s; finish on the x86-64 host
+\end{verbatim}
+
+\noindent \texttt{docker} needs no local cross-tools; \texttt{cross} wants an
+\texttt{x86\_64-linux-gnu-} or \texttt{x86\_64-elf-} binutils on \texttt{PATH}
+(e.g.\ \texttt{brew install x86\_64-elf-binutils}) and produces the ELF without
+a container; \texttt{emit} stops after the assembly and prints the two commands
+to finish the build on the target machine.  All three yield the same static
+\texttt{kcc\_linux}, which runs natively on x86-64 Linux---so
+\texttt{scp tmp/repro/work/kcc\_linux} to an x86-64 host and it compiles the
+kernel there directly (do \emph{not} copy the ARM64 \texttt{tmp/kcc}, which will
+not execute on x86).
+
 \emph{Native Linux:} run \texttt{make tangle}, then the \texttt{else}-branch's
-\texttt{\_link\_kcc.sh} body in \texttt{tmp/repro/work}; the result is
+\texttt{\_gcc\_link.sh} body in \texttt{tmp/repro/work}; the result is
 \texttt{kcc\_linux}.  (The \texttt{Darwin} branch is what an Apple-silicon
-developer gets automatically; to force the portable route anywhere, the
-detection is a plain \texttt{uname} test you can edit.)
+developer gets automatically; the detection is a plain \texttt{uname} test you
+can edit to force a route.)
 
 \subsection{Compiling and linking the kernel}
 

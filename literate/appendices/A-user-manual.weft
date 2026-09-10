@@ -794,8 +794,12 @@ make pdf        # weaves kcc.tex, then compiles kcc.pdf
 \end{verbatim}
 
 \noindent (\texttt{make pdf} depends on \texttt{make weave}, so it runs both;
-use \texttt{make weave} alone if you only want the \LaTeX{} source.)  This is
-purely optional and unrelated to using the compiler.
+use \texttt{make weave} alone if you only want the \LaTeX{} source.)  The PDF
+step needs a \TeX{} installation with \texttt{lualatex}, \texttt{latexmk}, and
+the \texttt{underscore} package (which lets the woven fragment names that
+contain underscores typeset in text mode); on a minimal distribution such as
+TinyTeX, \texttt{tlmgr install underscore} provides it.  This is purely optional
+and unrelated to using the compiler.
 
 \section{For Contributors}
 \label{sec:um-contributors}

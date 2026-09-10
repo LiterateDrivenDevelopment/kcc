@@ -57,6 +57,10 @@
 
 
 \usepackage{fancyhdr}
+% Load last: make `_' print literally in text mode, so the many woven fragment
+% names that contain underscores (Selfhost: emit_arm64, emit_x86, lexer_tables,
+% ...) typeset cleanly instead of triggering math-mode errors.
+\usepackage{underscore}
 \pagestyle{fancy}
 \fancyhf{}
 \fancyhead[L]{kcc - \leftmark}

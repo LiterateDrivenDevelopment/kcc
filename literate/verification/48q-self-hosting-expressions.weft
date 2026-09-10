@@ -759,16 +759,21 @@ unsigned long kcc_parse_atof(const char *str, unsigned long len) {
         }
         return double_to_bits(d);
     }
-    /* decimal */
+    /* decimal --- accumulate at most 18 significant digits into the 64-bit
+       mantissa M; a double keeps ~17, and feeding every digit of an ultra-long
+       literal (Lua's `\_VERSION' aside, its pi is
+       3.141592653589793238462643383279502884) overflowed M and produced garbage
+       -- 8.6e-18 instead of pi.  Integer digits past the cap raise the exponent
+       (`drop'); fractional digits past it are dropped without scaling. */
     const char *p = str;
     unsigned long M = 0, F = 0;
-    long emag = 0; int esign = 0;
+    long emag = 0, drop = 0; int esign = 0, digits = 0;
     while (p < end) {
         char c = *p;
         if (c == '.' || c == 'e' || c == 'E') break;
         unsigned long dv = (unsigned long)((unsigned char)c - '0');
         if (dv > 9) break;
-        M = M * 10 + dv;
+        if (digits < 18) { M = M * 10 + dv; digits++; } else drop++;
         p++;
     }
     if (p < end && *p == '.') {
@@ -778,7 +783,7 @@ unsigned long kcc_parse_atof(const char *str, unsigned long len) {
             if (c == 'e' || c == 'E') break;
             unsigned long dv = (unsigned long)((unsigned char)c - '0');
             if (dv > 9) break;
-            M = M * 10 + dv; F++;
+            if (digits < 18) { M = M * 10 + dv; F++; digits++; }
             p++;
         }
     }
@@ -796,7 +801,7 @@ unsigned long kcc_parse_atof(const char *str, unsigned long len) {
             p++;
         }
     }
-    long net = (esign ? -emag : emag) - (long)F;
+    long net = (esign ? -emag : emag) - (long)F + drop;
     double m = (double)(long)M;
     long k = net < 0 ? -net : net;
     double pw = 1.0;

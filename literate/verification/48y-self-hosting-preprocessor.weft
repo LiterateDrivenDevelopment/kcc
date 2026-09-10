@@ -13,7 +13,7 @@ sees a fully preprocessed token stream: \texttt{\#define}/\texttt{\#undef} with
 object- and function-like macros, argument prescan (\stdref{6.10.3.1}), the
 \texttt{\#} and \texttt{\#\#} operators, the \texttt{\#if} family with a
 recursive-descent constant-expression evaluator, \texttt{\#include} with a
-search path and nine compiler-resident freestanding headers, and the
+search path and a set of compiler-resident freestanding headers, and the
 \texttt{push\_macro}/\texttt{pop\_macro} pragmas.
 
 The port is verified by the strongest oracle available---\texttt{difftest}
@@ -2018,7 +2018,31 @@ struct StrResult kcc_strlit_gather(void) {
 }
 @}
 
-\section{The Nine Freestanding Built-in Headers}
+\section{The Compiler-Resident Built-in Headers}
+
+Like the assembly front end (\S\ref{sec:builtin-headers}), the self-hosting
+preprocessor carries a set of headers \emph{inside the binary}, so that a
+program \texttt{\#include}-ing \texttt{<stddef.h>} or \texttt{<stdio.h>}
+compiles with no header search path at all.  This began as the six freestanding
+headers the C standard guarantees to a hosted-independent implementation
+(\texttt{stddef}, \texttt{stdint}, \texttt{stdarg}, \texttt{stdbool},
+\texttt{limits}, \texttt{float}), plus the empty-but-required \texttt{iso646},
+\texttt{stdnoreturn}, and \texttt{stdalign}.  Compiling a real interpreter---Lua
+5.4.7---pulls in far more: \texttt{<math.h>} for its numeric library,
+\texttt{<stdio.h>} and \texttt{<stdlib.h>} and \texttt{<string.h>} throughout,
+\texttt{<ctype.h>}, \texttt{<errno.h>}, \texttt{<locale.h>}, \texttt{<time.h>},
+\texttt{<setjmp.h>} for its error mechanism, and a handful more.  Rather than
+force every downloader to point \texttt{-I} at a system tree, the built-in set is
+extended to the twenty-eight headers below---\emph{declarations only}, matching
+the assembly compiler's built-ins (\S\ref{sec:builtin-headers}) byte for
+byte, so a program compiles identically whether kcc is the assembly binary or
+its self-hosted self.  The bodies are prototypes and macros; the actual
+definitions come from the system C library at link time, exactly as with a real
+freestanding toolchain.  Where a declaration differs by platform---\texttt{errno}
+resolves through \texttt{\_\_errno\_location} on Linux and \texttt{\_\_error} on
+macOS, and the \texttt{stdio} stream globals are named differently---an inner
+\texttt{\#ifdef \_\_linux\_\_} selects the right one, which is why these headers
+are correct on both targets.
 
 @l c
 @d Selfhost: pp builtin @{
@@ -2031,6 +2055,24 @@ static const char hdr_float[] = "#ifndef _FLOAT_H\n#define _FLOAT_H\n#define FLT
 static const char hdr_iso646[] = "#ifndef _ISO646_H\n#define _ISO646_H\n#define and &&\n#define and_eq &=\n#define bitand &\n#define bitor |\n#define compl ~\n#define not !\n#define not_eq !=\n#define or ||\n#define or_eq |=\n#define xor ^\n#define xor_eq ^=\n#endif\n";
 static const char hdr_stdnoreturn[] = "#ifndef _STDNORETURN_H\n#define _STDNORETURN_H\n#define noreturn _Noreturn\n#define __noreturn_is_defined 1\n#endif\n";
 static const char hdr_stdalign[] = "#ifndef _STDALIGN_H\n#define _STDALIGN_H\n#define alignas _Alignas\n#define alignof _Alignof\n#define __alignas_is_defined 1\n#define __alignof_is_defined 1\n#endif\n";
+static const char hdr_assert[] = "#ifndef _ASSERT_H\n#define _ASSERT_H\n#define assert(x) ((void)0)\n#endif\n\n";
+static const char hdr_ctype[] = "#ifndef _CTYPE_H\n#define _CTYPE_H\nint isalpha(int c);\nint isdigit(int c);\nint isalnum(int c);\nint isspace(int c);\nint isupper(int c);\nint islower(int c);\nint ispunct(int c);\nint toupper(int c);\nint tolower(int c);\n#endif\n\n";
+static const char hdr_errno[] = "#ifndef _ERRNO_H\n#define _ERRNO_H\n#ifdef __linux__\nint *__errno_location(void);\n#define errno (*__errno_location())\n#else\nint *__error(void);\n#define errno (*__error())\n#endif\n#define EPERM 1\n#define ENOENT 2\n#define ESRCH 3\n#define EINTR 4\n#define EIO 5\n#define ENXIO 6\n#define EBADF 9\n#define ENOMEM 12\n#define EACCES 13\n#define EFAULT 14\n#define EBUSY 16\n#define EEXIST 17\n#define ENOTDIR 20\n#define EISDIR 21\n#define EINVAL 22\n#define ENOSPC 28\n#define EPIPE 32\n#define ERANGE 34\n#endif\n\n";
+static const char hdr_fcntl[] = "#ifndef _FCNTL_H\n#define _FCNTL_H\ntypedef unsigned short mode_t;\n#define O_RDONLY   0x0000\n#define O_WRONLY   0x0001\n#define O_RDWR     0x0002\n#define O_ACCMODE  0x0003\n#define O_NONBLOCK 0x0004\n#define O_APPEND   0x0008\n#define O_CREAT    0x0200\n#define O_TRUNC    0x0400\n#define O_EXCL     0x0800\n#define O_CLOEXEC  0x1000000\nint open(const char *path, int oflag, ...);\nint creat(const char *path, mode_t mode);\nint fcntl(int fd, int cmd, ...);\n#endif\n\n";
+static const char hdr_fenv[] = "#ifndef _FENV_H\n#define _FENV_H\ntypedef struct { unsigned long __fpsr; unsigned long __fpcr; } fenv_t;\ntypedef unsigned long fexcept_t;\nint feclearexcept(int excepts);\nint fetestexcept(int excepts);\nint feraiseexcept(int excepts);\nint fegetround(void);\nint fesetround(int round);\nint fegetenv(fenv_t *envp);\nint fesetenv(fenv_t *envp);\n#define FE_INEXACT    0x10\n#define FE_UNDERFLOW  0x08\n#define FE_OVERFLOW   0x04\n#define FE_DIVBYZERO  0x02\n#define FE_INVALID    0x01\n#define FE_ALL_EXCEPT 0x1F\n#define FE_TONEAREST  0x00\n#define FE_UPWARD     0x01\n#define FE_DOWNWARD   0x02\n#define FE_TOWARDZERO 0x03\n#endif\n\n";
+static const char hdr_inttypes[] = "#ifndef _INTTYPES_H\n#define _INTTYPES_H\n#include <stdint.h>\ntypedef struct { long quot; long rem; } imaxdiv_t;\nlong imaxabs(long n);\nimaxdiv_t imaxdiv(long num, long den);\nlong strtoimax(char *s, char **end, int base);\nunsigned long strtoumax(char *s, char **end, int base);\n#define PRId8  \"d\"\n#define PRId16 \"d\"\n#define PRId32 \"d\"\n#define PRId64 \"ld\"\n#define PRIi64 \"li\"\n#define PRIu8  \"u\"\n#define PRIu16 \"u\"\n#define PRIu32 \"u\"\n#define PRIu64 \"lu\"\n#define PRIx64 \"lx\"\n#define PRIX64 \"lX\"\n#define PRIo64 \"lo\"\n#define PRIdPTR \"ld\"\n#define PRIuPTR \"lu\"\n#define PRIxPTR \"lx\"\n#endif\n\n";
+static const char hdr_locale[] = "#ifndef _LOCALE_H\n#define _LOCALE_H\nstruct lconv {\n    char *decimal_point;\n    char *thousands_sep;\n    char *grouping;\n    char *int_curr_symbol;\n    char *currency_symbol;\n    char *mon_decimal_point;\n    char *mon_thousands_sep;\n    char *mon_grouping;\n    char *positive_sign;\n    char *negative_sign;\n    char int_frac_digits;\n    char frac_digits;\n    char p_cs_precedes;\n    char p_sep_by_space;\n    char n_cs_precedes;\n    char n_sep_by_space;\n    char p_sign_posn;\n    char n_sign_posn;\n    char int_p_cs_precedes;\n    char int_n_cs_precedes;\n    char int_p_sep_by_space;\n    char int_n_sep_by_space;\n    char int_p_sign_posn;\n    char int_n_sign_posn;\n};\nchar *setlocale(int category, char *locale);\nstruct lconv *localeconv(void);\n#define LC_ALL      0\n#define LC_COLLATE  1\n#define LC_CTYPE    2\n#define LC_MONETARY 3\n#define LC_NUMERIC  4\n#define LC_TIME     5\n#endif\n\n";
+static const char hdr_math[] = "#ifndef _MATH_H\n#define _MATH_H\n#define HUGE_VAL (1e308 * 10.0)\n#define INFINITY (1e308 * 10.0)\n#define NAN (0.0 * (1e308 * 10.0))\ndouble sqrt(double x);\ndouble cbrt(double x);\ndouble pow(double x, double y);\ndouble hypot(double x, double y);\ndouble sin(double x);\ndouble cos(double x);\ndouble tan(double x);\ndouble asin(double x);\ndouble acos(double x);\ndouble atan(double x);\ndouble atan2(double y, double x);\ndouble sinh(double x);\ndouble cosh(double x);\ndouble tanh(double x);\ndouble asinh(double x);\ndouble acosh(double x);\ndouble atanh(double x);\ndouble exp(double x);\ndouble exp2(double x);\ndouble expm1(double x);\ndouble log(double x);\ndouble log10(double x);\ndouble log2(double x);\ndouble log1p(double x);\ndouble frexp(double x, int *e);\ndouble ldexp(double x, int e);\ndouble modf(double x, double *ip);\ndouble scalbn(double x, int n);\ndouble fabs(double x);\ndouble floor(double x);\ndouble ceil(double x);\ndouble trunc(double x);\ndouble round(double x);\ndouble nearbyint(double x);\ndouble rint(double x);\ndouble fmod(double x, double y);\ndouble remainder(double x, double y);\ndouble copysign(double x, double y);\ndouble nextafter(double x, double y);\ndouble fdim(double x, double y);\ndouble fmax(double x, double y);\ndouble fmin(double x, double y);\ndouble fma(double x, double y, double z);\ndouble nan(const char *tag);\n#endif\n\n";
+static const char hdr_setjmp[] = "#ifndef _SETJMP_H\n#define _SETJMP_H\ntypedef long jmp_buf[48];\nint setjmp(jmp_buf env);\nvoid longjmp(jmp_buf env, int val);\n#endif\n\n";
+static const char hdr_signal[] = "#ifndef _SIGNAL_H\n#define _SIGNAL_H\ntypedef int sig_atomic_t;\ntypedef void (*sig_handler_t)(int);\nsig_handler_t signal(int sig, sig_handler_t handler);\nint raise(int sig);\n#define SIG_DFL ((sig_handler_t)0)\n#define SIG_IGN ((sig_handler_t)1)\n#define SIG_ERR ((sig_handler_t)-1)\n#define SIGINT  2\n#define SIGILL  4\n#define SIGABRT 6\n#define SIGFPE  8\n#define SIGSEGV 11\n#define SIGTERM 15\n#endif\n\n";
+static const char hdr_stdio[] = "#ifndef _STDIO_H\n#define _STDIO_H\n#ifndef NULL\n#define NULL ((void*)0)\n#endif\ntypedef unsigned long size_t;\ntypedef void FILE;\n#ifdef __linux__\nextern FILE *stdin;\nextern FILE *stdout;\nextern FILE *stderr;\n#else\nextern FILE *__stdinp;\nextern FILE *__stdoutp;\nextern FILE *__stderrp;\n#define stdin  __stdinp\n#define stdout __stdoutp\n#define stderr __stderrp\n#endif\n#define EOF (-1)\n#define BUFSIZ 1024\n#define FOPEN_MAX 20\n#define FILENAME_MAX 1024\n#define L_tmpnam 1024\n#define SEEK_SET 0\n#define SEEK_CUR 1\n#define SEEK_END 2\n#define _IOFBF 0\n#define _IOLBF 1\n#define _IONBF 2\nint printf(char *fmt, ...);\nint fprintf(FILE *stream, char *fmt, ...);\nint sprintf(char *str, char *fmt, ...);\nint snprintf(char *str, unsigned long size, char *fmt, ...);\nint puts(char *s);\nint putchar(int c);\nint fputs(char *s, FILE *stream);\nint fputc(int c, FILE *stream);\nint getchar(void);\nint scanf(char *fmt, ...);\nint sscanf(char *str, char *fmt, ...);\nFILE *fopen(char *path, char *mode);\nint fclose(FILE *stream);\nunsigned long fread(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nunsigned long fwrite(void *ptr, unsigned long size, unsigned long n, FILE *stream);\nint fflush(FILE *stream);\nint fgetc(FILE *stream);\nchar *fgets(char *s, int n, FILE *stream);\nint getc(FILE *stream);\nint ungetc(int c, FILE *stream);\nint feof(FILE *stream);\nint ferror(FILE *stream);\nvoid clearerr(FILE *stream);\nint fseek(FILE *stream, long offset, int whence);\nlong ftell(FILE *stream);\nvoid rewind(FILE *stream);\nint setvbuf(FILE *stream, char *buf, int mode, unsigned long size);\nvoid setbuf(FILE *stream, char *buf);\nFILE *freopen(char *path, char *mode, FILE *stream);\nFILE *tmpfile(void);\nchar *tmpnam(char *s);\nint fscanf(FILE *stream, char *fmt, ...);\nvoid perror(char *s);\nint remove(char *path);\nint rename(char *oldp, char *newp);\n#endif\n\n";
+static const char hdr_stdlib[] = "#ifndef _STDLIB_H\n#define _STDLIB_H\ntypedef unsigned long size_t;\n#define EXIT_SUCCESS 0\n#define EXIT_FAILURE 1\n#define RAND_MAX 2147483647\nvoid *malloc(unsigned long size);\nvoid *calloc(unsigned long n, unsigned long size);\nvoid *realloc(void *ptr, unsigned long size);\nvoid free(void *ptr);\nvoid exit(int status);\nvoid abort(void);\nint atoi(char *s);\nlong atol(char *s);\ndouble atof(char *s);\ndouble strtod(char *s, char **end);\nfloat strtof(char *s, char **end);\nlong strtol(char *s, char **end, int base);\nunsigned long strtoul(char *s, char **end, int base);\nlong long strtoll(char *s, char **end, int base);\nunsigned long long strtoull(char *s, char **end, int base);\nint abs(int x);\nlong labs(long x);\nint rand(void);\nvoid srand(unsigned int seed);\nvoid qsort(void *base, unsigned long n, unsigned long size, int (*cmp)(void *, void *));\nvoid *bsearch(void *key, void *base, unsigned long n, unsigned long size, int (*cmp)(void *, void *));\nchar *getenv(char *name);\nint system(char *cmd);\n#endif\n\n";
+static const char hdr_string[] = "#ifndef _STRING_H\n#define _STRING_H\ntypedef unsigned long size_t;\nunsigned long strlen(char *s);\nint strcmp(char *a, char *b);\nint strncmp(char *a, char *b, unsigned long n);\nchar *strcpy(char *d, char *s);\nchar *strncpy(char *d, char *s, unsigned long n);\nchar *strcat(char *d, char *s);\nchar *strncat(char *d, char *s, unsigned long n);\nchar *strchr(char *s, int c);\nchar *strrchr(char *s, int c);\nchar *strstr(char *h, char *n);\nchar *strpbrk(char *s, char *accept);\nunsigned long strspn(char *s, char *accept);\nunsigned long strcspn(char *s, char *reject);\nint strcoll(char *a, char *b);\nchar *strerror(int errnum);\nvoid *memcpy(void *d, void *s, unsigned long n);\nvoid *memmove(void *d, void *s, unsigned long n);\nvoid *memset(void *d, int c, unsigned long n);\nvoid *memchr(void *s, int c, unsigned long n);\nint memcmp(void *a, void *b, unsigned long n);\n#endif\n\n";
+static const char hdr_time[] = "#ifndef _TIME_H\n#define _TIME_H\ntypedef long time_t;\ntypedef long clock_t;\nstruct tm {\n    int tm_sec;\n    int tm_min;\n    int tm_hour;\n    int tm_mday;\n    int tm_mon;\n    int tm_year;\n    int tm_wday;\n    int tm_yday;\n    int tm_isdst;\n    long tm_gmtoff;\n    char *tm_zone;\n};\ntime_t time(time_t *t);\ndouble difftime(time_t end, time_t begin);\nclock_t clock(void);\nstruct tm *localtime(time_t *t);\nstruct tm *gmtime(time_t *t);\ntime_t mktime(struct tm *tm);\nchar *asctime(struct tm *tm);\nchar *ctime(time_t *t);\nunsigned long strftime(char *s, unsigned long max, char *fmt, struct tm *tm);\n#define CLOCKS_PER_SEC 1000000\n#endif\n\n";
+static const char hdr_uchar[] = "#ifndef _UCHAR_H\n#define _UCHAR_H\ntypedef unsigned short char16_t;\ntypedef unsigned int char32_t;\nunsigned long mbrtoc16(char16_t *pc16, char *s, unsigned long n, void *ps);\nunsigned long c16rtomb(char *s, char16_t c16, void *ps);\nunsigned long mbrtoc32(char32_t *pc32, char *s, unsigned long n, void *ps);\nunsigned long c32rtomb(char *s, char32_t c32, void *ps);\n#endif\n\n";
+static const char hdr_unistd[] = "#ifndef _UNISTD_H\n#define _UNISTD_H\ntypedef long ssize_t;\ntypedef long off_t;\n#ifndef SEEK_SET\n#define SEEK_SET 0\n#define SEEK_CUR 1\n#define SEEK_END 2\n#endif\nssize_t read(int fd, void *buf, unsigned long nbyte);\nssize_t write(int fd, const void *buf, unsigned long nbyte);\nint close(int fd);\noff_t lseek(int fd, off_t offset, int whence);\nint unlink(const char *path);\nint isatty(int fd);\n#endif\n\n";
+static const char hdr_wchar[] = "#ifndef _WCHAR_H\n#define _WCHAR_H\ntypedef int wchar_t;\n#ifndef _WINT_T\n#define _WINT_T\ntypedef int wint_t;\n#endif\nunsigned long wcslen(wchar_t *s);\nint wcscmp(wchar_t *a, wchar_t *b);\nwchar_t *wcscpy(wchar_t *d, wchar_t *s);\nwchar_t *wcscat(wchar_t *d, wchar_t *s);\nwchar_t *wcschr(wchar_t *s, wchar_t c);\n#define WEOF (-1)\n#endif\n\n";
+static const char hdr_wctype[] = "#ifndef _WCTYPE_H\n#define _WCTYPE_H\n#ifndef _WINT_T\n#define _WINT_T\ntypedef int wint_t;\n#endif\ntypedef unsigned long wctype_t;\nint iswalpha(wint_t c);\nint iswdigit(wint_t c);\nint iswalnum(wint_t c);\nint iswspace(wint_t c);\nint iswupper(wint_t c);\nint iswlower(wint_t c);\nint iswpunct(wint_t c);\nwint_t towupper(wint_t c);\nwint_t towlower(wint_t c);\n#endif\n\n";
 
 static const char *pp_builtin_header(const char *name) {
     if (kcc_strcmp2(name, "stddef.h")) return hdr_stddef;
@@ -2042,6 +2084,24 @@ static const char *pp_builtin_header(const char *name) {
     if (kcc_strcmp2(name, "iso646.h")) return hdr_iso646;
     if (kcc_strcmp2(name, "stdnoreturn.h")) return hdr_stdnoreturn;
     if (kcc_strcmp2(name, "stdalign.h")) return hdr_stdalign;
+    if (kcc_strcmp2(name, "assert.h")) return hdr_assert;
+    if (kcc_strcmp2(name, "ctype.h")) return hdr_ctype;
+    if (kcc_strcmp2(name, "errno.h")) return hdr_errno;
+    if (kcc_strcmp2(name, "fcntl.h")) return hdr_fcntl;
+    if (kcc_strcmp2(name, "fenv.h")) return hdr_fenv;
+    if (kcc_strcmp2(name, "inttypes.h")) return hdr_inttypes;
+    if (kcc_strcmp2(name, "locale.h")) return hdr_locale;
+    if (kcc_strcmp2(name, "math.h")) return hdr_math;
+    if (kcc_strcmp2(name, "setjmp.h")) return hdr_setjmp;
+    if (kcc_strcmp2(name, "signal.h")) return hdr_signal;
+    if (kcc_strcmp2(name, "stdio.h")) return hdr_stdio;
+    if (kcc_strcmp2(name, "stdlib.h")) return hdr_stdlib;
+    if (kcc_strcmp2(name, "string.h")) return hdr_string;
+    if (kcc_strcmp2(name, "time.h")) return hdr_time;
+    if (kcc_strcmp2(name, "uchar.h")) return hdr_uchar;
+    if (kcc_strcmp2(name, "unistd.h")) return hdr_unistd;
+    if (kcc_strcmp2(name, "wchar.h")) return hdr_wchar;
+    if (kcc_strcmp2(name, "wctype.h")) return hdr_wctype;
     return 0;
 }
 @}

@@ -1677,15 +1677,24 @@ distinguishes a hex float (\texttt{0x1.fp1}) from a hex integer
 
 \texttt{kcc\_parse\_atof} then evaluates the constant to an IEEE-754
 \texttt{double} \emph{at compile time} on the host's own
-floating-point unit.  For a decimal constant it accumulates \emph{all}
+floating-point unit.  For a decimal constant it accumulates the
 significant digits into a single integer mantissa $M$, counts the
 fractional digits $F$, reads any \texttt{e}-exponent, and reconstructs
 the value as $M \times 10^{\,e-F}$ with one final multiply or divide.
-Folding every digit into a single scaling step keeps the whole
-computation to one rounding: an exactly representable fraction such as
-\texttt{3.875} lands on its exact double, whereas the naive
-digit-by-digit $+\,d/10^{k}$ method rounds at every fraction digit and
-drifts a ULP low.  The power $10^{|e-F|}$ is built by repeated
+Only the first eighteen significant digits are folded into $M$: a
+\texttt{double} carries about seventeen, and a 64-bit $M$ overflows past
+nineteen, so an ultra-long literal---Lua's
+\texttt{3.141592653589793238462643383279502884}, thirty-four digits---would
+wrap $M$ around and yield garbage (an observed $8.6\times10^{-18}$ instead
+of $\pi$) if every digit were multiplied in.  Beyond the cap an
+\emph{integer} digit is not accumulated but instead bumps the power of ten
+(a \texttt{drop} counter added back into the exponent), and a
+\emph{fractional} digit is discarded without scaling; both are already
+below the mantissa's precision.  Folding the retained digits into a single
+scaling step keeps the whole computation to one rounding: an exactly
+representable fraction such as \texttt{3.875} lands on its exact double,
+whereas the naive digit-by-digit $+\,d/10^{k}$ method rounds at every
+fraction digit and drifts a ULP low.  The power $10^{|e-F|}$ is built by repeated
 multiplication, which is itself exact for $|e-F| \le 22$; only far
 larger magnitudes lose a bit, and those do not occur in real literals.
 
@@ -1791,6 +1800,8 @@ _kcc_parse_atof:
     mov x6, #0                   // F = fractional-digit count
     mov x8, #0                   // e-exponent magnitude (0 if no 'e' part)
     mov x9, #0                   // e-exponent sign: 0 = +, 1 = -
+    mov x13, #0                  // significant digits already in M (cap at 18)
+    mov x14, #0                  // integer digits dropped past the cap
     mov x12, #10
 .Latof_int:
     cmp x2, x3
@@ -1805,8 +1816,15 @@ _kcc_parse_atof:
     sub x10, x7, #'0'
     cmp x10, #9
     b.hi .Latof_scale           // suffix or other → done
+    cmp x13, #18
+    b.hs .Latof_int_drop        // mantissa full: this digit scales the exponent
     mul x5, x5, x12
     add x5, x5, x10             // M = M*10 + digit
+    add x13, x13, #1
+    add x2, x2, #1
+    b .Latof_int
+.Latof_int_drop:
+    add x14, x14, #1            // one more unaccumulated integer digit
     add x2, x2, #1
     b .Latof_int
 
@@ -1823,9 +1841,13 @@ _kcc_parse_atof:
     sub x10, x7, #'0'
     cmp x10, #9
     b.hi .Latof_scale
+    cmp x13, #18
+    b.hs .Latof_frac_next      // mantissa full: drop this fractional digit
     mul x5, x5, x12
     add x5, x5, x10
     add x6, x6, #1             // one more fractional digit
+    add x13, x13, #1
+.Latof_frac_next:
     add x2, x2, #1
     b .Latof_frac_loop
 
@@ -1862,6 +1884,7 @@ _kcc_parse_atof:
     neg x8, x8
 .Latof_scale_net:
     sub x8, x8, x6              // x8 = net decimal exponent (signed)
+    add x8, x8, x14             // integer digits past the cap raise the exponent
     scvtf d0, x5                // d0 = mantissa value
     mov x9, #10
     scvtf d3, x9                // d3 = 10.0

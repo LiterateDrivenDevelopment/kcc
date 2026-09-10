@@ -417,6 +417,91 @@ source into a working Linux/x86-64 \kcc{}, which in turn compiles the kernel
 object---and, run against its own source again, reproduces itself
 byte-for-byte.
 
+\section{Compiling a Real Program: Lua}
+\label{sec:um-lua}
+
+Before the kernel, a gentler capstone: \kcc{} compiles the \textbf{Lua~5.4.7}
+interpreter---about fifteen thousand lines of portable C across thirty-three
+translation units---into a working \texttt{lua} you can run scripts with, on
+both of \kcc{}'s targets.  Lua is a good proof because it leans on the whole
+language: a bytecode virtual machine, a precise mark-and-sweep collector,
+\texttt{setjmp}-based error handling, its own \texttt{printf}-style formatter,
+and a numeric library full of \texttt{double} arithmetic.  Nothing here is
+patched; it is the unmodified upstream tarball.
+
+Get the sources once:
+
+\begin{verbatim}
+curl -LO https://www.lua.org/ftp/lua-5.4.7.tar.gz
+tar xf lua-5.4.7.tar.gz && cd lua-5.4.7/src
+\end{verbatim}
+
+The interpreter is every \texttt{.c} in \texttt{src} \emph{except}
+\texttt{luac.c}, which is the standalone bytecode compiler and carries its own
+\texttt{main}.  \kcc{} needs no \texttt{-I} flag: the standard headers Lua
+includes---\texttt{<math.h>}, \texttt{<string.h>}, \texttt{<setjmp.h>},
+\texttt{<locale.h>}, and the rest---are the compiler-resident freestanding
+headers (\S\ref{sec:builtin-headers}), so the only search path required is the
+current directory for Lua's own \texttt{lua.h}.
+
+\subsection{On macOS (native ARM64)}
+
+Here \kcc{} is self-contained: it emits ARM64 machine code and links the
+executable itself, so a single tool takes the sources all the way to a binary.
+
+\begin{verbatim}
+KCC=/path/to/kcc/tmp/kcc
+for f in $(ls *.c | grep -v '^luac.c$'); do
+    "$KCC" -c "$f" -o "${f%.c}.o"
+done
+"$KCC" *.o -o lua -lm          # kcc drives the Mach-O link itself
+./lua -e 'print(_VERSION, math.pi)'
+\end{verbatim}
+
+which prints \texttt{Lua 5.4\quad3.1415926535898}.  A real script runs as you
+would expect:
+
+\begin{verbatim}
+$ ./lua
+> local function fib(n) return n<2 and n or fib(n-1)+fib(n-2) end
+> for i=1,10 do io.write(fib(i)," ") end print()
+1 1 2 3 5 8 13 21 34 55
+\end{verbatim}
+
+\subsection{On Linux (x86-64)}
+
+The x86-64 target follows the \texttt{gcc} model (\S\ref{sec:um-x86}): \kcc{}
+generates the object code and the system linker finishes the job.  Because Lua
+uses \texttt{malloc}, \texttt{printf}, and \texttt{libm}, the final link is the
+hosted one, through the system compiler driver:
+
+\begin{verbatim}
+for f in $(ls *.c | grep -v '^luac.c$'); do
+    kcc_linux -c "$f" --target=x86_64-linux -o "${f%.c}.o"
+done
+cc *.o -o lua -lm              # system ld pulls in libc + libm
+./lua -e 'print(_VERSION, math.pi)'
+\end{verbatim}
+
+The \texttt{kcc\_linux} used here is the self-hosted Linux compiler that
+\texttt{make meta-c} builds (\S\ref{sec:um-contributors}); on an Apple-silicon
+machine you can equally cross-compile each unit with the native \kcc{} and
+\texttt{-{}-target=x86\_64-linux}, then assemble and link on the x86-64 host.
+Either way the result is byte-for-byte the same interpreter, and it prints the
+same \texttt{3.1415926535898}.
+
+\paragraph{One bug worth naming.}  That \texttt{math.pi} value is not free.  Lua
+defines $\pi$ as a thirty-four-digit literal,
+\texttt{3.141592653589793238462643383279502884}, and \kcc{}'s compile-time
+decimal-to-\texttt{double} conversion originally folded \emph{every} digit into
+a 64-bit integer mantissa---which overflows past nineteen digits and yielded a
+nonsensical $8.6\times10^{-18}$.  The fix, on both back ends, is to accumulate
+only the first eighteen significant digits (a \texttt{double} carries about
+seventeen) and let any further integer digits raise the power-of-ten exponent
+instead of wrapping the mantissa (\S\ref{sec:parse-float}).  It is the kind of
+defect only a real program surfaces: no hand-written test reaches for a
+thirty-four-digit constant, but a numeric library does.
+
 \section{Booting a Linux Kernel Compiled by \kcc{}}
 \label{sec:um-kernelboot}
 

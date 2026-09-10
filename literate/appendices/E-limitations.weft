@@ -30,13 +30,17 @@ rejected.  Fixed-size and flexible-array-member forms are fully supported;
 only the run-time-bound automatic array is not.
 
 \paragraph{\texttt{\_Atomic} and \texttt{\_Complex}.}
-The atomic type qualifier \texttt{\_Atomic} and the complex type specifiers
-\texttt{\_Complex}/\texttt{\_Imaginary} (\stdref{6.7.2.4}, \stdref{6.2.5}) are
-not implemented.  \texttt{\_Atomic} needs the lock-free atomic instruction
-selection (load-acquire / store-release, \textsc{ldxr}/\textsc{stxr} loops) and
-the \texttt{<stdatomic.h>} generic machinery; \texttt{\_Complex} needs a
-two-component value representation and complex arithmetic lowering.  Both are
-rejected in the declaration specifiers.
+The complex type specifiers \texttt{\_Complex}/\texttt{\_Imaginary}
+(\stdref{6.2.5}) are not implemented and are rejected in the declaration
+specifiers: they need a two-component value representation and complex
+arithmetic lowering.  The atomic qualifier \texttt{\_Atomic} (\stdref{6.7.2.4})
+\emph{is} accepted as a type qualifier, but with \emph{relaxed}, non-atomic
+semantics---it is recorded and then ignored, so accesses compile to ordinary
+loads and stores rather than lock-free atomic sequences
+(\textsc{ldxr}/\textsc{stxr} loops).  The \texttt{\_Atomic(\emph{type-name})}
+specifier form and the \texttt{<stdatomic.h>} generic machinery are not
+modelled.  This is safe for single-threaded programs; it is \emph{not} a correct
+concurrency primitive, which is why it is called out here rather than claimed.
 
 \paragraph{\texttt{\_\_int128} arithmetic.}\label{sec:lim-int128}
 The GNU 128-bit integer type \texttt{\_\_int128} (and \texttt{unsigned
@@ -48,13 +52,14 @@ two \texttt{unsigned long} halves.  That is exactly the surface the Linux
 kernel's \texttt{cmpxchg16b} path uses (\texttt{union \_\_u128\_halves} plus
 inline assembly on the halves).
 
-The self-hosting (Linux/x86-64) port additionally lowers the two 128-bit
-operations the kernel's \texttt{math64.h} needs---an unsigned multiply and a
-logical right shift, i.e.\ \texttt{mul\_u64\_u32\_shr} and
-\texttt{mul\_u64\_u64\_shr}---by materialising a \texttt{\_\_int128} rvalue as a
-sixteen-byte stack slot and computing on the two halves with ordinary 64-bit
-operations (Section~\ref{sec:ir-int128}).  Everything else---add, subtract,
-divide, modulo, left shift, comparison, compound assignment, unary
+The self-hosting (Linux/x86-64) port additionally lowers the 128-bit operations
+the kernel needs---an unsigned multiply and a logical right shift
+(\texttt{math64.h}'s \texttt{mul\_u64\_u32\_shr} / \texttt{mul\_u64\_u64\_shr}),
+plus equality and inequality (\texttt{==}, \texttt{!=})---by materialising a
+\texttt{\_\_int128} rvalue as a sixteen-byte stack slot and computing on the two
+halves with ordinary 64-bit operations (Section~\ref{sec:ir-int128}).
+Everything else---add, subtract, divide, modulo, left shift, \emph{ordering}
+comparison ($<$, $>$, $\leq$, $\geq$), compound assignment, unary
 negation, and a \emph{signed} right shift---still needs carry-aware two-word
 arithmetic that is not yet emitted, so the semantic analyser rejects it rather
 than silently drop the high 64~bits.  The assembly reference goes further and
@@ -62,21 +67,25 @@ rejects \emph{all} \texttt{\_\_int128} arithmetic, as it does the other
 kernel-only builtins: register-pair lowering with carry
 (\textsc{adds}/\textsc{adc}) in the direct back ends remains future work.
 
-\paragraph{Extended inline assembly beyond two operands.}
-Basic inline assembly and the common two-operand extended forms
-(\texttt{"=r"}, \texttt{"r"}, \texttt{"+r"}, \texttt{"i"}, with
-\texttt{"memory"}/\texttt{"cc"} clobbers) work through the textual back end
-(\S\ref{sec:um-inline-asm}).  Three or more live operands, memory
-(\texttt{"m"}) or specific-register constraints, and \texttt{asm goto} are
-refused with a diagnostic.  The obstacle is that an asm operand's virtual
-register is carried on the AST node rather than in an instruction's operand
-fields, so it is invisible to the middle-end passes (copy propagation,
-common-subexpression elimination, dead-code elimination) and to the register
-allocator.  Making \texttt{IR\_ASM} a first-class multi-operand instruction ---
-operand vregs stored in an array that every pass iterates, with real
-use/def/clobber sets --- is the deliberate future project that lifts this
-ceiling (and also fixes the IR dumper, which currently faults on
-\texttt{IR\_ASM}).
+\paragraph{Extended inline assembly.}
+Basic inline assembly and the common extended forms (\texttt{"=r"},
+\texttt{"r"}, \texttt{"+r"}, \texttt{"i"}, with \texttt{"memory"}/\texttt{"cc"}
+clobbers) work through the textual back end (\S\ref{sec:um-inline-asm}).  To
+compile the Linux kernel's assembly the x86-64 path has grown well past the
+original two-operand ceiling: up to three live register operands, memory
+(\texttt{"m"}) operands including symbolic per-CPU references, value/immediate
+constraints such as \texttt{"Nd"}, string-literal operands lowered to
+\texttt{.rodata}, and the static-key jump-label pattern of \texttt{asm goto}.
+What remains refused is inline asm with more live operands than the back end can
+place, and the fully general \texttt{asm goto} with arbitrary outputs.  The
+structural obstacle is that an asm operand's virtual register is carried on the
+AST node rather than in an instruction's operand fields, so it is invisible to
+the middle-end passes (copy propagation, common-subexpression elimination,
+dead-code elimination) and to the register allocator.  Making \texttt{IR\_ASM} a
+first-class multi-operand instruction---operand vregs stored in an array that
+every pass iterates, with real use/def/clobber sets---is the deliberate future
+project that lifts this ceiling (and also fixes the IR dumper, which currently
+faults on \texttt{IR\_ASM}).
 
 \paragraph{Attribute layout at member granularity.}
 \texttt{\_\_attribute\_\_((packed))} and \texttt{aligned(N)} are honoured at the
@@ -86,8 +95,23 @@ is correct for the hint attributes but means member-level layout control is
 absent.
 
 \paragraph{Computed \texttt{goto}.}
-The GNU label-address (\texttt{\&\&label}) and computed-goto (\texttt{goto
-*p}) extension, used by some interpreter dispatch loops, is not supported.
+The GNU label-address (\texttt{\&\&label}) and computed-goto (\texttt{goto *p})
+extension---used by interpreter and BPF-style dispatch loops---is implemented in
+the self-hosting (Linux) compiler, which lowers a label address to an
+\texttt{IR\_LADDR} value and an indirect jump to \texttt{IR\_BR\_IND}.  The
+assembly-hosted bootstrap compiler does not yet parse the extension and rejects
+\texttt{\&\&label} with a diagnostic; a program that needs computed \texttt{goto}
+must be built with the self-hosting compiler.
+
+\paragraph{\texttt{volatile} through an aggregate object.}
+A \texttt{volatile}-qualified \emph{scalar} object is honoured, and a member or
+bit-field declared \texttt{volatile} is honoured, but \texttt{volatile} applied
+to an aggregate \emph{object} does not yet propagate to a member access on it
+(\texttt{vs.x}, where \texttt{vs} is a \texttt{volatile struct}): that access is
+currently treated as non-volatile.  This is the one remaining tail corner of
+C17's type-qualifier semantics; every other use of \texttt{volatile}---the CSE
+barrier, the guarantee that a volatile load or store is neither elided nor
+reordered away---is in place.
 
 \section{Standard Library and Headers}
 
@@ -105,17 +129,29 @@ set).
 
 \section{Code Generation and Targets}
 
-\paragraph{Single target.}
-\kcc{} targets ARM64 / Apple-silicon macOS (Mach-O) only.  The textual
-\texttt{.s}-emission back end (\S\ref{ch:emit-asm}) is the groundwork for a
-second target, but no other architecture or object format is implemented yet.
+\paragraph{Two targets; no third.}
+\kcc{}'s native, fully-supported target is ARM64 / Apple-silicon macOS
+(Mach-O), where it emits machine code and links directly.  A second target,
+x86-64, emits AT\&T assembly finished by the system \texttt{as}/\texttt{ld}, for
+both macOS (Mach-O, run under Rosetta) and Linux (ELF), selected with
+\texttt{-{}-target=x86\_64} / \texttt{-{}-target=x86\_64-linux}; it is complete
+enough to compile \kcc{}'s own sources, a Linux kernel object, and programs
+such as SQLite and Lua, and to self-host on Linux.  No architecture or object
+format beyond these two is implemented.  The x86-64 back end carries its own
+limits: it does \emph{not} allocate registers---an all-spill model puts every
+value in a stack slot, which is correct but makes the code large and slow (an
+x86 register allocator is the main outstanding piece)---and it refuses, cleanly,
+a few by-value aggregate-argument shapes it cannot classify and most
+\texttt{\_\_int128} operations (\S\ref{sec:lim-int128}).
 
 \paragraph{Optimisation scope.}
-The optimiser performs constant folding, dead-code elimination, common-subexpression
-elimination, a scalar mem2reg promotion, strength reduction, and copy
-propagation.  It does \emph{not} perform loop optimisations, inlining,
-vectorisation, or global (inter-procedural) analysis.  Generated code is
-correct but not aggressively optimised.
+The optimiser performs constant folding, dead-code elimination,
+common-subexpression elimination, a scalar mem2reg promotion, strength
+reduction, and copy propagation.  It does \emph{not} perform loop
+optimisations, inlining, vectorisation, or global (inter-procedural) analysis.
+Register allocation is a linear scan on the ARM64 target; the x86-64 target
+does not allocate registers at all (see above).  Generated code is correct but
+not aggressively optimised.
 
 \paragraph{Debug information granularity.}
 Under \texttt{-g}, DWARF is emitted at function granularity (each function's

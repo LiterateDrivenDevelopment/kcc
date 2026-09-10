@@ -424,9 +424,11 @@ int main(int argc, char **argv) {
 
 \section{Composition and Verification}
 
-@d Selfhost: main file @{
-@<Selfhost: main@>
-@}
+The assembly chapter routes the \texttt{Selfhost: main} fragment above into
+\texttt{tmp/selfhost/main.c}; nothing re-wraps it here.  What remains is to
+\emph{verify} that entry point, which \texttt{make selfhost-main} does: it
+compiles \texttt{main.c} with \kcc{} in place of the assembly \texttt{main.o},
+relinks the compiler, and runs the difftest, diagtest, and codegen sweeps.
 
 @d Selfhost: main verify @{
 #!/usr/bin/env bash

@@ -67,24 +67,19 @@ rejects \emph{all} \texttt{\_\_int128} arithmetic, as it does the other
 kernel-only builtins: register-pair lowering with carry
 (\textsc{adds}/\textsc{adc}) in the direct back ends remains future work.
 
-\paragraph{Extended inline assembly.}
-Basic inline assembly and the common extended forms (\texttt{"=r"},
-\texttt{"r"}, \texttt{"+r"}, \texttt{"i"}, with \texttt{"memory"}/\texttt{"cc"}
-clobbers) work through the textual back end (\S\ref{sec:um-inline-asm}).  To
-compile the Linux kernel's assembly the x86-64 path has grown well past the
-original two-operand ceiling: up to three live register operands, memory
-(\texttt{"m"}) operands including symbolic per-CPU references, value/immediate
-constraints such as \texttt{"Nd"}, string-literal operands lowered to
-\texttt{.rodata}, and the static-key jump-label pattern of \texttt{asm goto}.
-What remains refused is inline asm with more live operands than the back end can
-place, and the fully general \texttt{asm goto} with arbitrary outputs.  The
-structural obstacle is that an asm operand's virtual register is carried on the
-AST node rather than in an instruction's operand fields, so it is invisible to
-the middle-end passes (copy propagation, common-subexpression elimination,
-dead-code elimination) and to the register allocator.  Making \texttt{IR\_ASM} a
-first-class multi-operand instruction---operand vregs stored in an array that
-every pass iterates, with real use/def/clobber sets---is the deliberate future
-project that lifts this ceiling (and also fixes the IR dumper, which currently
+\paragraph{Fully general extended inline assembly.}
+Inline assembly works through the textual back end
+(\S\ref{sec:um-inline-asm})---including register, immediate, memory, and
+per-CPU symbolic operands and the static-key \texttt{asm goto} pattern---but not
+in full generality: inline asm with more live operands than the back end can
+place, and \texttt{asm goto} with arbitrary outputs, are refused with a
+diagnostic.  The obstacle is structural: an asm operand's virtual register is
+carried on the AST node rather than in an instruction's operand fields, so it is
+invisible to the middle-end passes (copy propagation, common-subexpression
+elimination, dead-code elimination) and to the register allocator.  Making
+\texttt{IR\_ASM} a first-class multi-operand instruction---operand vregs stored
+in an array that every pass iterates, with real use/def/clobber sets---is the
+future project that lifts this ceiling (and also fixes the IR dumper, which
 faults on \texttt{IR\_ASM}).
 
 \paragraph{Attribute layout at member granularity.}
@@ -93,15 +88,6 @@ aggregate level, but not on an individual member (\texttt{int x
 \_\_attribute\_\_((packed));}).  Other attributes are parsed and ignored, which
 is correct for the hint attributes but means member-level layout control is
 absent.
-
-\paragraph{Computed \texttt{goto}.}
-The GNU label-address (\texttt{\&\&label}) and computed-goto (\texttt{goto *p})
-extension---used by interpreter and BPF-style dispatch loops---is implemented in
-the self-hosting (Linux) compiler, which lowers a label address to an
-\texttt{IR\_LADDR} value and an indirect jump to \texttt{IR\_BR\_IND}.  The
-assembly-hosted bootstrap compiler does not yet parse the extension and rejects
-\texttt{\&\&label} with a diagnostic; a program that needs computed \texttt{goto}
-must be built with the self-hosting compiler.
 
 \paragraph{\texttt{volatile} through an aggregate object.}
 A \texttt{volatile}-qualified \emph{scalar} object is honoured, and a member or
@@ -129,20 +115,15 @@ set).
 
 \section{Code Generation and Targets}
 
-\paragraph{Two targets; no third.}
-\kcc{}'s native, fully-supported target is ARM64 / Apple-silicon macOS
-(Mach-O), where it emits machine code and links directly.  A second target,
-x86-64, emits AT\&T assembly finished by the system \texttt{as}/\texttt{ld}, for
-both macOS (Mach-O, run under Rosetta) and Linux (ELF), selected with
-\texttt{-{}-target=x86\_64} / \texttt{-{}-target=x86\_64-linux}; it is complete
-enough to compile \kcc{}'s own sources, a Linux kernel object, and programs
-such as SQLite and Lua, and to self-host on Linux.  No architecture or object
-format beyond these two is implemented.  The x86-64 back end carries its own
-limits: it does \emph{not} allocate registers---an all-spill model puts every
-value in a stack slot, which is correct but makes the code large and slow (an
-x86 register allocator is the main outstanding piece)---and it refuses, cleanly,
-a few by-value aggregate-argument shapes it cannot classify and most
-\texttt{\_\_int128} operations (\S\ref{sec:lim-int128}).
+\paragraph{No target beyond ARM64 and x86-64.}
+\kcc{} targets ARM64 (Apple-silicon macOS / Mach-O) and x86-64 (macOS and
+Linux/ELF); no other architecture or object format is implemented.  The two are
+not equally mature.  The x86-64 back end does \emph{not} allocate registers---an
+all-spill model puts every value in a stack slot, which is correct but makes the
+generated code large and slow (an x86 register allocator is the main
+outstanding piece)---and it refuses, cleanly, a few by-value aggregate-argument
+shapes it cannot classify and most \texttt{\_\_int128} operations
+(\S\ref{sec:lim-int128}).
 
 \paragraph{Optimisation scope.}
 The optimiser performs constant folding, dead-code elimination,

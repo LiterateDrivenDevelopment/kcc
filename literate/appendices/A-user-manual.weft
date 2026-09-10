@@ -783,14 +783,19 @@ which works everywhere but takes about half a minute to reach the prompt.
 \section{Building This Book}
 \label{sec:um-docs}
 
-If you have \texttt{lualatex} installed and want the typeset PDF of this
-literate program, run:
+Two targets build the document, mirroring how \texttt{make tangle} extracts the
+code: \texttt{make weave} runs \weft{} to produce the \LaTeX{} source
+(\texttt{kcc.tex}), and \texttt{make pdf} compiles that \texttt{.tex} into the
+typeset \texttt{kcc.pdf} (with \texttt{lualatex}, for native Unicode).  So for
+the finished book you want:
 
 \begin{verbatim}
-make weave
+make pdf        # weaves kcc.tex, then compiles kcc.pdf
 \end{verbatim}
 
-This is purely optional and unrelated to using the compiler.
+\noindent (\texttt{make pdf} depends on \texttt{make weave}, so it runs both;
+use \texttt{make weave} alone if you only want the \LaTeX{} source.)  This is
+purely optional and unrelated to using the compiler.
 
 \section{For Contributors}
 \label{sec:um-contributors}

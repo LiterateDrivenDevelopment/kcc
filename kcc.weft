@@ -132,6 +132,7 @@
 \newcommand{\idb}{\textsc{ib}}
 \newcommand{\stdref}[1]{\S\,#1}
 \newcommand{\kcc}{\textsf{kcc}}
+\newcommand{\weft}{\textsf{weft}}
 \newcommand{\reg}[1]{\texttt{#1}}
 \newcommand{\meta}[1]{\textsf{#1}}
 \newcommand{\arch}[1]{\textsf{#1}}

@@ -29,7 +29,7 @@ LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
         selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
         selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema \
         selfhost-emit-x86 selfhost-preprocessor selfhost-codegen selfhost-ir selfhost-main selfhost-lexer-core meta-a meta-c \
-        difftest interop e2e diagtest warntest test-codegen doc weave clean \
+        difftest interop e2e diagtest warntest test-codegen weave pdf clean \
         run map
 
 # Default: build everything
@@ -264,12 +264,13 @@ test-codegen: build
 	chmod +x tmp/tests/test_codegen.sh
 	tmp/tests/test_codegen.sh
 
-# Weave: generate LaTeX source
-doc:
+# Weave: literate .weft sources -> LaTeX (kcc.tex). Mirrors `tangle`, which
+# produces the code to compile; `weave` produces the document source.
+weave:
 	weft -w tex -d -r kcc.weft
 
-# Weave + compile to PDF (lualatex for native Unicode)
-weave: doc
+# PDF: compile the woven LaTeX to kcc.pdf (lualatex for native Unicode).
+pdf: weave
 	latexmk -lualatex -interaction=nonstopmode -f kcc.tex
 
 # Clean generated files

@@ -502,7 +502,7 @@ itself.
 \item The \stdref{J.3} implementation-defined behavior document
       is complete (Appendix~A).
 \item The UB policy matrix is complete (Appendix~B).
-\item \texttt{make weave} produces a typeset document that
+\item \texttt{make pdf} produces a typeset document that
       serves as a comprehensive textbook on both compiler
       construction and ARM64 systems programming.
 \end{enumerate}

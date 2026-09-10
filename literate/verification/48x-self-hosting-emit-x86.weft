@@ -1403,6 +1403,19 @@ static void x86_build_refset(void) {
             if (ar && ar->alias) x86_ref_mark(ar->alias);  /* alias .set target */
         }
     }
+    /* Static-local initializers are emitted as their own objects (below) and one
+       may take a static function's address---Lua's `createsearcherstable' holds a
+       block-local `static const lua_CFunction searchers[] = { searcher_preload,
+       ... }'.  Those decls are not in the file-scope chain, so scan them here too,
+       or a function referenced only from such a table would be dropped as unused
+       and the link would fail with an undefined reference. */
+    if (kcc_ir_static_decls) {
+        unsigned long ns = IL(kcc_ir_static_decls, VEC_COUNT);
+        for (unsigned long i = 0; i < ns; i++) {
+            struct Node *sd = *(struct Node **)kcc_vec_get(kcc_ir_static_decls, i);
+            if (sd && sd->f2) x86_ref_scan_init((struct Node *)sd->f2);
+        }
+    }
 }
 
 static void x86_render_text(void) {

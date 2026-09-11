@@ -1424,7 +1424,15 @@ treatment.  The \texttt{defined} operator tests whether a macro name
 exists in the macro table, returning~1 or~0 without expanding it; both
 \texttt{defined(NAME)} and \texttt{defined NAME} forms are accepted per
 \stdref{6.10.1}.  Any other identifier is looked up as a macro and its
-body parsed as an integer; undefined names evaluate to~0.
+body parsed as an integer; undefined names evaluate to~0.  One subtlety
+in the zero-returning paths: the primary must \emph{advance} past the
+identifier with \texttt{\_kcc\_lex\_next} before loading the constant
+\texttt{0}, because the lexer call returns its own value in \texttt{x0}
+and would otherwise overwrite the zero.  Getting this backwards makes an
+undefined name evaluate to the leftover token value---so a bound like
+\verb|#if SQLITE_OS_OTHER + 1 > 1| (with \texttt{SQLITE\_OS\_OTHER}
+undefined) folds to \emph{true} instead of \texttt{0 + 1 > 1}, silently
+picking the wrong configuration branch.
 
 @d PP: eval @{
 .Leval_ident:
@@ -1495,8 +1503,8 @@ body parsed as an integer; undefined names evaluate to~0.
     ret
 
 .Leval_defined_zero:
-    mov  x0, #0
-    bl _kcc_lex_next
+    bl _kcc_lex_next            // clobbers x0 with the lexer's result...
+    mov  x0, #0                 // ...so zero the value AFTER advancing
     ldr  x19, [sp, #16]
     ldp  x29, x30, [sp], #32
     ret
@@ -1527,8 +1535,8 @@ body parsed as an integer; undefined names evaluate to~0.
     ret
 
 .Leval_ident_zero:
-    mov  x0, #0
-    bl _kcc_lex_next
+    bl _kcc_lex_next            // clobbers x0 with the lexer's result...
+    mov  x0, #0                 // ...so an undefined name yields 0 AFTER advancing
     ldr  x19, [sp, #16]
     ldp  x29, x30, [sp], #32
     ret

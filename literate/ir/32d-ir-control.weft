@@ -674,6 +674,25 @@ the builtin is a genuine integer constant expression usable in a
 compile-time choice.  The rodata predicate accepts it too, so a file-scope
 initializer folds rather than being mistaken for a run-time value.
 
+The evaluator also folds \texttt{offsetof}-style null-based address constants,
+the one addition that lets \kcc{} compile the SQLite amalgamation on this target
+as it already does on x86-64.  \texttt{offsetof(T, m)} expands to
+\verb|((size_t)&(((T*)0)->m))|, and a bound such as
+\verb|char b[sizeof(P) - offsetof(P, tail)]| --- SQLite's saved-parser buffer ---
+is a perfectly good integer constant expression that clang accepts.  Two small
+mutually-recursive helpers add it: \texttt{\_kcc\_addr\_is\_iconst} decides
+whether the address of an lvalue is a constant (its ultimate base must be a
+constant pointer, so it walks \texttt{\&}, member access, and \texttt{*} down to a
+cast-of-zero), and \texttt{\_kcc\_eval\_addr} computes the value --- a member adds
+its byte offset (found through the same \texttt{\_kcc\_type\_find\_member} the IR
+builder uses, so type-check and fold agree) to the base pointer's value.
+\texttt{\_kcc\_expr\_is\_ice} routes a \texttt{\&} through the former and
+\texttt{\_kcc\_eval\_const\_int} routes it through the latter; without them the
+member offset folds to \texttt{0} and the array is wrongly rejected as a
+variable-length array.  During array-bound folding the operand's type may not yet
+be resolved, so \texttt{\_kcc\_eval\_addr} type-checks it on demand, exactly as
+the \texttt{sizeof} case does.
+
 @d IR: build switch @{
 // -- kcc_eval_const_int ---------------------------------------------------
 // int64_t kcc_eval_const_int(node *n)
@@ -793,6 +812,8 @@ _kcc_eval_const_int:
     b .Lec_ret
 .Lec_unary:
     ldr x20, [x19, #AST_F0]     // op
+    cmp x20, #TOK_AMP
+    b.eq .Lec_un_addr           // &lvalue: a null-based address constant (offsetof)
     ldr x0, [x19, #AST_F1]
     bl _kcc_eval_const_int
     cmp x20, #TOK_MINUS
@@ -806,9 +827,17 @@ _kcc_eval_const_int:
     b .Lec_ret
 .Lec_un_bang:
     cmp x20, #TOK_BANG
-    b.ne .Lec_ret               // +x, *x, &x → value unchanged
+    b.ne .Lec_ret               // +x, *x → value unchanged
     cmp x0, #0
     cset x0, eq
+    b .Lec_ret
+.Lec_un_addr:
+    // &(((T*)0)->m) --- the expansion of offsetof --- folds to the member's byte
+    // offset via the address evaluator, so a bound like
+    // `char b[sizeof(P) - offsetof(P, tail)]` lays out at its true size instead
+    // of folding to 0 (which under-sizes the array).
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_eval_addr
     b .Lec_ret
 .Lec_binary:
     ldr x20, [x19, #AST_F0]     // op
@@ -911,6 +940,91 @@ _kcc_eval_const_int:
     ldp x29, x30, [sp], #48
     ret
 
+// -- kcc_eval_addr --------------------------------------------------------
+// uint64_t kcc_eval_addr(node *n)
+//   The integer value of a null-based address constant --- the address of an
+//   lvalue whose ultimate base is a constant pointer, as produced by
+//   `offsetof(T, m)` = `((size_t)&(((T*)0)->m))`.  A member access adds its
+//   byte offset within the aggregate to the base; `p->m` takes the pointer's
+//   value as the base, `s.m` the address of `s`; a dereference `*p` yields the
+//   pointer's value.  Anything else contributes 0.  Paired with
+//   kcc_addr_is_iconst, which decides when such an address is a constant.
+.p2align 2
+_kcc_eval_addr:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    cbz x0, .Lea_zero
+    mov x19, x0
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_PAREN_EXPR
+    b.eq .Lea_paren
+    cmp x0, #AST_MEMBER
+    b.eq .Lea_member
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Lea_unary
+.Lea_zero:
+    mov x0, #0
+    b .Lea_ret
+.Lea_paren:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_eval_addr
+    b .Lea_ret
+.Lea_unary:
+    ldr x1, [x19, #AST_F0]      // op
+    cmp x1, #TOK_STAR
+    b.ne .Lea_zero              // only *p contributes an address value
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_eval_const_int
+    b .Lea_ret
+.Lea_member:
+    ldr x22, [x19, #AST_F0]     // object expression
+    ldr x0, [x19, #AST_F2]      // arrow (p->m) vs dot (s.m)
+    cbz x0, .Lea_dot
+    mov x0, x22                 // p->m: base = the pointer's value
+    bl _kcc_eval_const_int
+    b .Lea_base_done
+.Lea_dot:
+    mov x0, x22                 // s.m: base = the address of s
+    bl _kcc_eval_addr
+.Lea_base_done:
+    mov x21, x0                 // base
+    // Resolve the object's type.  During array-bound folding sema has not yet
+    // visited the operand, so its AST_F3 may be null; type-check it now.
+    ldr x20, [x22, #AST_F3]
+    cbnz x20, .Lea_have_type
+    mov x0, x22
+    bl _kcc_sema_expr
+    mov x20, x0
+.Lea_have_type:
+    cbz x20, .Lea_base_ret
+    ldr x0, [x20, #TY_KIND]
+    cmp x0, #TY_PTR
+    b.ne .Lea_check_agg
+    ldr x20, [x20, #TY_F0]      // arrow: follow the pointer to the aggregate
+    cbz x20, .Lea_base_ret
+.Lea_check_agg:
+    ldr x0, [x20, #TY_KIND]
+    cmp x0, #TY_STRUCT
+    b.eq .Lea_find
+    cmp x0, #TY_UNION
+    b.ne .Lea_base_ret
+.Lea_find:
+    mov x0, x20                 // struct/union type
+    ldr x1, [x19, #AST_F1]      // member name
+    bl _kcc_type_find_member    // x0 = field decl (0 if none), x1 = byte offset
+    cbz x0, .Lea_base_ret       // member not found → add nothing
+    add x0, x21, x1
+    b .Lea_ret
+.Lea_base_ret:
+    mov x0, x21
+.Lea_ret:
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
 // -- kcc_expr_is_ice ------------------------------------------------------
 // uint64_t kcc_expr_is_ice(node *n)
 //   1 if n is an integer constant expression (\stdref{6.6}) --- literals,
@@ -940,7 +1054,7 @@ _kcc_expr_is_ice:
     cmp x0, #AST_CAST_EXPR
     b.eq .Lice_f1
     cmp x0, #AST_UNARY_EXPR
-    b.eq .Lice_f1
+    b.eq .Lice_unary
     cmp x0, #AST_BINARY_EXPR
     b.eq .Lice_bin
     cmp x0, #AST_COND_EXPR
@@ -955,6 +1069,19 @@ _kcc_expr_is_ice:
 .Lice_f1:
     ldr x0, [x19, #AST_F1]
     bl _kcc_expr_is_ice
+    b .Lice_ret
+.Lice_unary:
+    ldr x1, [x19, #AST_F0]      // op
+    cmp x1, #TOK_AMP
+    b.eq .Lice_addr             // &lvalue → ICE iff its address is (offsetof)
+    cmp x1, #TOK_STAR
+    b.eq .Lice_no               // *p is not a constant expression
+    ldr x0, [x19, #AST_F1]      // +x, -x, ~x, !x → operand must be an ICE
+    bl _kcc_expr_is_ice
+    b .Lice_ret
+.Lice_addr:
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_addr_is_iconst
     b .Lice_ret
 .Lice_bin:
     ldr x0, [x19, #AST_F1]
@@ -991,6 +1118,55 @@ _kcc_expr_is_ice:
 .Lice_yes:
     mov x0, #1
 .Lice_ret:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+// -- kcc_addr_is_iconst ---------------------------------------------------
+// uint64_t kcc_addr_is_iconst(node *n)
+//   Whether the address of the lvalue `n` reduces to an integer constant
+//   expression: its ultimate base must be a constant pointer, as in the
+//   `&(((T*)0)->m)` that offsetof expands to.  A member keeps walking (`p->m`
+//   requires the pointer `p` to be an ICE, `s.m` requires `s`'s address to be a
+//   constant); a dereference `*p` requires `p` to be an ICE; anything else is 0.
+.p2align 2
+_kcc_addr_is_iconst:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    cbz x0, .Laic_no
+    mov x19, x0
+    ldr x0, [x19, #AST_TAG]
+    cmp x0, #AST_PAREN_EXPR
+    b.eq .Laic_paren
+    cmp x0, #AST_MEMBER
+    b.eq .Laic_member
+    cmp x0, #AST_UNARY_EXPR
+    b.eq .Laic_unary
+.Laic_no:
+    mov x0, #0
+    b .Laic_ret
+.Laic_paren:
+    ldr x0, [x19, #AST_F0]
+    bl _kcc_addr_is_iconst
+    b .Laic_ret
+.Laic_member:
+    ldr x1, [x19, #AST_F2]      // arrow (p->m) vs dot (s.m)
+    ldr x0, [x19, #AST_F0]      // base object
+    cbz x1, .Laic_member_dot
+    bl _kcc_expr_is_ice         // p->m: the pointer must be an ICE
+    b .Laic_ret
+.Laic_member_dot:
+    bl _kcc_addr_is_iconst      // s.m: the base address must be constant
+    b .Laic_ret
+.Laic_unary:
+    ldr x1, [x19, #AST_F0]      // op
+    cmp x1, #TOK_STAR
+    b.ne .Laic_no
+    ldr x0, [x19, #AST_F1]
+    bl _kcc_expr_is_ice
+    b .Laic_ret
+.Laic_ret:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #32
     ret
@@ -1420,7 +1596,7 @@ _kcc_ir_build_switch:
     ldp x19, x20, [sp, #16]
     ldp x29, x30, [sp], #96
     ret
-@| _kcc_ir_build_switch _kcc_eval_const_int _kcc_ir_sw_scan _kcc_ir_sw_disp
+@| _kcc_ir_build_switch _kcc_eval_const_int _kcc_eval_addr _kcc_expr_is_ice _kcc_addr_is_iconst _kcc_ir_sw_scan _kcc_ir_sw_disp
 @}
 
 \paragraph{End-to-end tests.}

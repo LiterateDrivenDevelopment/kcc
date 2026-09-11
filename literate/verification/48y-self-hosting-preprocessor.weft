@@ -1667,8 +1667,13 @@ unsigned long kcc_pp_atoi(const char *p, unsigned long len) {
 \section{File Inclusion and Built-in Headers}
 
 \texttt{\#include} resolves a header by trying, in order, the including file's
-own directory, the literal path, and each \texttt{-I} directory; a small set of
-headers is served from memory as built-ins.  Alongside resolution, the
+own directory, the literal path, and each \texttt{-I} directory; only if no file
+is found there is the header served from memory as a built-in.  Disk before
+built-in is deliberate: the compiler-resident headers are a freestanding
+fallback so a program can compile with no search path at all, but a hosted build
+that supplies a fuller shim through \texttt{-I}---the platform's real
+\texttt{errno} values or \texttt{struct flock}, say---must get that shim rather
+than the leaner built-in.  Alongside resolution, the
 preprocessor keeps the \emph{dependency list} for \texttt{-MD}: every real
 include file it opens is recorded (built-ins have no path and are skipped), and
 \texttt{kcc\_dep\_write} later emits the Makefile fragment
@@ -1841,7 +1846,26 @@ void kcc_pp_do_include(void) {
     kcc_memcpy(path, nstart, nlen);
     path[nlen] = 0;
     pp_skip_line();
-    /* built-in header? */
+    /* A header found on disk (via the same directory, a literal path, or a -I
+       directory) takes precedence over a compiler-resident one: the built-in set
+       is a freestanding FALLBACK, so a hosted build that points -I at a fuller
+       system shim gets that shim.  Without this order, adding a built-in
+       <errno.h>/<fcntl.h> would shadow a -I shim carrying the platform's real
+       errno values and `struct flock`, breaking a program (SQLite) that needs
+       them.  A bare <name> with no -I match still falls through to the built-in,
+       so a program that includes nothing but standard headers compiles with no
+       search path at all. */
+    const char *rp = pp_resolve_include(path, system);
+    if (rp) {
+        kcc_dep_add(rp);                          /* record for -MD dependency output */
+        pp_ctx_push(PP_CTX_INCLUDE);
+        kcc_source_open(rp);
+        kcc_source_encode();
+        kcc_source_splice();
+        kcc_lex_init(kcc_src_base, kcc_src_size);
+        pp_prev_line = 0;
+        return;
+    }
     const char *hdr = pp_builtin_header(path);
     if (hdr) {
         unsigned long hlen = kcc_strlen(hdr);
@@ -1853,18 +1877,7 @@ void kcc_pp_do_include(void) {
         pp_prev_line = 0;
         return;
     }
-    const char *rp = pp_resolve_include(path, system);
-    if (!rp) {
-        if (!system) kcc_diag_error(pp_dir_line, 1, m_notfound);
-        return;
-    }
-    kcc_dep_add(rp);                              /* record for -MD dependency output */
-    pp_ctx_push(PP_CTX_INCLUDE);
-    kcc_source_open(rp);
-    kcc_source_encode();
-    kcc_source_splice();
-    kcc_lex_init(kcc_src_base, kcc_src_size);
-    pp_prev_line = 0;
+    if (!system) kcc_diag_error(pp_dir_line, 1, m_notfound);
 }
 
 /* Force-include: process FILE as if `#include "FILE"` stood at the very top of

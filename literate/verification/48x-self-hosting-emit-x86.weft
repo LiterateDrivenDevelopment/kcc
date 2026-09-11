@@ -126,7 +126,7 @@ enum {
     AST_VAR_DECL=10, AST_FUNC_DECL=11, AST_STR_LIT=52, AST_ASM_STMT=74, AST_COMPOUND=30, AST_IF_STMT=32,
     AST_SWITCH_STMT=33, AST_WHILE_STMT=34, AST_DO_STMT=35, AST_FOR_STMT=36,
     AST_CASE_STMT=42, AST_LABEL_STMT=41, AST_DEFAULT_STMT=43, AST_INIT_LIST=65,
-    AST_IDENT_EXPR=50, AST_UNARY_EXPR=55, AST_DESIGNATOR=66
+    AST_IDENT_EXPR=50, AST_UNARY_EXPR=55, AST_CAST_EXPR=61, AST_DESIGNATOR=66
 };
 
 /* exported target-selection state (the driver sets these) */
@@ -1242,7 +1242,12 @@ callee of an \texttt{IR\_CALL} or the target of an \texttt{IR\_GLOBAL\_REF}
 anywhere in \emph{any} function's IR (this captures both direct calls and
 address-of-function), or as an identifier inside any file-scope initializer, as
 the target of an \texttt{alias} attribute, or as a token in a file-scope
-\texttt{asm} template---the last is how an \texttt{\_\_initcall} or
+\texttt{asm} template.  The initializer scan looks \emph{through} casts and
+parentheses, not just bare identifiers and \texttt{\&}: SQLite's syscall table is
+an array of structs whose function-pointer members are written
+\verb|(sqlite3_syscall_ptr)posixOpen|, so without descending into the cast the
+scanner would miss \texttt{posixOpen} and its siblings and the VFS would fail to
+link.  The \texttt{asm}-template case is how an \texttt{\_\_initcall} or
 \texttt{DECLARE\_PCI\_FIXUP} names its \texttt{static} hook on x86-64, through a
 \verb|.long fn - .| the IR never sees.  A function is additionally kept whenever
 it carries any linkage attribute (\texttt{section}, \texttt{weak},
@@ -1331,6 +1336,10 @@ static void x86_ref_scan_init(struct Node *n) {
         x86_ref_mark((const char *)n->f0);
     } else if (n->tag == AST_UNARY_EXPR) {          /* e.g. &func */
         x86_ref_scan_init((struct Node *)n->f1);
+    } else if (n->tag == AST_CAST_EXPR) {           /* (T)func --- SQLite's aSyscall[] */
+        x86_ref_scan_init((struct Node *)n->f1);
+    } else if (n->tag == AST_PAREN_EXPR) {
+        x86_ref_scan_init((struct Node *)n->f0);
     } else if (n->tag == AST_INIT_LIST) {
         for (struct Node *e = (struct Node *)n->f0; e; e = (struct Node *)e->f4)
             x86_ref_scan_init(e);
@@ -1517,6 +1526,21 @@ attribute record carries no alignment, so the cell takes the default 8-byte
 \texttt{.p2align}; being the sole and first symbol of its section it still resolves
 to offset~0.)
 
+A subtler duplicate arises when a tentative declaration is followed by a
+\emph{defining} one that carries an initialiser---\verb|u32 sqlite3WhereTrace;|
+near the top of the SQLite amalgamation and \verb|u32 sqlite3WhereTrace = 0;|
+tens of thousands of lines later.  These are one object with one definition
+(\stdref{6.9.2}), and the defining declaration is the one that must reach the
+assembler; the tentative would otherwise be emitted as a zero-storage cell
+\emph{and} the definition as a real data label, and \texttt{as} refuses the pair
+(``symbol already defined'')---the \verb|.comm|-coalescing that hides a
+double \emph{tentative} does not save a common paired with a genuine label.  So
+before the data pass writes a tentative's zero cell it scans the unit for a full
+definition of the same name (\texttt{x86\_superseded\_tentative}) and, finding
+one, drops the tentative; the defining declaration then emits the object once,
+with its initialiser.  The ARM back end already handled this; the x86 pass now
+matches it.
+
 @l c
 @d Selfhost: emit_x86 data @{
 /* A single file-scope object may be spelled by both a tentative declaration
@@ -1569,6 +1593,22 @@ static unsigned long round8_min8(unsigned long n) {
     return (n + 7) & ~7UL;
 }
 
+/* A tentative definition (`static int x;', no initializer) is superseded by a
+   full definition of the same name elsewhere in the translation unit
+   (\stdref{6.9.2}): SQLite writes `u32 sqlite3WhereTrace;' and, thousands of
+   lines later, `u32 sqlite3WhereTrace = 0;'.  Only the full definition may reach
+   the assembler---emitting both gives it a `.comm' (or zerofill label) and a
+   real data label for one symbol, which `as' rejects as "already defined".  The
+   full definition carries the object's storage, so the tentative is dropped. */
+static int x86_superseded_tentative(struct Node *tu, const char *name) {
+    for (struct Node *d = (struct Node *)tu->f0; d; d = (struct Node *)d->f4) {
+        if (d->tag != AST_VAR_DECL || !d->f2) continue;   /* only full definitions */
+        const char *n2 = (const char *)d->f1;
+        if (n2 && kcc_strcmp(n2, name) == 0) return 1;
+    }
+    return 0;
+}
+
 void kcc_x86_emit_data(void) {
     struct Node *tu = (struct Node *)kcc_x86_tu;
     if (!tu) return;
@@ -1580,6 +1620,8 @@ void kcc_x86_emit_data(void) {
         if (!name) continue;
         unsigned long sc = d->f3;                /* storage class */
         if (sc == 2 || sc == 1) continue;        /* extern / typedef: no storage */
+        if (!d->f2 && x86_superseded_tentative(tu, (const char *)name))
+            continue;                            /* tentative def; a full one follows */
         if (kcc_global_const_rodata(d)) {
             x86_emit_rodata_global(d, name);
             continue;

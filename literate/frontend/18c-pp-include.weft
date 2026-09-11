@@ -378,46 +378,18 @@ _kcc_pp_do_include:
     // Skip rest of directive line
     bl _kcc_pp_skip_line
 
-    // Built-in standard header?  Lex its resident text instead of a file.
-    mov  x0, x21
-    bl _kcc_pp_builtin_header
-    cbz  x0, .Lincl_resolve
-    mov  x22, x0                 // header text
-    bl _kcc_strlen
-    mov  x23, x0                 // length
-
-    mov  x0, #PP_CTX_INCLUDE
-    bl _kcc_pp_ctx_push
-
-    adrp x0, _kcc_src_base@@PAGE
-    add  x0, x0, _kcc_src_base@@PAGEOFF
-    str  x22, [x0]
-    adrp x0, _kcc_src_size@@PAGE
-    add  x0, x0, _kcc_src_size@@PAGEOFF
-    str  x23, [x0]
-    adrp x0, _kcc_src_path@@PAGE
-    add  x0, x0, _kcc_src_path@@PAGEOFF
-    str  x21, [x0]               // path = header name
-
-    mov  x0, x22
-    mov  x1, x23
-    bl _kcc_lex_init
-    adrp x0, _kcc_pp_prev_line@@PAGE
-    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
-    str  xzr, [x0]
-
-    ldp x23, x24, [sp, #48]
-    ldp x21, x22, [sp, #32]
-    ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #64
-    ret
-
-.Lincl_resolve:
-    // Resolve against the including file's directory, then the name as given
+    // Resolve on disk first (the including file's directory, the literal path,
+    // then each -I directory); a compiler-resident built-in serves only as the
+    // fallback when nothing is found.  Disk-before-built-in lets a hosted build
+    // point -I at a fuller shim---the platform's real errno values or `struct
+    // flock`---and get it, while a bare standard include with no -I match still
+    // falls through to the resident header, so a freestanding program compiles
+    // with no search path.  x21 (name) and x22 (system flag) survive the resolve
+    // call for the fallback and the not-found decision.
     mov  x0, x21
     bl _kcc_pp_resolve_include
-    mov  x21, x0
-    cbz  x21, .Lincl_notfound
+    cbz  x0, .Lincl_builtin
+    mov  x21, x0                 // resolved path (name no longer needed)
 
     // Push current state onto context stack
     mov  x0, #PP_CTX_INCLUDE
@@ -439,6 +411,42 @@ _kcc_pp_do_include:
     bl _kcc_lex_init
 
     // Reset prev_line for new file
+    adrp x0, _kcc_pp_prev_line@@PAGE
+    add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
+    str  xzr, [x0]
+
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+.Lincl_builtin:
+    // Not on disk: fall back to a resident built-in header, if any.  Use x23/x24
+    // for its text/length so x22 (system flag) stays live for .Lincl_notfound.
+    mov  x0, x21
+    bl _kcc_pp_builtin_header
+    cbz  x0, .Lincl_notfound
+    mov  x23, x0                 // header text
+    bl _kcc_strlen
+    mov  x24, x0                 // length
+
+    mov  x0, #PP_CTX_INCLUDE
+    bl _kcc_pp_ctx_push
+
+    adrp x0, _kcc_src_base@@PAGE
+    add  x0, x0, _kcc_src_base@@PAGEOFF
+    str  x23, [x0]
+    adrp x0, _kcc_src_size@@PAGE
+    add  x0, x0, _kcc_src_size@@PAGEOFF
+    str  x24, [x0]
+    adrp x0, _kcc_src_path@@PAGE
+    add  x0, x0, _kcc_src_path@@PAGEOFF
+    str  x21, [x0]               // path = header name
+
+    mov  x0, x23
+    mov  x1, x24
+    bl _kcc_lex_init
     adrp x0, _kcc_pp_prev_line@@PAGE
     add  x0, x0, _kcc_pp_prev_line@@PAGEOFF
     str  xzr, [x0]
@@ -492,10 +500,12 @@ every program to hand-declare \texttt{printf}, \texttt{malloc}, and friends.
 That is tolerable for the compiler's own bootstrap sources but hostile to
 ordinary C.  kcc answers this in two ways, along the fault line the Standard
 itself draws.  The \emph{freestanding} headers are embedded directly in the
-compiler: when the include machinery is asked for a recognised name it hands
-back a compiler-resident C snippet and lexes it in place of a file (the hook in
-\texttt{.Lincl\_open} above).  The \emph{hosted} headers are shipped as ordinary
-files in the \texttt{include/} directory beside the binary
+compiler: when the include machinery finds no file on disk for a recognised
+name, it hands back a compiler-resident C snippet and lexes it in place of a
+file (the fallback at \texttt{.Lincl\_builtin} above, reached only after the
+disk search comes up empty---so a \texttt{-I} shim carrying a fuller version of
+the same header wins over the built-in).  The \emph{hosted} headers are shipped
+as ordinary files in the \texttt{include/} directory beside the binary
 (\S\ref{sec:include-path}), found on the search path like any other header.
 Either way the text carries real prototypes, so the front end learns each
 function's arity and argument classes---enough to marshal a call

@@ -1081,6 +1081,22 @@ _kcc_pp_expand_arg:
 
     mov x19, x0                  // text
     mov x20, x1                  // len
+
+    // Save the source beginning-of-line watermark across the argument prescan.
+    // Lexing an argument runs through the pp loop, which updates _kcc_pp_prev_line
+    // for each token it reads; an argument whose source span carries embedded
+    // newlines (a multi-line invocation like SQLite's per-VFS IOMETHODS(...)
+    // spread across lines) advances the line counter and leaves prev_line ABOVE
+    // the invocation's line.  That leak makes the next real directive appear to
+    // be on a line <= prev_line, so it fails the beginning-of-line test and is
+    // silently mistaken for ordinary tokens.  The lexer's own line counter is
+    // restored by the context pop; prev_line is a separate global, so save and
+    // restore it here too.
+    adrp x2, _kcc_pp_prev_line@@PAGE
+    add  x2, x2, _kcc_pp_prev_line@@PAGEOFF
+    ldr  x2, [x2]
+    str  x2, [sp, #112]          // saved prev_line
+
     cbz x20, .Lea_empty
 
     // base_depth = current stack depth.  Set the drain floor one above it, so
@@ -1187,6 +1203,10 @@ _kcc_pp_expand_arg:
     adrp x1, _kcc_pp_has_pending@@PAGE
     add  x1, x1, _kcc_pp_has_pending@@PAGEOFF
     str  x0, [x1]
+    ldr x0, [sp, #112]           // restore prev_line (see prologue)
+    adrp x1, _kcc_pp_prev_line@@PAGE
+    add  x1, x1, _kcc_pp_prev_line@@PAGEOFF
+    str  x0, [x1]
     mov x0, x21                  // buf
     mov x1, x22                  // len
     ldr x27, [sp, #80]
@@ -1198,6 +1218,10 @@ _kcc_pp_expand_arg:
     ret
 
 .Lea_empty:
+    ldr x2, [sp, #112]           // restore prev_line (no lexing happened, but keep symmetric)
+    adrp x3, _kcc_pp_prev_line@@PAGE
+    add  x3, x3, _kcc_pp_prev_line@@PAGEOFF
+    str  x2, [x3]
     mov x0, x19                  // original (empty) text
     mov x1, #0
     ldr x27, [sp, #80]

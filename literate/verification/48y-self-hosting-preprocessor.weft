@@ -127,6 +127,7 @@ static struct PPCtx pp_ctx_stack[PP_MAX_CTX_DEPTH];
 static unsigned char pp_cond_stack[PP_MAX_COND];
 static const char *pp_inc_dirs[64];
 static unsigned long pp_inc_ndirs = 0;
+static const char *pp_default_inc = 0;   /* compiler's own include/; searched LAST */
 static const char *pp_cmdline_defs[64];
 static unsigned long pp_cmdline_ndefs = 0;
 
@@ -1667,13 +1668,17 @@ unsigned long kcc_pp_atoi(const char *p, unsigned long len) {
 \section{File Inclusion and Built-in Headers}
 
 \texttt{\#include} resolves a header by trying, in order, the including file's
-own directory, the literal path, and each \texttt{-I} directory; only if no file
-is found there is the header served from memory as a built-in.  Disk before
-built-in is deliberate: the compiler-resident headers are a freestanding
-fallback so a program can compile with no search path at all, but a hosted build
-that supplies a fuller shim through \texttt{-I}---the platform's real
-\texttt{errno} values or \texttt{struct flock}, say---must get that shim rather
-than the leaner built-in.  Alongside resolution, the
+own directory, the literal path, each \texttt{-I} directory, and finally the
+compiler's own \texttt{include/} directory; only if no file is found there is
+the header served from memory as a built-in.  Two orderings are deliberate.
+Disk before built-in: the compiler-resident headers are a freestanding fallback
+so a program can compile with no search path at all, but a hosted build that
+supplies a fuller shim through \texttt{-I}---the platform's real \texttt{errno}
+values or \texttt{struct flock}, say---must get that shim rather than the leaner
+built-in.  And the default \texttt{include/} directory is kept in a separate
+slot searched \emph{after} every \texttt{-I}, not pushed onto the \texttt{-I}
+array where---being registered at startup---it would sit ahead of the user's
+\texttt{-I} and shadow it.  Alongside resolution, the
 preprocessor keeps the \emph{dependency list} for \texttt{-MD}: every real
 include file it opens is recorded (built-ins have no path and are skipped), and
 \texttt{kcc\_dep\_write} later emits the Makefile fragment
@@ -1758,6 +1763,17 @@ static const char *pp_resolve_include(const char *name, int system) {
         cand[dl + namelen] = 0;
         if (pp_file_exists(cand)) return cand;
     }
+    /* The compiler's own include/ directory is consulted only AFTER every -I, so
+       a hosted build's -I shim (a fuller <fcntl.h>/<errno.h>) is never shadowed
+       by the leaner headers shipped beside the binary. */
+    if (pp_default_inc) {
+        unsigned long dl = kcc_strlen(pp_default_inc);
+        char *cand = (char *)kcc_arena_alloc(dl + namelen + 1);
+        kcc_memcpy(cand, pp_default_inc, dl);
+        kcc_memcpy(cand + dl, name, namelen);
+        cand[dl + namelen] = 0;
+        if (pp_file_exists(cand)) return cand;
+    }
     return 0;
 }
 
@@ -1774,11 +1790,14 @@ void kcc_pp_add_include_dir(const char *dir) {
 void kcc_pp_add_default_includes(const char *argv0) {
     unsigned long prefixlen = 0;
     for (unsigned long i = 0; argv0[i]; i++) if (argv0[i] == '/') prefixlen = i + 1;
-    char *buf = (char *)kcc_arena_alloc(prefixlen + 8);
+    char *buf = (char *)kcc_arena_alloc(prefixlen + 9);
     kcc_memcpy(buf, argv0, prefixlen);
     kcc_memcpy(buf + prefixlen, "include", 7);
-    buf[prefixlen + 7] = 0;
-    kcc_pp_add_include_dir(buf);
+    buf[prefixlen + 7] = '/';    /* trailing slash for a plain join */
+    buf[prefixlen + 8] = 0;
+    /* Kept out of the -I array so it is searched only after every -I (see
+       pp_resolve_include), never ahead of a user's -I shim. */
+    pp_default_inc = buf;
 }
 
 void kcc_pp_do_include(void) {
@@ -2083,7 +2102,7 @@ static const char hdr_stdlib[] = "#ifndef _STDLIB_H\n#define _STDLIB_H\ntypedef 
 static const char hdr_string[] = "#ifndef _STRING_H\n#define _STRING_H\ntypedef unsigned long size_t;\nunsigned long strlen(char *s);\nint strcmp(char *a, char *b);\nint strncmp(char *a, char *b, unsigned long n);\nchar *strcpy(char *d, char *s);\nchar *strncpy(char *d, char *s, unsigned long n);\nchar *strcat(char *d, char *s);\nchar *strncat(char *d, char *s, unsigned long n);\nchar *strchr(char *s, int c);\nchar *strrchr(char *s, int c);\nchar *strstr(char *h, char *n);\nchar *strpbrk(char *s, char *accept);\nunsigned long strspn(char *s, char *accept);\nunsigned long strcspn(char *s, char *reject);\nint strcoll(char *a, char *b);\nchar *strerror(int errnum);\nvoid *memcpy(void *d, void *s, unsigned long n);\nvoid *memmove(void *d, void *s, unsigned long n);\nvoid *memset(void *d, int c, unsigned long n);\nvoid *memchr(void *s, int c, unsigned long n);\nint memcmp(void *a, void *b, unsigned long n);\n#endif\n\n";
 static const char hdr_time[] = "#ifndef _TIME_H\n#define _TIME_H\ntypedef long time_t;\ntypedef long clock_t;\nstruct tm {\n    int tm_sec;\n    int tm_min;\n    int tm_hour;\n    int tm_mday;\n    int tm_mon;\n    int tm_year;\n    int tm_wday;\n    int tm_yday;\n    int tm_isdst;\n    long tm_gmtoff;\n    char *tm_zone;\n};\ntime_t time(time_t *t);\ndouble difftime(time_t end, time_t begin);\nclock_t clock(void);\nstruct tm *localtime(time_t *t);\nstruct tm *gmtime(time_t *t);\ntime_t mktime(struct tm *tm);\nchar *asctime(struct tm *tm);\nchar *ctime(time_t *t);\nunsigned long strftime(char *s, unsigned long max, char *fmt, struct tm *tm);\n#define CLOCKS_PER_SEC 1000000\n#endif\n\n";
 static const char hdr_uchar[] = "#ifndef _UCHAR_H\n#define _UCHAR_H\ntypedef unsigned short char16_t;\ntypedef unsigned int char32_t;\nunsigned long mbrtoc16(char16_t *pc16, char *s, unsigned long n, void *ps);\nunsigned long c16rtomb(char *s, char16_t c16, void *ps);\nunsigned long mbrtoc32(char32_t *pc32, char *s, unsigned long n, void *ps);\nunsigned long c32rtomb(char *s, char32_t c32, void *ps);\n#endif\n\n";
-static const char hdr_unistd[] = "#ifndef _UNISTD_H\n#define _UNISTD_H\ntypedef long ssize_t;\ntypedef long off_t;\n#ifndef SEEK_SET\n#define SEEK_SET 0\n#define SEEK_CUR 1\n#define SEEK_END 2\n#endif\nssize_t read(int fd, void *buf, unsigned long nbyte);\nssize_t write(int fd, const void *buf, unsigned long nbyte);\nint close(int fd);\noff_t lseek(int fd, off_t offset, int whence);\nint unlink(const char *path);\nint isatty(int fd);\n#endif\n\n";
+static const char hdr_unistd[] = "#ifndef _UNISTD_H\n#define _UNISTD_H\ntypedef long ssize_t;\ntypedef long off_t;\n#ifndef SEEK_SET\n#define SEEK_SET 0\n#define SEEK_CUR 1\n#define SEEK_END 2\n#endif\n#define STDIN_FILENO 0\n#define STDOUT_FILENO 1\n#define STDERR_FILENO 2\n#define F_OK 0\n#define X_OK 1\n#define W_OK 2\n#define R_OK 4\n#define _SC_PAGESIZE 30\nssize_t read(int fd, void *buf, unsigned long nbyte);\nssize_t write(int fd, const void *buf, unsigned long nbyte);\nssize_t pread(int fd, void *buf, unsigned long nbyte, off_t off);\nssize_t pwrite(int fd, const void *buf, unsigned long nbyte, off_t off);\nint close(int fd);\noff_t lseek(int fd, off_t offset, int whence);\nint unlink(const char *path);\nint rmdir(const char *path);\nint isatty(int fd);\nint access(const char *path, int mode);\nchar *getcwd(char *buf, unsigned long size);\nint chdir(const char *path);\nint fchdir(int fd);\nint ftruncate(int fd, off_t length);\nint fsync(int fd);\nint fdatasync(int fd);\nint fchown(int fd, unsigned uid, unsigned gid);\nunsigned geteuid(void);\nunsigned getuid(void);\nint getpid(void);\nint getpagesize(void);\nssize_t readlink(const char *path, char *buf, unsigned long size);\nint usleep(unsigned usec);\nunsigned sleep(unsigned sec);\nint pipe(int *fds);\nlong sysconf(int name);\nint gethostname(char *name, unsigned long len);\n#endif\n\n";
 static const char hdr_wchar[] = "#ifndef _WCHAR_H\n#define _WCHAR_H\ntypedef int wchar_t;\n#ifndef _WINT_T\n#define _WINT_T\ntypedef int wint_t;\n#endif\nunsigned long wcslen(wchar_t *s);\nint wcscmp(wchar_t *a, wchar_t *b);\nwchar_t *wcscpy(wchar_t *d, wchar_t *s);\nwchar_t *wcscat(wchar_t *d, wchar_t *s);\nwchar_t *wcschr(wchar_t *s, wchar_t c);\n#define WEOF (-1)\n#endif\n\n";
 static const char hdr_wctype[] = "#ifndef _WCTYPE_H\n#define _WCTYPE_H\n#ifndef _WINT_T\n#define _WINT_T\ntypedef int wint_t;\n#endif\ntypedef unsigned long wctype_t;\nint iswalpha(wint_t c);\nint iswdigit(wint_t c);\nint iswalnum(wint_t c);\nint iswspace(wint_t c);\nint iswupper(wint_t c);\nint iswlower(wint_t c);\nint iswpunct(wint_t c);\nwint_t towupper(wint_t c);\nwint_t towlower(wint_t c);\n#endif\n\n";
 

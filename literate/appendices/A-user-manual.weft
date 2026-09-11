@@ -507,21 +507,22 @@ thirty-four-digit constant, but a numeric library does.
 
 The next rung up from an interpreter is a database engine.  \textbf{SQLite
 3.45.0} ships as a single 250\,000-line \emph{amalgamation}, \texttt{sqlite3.c},
-and \kcc{} compiles it into a working library: the demo below opens an
-in-memory database, creates a table, inserts rows, and runs a
-\texttt{SELECT}---and the results match a \texttt{clang}-built SQLite exactly.
-SQLite is a harder test than Lua because it reaches for the operating system
-directly---its Unix VFS calls \texttt{mmap}, \texttt{fcntl} file locks,
-\texttt{fstat}, and the \texttt{errno} constants---so unlike the freestanding
-Lua build it needs a few POSIX headers on the search path.
-
-This is an x86-64/Linux build, driven by the self-hosted \texttt{kcc\_linux}
-that \texttt{make meta-c} produces (\S\ref{sec:um-contributors}); on Apple
-silicon you cross-compile each unit with \texttt{-{}-target=x86\_64-linux} and
-finish on an x86-64 host.  Fetch the amalgamation and supply the handful of
-POSIX declarations SQLite needs through a small \texttt{sysinc/} directory
-(\texttt{<sys/mman.h>}, \texttt{<sys/stat.h>}, \texttt{<fcntl.h>} with
-\texttt{struct flock}, and \texttt{<errno.h>} with the Linux error numbers):
+and \kcc{} compiles it---on \emph{both} targets---into a working library: the
+demo below opens an in-memory database, creates a table, inserts rows, and runs
+a \texttt{SELECT}, and the rows come back byte-for-byte as a \texttt{clang}-built
+SQLite prints them.  SQLite is a harder test than Lua because it reaches for the
+operating system directly---its Unix VFS calls \texttt{mmap}, \texttt{fcntl}
+file locks, \texttt{fstat}, and the \texttt{errno} constants---so unlike the
+freestanding Lua build it needs a few POSIX headers on the search path, gathered
+in a small \texttt{sysinc/} directory alongside the source:
+\texttt{<sys/mman.h>}, \texttt{<sys/stat.h>}, \texttt{<sys/types.h>},
+\texttt{<fcntl.h>} (with \texttt{struct flock} and the \texttt{F\_*LCK}
+constants), and \texttt{<errno.h>}.  Two of those---\texttt{<fcntl.h>} and
+\texttt{<errno.h>}---are \emph{platform-aware}: \texttt{errno} numbers, the
+\texttt{F\_GETLK}/\texttt{F\_SETLK} values, and even the field order of
+\texttt{struct flock} differ between Linux and macOS, so the shim wraps them in
+\texttt{\#ifdef \_\_linux\_\_} and \kcc{} predefines \texttt{\_\_linux\_\_} only
+for the Linux target.  One shim, correct on both.  Fetch the amalgamation once:
 
 \begin{verbatim}
 curl -LO https://sqlite.org/2024/sqlite-amalgamation-3450000.zip
@@ -529,28 +530,62 @@ unzip sqlite-amalgamation-3450000.zip && cd sqlite-amalgamation-3450000
 FLAGS="-DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION \
        -DSQLITE_DISABLE_LFS -DSQLITE_OMIT_WAL -DNDEBUG \
        -DSQLITE_DISABLE_INTRINSIC"
-kcc_linux -c sqlite3.c --target=x86_64-linux -Isysinc -I. $FLAGS -o sqlite3.o
-kcc_linux -c main.c    --target=x86_64-linux -Isysinc -I. $FLAGS -o main.o
-cc -static sqlite3.o main.o -o sqltest -lm     # system ld links libc
+\end{verbatim}
+
+\subsection{On macOS (native ARM64)}
+
+\kcc{} emits ARM64 machine code and the system linker binds the two objects to
+\texttt{libSystem}; \texttt{main.c} opens \texttt{":memory:"} and drives
+\texttt{CREATE TABLE}/\texttt{INSERT}/\texttt{SELECT} through
+\texttt{sqlite3\_exec}.
+
+\begin{verbatim}
+kcc -c sqlite3.c -Isysinc -I. $FLAGS -o sqlite3.o
+kcc -c main.c    -Isysinc -I. $FLAGS -o main.o
+cc sqlite3.o main.o -o sqltest         # clang links against libSystem
 ./sqltest
 \end{verbatim}
 
-where \texttt{main.c} opens \texttt{":memory:"} and runs \texttt{CREATE
-TABLE}/\texttt{INSERT}/\texttt{SELECT} through \texttt{sqlite3\_exec}; it prints
-the selected rows and \texttt{sqlite ok}.  Because \kcc{} searches the
-\texttt{-I} directories \emph{before} its own resident headers
-(\S\ref{sec:builtin-headers}), the \texttt{sysinc/} shim's fuller
-\texttt{<errno.h>} and \texttt{<fcntl.h>}---carrying \texttt{ETIMEDOUT},
-\texttt{ENOLCK}, and \texttt{struct flock}, which the leaner built-ins omit---is
-what SQLite's VFS actually sees.  The \texttt{SQLITE\_OMIT\_*} flags trim
-optional subsystems (write-ahead logging, extension loading) that a minimal
-build does not need; the core SQL engine is fully present.  The one non-obvious
-flag is \texttt{-DSQLITE\_DISABLE\_INTRINSIC}: because \kcc{} defines
-\texttt{\_\_GNUC\_\_} (the kernel and much else test it), SQLite would otherwise
-reach for GCC's \texttt{\_\_atomic\_load\_n} builtins with
-\texttt{\_\_ATOMIC\_RELAXED}, which \kcc{} does not implement; the flag selects
-SQLite's portable plain-load fallback instead, which is exactly right for the
-single-threaded (\texttt{THREADSAFE=0}) build here.
+which prints the two selected rows and \texttt{sqlite ok}.
+
+\subsection{On Linux (x86-64)}
+
+Identical, driven by the self-hosted \texttt{kcc\_linux} that \texttt{make
+meta-c} builds (\S\ref{sec:um-contributors}); \kcc{} emits the objects and the
+system \texttt{cc} links them against glibc.  On an Apple-silicon machine you can
+equally cross-compile each unit with \texttt{-{}-target=x86\_64-linux} and finish
+on an x86-64 host.
+
+\begin{verbatim}
+kcc_linux -c sqlite3.c --target=x86_64-linux -Isysinc -I. $FLAGS -o sqlite3.o
+kcc_linux -c main.c    --target=x86_64-linux -Isysinc -I. $FLAGS -o main.o
+cc -static sqlite3.o main.o -o sqltest -lm
+./sqltest
+\end{verbatim}
+
+\paragraph{Why the shim reaches the VFS at all.}  \kcc{} searches the \texttt{-I}
+directories \emph{before} both its own resident built-in headers and the
+\texttt{include/} folder it ships (\S\ref{sec:builtin-headers}), so the
+\texttt{sysinc/} shim's fuller \texttt{<errno.h>} and \texttt{<fcntl.h>}---the
+ones carrying \texttt{ETIMEDOUT}, \texttt{ENOLCK}, and \texttt{struct
+flock}---win over the leaner shipped copies.  Getting that precedence wrong (the
+default \texttt{include/} sitting ahead of \texttt{-I}) is one of two compiler
+bugs SQLite surfaced; the other is subtler: SQLite defines each VFS's I/O-method
+table through a long, comment-laden, multi-line \texttt{IOMETHODS(...)} macro
+invocation, and \kcc{}'s line counter drifted across the argument prescan, so
+the \texttt{\#if} directive on the line just after the invocation stopped being
+recognised and its whole block leaked into the parser.  Both are fixed; the VFS
+now compiles verbatim.
+
+\paragraph{Flags.}  The \texttt{SQLITE\_OMIT\_*} flags trim optional subsystems
+(write-ahead logging, extension loading) a minimal build does not need; the core
+SQL engine is fully present.  The one non-obvious flag is
+\texttt{-DSQLITE\_DISABLE\_INTRINSIC}: because \kcc{} defines \texttt{\_\_GNUC\_\_}
+(the kernel and much else test it), SQLite would otherwise reach for GCC's
+\texttt{\_\_atomic\_load\_n} builtins with \texttt{\_\_ATOMIC\_RELAXED}, which
+\kcc{} does not implement; the flag selects SQLite's portable plain-load
+fallback, exactly right for the single-threaded (\texttt{THREADSAFE=0}) build
+here.
 
 \section{Playing DOOM}
 \label{sec:um-doom}

@@ -595,9 +595,7 @@ id~Software engine, by way of the portable \texttt{doomgeneric} tree---into a
 playable, windowed game on Apple silicon.  All eighty-one C files are compiled
 by \kcc{}: the entire engine (fixed-point renderer, BSP tree walk, WAD loader,
 sound and game logic) \emph{and} the SDL platform shim that opens a window and
-blits the framebuffer, which pulls in the large \texttt{<SDL2/SDL.h>}.  Only the
-final link uses \texttt{clang}, as a stand-in for \texttt{ld} against the SDL2
-library.
+blits the framebuffer, which pulls in the large \texttt{<SDL2/SDL.h>}.
 
 \begin{verbatim}
 brew install sdl2                       # the one external dependency
@@ -607,9 +605,27 @@ for f in <every engine .c> doomgeneric.c doomgeneric_sdl.c; do
     "$KCC" -O0 -DNORMALUNIX -DLINUX -I/opt/homebrew/include/SDL2 \
            -c "$f" -o "${f%.c}.o"
 done
-clang *.o -L/opt/homebrew/lib -lSDL2 -lm -o doom
+clang *.o -L/opt/homebrew/lib -lSDL2 -lm -o doom   # clang == the linker only
 ./doom -iwad freedoom1.wad              # a window opens; DOOM runs
 \end{verbatim}
+
+\paragraph{\texttt{clang} here is the linker, not a compiler.}  Every
+\texttt{.o} above is emitted by \kcc{}; the final \texttt{clang} line compiles
+nothing---it is invoked purely as a \emph{link driver}, a convenient stand-in
+for \texttt{ld}.  \kcc{} on its native ARM64 target is perfectly capable of
+driving the link itself (the Lua build above ends with plain
+\verb|kcc *.o -o lua -lm|), and it would do so for a self-contained program.
+DOOM is not self-contained: it links against Homebrew's \texttt{SDL2}
+(\verb|-L/opt/homebrew/lib -lSDL2|), which in turn drags in a constellation of
+macOS system frameworks and SDK stubs.  \texttt{clang} already knows the SDK
+paths, the C runtime startup object, the default \verb|-lSystem|, and the
+framework search rules, so handing it the objects is simply less fuss than
+reconstructing all of that on \kcc{}'s own \texttt{ld} invocation.  The division
+of labour is exactly the one this manual draws throughout---\kcc{} is the
+compiler, the system \texttt{ld} (however it is invoked) is the linker---and it
+is what makes the demonstration meaningful: because \kcc{}, not \texttt{clang},
+compiled all eighty-one files, the game running is a statement about \kcc{}'s
+code generation, right down to the software renderer that computes every pixel.
 
 DOOM earns its place because it is unforgiving of a miscompiled arithmetic
 detail.  One bug surfaced only here: the engine's wall renderer does

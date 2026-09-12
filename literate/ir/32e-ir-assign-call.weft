@@ -108,7 +108,7 @@ the target first, rewriting the assignment node's LHS field to the bare
 lvalue before dispatching.
 
 @d IR: build assign @{
-// -- kcc_ir_build_assign --------------------------------------------------
+// -- kcc_ir_build_assign ---
 // uint64_t kcc_ir_build_assign(node *expr)
 //   x0 = AST_ASSIGN_EXPR (F0=op, F1=lhs, F2=rhs)
 // For simple assignment (=), evaluates RHS and stores to LHS alloca.
@@ -829,7 +829,7 @@ is \texttt{TY\_FUNC}, leaving the bare pointer expression to build into the
 function-pointer vreg directly.
 
 @d IR: build call @{
-// -- kcc_ir_build_call ----------------------------------------------------
+// -- kcc_ir_build_call ---
 // uint64_t kcc_ir_build_call(node *expr)
 //   x0 = AST_CALL_EXPR (F0=callee, F1=first_arg linked via F4)
 // Evaluates arguments, stores arg vregs in IR_SRC2 array, emits IR_CALL.
@@ -1297,7 +1297,7 @@ writes the cursor back, all with ordinary IR.  Both builtins locate
 local identifier to its alloca vreg.
 
 @d IR: variadic builtins @{
-// -- kcc_ir_ident_alloca --------------------------------------------------
+// -- kcc_ir_ident_alloca ---
 // uint64_t kcc_ir_ident_alloca(node *ident)
 //   x0 = AST_IDENT_EXPR.  Returns the identifier's alloca vreg, or ~0 when
 //   it is not a known local.
@@ -1369,7 +1369,7 @@ _kcc_ir_ident_alloca:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_build_va_start ------------------------------------------------
+// -- kcc_ir_build_va_start ---
 // void kcc_ir_build_va_start(node *call)   — call = va_start(ap, last)
 .text
 .globl _kcc_ir_build_va_start
@@ -1420,7 +1420,7 @@ _kcc_ir_build_va_start:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_build_va_arg --------------------------------------------------
+// -- kcc_ir_build_va_arg ---
 // uint64_t kcc_ir_build_va_arg(node *va_arg)
 //   Reads one argument from the va_list cursor and advances it by one 8-byte
 //   slot.  For a scalar the loaded 8 bytes are the value.  A struct/union is
@@ -1576,7 +1576,7 @@ carries the data pointer in \texttt{SRC1} and the byte length in
 vreg holds the string's run-time address.
 
 @d IR: build string literal @{
-// -- kcc_ir_build_string_lit ----------------------------------------------
+// -- kcc_ir_build_string_lit ---
 // uint64_t kcc_ir_build_string_lit(node *lit)
 //   x0 = AST_STR_LIT (F0=str_ptr, F1=str_len)
 // Returns vreg holding the string's address.
@@ -1640,7 +1640,7 @@ approach works naturally with the all-spill code generator and avoids
 phi nodes entirely.
 
 @d IR: build conditional @{
-// -- kcc_ir_build_cond_expr -----------------------------------------------
+// -- kcc_ir_build_cond_expr ---
 // uint64_t kcc_ir_build_cond_expr(node *expr)
 //   x0 = AST_COND_EXPR (F0=cond, F1=then, F2=else)
 // Lowers to: alloca tmp → br_cond → then: store → br merge
@@ -1855,7 +1855,7 @@ chunk.  Word-width targets ($\geq 4$ bytes) share a bit pattern under
 AArch64's zero-extending 32-bit operations and are left unchanged.
 
 @d IR: build cast @{
-// -- kcc_ir_build_cast ----------------------------------------------------
+// -- kcc_ir_build_cast ---
 // uint64_t kcc_ir_build_cast(node *cast)
 //   x0 = AST_CAST_EXPR (F0=type, F1=expr, F3=resolved target type)
 // Returns vreg.

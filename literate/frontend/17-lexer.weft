@@ -25,7 +25,7 @@ We assign a unique integer code to each.  Codes 0--9 are structural,
 10--53 are the 44 keywords, and 60+ are punctuators.
 
 @d Lexer: token constants @{
-// -- Token type codes -----------------------------------------------
+// -- Token type codes ---
 // Structural tokens
 .equ TOK_EOF,          0
 .equ TOK_IDENT,        1
@@ -148,7 +148,7 @@ It sets the cursor to the start of the buffer and initializes the
 line counter to~1.
 
 @d Lexer: init @{
-// -- kcc_lex_init ---------------------------------------------------
+// -- kcc_lex_init ---
 // void kcc_lex_init(const char *base, uint64_t size)
 //   x0 = pointer to source buffer
 //   x1 = buffer size in bytes
@@ -191,7 +191,7 @@ and comments, then dispatches to the appropriate scanner based on the
 first character.  The result is stored in the global token variables.
 
 @d Lexer: next token @{
-// -- kcc_lex_next ---------------------------------------------------
+// -- kcc_lex_next ---
 // void kcc_lex_next(void)
 // Advances to the next token.  Stores result in _kcc_tok_* globals.
 .globl _kcc_lex_next
@@ -497,7 +497,7 @@ Record the current line and column into the token globals.  Column is
 computed as \texttt{cursor $-$ line\_start $+$ 1}.
 
 @d Lexer: record location @{
-// -- kcc_lex_record_loc ---------------------------------------------
+// -- kcc_lex_record_loc ---
 // Internal: records current line/col into tok globals.
 .p2align 2
 _kcc_lex_record_loc:
@@ -540,7 +540,7 @@ we look up the identifier text in the keyword hash table; if found,
 the token type is changed to the corresponding keyword code.
 
 @d Lexer: scan identifier @{
-// -- kcc_lex_scan_ident ---------------------------------------------
+// -- kcc_lex_scan_ident ---
 // Internal: scans an identifier or keyword.
 // Cursor is at the first identifier character.
 .p2align 2
@@ -638,7 +638,7 @@ with digits, letters, underscores, dots, and \texttt{e/E/p/P} signs.
 We scan the full pp-number here; value parsing is deferred to Phase~5.
 
 @d Lexer: scan number @{
-// -- kcc_lex_scan_number --------------------------------------------
+// -- kcc_lex_scan_number ---
 // Internal: scans a preprocessing number.
 .p2align 2
 _kcc_lex_scan_number:
@@ -750,7 +750,7 @@ escape processing is deferred to Phase~5).  An unescaped newline
 or end-of-file before the closing quote is an error.
 
 @d Lexer: scan string @{
-// -- kcc_lex_scan_string --------------------------------------------
+// -- kcc_lex_scan_string ---
 // Internal: scans a string literal (opening '"' at cursor).
 .p2align 2
 _kcc_lex_scan_string:
@@ -849,7 +849,7 @@ Character literals are similar to strings but delimited by single
 quotes (\stdref{6.4.4.4}).
 
 @d Lexer: scan char @{
-// -- kcc_lex_scan_char ----------------------------------------------
+// -- kcc_lex_scan_char ---
 // Internal: scans a character constant (opening '\'' at cursor).
 .p2align 2
 _kcc_lex_scan_char:
@@ -948,7 +948,7 @@ The punctuator scanner implements longest-match for all C17 punctuators
 \texttt{...} are handled by peeking ahead.
 
 @d Lexer: scan punctuator @{
-// -- kcc_lex_scan_punct ---------------------------------------------
+// -- kcc_lex_scan_punct ---
 // Internal: scans a punctuator.
 .p2align 2
 _kcc_lex_scan_punct:
@@ -1028,7 +1028,7 @@ _kcc_lex_scan_punct:
     mov x0, #TOK_UNKNOWN
     b .Lpunct_store
 
-// -- Simple single-character punctuators ----------------------------
+// -- Simple single-character punctuators ---
 .Lpunct_1_lparen:
     mov x0, #TOK_LPAREN
     b .Lpunct_single
@@ -1078,7 +1078,7 @@ Additionally, \texttt{+} and \texttt{-} form increment/decrement
 between the single and compound forms.
 
 @d Lexer: scan punctuator @{
-// -- Multi-character punctuators ------------------------------------
+// -- Multi-character punctuators ---
 .Lpunct_plus:                     // + ++ +=
     add x1, x20, #1
     cmp x1, x21
@@ -1357,7 +1357,7 @@ pointer, and length into the global variables.
     mov x0, #TOK_DOT
     b .Lpunct_single
 
-// -- Length helpers --------------------------------------------------
+// -- Length helpers ---
 .Lpunct_double:
     add x20, x20, #2
     str x20, [x19]
@@ -1404,7 +1404,7 @@ in the format:
 \texttt{kcc\_lex\_dump\_all} loops through the entire source.
 
 @d Lexer: dump token @{
-// -- kcc_lex_dump_token ---------------------------------------------
+// -- kcc_lex_dump_token ---
 // void kcc_lex_dump_token(void)
 // Prints the current token in dump format.
 .globl _kcc_lex_dump_token
@@ -1472,7 +1472,7 @@ The dump-all loop repeatedly calls \texttt{kcc\_lex\_next} and
 \texttt{kcc\_lex\_dump\_token} until EOF.
 
 @d Lexer: dump all @{
-// -- kcc_lex_dump_all -----------------------------------------------
+// -- kcc_lex_dump_all ---
 // void kcc_lex_dump_all(void)
 // Tokenizes entire source and dumps each token.
 .globl _kcc_lex_dump_all
@@ -1507,7 +1507,7 @@ returns a pointer to the name string for a given token type.
 
 @d Lexer: token names @{
 .text
-// -- kcc_lex_type_name ----------------------------------------------
+// -- kcc_lex_type_name ---
 // const char *kcc_lex_type_name(uint64_t type)
 //   x0 = token type code
 // Returns pointer to a null-terminated type name string.
@@ -1535,7 +1535,7 @@ _kcc_lex_type_name:
     ldp x29, x30, [sp], #16
     ret
 
-// -- Token name strings ---------------------------------------------
+// -- Token name strings ---
 .section __TEXT,__cstring,cstring_literals
 _kcc_tn_eof:          .asciz "eof"
 _kcc_tn_identifier:   .asciz "identifier"
@@ -1756,7 +1756,7 @@ code space (6--9 for future structural tokens, 54--59 reserved
 between keywords and punctuators) are filled with null entries.
 
 @d Lexer: token names @{
-// -- Token name pointer table ---------------------------------------
+// -- Token name pointer table ---
 // Indexed by token type code.  Entries 6-9, 54-59 are NULL (unused).
 .data
 .p2align 3
@@ -1873,7 +1873,7 @@ At startup, we populate a hash table with all 44 C17 keywords.
 Each entry maps the keyword text to its token type code.
 
 @d Lexer: keyword data @{
-// -- Keyword strings ------------------------------------------------
+// -- Keyword strings ---
 .section __TEXT,__cstring,cstring_literals
 _kcc_kw_s_auto:       .asciz "auto"
 _kcc_kw_s_break:      .asciz "break"
@@ -1944,7 +1944,7 @@ _kcc_kw_s_int128:     .asciz "__int128"
 _kcc_kw_s_alignof1:   .asciz "__alignof__"
 _kcc_kw_s_alignof2:   .asciz "__alignof"
 
-// -- Keyword registration table -------------------------------------
+// -- Keyword registration table ---
 // Each entry: (string_ptr, string_len, token_type) = 24 bytes
 .data
 .p2align 3
@@ -2069,7 +2069,7 @@ by looping through the registration table.
 
 @d Lexer: keyword init @{
 .text
-// -- kcc_lex_kw_init ------------------------------------------------
+// -- kcc_lex_kw_init ---
 // void kcc_lex_kw_init(void)
 // Builds the keyword hash table from the registration table.
 .globl _kcc_lex_kw_init
@@ -2126,7 +2126,7 @@ The lexer maintains its state in global variables: the cursor position,
 end of buffer, current line/column tracking, and the current token.
 
 @d Lexer: data @{
-// -- Lexer global state ---------------------------------------------
+// -- Lexer global state ---
 .data
 .p2align 3
 .globl _kcc_lex_cursor

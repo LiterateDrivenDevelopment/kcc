@@ -25,7 +25,7 @@ tokens), and \texttt{DONE} (active branch already seen, skip rest).
 
 @d PP: conditional @{
 .text
-// -- _kcc_pp_do_ifdef -----------------------------------------------
+// -- _kcc_pp_do_ifdef ---
 // x0 = negate (0 for ifdef, 1 for ifndef)
 .p2align 2
 _kcc_pp_do_ifdef:
@@ -136,7 +136,7 @@ macro expander already uses, which performs a complete macro replacement
 (function-like invocations included) and returns re-lexable text.
 
 @d PP: conditional @{
-// -- _kcc_pp_protect_defined ----------------------------------------
+// -- _kcc_pp_protect_defined ---
 // (const char *src, uint64_t len) -> x0 = buf, x1 = len
 // Raw-scans one #if/#elif controlling line, copying every token verbatim
 // EXCEPT `defined NAME` / `defined(NAME)`, which become the literal 1 or 0.
@@ -280,7 +280,7 @@ _kcc_pp_protect_defined:
     ldp  x29, x30, [sp], #96
     ret
 
-// -- _kcc_pp_prepare_cond -------------------------------------------
+// -- _kcc_pp_prepare_cond ---
 // (const char *src, uint64_t len) -> x0 = buf, x1 = len
 // Resolves `defined`, then fully macro-expands the controlling line, so the
 // evaluator downstream sees only literals and operators.
@@ -325,7 +325,7 @@ _kcc_pp_prepare_cond:
     ldp x29, x30, [sp], #48
     ret
 
-// -- _kcc_pp_do_if --------------------------------------------------
+// -- _kcc_pp_do_if ---
 // Handles #if with basic expression evaluation.
 .p2align 2
 _kcc_pp_do_if:
@@ -385,7 +385,7 @@ _kcc_pp_do_if:
     ldp x29, x30, [sp], #48
     ret
 
-// -- _kcc_pp_do_line ------------------------------------------------
+// -- _kcc_pp_do_line ---
 // #line N ["file"] (\stdref{6.10.4}): set the presumed line number of the
 // following source line to N, which may itself come from a macro
 // (`#line line`).  We evaluate the operand exactly as an #if expression --
@@ -463,7 +463,7 @@ branch has yet matched---does the handler evaluate the expression and
 potentially activate the branch.
 
 @d PP: conditional @{
-// -- _kcc_pp_do_elif ------------------------------------------------
+// -- _kcc_pp_do_elif ---
 .p2align 2
 _kcc_pp_do_elif:
     stp x29, x30, [sp, #-48]!
@@ -588,7 +588,7 @@ simply pops the stack by decrementing the depth counter.
 state byte onto the stack and increments the depth.
 
 @d PP: conditional @{
-// -- _kcc_pp_do_else ------------------------------------------------
+// -- _kcc_pp_do_else ---
 .p2align 2
 _kcc_pp_do_else:
     stp x29, x30, [sp, #-16]!
@@ -640,7 +640,7 @@ _kcc_pp_do_else:
     ldp x29, x30, [sp], #16
     ret
 
-// -- _kcc_pp_do_endif -----------------------------------------------
+// -- _kcc_pp_do_endif ---
 .p2align 2
 _kcc_pp_do_endif:
     stp x29, x30, [sp, #-16]!
@@ -669,7 +669,7 @@ _kcc_pp_do_endif:
     ldp x29, x30, [sp], #16
     ret
 
-// -- _kcc_pp_cond_push ----------------------------------------------
+// -- _kcc_pp_cond_push ---
 // x0 = state to push
 .p2align 2
 _kcc_pp_cond_push:
@@ -703,7 +703,7 @@ branches skipped, whereas \texttt{SKIP} would treat a nested
 inside the dead region.
 
 @d PP: conditional @{
-// -- _kcc_pp_skip_directive -----------------------------------------
+// -- _kcc_pp_skip_directive ---
 // Handle directives encountered while skipping (conditional false).
 // Only #if/#ifdef/#ifndef (push), #elif/#else (toggle), #endif (pop)
 // are meaningful; all others are ignored.
@@ -850,7 +850,7 @@ Any identifier not recognized as a macro evaluates to~0 per
 
 @d PP: eval @{
 .text
-// -- _kcc_pp_eval_expr ----------------------------------------------
+// -- _kcc_pp_eval_expr ---
 // Evaluates #if expression. Token stream already set up.
 // Returns x0 = integer result.
 .globl _kcc_pp_eval_expr
@@ -1560,7 +1560,7 @@ itself, which \stdref{6.10.3.4} forbids from re-expanding but which we
 must at least not loop on.
 
 @d PP: eval @{
-// -- _kcc_pp_eval_macro ---------------------------------------------
+// -- _kcc_pp_eval_macro ---
 // int64_t _kcc_pp_eval_macro(pp_macro *m)
 //   x0 = macro entry.  Returns the integer value of its expanded body.
 // Saves the lexer over the #if line, evaluates the body, and restores it
@@ -1647,7 +1647,7 @@ suffix handling is needed.  Constants here are non-negative; unary minus is
 applied one precedence level up.
 
 @d PP: eval @{
-// -- _kcc_pp_atoi ---------------------------------------------------
+// -- _kcc_pp_atoi ---
 // Integer-constant to value (hex/octal/decimal): x0=ptr, x1=len → x0=value
 .globl _kcc_pp_atoi
 .p2align 2

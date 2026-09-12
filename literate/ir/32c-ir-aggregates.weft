@@ -57,7 +57,7 @@ independent of the packed field layout.  The same helper is reused by
 the assignment builder for statements like \texttt{cur = saved;}.
 
 @d IR: struct copy helper @{
-// -- kcc_ir_emit_struct_copy ----------------------------------------------
+// -- kcc_ir_emit_struct_copy ---
 // void kcc_ir_emit_struct_copy(src_base_vreg, dst_base_vreg, byte_size)
 //   x0 = source base vreg
 //   x1 = destination base vreg
@@ -220,7 +220,7 @@ scalar and faulting on it as an address.  Anything else falls back to
 \texttt{build\_expr}, which for a pointer operand already produces an address.
 
 @d IR: struct address helper @{
-// -- kcc_ir_build_struct_addr ---------------------------------------------
+// -- kcc_ir_build_struct_addr ---
 // uint64_t kcc_ir_build_struct_addr(node *expr)
 //   x0 = expression node of struct type
 //   returns x0 = vreg holding the struct's base address (0 if unknown)
@@ -462,7 +462,7 @@ in place of the explicit zero-fill, so designator chains and brace elision
 work identically at file scope.
 
 @d IR: aggregate init helpers @{
-// -- kcc_ir_initlist_count ------------------------------------------------
+// -- kcc_ir_initlist_count ---
 // uint64_t kcc_ir_initlist_count(node *init_list)
 //   x0 = AST_INIT_LIST node → number of array slots the list spans.  Plain
 //   elements advance a running index; an `[i] =` designator resets it, so a
@@ -504,7 +504,7 @@ _kcc_ir_initlist_count:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_emit_indexed_store --------------------------------------------
+// -- kcc_ir_emit_indexed_store ---
 // void kcc_ir_emit_indexed_store(base_vreg, byte_offset, value_vreg, width)
 //   x0 = base vreg, x1 = byte offset, x2 = value vreg, x3 = store width
 //        (0 = 8-byte slot, else 1/2/4)
@@ -573,7 +573,7 @@ _kcc_ir_emit_indexed_store:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_ir_elem_off_width ------------------------------------------------
+// -- kcc_ir_elem_off_width ---
 // (byte_offset, width) kcc_ir_elem_off_width(type *ty, uint64_t index)
 //   x0 = element type (array) or aggregate type (struct/union), x1 = index
 // Returns x0 = byte offset of the index-th initializer element,
@@ -654,7 +654,7 @@ _kcc_ir_elem_off_width:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_field_index ---------------------------------------------------
+// -- kcc_ir_field_index ---
 // int64_t kcc_ir_field_index(type *aggregate, char *name)
 //   x0 = struct/union type, x1 = interned member name
 // Returns the zero-based position of the named member (so the positional
@@ -693,7 +693,7 @@ _kcc_ir_field_index:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_type_has_member -----------------------------------------------
+// -- kcc_ir_type_has_member ---
 // uint64_t kcc_ir_type_has_member(type *ty, char *name)
 //   Whether `name` is a member of struct/union `ty`, directly or promoted
 //   through one of its anonymous (unnamed) struct/union members (C17
@@ -742,7 +742,7 @@ _kcc_ir_type_has_member:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_anon_containing -----------------------------------------------
+// -- kcc_ir_anon_containing ---
 // int64_t kcc_ir_anon_containing(type *agg, char *name)
 //   Position of the anonymous struct/union member of `agg` through which
 //   `name` is reachable, or -1.  Used by the designator resolver to step
@@ -783,7 +783,7 @@ _kcc_ir_anon_containing:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_subobj --------------------------------------------------------
+// -- kcc_ir_subobj ---
 // (offset, width, sub_type) kcc_ir_subobj(type *agg, uint64_t index)
 //   x0 = the *actual* aggregate type (array, struct, or union); x1 = the
 //        position of a sub-object within it.
@@ -883,7 +883,7 @@ _kcc_ir_subobj:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_resolve_designator --------------------------------------------
+// -- kcc_ir_resolve_designator ---
 // (offset, sub_type, first_pos, field)
 //     kcc_ir_resolve_designator(type *agg, uint64_t base_off, node *desig)
 //   x0 = the aggregate type the designation applies to; x1 = its base byte
@@ -974,7 +974,7 @@ _kcc_ir_resolve_designator:
     ldp x29, x30, [sp], #80
     ret
 
-// -- kcc_ir_agg_count -----------------------------------------------------
+// -- kcc_ir_agg_count ---
 // uint64_t kcc_ir_agg_count(type *ty)
 //   Number of sub-objects the brace-elision consumer must fill for an
 //   aggregate: an array's element count, a struct's field count, 1 for a
@@ -1008,7 +1008,7 @@ _kcc_ir_agg_count:
 .Lac_scdone:
     ret
 
-// -- kcc_ir_fill_one ------------------------------------------------------
+// -- kcc_ir_fill_one ---
 // void kcc_ir_fill_one(type *ty, base_alloca, uint64_t off, node, field)
 //   Initialize the single object of type `ty` at `off` from ONE initializer
 //   `node` (no stream elision).  A braced `node` fills `ty` from its own
@@ -1109,7 +1109,7 @@ address directly.  A file-scope compound literal is a different animal (static
 storage), handled in the global-initializer path.
 
 @d IR: aggregate init helpers @{
-// -- kcc_ir_build_compound_lit --------------------------------------------
+// -- kcc_ir_build_compound_lit ---
 // uint64_t kcc_ir_build_compound_lit(node *cl)
 //   x0 = AST_COMPOUND_LIT (F0 = type, F1 = brace init list)
 // Returns the vreg holding the address of the materialised automatic object.
@@ -1209,7 +1209,7 @@ _kcc_ir_build_compound_lit:
 @}
 
 @d IR: aggregate init helpers @{
-// -- kcc_ir_fill ----------------------------------------------------------
+// -- kcc_ir_fill ---
 // node *kcc_ir_fill(type *ty, base_alloca, uint64_t off, node *elem)
 //   Brace-elision stream consumer.  Fills the object of type `ty` at `off`
 //   by drawing elements from the flat list stream starting at `elem`, and
@@ -1363,7 +1363,7 @@ _kcc_ir_fill:
     ldp x29, x30, [sp], #80
     ret
 
-// -- kcc_ir_fill_list -----------------------------------------------------
+// -- kcc_ir_fill_list ---
 // void kcc_ir_fill_list(type *ty, base_alloca, uint64_t base_off, node *head)
 //   Fill the aggregate `ty` at `base_off` from a brace-delimited element
 //   list `head..`.  Walks a running cursor over `ty`'s sub-objects; a
@@ -1565,7 +1565,7 @@ array larger than a slot has correct storage.  (A brace initialiser on a
 static \emph{aggregate} is still stored as a scalar and remains a gap.)
 
 @d IR: static local helper @{
-// -- kcc_ir_static_name ---------------------------------------------------
+// -- kcc_ir_static_name ---
 // char *kcc_ir_static_name(node *decl)
 //   x0 = declaration node → arena string "sl_" + 16 hex digits of the node
 //        pointer, the unique symbol name for this static local's global.
@@ -1623,7 +1623,7 @@ and instead binds its name to the ``resolve as a global'' marker in the
 the block.  Everything else is an ordinary automatic with a stack alloca.
 
 @d IR: build var decl @{
-// -- kcc_ir_build_var_decl ------------------------------------------------
+// -- kcc_ir_build_var_decl ---
 // void kcc_ir_build_var_decl(node *decl)
 //   x0 = AST_VAR_DECL (F0=type, F1=name, F2=init)
 .text

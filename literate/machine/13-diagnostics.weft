@@ -33,7 +33,7 @@ in cascading errors.  After \texttt{DIAG\_MAX\_ERRORS} errors, the
 engine prints a summary and calls \texttt{sys\_exit(1)}.
 
 @d Diag: constants @{
-// -- Diagnostic severity codes ------------------------------------------
+// -- Diagnostic severity codes ---
 .equ DIAG_ERROR,       0
 .equ DIAG_WARNING,     1
 .equ DIAG_NOTE,        2
@@ -51,7 +51,7 @@ mirrors \texttt{kcc\_io\_putu} (Chapter~\ref{ch:io}) but bypasses the
 stdout buffer.
 
 @d Diag: putu stderr @{
-// -- _kcc_diag_putu -----------------------------------------------------
+// -- _kcc_diag_putu ---
 // void _kcc_diag_putu(uint64_t n)
 //   x0 = unsigned integer to print
 // Outputs the decimal representation directly to stderr (fd=2).
@@ -111,7 +111,7 @@ reaches \texttt{DIAG\_MAX\_ERRORS}, a ``too many errors'' message is
 printed and the process exits with status~1.
 
 @d Diag: emit @{
-// -- kcc_diag_emit ------------------------------------------------------
+// -- kcc_diag_emit ---
 // void kcc_diag_emit(int severity, uint64_t line, uint64_t col,
 //                    const char *msg)
 //   x0 = severity (DIAG_ERROR/DIAG_WARNING/DIAG_NOTE)
@@ -279,7 +279,7 @@ an over-long indent is clamped to the buffer, which at worst nudges the
 caret left on a pathologically wide line.
 
 @d Diag: caret @{
-// -- _kcc_diag_caret ----------------------------------------------------
+// -- _kcc_diag_caret ---
 // void _kcc_diag_caret(uint64_t line, uint64_t col)
 //   x0 = line (1-based), x1 = column (1-based)
 // Prints the source line for `line`, then a caret under `col`.
@@ -407,7 +407,7 @@ These are tail-call wrappers: they rearrange the arguments and branch
 in \reg{x30} passes through untouched.
 
 @d Diag: error @{
-// -- kcc_diag_error -----------------------------------------------------
+// -- kcc_diag_error ---
 // void kcc_diag_error(uint64_t line, uint64_t col, const char *msg)
 //   x0 = line, x1 = col, x2 = msg
 .globl _kcc_diag_error
@@ -425,7 +425,7 @@ The warning wrapper is identical in structure, substituting
 \texttt{DIAG\_WARNING} for the severity argument.
 
 @d Diag: warning @{
-// -- kcc_diag_warning ---------------------------------------------------
+// -- kcc_diag_warning ---
 // void kcc_diag_warning(uint64_t line, uint64_t col, const char *msg)
 .globl _kcc_diag_warning
 .p2align 2
@@ -444,7 +444,7 @@ error to provide additional context (e.g., ``previous definition
 was here'').
 
 @d Diag: note @{
-// -- kcc_diag_note ------------------------------------------------------
+// -- kcc_diag_note ---
 // void kcc_diag_note(uint64_t line, uint64_t col, const char *msg)
 .globl _kcc_diag_note
 .p2align 2
@@ -464,7 +464,7 @@ The driver uses this after tokenization to decide whether to continue
 with subsequent phases or exit with a failure status.
 
 @d Diag: had errors @{
-// -- kcc_diag_had_errors ------------------------------------------------
+// -- kcc_diag_had_errors ---
 // uint64_t kcc_diag_had_errors(void)
 // Returns the error count in x0.
 .globl _kcc_diag_had_errors
@@ -484,7 +484,7 @@ This is used by the test harness between individual tests to prevent
 counters from one test affecting the next.
 
 @d Diag: reset @{
-// -- kcc_diag_reset -----------------------------------------------------
+// -- kcc_diag_reset ---
 // void kcc_diag_reset(void)
 // Resets error and warning counts to zero.
 .globl _kcc_diag_reset
@@ -513,7 +513,7 @@ without it produces exactly the output it did before warnings existed,
 so no existing test's stderr shifts.
 
 @d Diag: data @{
-// -- Diagnostic global state --------------------------------------------
+// -- Diagnostic global state ---
 .data
 .p2align 3
 _kcc_diag_error_count:  .quad 0    // running error count

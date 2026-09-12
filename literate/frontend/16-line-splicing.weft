@@ -30,7 +30,7 @@ to write position.  The final buffer size is the write pointer's
 offset from the base.
 
 @d Splice: translate @{
-// -- kcc_source_splice --------------------------------------------------
+// -- kcc_source_splice ---
 // void kcc_source_splice(void)
 // Translation Phase 2: removes backslash-newline sequences in-place.
 // Requires that _kcc_src_base points to a writable buffer (as

@@ -15,7 +15,7 @@ The C language requires that every identifier be declared before use and that de
 Each symbol is a 64-byte arena-allocated record:
 
 @d Symtab: constants @{
-// -- Symbol record layout -------------------------------------------------
+// -- Symbol record layout ---
 .equ SYM_KIND,       0    // SYM_VAR=1, SYM_FUNC=2, SYM_TYPEDEF=3, SYM_ENUM_CONST=4
 .equ SYM_TYPE,       8    // pointer to type descriptor
 .equ SYM_NAME,      16    // interned name pointer
@@ -27,7 +27,7 @@ Each symbol is a 64-byte arena-allocated record:
 .equ SYM_COL,       64    // declaration column (for -Wunused-variable)
 .equ SYM_SIZE,      72
 
-// -- Symbol kind constants ------------------------------------------------
+// -- Symbol kind constants ---
 .equ SYM_VAR,         1
 .equ SYM_FUNC,        2
 .equ SYM_TYPEDEF,     3
@@ -42,7 +42,7 @@ of hash table pointers.  After the stacks are allocated, file scope (depth~0)
 is pushed so that top-level declarations have a scope to land in.
 
 @d Symtab: init @{
-// -- kcc_symtab_init ------------------------------------------------------
+// -- kcc_symtab_init ---
 // void kcc_symtab_init(void)
 // Creates three scope stacks, pushes file scope (depth 0).
 .text
@@ -98,7 +98,7 @@ top entry from each stack and decrements the depth.  This mirrors the C
 scoping rule that each block introduces a new scope (\stdref{6.2.1}).
 
 @d Symtab: push scope @{
-// -- kcc_symtab_push_scope ------------------------------------------------
+// -- kcc_symtab_push_scope ---
 // void kcc_symtab_push_scope(void)
 // Pushes a new hash table onto ordinary and tags scope stacks.
 .text
@@ -154,7 +154,7 @@ decreases the depth counter.  The hash tables themselves are not freed
 --- the arena reclaims all memory at program end.
 
 @d Symtab: pop scope @{
-// -- kcc_symtab_pop_scope -------------------------------------------------
+// -- kcc_symtab_pop_scope ---
 // void kcc_symtab_pop_scope(void)
 // Pops from ordinary and tags scope stacks, decrements depth.
 .text
@@ -203,7 +203,7 @@ top-down, returning the first matching symbol---this implements C's
 inner-scope-shadows-outer rule.
 
 @d Symtab: declare @{
-// -- kcc_symtab_declare ---------------------------------------------------
+// -- kcc_symtab_declare ---
 // sym *kcc_symtab_declare(char *name, uint64_t len, uint64_t kind, type_desc *type)
 //   x0 = name, x1 = len, x2 = kind, x3 = type descriptor
 // Creates SYM record, inserts into current scope.
@@ -292,7 +292,7 @@ can walk every symbol declared in a block as the block is left---the
 basis for the unused-variable warning.
 
 @d Symtab: lookup @{
-// -- kcc_symtab_lookup ----------------------------------------------------
+// -- kcc_symtab_lookup ---
 // sym *kcc_symtab_lookup(char *name, uint64_t len)
 //   x0 = name, x1 = len
 // Searches ordinary scopes top-down.
@@ -348,7 +348,7 @@ _kcc_symtab_lookup:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_symtab_lookup_current --------------------------------------------
+// -- kcc_symtab_lookup_current ---
 // sym *kcc_symtab_lookup_current(char *name, uint64_t len)
 // Searches ONLY the innermost (current) scope, so a redefinition check can
 // tell a same-scope duplicate from a legal shadow of an outer declaration.
@@ -375,7 +375,7 @@ _kcc_symtab_lookup_current:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_symtab_current_ht ------------------------------------------------
+// -- kcc_symtab_current_ht ---
 // void *kcc_symtab_current_ht(void)
 // Returns the hash table of the innermost (current) ordinary scope, so a
 // caller can iterate the symbols declared directly in that scope (used by
@@ -410,7 +410,7 @@ to use the same identifier as both a tag and an ordinary name without
 conflict.
 
 @d Symtab: declare tag @{
-// -- kcc_symtab_declare_tag -----------------------------------------------
+// -- kcc_symtab_declare_tag ---
 // sym *kcc_symtab_declare_tag(char *name, uint64_t len, type_desc *type)
 //   x0 = tag name, x1 = len, x2 = type descriptor
 // Inserts into tags scope stack.
@@ -476,7 +476,7 @@ the tag scope stack.  This is used when the parser encounters
 find the corresponding type definition.
 
 @d Symtab: lookup tag @{
-// -- kcc_symtab_lookup_tag ------------------------------------------------
+// -- kcc_symtab_lookup_tag ---
 // sym *kcc_symtab_lookup_tag(char *name, uint64_t len)
 //   x0 = tag name, x1 = len
 // Searches tags scopes top-down.
@@ -534,7 +534,7 @@ _kcc_symtab_lookup_tag:
 Labels are function-scoped: one hash table per function.
 
 @d Symtab: label scope @{
-// -- kcc_symtab_label_begin -----------------------------------------------
+// -- kcc_symtab_label_begin ---
 // void kcc_symtab_label_begin(void)
 // Pushes a new label hash table for a function body.
 .text
@@ -558,7 +558,7 @@ _kcc_symtab_label_begin:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_symtab_label_end -------------------------------------------------
+// -- kcc_symtab_label_end ---
 // void kcc_symtab_label_end(void)
 // Pops the label hash table after function body.
 .globl _kcc_symtab_label_end
@@ -589,7 +589,7 @@ the top hash table with a sentinel value of~1, while
 a boolean indicating whether the label exists (\stdref{6.8.1}).
 
 @d Symtab: label scope @{
-// -- kcc_symtab_label_add -------------------------------------------------
+// -- kcc_symtab_label_add ---
 // void kcc_symtab_label_add(char *name, uint64_t len)
 .globl _kcc_symtab_label_add
 .p2align 2
@@ -619,7 +619,7 @@ _kcc_symtab_label_add:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_symtab_label_lookup ----------------------------------------------
+// -- kcc_symtab_label_lookup ---
 // int kcc_symtab_label_lookup(char *name, uint64_t len)
 // Returns 1 if label is defined, 0 otherwise.
 .globl _kcc_symtab_label_lookup
@@ -664,7 +664,7 @@ per scope stack) and the current scope depth counter.  All four are
 zero-initialised and populated by \texttt{kcc\_symtab\_init} at startup.
 
 @d Symtab: data @{
-// -- Symbol table globals -------------------------------------------------
+// -- Symbol table globals ---
 .data
 .globl _kcc_sym_ordinary
 _kcc_sym_ordinary:    .quad 0       // vec* for ordinary scope stack

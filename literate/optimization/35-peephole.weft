@@ -37,7 +37,7 @@ for each \texttt{IR\_CONST} it finds, it stores the immediate in the
 corresponding slot and marks it valid.
 
 @d Opt: constant fold @{
-// -- kcc_opt_constfold ----------------------------------------------------
+// -- kcc_opt_constfold ---
 // uint64_t kcc_opt_constfold(ir_func *func)
 // Folds constant expressions.  Returns number of folds performed.
 .text
@@ -431,7 +431,7 @@ peepholes, and its rewrites are behaviour-preserving, so the differential
 corpus, Lua, and zlib are the oracle rather than byte-identical output.
 
 @d Opt: strength reduction @{
-// -- kcc_opt_strength -----------------------------------------------------
+// -- kcc_opt_strength ---
 // uint64_t kcc_opt_strength(ir_func *func) -> number of rewrites.
 // Strength reduction + algebraic simplification, all behaviour-preserving:
 //   x * 2^k   -> x << k          (signed & unsigned)
@@ -640,7 +640,7 @@ _kcc_opt_strength:
     ldp x29, x30, [sp], #112
     ret
 
-// -- kcc_opt_sr_cval ------------------------------------------------------
+// -- kcc_opt_sr_cval ---
 // Helper: given a vreg in x10 and the const map (x20 size, x21 values,
 // x22 valid), return x0 = 1 and x1 = value if the vreg holds a known
 // constant, else x0 = 0.  Leaf; clobbers x0-x3 only.

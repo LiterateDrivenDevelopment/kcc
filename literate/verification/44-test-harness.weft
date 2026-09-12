@@ -27,7 +27,7 @@ After all tests, a summary line reports the pass/fail counts and the
 process exits with status~0 (all passed) or~1 (any failed).
 
 @d Test: runner entry @{
-// -- test_kcc _main -----------------------------------------------------
+// -- test_kcc _main ---
 // Entry point for the test binary.
 .text
 .globl _main
@@ -141,7 +141,7 @@ whether the resulting token type matches the expected value.  Returns
 0 on match, 1 on mismatch.
 
 @d Test: assert helpers @{
-// -- kcc_test_lex_setup -------------------------------------------------
+// -- kcc_test_lex_setup ---
 // void kcc_test_lex_setup(const char *src, size_t len)
 //   x0 = pointer to test source string
 //   x1 = length in bytes (excluding null terminator)
@@ -191,7 +191,7 @@ _kcc_test_lex_setup:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_test_expect_tok ------------------------------------------------
+// -- kcc_test_expect_tok ---
 // int kcc_test_expect_tok(int expected_type)
 //   x0 = expected token type code
 // Calls lex_next, checks tok_type against expected.
@@ -230,7 +230,7 @@ _kcc_test_expect_tok:
 String constants for the test runner's output formatting.
 
 @d Test: runner data @{
-// -- Test runner string constants ---------------------------------------
+// -- Test runner string constants ---
 .section __TEXT,__cstring,cstring_literals
 _test_header:     .asciz "kcc test suite\n==============\n"
 _test_prefix:     .asciz "  "

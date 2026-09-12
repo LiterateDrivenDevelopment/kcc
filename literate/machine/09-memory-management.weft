@@ -43,7 +43,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d Arena: constants @{
-// -- Arena chunk layout ---------------------------------------------
+// -- Arena chunk layout ---
 .equ CHUNK_NEXT,    0         // pointer to next chunk
 .equ CHUNK_LIMIT,   8         // end of usable region
 .equ CHUNK_AVAIL,  16         // next free byte (bump pointer)
@@ -66,7 +66,7 @@ in a global variable; in later phases, the main processing loop
 will cache it in \reg{x19}.
 
 @d Arena: init @{
-// -- kcc_arena_init -------------------------------------------------
+// -- kcc_arena_init ---
 // void kcc_arena_init(void)
 // Allocates the initial arena chunk via mmap.
 // On failure (mmap returns MAP_FAILED), exits with status 1.
@@ -134,7 +134,7 @@ The fast path is a single comparison and pointer bump --- three
 instructions after the alignment arithmetic:
 
 @d Arena: alloc fast path @{
-// -- kcc_arena_alloc ------------------------------------------------
+// -- kcc_arena_alloc ---
 // void *kcc_arena_alloc(size_t size)
 //   x0 = number of bytes to allocate
 // Returns pointer to allocated memory in x0.
@@ -240,7 +240,7 @@ The arena's mutable state is a single pointer to the current (most
 recently allocated) chunk.  We store it in the \texttt{\_\_DATA} segment.
 
 @d Arena: data @{
-// -- Arena global state ---------------------------------------------
+// -- Arena global state ---
 .data
 .p2align 3
 _kcc_arena_current: .quad 0   // pointer to current arena chunk

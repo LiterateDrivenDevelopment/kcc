@@ -85,7 +85,7 @@ _kcc_as_s_env:    .asciz "KCC_EMIT_ASM"
 @}
 
 @d Emit-asm: buffer @{
-// -- kcc_as_init --------------------------------------------------------------
+// -- kcc_as_init ---
 // Allocate the text buffer (64 KiB, grows on demand).
 .globl _kcc_as_init
 .p2align 2
@@ -107,7 +107,7 @@ _kcc_as_init:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_as_ch ----------------------------------------------------------------
+// -- kcc_as_ch ---
 // void kcc_as_ch(uint32_t byte) — append one byte, growing the buffer if full.
 .globl _kcc_as_ch
 .p2align 2
@@ -154,7 +154,7 @@ _kcc_as_ch:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_str ---------------------------------------------------------------
+// -- kcc_as_str ---
 // void kcc_as_str(const char *s) — append a NUL-terminated string.
 .globl _kcc_as_str
 .p2align 2
@@ -173,7 +173,7 @@ _kcc_as_str:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_as_putn --------------------------------------------------------------
+// -- kcc_as_putn ---
 // void kcc_as_putn(const char *p, uint64_t n) — append n raw bytes.
 .globl _kcc_as_putn
 .p2align 2
@@ -194,7 +194,7 @@ _kcc_as_putn:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_dec ---------------------------------------------------------------
+// -- kcc_as_dec ---
 // void kcc_as_dec(uint64_t n) — append decimal digits.
 .globl _kcc_as_dec
 .p2align 2
@@ -233,7 +233,7 @@ _kcc_as_dec:
     ldp x29, x30, [sp], #80
     ret
 
-// -- kcc_as_hex8 --------------------------------------------------------------
+// -- kcc_as_hex8 ---
 // void kcc_as_hex8(uint32_t w) — append exactly 8 hex digits (no 0x prefix).
 .globl _kcc_as_hex8
 .p2align 2
@@ -256,7 +256,7 @@ _kcc_as_hex8:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_hex2 --------------------------------------------------------------
+// -- kcc_as_hex2 ---
 // void kcc_as_hex2(uint32_t b) — append exactly 2 hex digits (low byte of b).
 .globl _kcc_as_hex2
 .p2align 2
@@ -279,7 +279,7 @@ _kcc_as_hex2:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_xreg --------------------------------------------------------------
+// -- kcc_as_xreg ---
 // void kcc_as_xreg(uint32_t n) — append an x-register name (31 → xzr).
 .globl _kcc_as_xreg
 .p2align 2
@@ -317,7 +317,7 @@ A small helper appends a symbol's name given its index in the linker's symbol
 vector.
 
 @d Emit-asm: render @{
-// -- kcc_as_symname -----------------------------------------------------------
+// -- kcc_as_symname ---
 // void kcc_as_symname(uint64_t idx) — append symbol[idx].name.
 .globl _kcc_as_symname
 .p2align 2
@@ -335,7 +335,7 @@ _kcc_as_symname:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_as_reloc_at ----------------------------------------------------------
+// -- kcc_as_reloc_at ---
 // uint64_t kcc_as_reloc_at(uint64_t off)
 //   Returns pointer to the reloc entry whose RELOC_OFFSET == off, or 0.
 .globl _kcc_as_reloc_at
@@ -364,7 +364,7 @@ _kcc_as_reloc_at:
     mov x0, #0
     ret
 
-// -- kcc_as_add_snip ----------------------------------------------------------
+// -- kcc_as_add_snip ---
 // void kcc_as_add_snip(uint64_t off, const char *tmpl, uint64_t len)
 //   Record an inline-asm snippet at code offset `off`.  Called by codegen.
 .globl _kcc_as_add_snip
@@ -432,7 +432,7 @@ _kcc_as_add_snip:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_as_snip_at -----------------------------------------------------------
+// -- kcc_as_snip_at ---
 // uint64_t kcc_as_snip_at(uint64_t off) — pointer to the snippet at `off`, or 0.
 .globl _kcc_as_snip_at
 .p2align 2
@@ -462,7 +462,7 @@ _kcc_as_snip_at:
     mov x0, #0
     ret
 
-// -- kcc_as_labels_at ---------------------------------------------------------
+// -- kcc_as_labels_at ---
 // void kcc_as_labels_at(uint64_t off) — emit `name:` for every text symbol
 // defined at this offset (and `.globl name` first if it is external).
 .globl _kcc_as_labels_at
@@ -523,7 +523,7 @@ _kcc_as_labels_at:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_as_reloc_line --------------------------------------------------------
+// -- kcc_as_reloc_line ---
 // void kcc_as_reloc_line(uint64_t reloc, uint32_t word)
 //   Emit the symbolic assembly for a relocated instruction.
 .globl _kcc_as_reloc_line
@@ -657,7 +657,7 @@ _kcc_as_reloc_line:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_as_wreg --------------------------------------------------------------
+// -- kcc_as_wreg ---
 // void kcc_as_wreg(uint32_t n) — append a w-register name (31 → wzr).
 .globl _kcc_as_wreg
 .p2align 2
@@ -683,7 +683,7 @@ _kcc_as_wreg:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_sym_at ------------------------------------------------------------
+// -- kcc_as_sym_at ---
 // uint64_t kcc_as_sym_at(uint64_t off) — name pointer of a text symbol defined
 // at `off`, or 0.  Used to reference a branch/call target by its real name.
 .globl _kcc_as_sym_at
@@ -715,7 +715,7 @@ _kcc_as_sym_at:
     mov x0, #0
     ret
 
-// -- kcc_as_branch_kind -------------------------------------------------------
+// -- kcc_as_branch_kind ---
 // uint64_t kcc_as_branch_kind(uint32_t word)
 //   0 = not a branch, 1 = b, 2 = bl, 3 = b.cond, 4 = cbz, 5 = cbnz.
 .globl _kcc_as_branch_kind
@@ -756,7 +756,7 @@ _kcc_as_branch_kind:
     mov x0, #5
     ret
 
-// -- kcc_as_branch_target -----------------------------------------------------
+// -- kcc_as_branch_target ---
 // uint64_t kcc_as_branch_target(uint32_t word, uint64_t off)
 //   Byte offset the branch targets, or (uint64_t)-1 if not a branch.
 .globl _kcc_as_branch_target
@@ -792,7 +792,7 @@ _kcc_as_branch_target:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_label_ref ---------------------------------------------------------
+// -- kcc_as_label_ref ---
 // void kcc_as_label_ref(uint64_t target) — append the target's symbol name if
 // one is defined there, else a synthetic `Lc<target>` label.
 .globl _kcc_as_label_ref
@@ -817,7 +817,7 @@ _kcc_as_label_ref:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_render_branch -----------------------------------------------------
+// -- kcc_as_render_branch ---
 // void kcc_as_render_branch(uint32_t word, uint64_t off) — emit the symbolic
 // form of an internal (non-relocated) branch, so `as` recomputes its distance.
 .globl _kcc_as_render_branch
@@ -907,7 +907,7 @@ _kcc_as_render_branch:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_as_mark_targets ------------------------------------------------------
+// -- kcc_as_mark_targets ---
 // void kcc_as_mark_targets(uint64_t code_size) — allocate the per-word target
 // flag array and mark the target of every internal (non-relocated) branch that
 // lands where no symbol is defined, so the renderer can emit a synthetic label.
@@ -976,7 +976,7 @@ _kcc_as_mark_targets:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_as_render_text -------------------------------------------------------
+// -- kcc_as_render_text ---
 // void kcc_as_render_text(void) — emit the __text section.  The code buffer is
 // [ instructions | string-literal bytes ]: emit_strings appended the cstring
 // region and advanced code_pos, so the instructions occupy the first
@@ -1115,7 +1115,7 @@ The top-level entry initialises the buffer, renders the text section, and
 writes the accumulated bytes to the given path in a single \texttt{write}.
 
 @d Emit-asm: render @{
-// -- kcc_as_common_size -------------------------------------------------------
+// -- kcc_as_common_size ---
 // uint64_t kcc_as_common_size(uint64_t off) — size of the __common global at
 // `off`: the gap to the next section-2 symbol offset, or to the end of the
 // __common region.  (kcc stores only offsets, not per-symbol sizes.)
@@ -1153,7 +1153,7 @@ _kcc_as_common_size:
     sub x0, x9, x8
     ret
 
-// -- kcc_as_render_common -----------------------------------------------------
+// -- kcc_as_render_common ---
 // void kcc_as_render_common(void) — emit a `.zerofill __DATA,__common` entry for
 // every zero-storage global (section 2).  Their initialisers, if any, run as
 // ordinary code in the module-init function.
@@ -1212,7 +1212,7 @@ _kcc_as_render_common:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_as_render_modinit ----------------------------------------------------
+// -- kcc_as_render_modinit ---
 // void kcc_as_render_modinit(void) — when this TU synthesised a module-init
 // function, emit the __mod_init_func pointer so dyld runs it before main (this
 // is what initialises non-const globals).
@@ -1238,7 +1238,7 @@ _kcc_as_render_modinit:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_render ------------------------------------------------------------
+// -- kcc_as_render ---
 // int kcc_as_render(const char *path) — render the current translation unit's
 // generated code as `.s` text and write it to `path`.  Returns 0 on success.
 .globl _kcc_as_render
@@ -1258,7 +1258,7 @@ _kcc_as_render:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_as_write_file --------------------------------------------------------
+// -- kcc_as_write_file ---
 // int kcc_as_write_file(const char *path) — write the rendered text buffer
 // (_kcc_as_buf, _kcc_as_pos) to `path` and close it.  Shared by every
 // assembly-emission back end (ARM64 `.s` and x86-64), so the buffer globals

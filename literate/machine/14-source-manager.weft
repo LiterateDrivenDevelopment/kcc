@@ -43,7 +43,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d Source: constants @{
-// -- Source buffer layout --------------------------------------------
+// -- Source buffer layout ---
 .equ SRC_BASE,      0         // pointer to mmap'd file data
 .equ SRC_SIZE,      8         // file size in bytes
 .equ SRC_PATH,     16         // pointer to file path (null-terminated)
@@ -66,7 +66,7 @@ If any step fails, the function prints an error message to stderr
 and exits with status~1.
 
 @d Source: open file @{
-// -- kcc_source_open ------------------------------------------------
+// -- kcc_source_open ---
 // void kcc_source_open(const char *path)
 //   x0 = null-terminated file path
 // Opens and mmaps the file, stores result in global state.
@@ -187,7 +187,7 @@ The source manager's state consists of the mapped buffer, its size,
 and the file path.  These are accessed by the lexer when scanning.
 
 @d Source: data @{
-// -- Source manager global state ------------------------------------
+// -- Source manager global state ---
 .data
 .p2align 3
 .globl _kcc_src_base

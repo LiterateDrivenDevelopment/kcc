@@ -164,7 +164,7 @@ prologue saves exactly the \texttt{d8}--\texttt{d15} the scan claimed just above
 the general callee-saved area.
 
 @d CodeGen: register allocation @{
-// -- kcc_ra_use ---------------------------------------------------------------
+// -- kcc_ra_use ---
 // Record one vreg use during pass 1.  x0=vreg, x1=cur_bb, x2=pos, x3=calls.
 // Reads bases x20=vreg_n, x21=lastuse, x22=defbb, x23=calldef, x24=flags.
 // flags bits: 1=candidate def, 2=escapes its block, 4=crosses a call.
@@ -190,7 +190,7 @@ _kcc_ra_use:
 .Lrau_ret:
     ret
 
-// -- kcc_ra_disq --------------------------------------------------------------
+// -- kcc_ra_disq ---
 // Disqualify a vreg from scalar-local promotion: if x0 is a valid vreg whose
 // flags (x1 = flags base, x2 = vreg_n) carry the promotable bit (0x100), clear
 // it.  Called for every vreg operand that appears in a position OTHER than
@@ -209,7 +209,7 @@ _kcc_ra_disq:
 .Lrd_ret:
     ret
 
-// -- kcc_cg_regalloc ----------------------------------------------------------
+// -- kcc_cg_regalloc ---
 // void kcc_cg_regalloc(ir_func *func)
 // Computes the per-function vreg→physreg map and publishes it in
 // _kcc_cg_regmap (0 for an unallocated vreg).
@@ -291,7 +291,7 @@ _kcc_cg_regalloc:
     b .Lra_zero
 .Lra_zeroed:
 
-    // ---- Pass 1: liveness / candidate analysis ----
+    // --- Pass 1: liveness / candidate analysis ---
     ldr x0, [x19, #IRF_BLOCKS]
     ldr x1, [x0, #VEC_COUNT]
     str x1, [sp, #112]            // bb_count
@@ -518,7 +518,7 @@ _kcc_cg_regalloc:
     b .Lp1_bb
 .Lp1_done:
 
-    // ---- Promotability analysis (mem2reg) ----
+    // --- Promotability analysis (mem2reg) ---
     // A scalar local (an IR_ALLOCA of an integer/pointer type occupying a
     // single slot) can live in a physical register instead of memory, provided
     // its address never escapes.  In this IR the address escapes exactly when
@@ -710,7 +710,7 @@ _kcc_cg_regalloc:
     b .Lpr_bb
 .Lpr_done:
 
-    // ---- Loop detection ----
+    // --- Loop detection ---
     // A value whose live range escapes its defining block can be kept in a
     // register across blocks only when the linear instruction numbering is a
     // valid execution order---that is, when the function has no back-edge.  A
@@ -766,7 +766,7 @@ _kcc_cg_regalloc:
     b .Lhl_bb
 .Lhl_done:
 
-    // ---- Pass 2: linear scan over x12..x15 (caller-saved) and x19..x27
+    // --- Pass 2: linear scan over x12..x15 (caller-saved) and x19..x27
     //      (callee-saved).  reg_end[i] lives at [sp,#152 + i*8]; -1 = free.
     add x1, sp, #152
     mov x9, #-1
@@ -779,7 +779,7 @@ _kcc_cg_regalloc:
     b .Lp2_rinit
 .Lp2_rinit_done:
 
-    // ---- Loop-carried reservation ----
+    // --- Loop-carried reservation ---
     // In a function with a back-edge the in-order scan below still declines
     // cross-block values (they need liveness to bound the reservation across
     // the loop).  But every vreg has a single definition, so a cross-block
@@ -941,7 +941,7 @@ _kcc_cg_regalloc:
     b .Lp2_bb
 .Lp2_done:
 
-    // ---- FP linear scan (dedicated d-register bank) ----
+    // --- FP linear scan (dedicated d-register bank) ---
     // Floating candidates (flag bit 0x8) are allocated to a floating register
     // instead of riding in a general register: this frees the general bank for
     // integer values and drops the fmov round-trip on FP-only chains.  The bank
@@ -1249,7 +1249,7 @@ Because the map defaults to absent and \texttt{max\_slot} to the raw vreg count,
 a function the pass declines to touch keeps its exact all-spill layout.
 
 @d CodeGen: slot colouring @{
-// -- kcc_cg_color_slots -------------------------------------------------------
+// -- kcc_cg_color_slots ---
 // void kcc_cg_color_slots(ir_func *func, uint64_t vreg_n,
 //                         uint64_t *lastuse, uint64_t *flags)
 // Builds _kcc_cg_slotmap (vreg → reused stack-slot index) and _kcc_cg_max_slot

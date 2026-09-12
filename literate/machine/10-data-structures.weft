@@ -30,7 +30,7 @@ The 64-bit constants are:
 \end{itemize}
 
 @d Hash: FNV-1a @{
-// -- kcc_fnv1a ------------------------------------------------------
+// -- kcc_fnv1a ---
 // uint64_t kcc_fnv1a(const void *data, size_t len)
 //   x0 = pointer to data
 //   x1 = byte count
@@ -87,7 +87,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d Hash: constants @{
-// -- Hash table layout ----------------------------------------------
+// -- Hash table layout ---
 .equ HT_ENTRIES,       0     // pointer to entries array
 .equ HT_CAP,           8     // capacity (power of 2)
 .equ HT_COUNT,        16     // number of occupied slots
@@ -107,7 +107,7 @@ Offset & Field & Description \\
 and zero-filled, so all key pointers start as \texttt{NULL}.
 
 @d Hash: init @{
-// -- kcc_ht_init ----------------------------------------------------
+// -- kcc_ht_init ---
 // void *kcc_ht_init(uint64_t capacity)
 //   x0 = capacity (must be power of 2)
 // Returns pointer to hash table header.
@@ -163,7 +163,7 @@ the associated value if found, or 0 if not.  Since 0 is a valid
 at~10), this is sufficient.
 
 @d Hash: get @{
-// -- kcc_ht_get -----------------------------------------------------
+// -- kcc_ht_get ---
 // uint64_t kcc_ht_get(void *ht, const void *key, uint64_t keylen)
 //   x0 = hash table pointer
 //   x1 = key pointer
@@ -265,7 +265,7 @@ place, so every caller's handle to the table stays valid; keeping the load
 factor bounded turns insertion and lookup back into amortised~$O(1)$.
 
 @d Hash: put @{
-// -- kcc_ht_grow ----------------------------------------------------
+// -- kcc_ht_grow ---
 // void kcc_ht_grow(void *ht)
 // Double the table's capacity and rehash all entries into the new array,
 // updating HT_ENTRIES/HT_CAP in the header.  Keys are already unique, so each
@@ -339,7 +339,7 @@ _kcc_ht_grow:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_ht_put -----------------------------------------------------
+// -- kcc_ht_put ---
 // void kcc_ht_put(void *ht, const void *key, uint64_t keylen, uint64_t value)
 //   x0 = hash table pointer
 //   x1 = key pointer
@@ -467,7 +467,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d Vec: constants @{
-// -- Vector layout --------------------------------------------------
+// -- Vector layout ---
 .equ VEC_DATA,      0         // pointer to element array
 .equ VEC_COUNT,     8         // number of elements
 .equ VEC_CAP,      16         // capacity
@@ -483,7 +483,7 @@ both arena-allocated.  The count starts at zero; the caller never needs
 to specify an initial capacity.
 
 @d Vec: init @{
-// -- kcc_vec_init ---------------------------------------------------
+// -- kcc_vec_init ---
 // void *kcc_vec_init(uint64_t elem_size)
 //   x0 = element size in bytes
 // Returns pointer to vector header.  Initial capacity is 16.
@@ -529,7 +529,7 @@ Append an element.  If the vector is full, a new array of double
 capacity is allocated from the arena, and the old contents are copied.
 
 @d Vec: push @{
-// -- kcc_vec_push ---------------------------------------------------
+// -- kcc_vec_push ---
 // void kcc_vec_push(void *vec, const void *elem)
 //   x0 = vector pointer
 //   x1 = pointer to element to copy
@@ -602,7 +602,7 @@ checking is performed --- the caller must ensure the index is less
 than the current count.
 
 @d Vec: get @{
-// -- kcc_vec_get ----------------------------------------------------
+// -- kcc_vec_get ---
 // void *kcc_vec_get(void *vec, uint64_t index)
 //   x0 = vector pointer
 //   x1 = element index
@@ -641,7 +641,7 @@ hash table never resizes, choosing a power of two large enough to
 keep the load factor low is important.
 
 @d Strtab: init @{
-// -- kcc_strtab_init ------------------------------------------------
+// -- kcc_strtab_init ---
 // void kcc_strtab_init(void)
 // Creates the global string intern table.
 .globl _kcc_strtab_init
@@ -667,7 +667,7 @@ it returns the existing interned pointer.  If not, it copies the string
 into the arena, inserts it, and returns the new pointer.
 
 @d Strtab: intern @{
-// -- kcc_strtab_intern ----------------------------------------------
+// -- kcc_strtab_intern ---
 // const char *kcc_strtab_intern(const char *s, uint64_t len)
 //   x0 = pointer to string (not necessarily null-terminated)
 //   x1 = string length
@@ -730,7 +730,7 @@ The string intern table maintains a single global pointer to its underlying hash
 The table is created lazily on the first call to \texttt{kcc\_strtab\_intern}.
 
 @d Strtab: data @{
-// -- String intern table global state -------------------------------
+// -- String intern table global state ---
 .data
 .p2align 3
 _kcc_strtab: .quad 0             // pointer to hash table

@@ -1477,7 +1477,7 @@ _kcc_x86_sel:
     bl _kcc_as_str
     b .Lx86sel_done
 
-// ---- Two-operand ALU tails: load mnemonic, call the binop shape. ----
+// --- Two-operand ALU tails: load mnemonic, call the binop shape. ---
 .Lx86sel_add:
     // A floating ADD/SUB/MUL/DIV (typed float/double) uses the SSE unit; the
     // shared IR_GEP that also lands here is integer address arithmetic, so its
@@ -1590,7 +1590,7 @@ _kcc_x86_sel:
     bl _kcc_x86_divop
     b .Lx86sel_done
 
-// ---- Floating-point conversions (rung 4). ----
+// --- Floating-point conversions (rung 4). ---
 .Lx86sel_sitofp:
     // int slot → double: cvtsi2sdq %r10, %xmm0 ; movsd %xmm0, slot(dest).
     ldr x0, [x19, #IR_SRC1]
@@ -1683,7 +1683,7 @@ _kcc_x86_sel:
     bl _kcc_x86_conv
     b .Lx86sel_done
 
-// ---- Comparisons: load the set<cc> mnemonic, call the cmp shape. ----
+// --- Comparisons: load the set<cc> mnemonic, call the cmp shape. ---
 .Lx86sel_cmpeq:
     adrp x1, _kcc_x86_s_sete@@PAGE
     add  x1, x1, _kcc_x86_s_sete@@PAGEOFF
@@ -1720,7 +1720,7 @@ _kcc_x86_sel:
     bl _kcc_x86_cmp
     b .Lx86sel_done
 
-// ---- Unconditional branch: jmp .Lkccbb<target>. ----
+// --- Unconditional branch: jmp .Lkccbb<target>. ---
 .Lx86sel_br:
     adrp x0, _kcc_x86_s_jmp@@PAGE
     add  x0, x0, _kcc_x86_s_jmp@@PAGEOFF
@@ -1731,7 +1731,7 @@ _kcc_x86_sel:
     bl _kcc_as_ch
     b .Lx86sel_done
 
-// ---- Conditional branch: test cond, jne true, jmp false. ----
+// --- Conditional branch: test cond, jne true, jmp false. ---
 .Lx86sel_brcond:
     ldr x0, [x19, #IR_DEST]         // condition vreg
     adrp x1, _kcc_x86_s_r10@@PAGE
@@ -1756,7 +1756,7 @@ _kcc_x86_sel:
     bl _kcc_as_ch
     b .Lx86sel_done
 
-// ---- Global reference: the symbol's address into %r10, stored to dest. ----
+// --- Global reference: the symbol's address into %r10, stored to dest. ---
 .Lx86sel_globalref:
     // Darwin: movq _<name>@@GOTPCREL(%rip), %r10 --- the GOT form resolves
     // uniformly for a locally defined symbol and for a dylib import (like puts),
@@ -1795,7 +1795,7 @@ _kcc_x86_sel:
     bl _kcc_x86_store
     b .Lx86sel_done
 
-// ---- String literal: record (bytes,len), leaq .Lx86str<id>(%rip), %r10. ----
+// --- String literal: record (bytes,len), leaq .Lx86str<id>(%rip), %r10. ---
 .Lx86sel_strlit:
     // id = current count of the string table; record {SRC1, SRC2}.
     adrp x0, _kcc_x86_strs@@PAGE
@@ -1826,7 +1826,7 @@ _kcc_x86_sel:
     bl _kcc_x86_store
     b .Lx86sel_done
 
-// ---- Direct call: marshal args, call _<name>, store %rax. ----
+// --- Direct call: marshal args, call _<name>, store %rax. ---
 .Lx86sel_call:
     ldr x0, [x19, #IR_SRC2]         // args array (0 if none)
     bl _kcc_x86_call_args           // loads args into ABI regs/stack
@@ -1845,7 +1845,7 @@ _kcc_x86_sel:
     bl _kcc_as_ch
     b .Lx86sel_call_tail
 
-// ---- Indirect call: marshal args, call *%r11, store %rax. ----
+// --- Indirect call: marshal args, call *%r11, store %rax. ---
 .Lx86sel_callind:
     ldr x0, [x19, #IR_SRC2]         // args array
     bl _kcc_x86_call_args           // loads args into ABI regs/stack

@@ -24,7 +24,7 @@ We save these immediately in callee-saved registers, then initialize
 the arena and I/O subsystems before doing any real work.
 
 @d Main: entry point @{
-// -- _main ----------------------------------------------------------
+// -- _main ---
 // Entry point for kcc.
 // x0 = argc, x1 = argv
 .text
@@ -514,7 +514,7 @@ The driver's string literals.  These live in the read-only data section.
 Each is null-terminated for use with \texttt{kcc\_io\_puts}.
 
 @d Main: data @{
-// -- Driver string constants ----------------------------------------
+// -- Driver string constants ---
 .section __TEXT,__cstring,cstring_literals
 _kcc_banner:
     .asciz "kcc v0.1.0 - a formal C17 compiler for ARM64\n"

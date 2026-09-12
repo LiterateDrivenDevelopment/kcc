@@ -17,7 +17,7 @@ if it modified something.  The outer loop iterates all functions in the
 module; the inner loop repeats the pass sequence until stable.
 
 @d Opt: pass manager @{
-// -- kcc_opt_run ----------------------------------------------------------
+// -- kcc_opt_run ---
 // void kcc_opt_run(void)
 // Runs optimization passes on all IR functions until stable.
 .text
@@ -69,7 +69,7 @@ modification occurred.  When a pass fires, the \texttt{changed} flag resets
 the fixed-point loop so all passes run again on the modified IR.
 
 @d Opt: pass manager @{
-// -- kcc_opt_run_func -----------------------------------------------------
+// -- kcc_opt_run_func ---
 // void kcc_opt_run_func(ir_func *func)
 // Iterates constfold + cse + dce until no changes.
 .text

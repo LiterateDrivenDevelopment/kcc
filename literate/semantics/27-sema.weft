@@ -18,7 +18,7 @@ and walks its linked list of declarations (chained via
 populates the symbol table.
 
 @d Sema: check @{
-// -- kcc_sema_check -------------------------------------------------------
+// -- kcc_sema_check ---
 // void kcc_sema_check(node *trans_unit)
 //   x0 = AST_TRANS_UNIT node
 // Walks all top-level declarations.
@@ -70,7 +70,7 @@ passed through to the base type.  Any unrecognised or null type node falls back
 to \texttt{int}.
 
 @d Sema: resolve type @{
-// -- kcc_sema_resolve_type ------------------------------------------------
+// -- kcc_sema_resolve_type ---
 // type_desc *kcc_sema_resolve_type(node *type_node)
 //   x0 = AST type node (AST_TYPE_BUILTIN, AST_TYPE_PTR, etc.)
 // Returns type descriptor pointer.
@@ -431,7 +431,7 @@ typedef size_t = unsigned long
 \end{verbatim}
 
 @d Sema: dump types @{
-// -- kcc_sema_dump_types --------------------------------------------------
+// -- kcc_sema_dump_types ---
 // void kcc_sema_dump_types(node *trans_unit)
 //   x0 = AST_TRANS_UNIT after semantic analysis
 // Prints each declaration with resolved types.
@@ -548,7 +548,7 @@ error message strings for diagnostics, and formatting strings used by
 the type dumper.
 
 @d Sema: data @{
-// -- Sema globals ---------------------------------------------------------
+// -- Sema globals ---
 .data
 .globl _kcc_sema_cur_ret
 _kcc_sema_cur_ret:    .quad 0       // current function return type
@@ -557,7 +557,7 @@ _kcc_sema_callee_ctx: .quad 0       // 1 while checking a call's direct callee
 .globl _kcc_sema_callee_implicit
 _kcc_sema_callee_implicit: .quad 0  // 1 if the callee was an implicit function
 
-// -- Sema error messages --------------------------------------------------
+// -- Sema error messages ---
 .section __TEXT,__cstring,cstring_literals
 .globl _kcc_sema_undecl_pre
 _kcc_sema_undecl_pre:
@@ -611,7 +611,7 @@ _kcc_sema_noreturn_tbl:
     .quad _kcc_nr_longjmp, _kcc_nr_unreach, _kcc_nr_trap, 0
 .section __TEXT,__cstring,cstring_literals
 
-// -- Dump type strings ----------------------------------------------------
+// -- Dump type strings ---
 _kcc_sema_str_var:      .asciz "var "
 _kcc_sema_str_func:     .asciz "func "
 _kcc_sema_str_typedef:  .asciz "typedef "

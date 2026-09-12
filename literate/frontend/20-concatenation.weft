@@ -31,7 +31,7 @@ ceiling.  The loop leaves the first non-string token current, exactly as a
 plain single-literal parse would, so the caller continues unchanged.
 
 @d Concat: adjacent strings @{
-// -- Adjacent string literal concatenation (translation phase 6) -------
+// -- Adjacent string literal concatenation (translation phase 6) ---
 // char *_kcc_strlit_gather(uint64_t *out_len)  [x1 returned, not by pointer]
 //   On entry the current token is a TOK_STRING_LIT.  Processes it and every
 //   adjacent string literal (through macro expansion, via _kcc_pp_next),
@@ -118,7 +118,7 @@ _kcc_strlit_gather:
 Reserved for future use (e.g., wide string concatenation tracking).
 
 @d Concat: data @{
-// -- Concatenation data (reserved) -------------------------------------
+// -- Concatenation data (reserved) ---
 .data
 .p2align 3
 @}

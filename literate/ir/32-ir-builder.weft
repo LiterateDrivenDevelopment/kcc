@@ -37,7 +37,7 @@ unit that owns \texttt{main} is left untouched---its initializers still
 run at \texttt{main}'s entry---so single-unit programs are unaffected.
 
 @d IR: build @{
-// -- kcc_ir_build ---------------------------------------------------------
+// -- kcc_ir_build ---
 // void kcc_ir_build(node *trans_unit)
 //   x0 = AST_TRANS_UNIT node
 // Walks all top-level declarations and builds IR for functions.
@@ -216,7 +216,7 @@ arrays of structs, structs with aggregate fields) falls back to the ordinary
 writable path, correct but unprotected.
 
 @d IR: build @{
-// -- kcc_rodata_is_lit --------------------------------------------------------
+// -- kcc_rodata_is_lit ---
 // uint64_t kcc_rodata_binop_ok(uint64_t op)
 // 1 iff op is a binary operator _kcc_eval_const_int folds (arithmetic, shift,
 // bitwise).  Comparison and logical ops are excluded so an accepted expression
@@ -472,7 +472,7 @@ _kcc_rodata_aos_ok:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_global_const_rodata --------------------------------------------------
+// -- kcc_global_const_rodata ---
 // uint64_t kcc_global_const_rodata(node *decl)
 // 1 iff decl is a const-qualified global whose storage can be a fixed byte
 // image: an integer/floating scalar or array with matching literal leaves, a
@@ -623,7 +623,7 @@ _kcc_global_const_ptrarr:
 @}
 
 @d IR: build @{
-// -- kcc_ir_emit_global_inits --------------------------------------------
+// -- kcc_ir_emit_global_inits ---
 // void kcc_ir_emit_global_inits(void)
 // Walks the saved translation unit for global var_decls with initializers
 // and emits IR_GLOBAL_REF + build_expr(init) + IR_STORE into the current BB.
@@ -872,7 +872,7 @@ routing both scopes through the same recursion keeps that class of bug fixed
 in one place.
 
 @d IR: build @{
-// -- kcc_ir_emit_aggregate_init ------------------------------------------
+// -- kcc_ir_emit_aggregate_init ---
 // void kcc_ir_emit_aggregate_init(node *init_list, type *agg, uint64_t base)
 //   x0 = AST_INIT_LIST, x1 = aggregate type (array/struct/union, or a scalar
 //   type for the untyped int fallback), x2 = base ADDRESS vreg.
@@ -899,7 +899,7 @@ _kcc_ir_emit_aggregate_init:
 @}
 
 @d IR: build @{
-// -- kcc_ir_emit_init_stores ---------------------------------------------
+// -- kcc_ir_emit_init_stores ---
 // void kcc_ir_emit_init_stores(node *decl, uint64_t base_vreg)
 //   x0 = AST_VAR_DECL (AST_F0 = declared type, AST_F2 = initializer)
 //   x1 = base address vreg (storage the initializer writes into)
@@ -1077,7 +1077,7 @@ Mach-O writer to emit the \texttt{\_\_mod\_init\_func} pointer that makes
 \texttt{dyld} run it.
 
 @d IR: build @{
-// -- kcc_ir_emit_modinit --------------------------------------------------
+// -- kcc_ir_emit_modinit ---
 // void kcc_ir_emit_modinit(void)
 // Synthesises a local void(void) function whose body is the file-scope
 // initializer stores, so a non-main translation unit initialises its
@@ -1196,7 +1196,7 @@ it from register~\texttt{x$k$} (where $k$ is the declared parameter
 count), and \texttt{build\_return} reads it back as the copy destination.
 
 @d IR: build function @{
-// -- kcc_ir_build_func ----------------------------------------------------
+// -- kcc_ir_build_func ---
 // void kcc_ir_build_func(node *func_decl)
 //   x0 = AST_FUNC_DECL node (F0=type, F1=name, F2=params, F3=body)
 // Builds IR for one function.
@@ -1529,7 +1529,7 @@ arguments.  Passing more than eight registers' worth of arguments on
 the stack remains a separate, still-open ABI item.
 
 @d IR: build param @{
-// -- kcc_ir_build_param ---------------------------------------------------
+// -- kcc_ir_build_param ---
 // void kcc_ir_build_param(node *param_decl, uint64_t param_index)
 //   x0 = AST_PARAM_DECL (F0=type, F1=name)
 //   x1 = param index (0-based, corresponds to reserved vreg)
@@ -1708,7 +1708,7 @@ fall-through) and continues there; a \emph{goto} branches to the target
 and opens a fresh block for any unreachable statements that follow.
 
 @d IR: build goto @{
-// -- kcc_ir_branch_to -----------------------------------------------------
+// -- kcc_ir_branch_to ---
 // void kcc_ir_branch_to(bb *target)
 //   Ends the current BB with IR_BR to target (and marks it terminated),
 //   unless the current BB already has a terminator.
@@ -1746,7 +1746,7 @@ _kcc_ir_branch_to:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_label_bb ------------------------------------------------------
+// -- kcc_ir_label_bb ---
 // bb *kcc_ir_label_bb(const char *name)   → pre-allocated BB, or 0
 .text
 .globl _kcc_ir_label_bb
@@ -1772,7 +1772,7 @@ _kcc_ir_label_bb:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_prescan_labels ------------------------------------------------
+// -- kcc_ir_prescan_labels ---
 // void kcc_ir_prescan_labels(node *stmt)
 //   Recursively allocate a BB for every label and register name -> BB.
 .text
@@ -1889,7 +1889,7 @@ reference lowers to a \texttt{GLOBAL\_REF}, then the outer binding returns
 on exit.  The journal lives in \texttt{.bss} and is reset per function.
 
 @d IR: build statement @{
-// -- kcc_ir_locals_put ----------------------------------------------------
+// -- kcc_ir_locals_put ---
 // void kcc_ir_locals_put(char *name, size_t keylen, uint64_t value)
 //   Records name → value in the locals map, first journalling the name's
 //   PREVIOUS value so the enclosing block scope can be restored on exit.  A
@@ -1944,7 +1944,7 @@ _kcc_ir_locals_put:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_ir_scope_enter ---------------------------------------------------
+// -- kcc_ir_scope_enter ---
 // void kcc_ir_scope_enter(void)
 //   Marks the start of a block scope by pushing the journal's current depth.
 .globl _kcc_ir_scope_enter
@@ -1963,7 +1963,7 @@ _kcc_ir_scope_enter:
     str x3, [x2]
     ret
 
-// -- kcc_ir_scope_leave ---------------------------------------------------
+// -- kcc_ir_scope_leave ---
 // void kcc_ir_scope_leave(void)
 //   Ends the current block scope: replays every journal entry recorded since
 //   the matching enter, restoring each name's previous locals-map binding.
@@ -2011,7 +2011,7 @@ _kcc_ir_scope_leave:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_build_stmt ----------------------------------------------------
+// -- kcc_ir_build_stmt ---
 // void kcc_ir_build_stmt(node *stmt)
 //   x0 = AST statement node
 // Dispatches to the appropriate lowering based on AST_TAG.
@@ -2218,7 +2218,7 @@ operand node (\texttt{AST\_F2} = value, \texttt{AST\_F3} = address; 0 means
 absent, so the valid vreg~0 is not mistaken for ``none'').
 
 @d IR: build asm operands @{
-// -- kcc_ir_asm_addr_of -----------------------------------------------------
+// -- kcc_ir_asm_addr_of ---
 // uint64_t kcc_ir_asm_addr_of(node *lvalue)
 // Build the address of an lvalue by lowering a synthetic `&lvalue`.
 .globl _kcc_ir_asm_addr_of
@@ -2240,7 +2240,7 @@ _kcc_ir_asm_addr_of:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_asm_lower_operands ----------------------------------------------
+// -- kcc_ir_asm_lower_operands ---
 // void kcc_ir_asm_lower_operands(node *asm_stmt)
 // Lower every operand's expression.  AST_F2 receives (size<<32)|(value_vreg+1)
 // for an input, AST_F3 receives (size<<32)|(addr_vreg+1) for an output; a zero
@@ -2363,7 +2363,7 @@ returned a struct by value (e.g.\ \texttt{kcc\_ir\_resolve\_designator}'s
 four-word result) it dereferenced that garbage and crashed.
 
 @d IR: build return @{
-// -- kcc_ir_build_return --------------------------------------------------
+// -- kcc_ir_build_return ---
 // void kcc_ir_build_return(node *ret_stmt)
 //   x0 = AST_RETURN_STMT (F0=expr or 0)
 .text
@@ -2544,7 +2544,7 @@ them.  The loop stack data (depth counter and 16-entry array) is
 placed in \texttt{.data} since it is mutable at run time.
 
 @d IR: builder data @{
-// -- IR builder string constants ------------------------------------------
+// -- IR builder string constants ---
 .section __TEXT,__cstring,cstring_literals
 
 _kcc_str_main:          .asciz "main"

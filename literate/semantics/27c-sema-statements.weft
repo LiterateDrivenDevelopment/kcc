@@ -18,7 +18,7 @@ themselves in the label namespace.  Declarations encountered inside
 compound statements are forwarded to the declaration checker.
 
 @d Sema: check statement @{
-// -- kcc_sema_check_stmt --------------------------------------------------
+// -- kcc_sema_check_stmt ---
 // void kcc_sema_check_stmt(node *stmt)
 //   x0 = statement AST node
 .text

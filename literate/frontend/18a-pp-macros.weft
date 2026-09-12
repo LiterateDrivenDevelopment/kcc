@@ -30,7 +30,7 @@ into that already-named slot.
 
 @d PP: define @{
 .text
-// -- _kcc_pp_do_define ----------------------------------------------
+// -- _kcc_pp_do_define ---
 // Handles #define: reads macro name, optional params, body.
 .p2align 2
 _kcc_pp_do_define:
@@ -297,7 +297,7 @@ its value.
 
 @d PP: undef @{
 .text
-// -- _kcc_pp_do_undef -----------------------------------------------
+// -- _kcc_pp_do_undef ---
 .p2align 2
 _kcc_pp_do_undef:
     stp x29, x30, [sp, #-16]!
@@ -355,7 +355,7 @@ mechanism reuses the same \texttt{\_kcc\_pp\_macros} table that
 \texttt{\#define} and \texttt{\#undef} manipulate.
 
 @d PP: pragma @{
-// -- _kcc_pp_do_pragma ----------------------------------------------
+// -- _kcc_pp_do_pragma ---
 // Handles `#pragma push_macro("X")` / `#pragma pop_macro("X")`; any other
 // pragma is skipped.  Called with the `pragma` keyword already consumed.
 .text
@@ -472,7 +472,7 @@ _kcc_pp_do_pragma:
     ldp x29, x30, [sp], #32
     ret
 
-// -- _kcc_pp_pragma_name --------------------------------------------
+// -- _kcc_pp_pragma_name ---
 // Parse `( "NAME" )` following a push_macro/pop_macro verb.  Returns
 // x0 = pointer to NAME's bytes (inside the string literal), x1 = its length,
 // or x1 = 0 on any parse failure.  The macro name is the string-literal
@@ -524,7 +524,7 @@ corresponding argument text.
 
 @d PP: expand @{
 .text
-// -- _kcc_pp_try_expand ---------------------------------------------
+// -- _kcc_pp_try_expand ---
 // Checks current identifier token against macro table.
 // Returns x0 = 1 if expanded (pushed context), 0 if not.
 .globl _kcc_pp_try_expand
@@ -1066,7 +1066,7 @@ meaning because kcc implements neither \texttt{\#} nor \texttt{\#\#}---%
 there are no operands whose spelling or pasting the spacing could disturb.
 
 @d PP: expand @{
-// -- _kcc_pp_expand_arg ---------------------------------------------
+// -- _kcc_pp_expand_arg ---
 // (const char *text, uint64_t len) → x0 = expanded buf, x1 = expanded len
 // Fully macro-expands one argument's text (argument prescan, 6.10.3.1).
 .p2align 2
@@ -1232,7 +1232,7 @@ _kcc_pp_expand_arg:
     ldp x29, x30, [sp], #144
     ret
 
-// -- _kcc_pp_expand_all_args ----------------------------------------
+// -- _kcc_pp_expand_all_args ---
 // (arg_array, count): replaces each 16-byte {start,len} entry with its
 // fully-expanded {buf,len} in place, ahead of substitution.
 .p2align 2
@@ -1307,7 +1307,7 @@ ordinary trim).  This is what makes the kernel's
 the stringisation operator, handled just below.
 
 @d PP: expand @{
-// -- _kcc_pp_substitute ---------------------------------------------
+// -- _kcc_pp_substitute ---
 // Substitutes parameters in macro body with argument text.
 // x0=body_ptr, x1=body_len, x2=params, x3=nparam, x4=args, x5=nargs
 // Returns x0=result_ptr, x1=result_len (arena-allocated)
@@ -1810,7 +1810,7 @@ only when a \texttt{\#} operand is itself a macro, which real code stringising
 a type or token name never does.
 
 @d PP: expand @{
-// -- _kcc_pp_emit_string --------------------------------------------
+// -- _kcc_pp_emit_string ---
 // (const char *src, uint64_t len, char *dest) → x0 = bytes written.
 // Emits a "..." string literal of src with whitespace collapsed and " / \ escaped.
 .p2align 2
@@ -1922,7 +1922,7 @@ defined together: an undefined \texttt{\_\_BYTE\_ORDER\_\_} is \texttt{0} inside
 
 @d PP: predefined @{
 .text
-// -- _kcc_pp_predefine ----------------------------------------------
+// -- _kcc_pp_predefine ---
 // Registers predefined macros in the macro table.
 .p2align 2
 _kcc_pp_predefine:
@@ -2103,7 +2103,7 @@ _kcc_pp_predefine:
     ldp x29, x30, [sp], #32
     ret
 
-// -- _kcc_pp_def_simple ---------------------------------------------
+// -- _kcc_pp_def_simple ---
 // Helper: define a simple object-like macro.
 // x0=name, x1=namelen, x2=body, x3=bodylen
 .p2align 2
@@ -2158,7 +2158,7 @@ _kcc_cmdline_defs:  .space 512    // up to 64 payload pointers
 _kcc_cmdline_ndefs: .quad 0
 .text
 
-// -- _kcc_pp_add_cmdline_define -------------------------------------
+// -- _kcc_pp_add_cmdline_define ---
 // void _kcc_pp_add_cmdline_define(const char *payload)
 //   Records a -D payload ("NAME" or "NAME=VALUE"); ignored once full.
 .globl _kcc_pp_add_cmdline_define
@@ -2177,7 +2177,7 @@ _kcc_pp_add_cmdline_define:
 .Lacd_done:
     ret
 
-// -- _kcc_pp_apply_cmdline_defines ----------------------------------
+// -- _kcc_pp_apply_cmdline_defines ---
 // void _kcc_pp_apply_cmdline_defines(void)
 //   Defines each recorded -D macro.  "NAME" defines NAME as 1; "NAME=VALUE"
 //   splits at the first '=' and defines NAME as VALUE (a bare NAME with no

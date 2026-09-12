@@ -18,7 +18,7 @@ expressions unwrap to their child.  The comma operator evaluates both
 sides and returns the right-hand vreg.
 
 @d IR: build expression @{
-// -- kcc_ir_build_expr ----------------------------------------------------
+// -- kcc_ir_build_expr ---
 // uint64_t kcc_ir_build_expr(node *expr)
 //   x0 = AST expression node
 // Returns vreg number containing the result.
@@ -254,7 +254,7 @@ function-global, the returned vreg remains valid after the block's names go out
 of scope.
 
 @d IR: build expression @{
-// -- kcc_ir_build_stmt_expr -----------------------------------------------
+// -- kcc_ir_build_stmt_expr ---
 // uint64_t kcc_ir_build_stmt_expr(node *se)
 //   x0 = AST_STMT_EXPR (F0 = compound statement)
 // Returns the value vreg of the final expression-statement (0 if void).
@@ -344,7 +344,7 @@ receive the same treatment because the parser stores the character's
 numeric value in \texttt{AST\_F0}.
 
 @d IR: build int literal @{
-// -- kcc_ir_build_int_lit -------------------------------------------------
+// -- kcc_ir_build_int_lit ---
 // uint64_t kcc_ir_build_int_lit(node *lit)
 //   x0 = AST_INT_LIT or AST_CHAR_LIT (F0=value)
 // Returns vreg.
@@ -392,7 +392,7 @@ _kcc_ir_build_int_lit:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_build_float_lit -----------------------------------------------
+// -- kcc_ir_build_float_lit ---
 // uint64_t kcc_ir_build_float_lit(node *float_lit)
 //   x0 = AST_FLOAT_LIT (F0 = IEEE-754 double bit pattern)
 // A floating constant lowers to the same IR_CONST as an integer: the
@@ -436,7 +436,7 @@ _kcc_ir_build_float_lit:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_type_is_fp ----------------------------------------------------
+// -- kcc_ir_type_is_fp ---
 // uint64_t kcc_ir_type_is_fp(type_desc *ty)  → 1 if float/double, else 0.
 .text
 .globl _kcc_ir_type_is_fp
@@ -455,7 +455,7 @@ _kcc_ir_type_is_fp:
     mov x0, #1
     ret
 
-// -- kcc_ir_classify_type -------------------------------------------------
+// -- kcc_ir_classify_type ---
 // uint64_t kcc_ir_classify_type(type_desc *ty)
 //   AAPCS64 argument class:
 //     0 = GP    (integer/pointer, one general register)
@@ -505,7 +505,7 @@ _kcc_ir_classify_type:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_emit_sitofp ---------------------------------------------------
+// -- kcc_ir_emit_sitofp ---
 // uint64_t kcc_ir_emit_sitofp(uint64_t src_vreg)
 // Emits IR_SITOFP: converts a signed integer vreg to a double vreg.
 .text
@@ -534,7 +534,7 @@ _kcc_ir_emit_sitofp:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_emit_uitofp ---------------------------------------------------
+// -- kcc_ir_emit_uitofp ---
 // uint64_t kcc_ir_emit_uitofp(uint64_t src_vreg)
 // Emits IR_UITOFP: converts an UNSIGNED integer vreg to a double vreg.  The
 // only difference from sitofp is the opcode; codegen picks UCVTF over SCVTF so
@@ -566,7 +566,7 @@ _kcc_ir_emit_uitofp:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_emit_int_to_fp ------------------------------------------------
+// -- kcc_ir_emit_int_to_fp ---
 // uint64_t kcc_ir_emit_int_to_fp(uint64_t src_vreg, type *int_type)
 // Converts an integer vreg to double, choosing signed (SCVTF) or unsigned
 // (UCVTF) widening by the SOURCE integer's signedness.  A null type falls back
@@ -595,7 +595,7 @@ _kcc_ir_emit_int_to_fp:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_emit_fpround --------------------------------------------------
+// -- kcc_ir_emit_fpround ---
 // uint64_t kcc_ir_emit_fpround(uint64_t src_vreg)
 // Emits IR_FPROUND: rounds a double vreg to single precision (float type).
 .text
@@ -624,7 +624,7 @@ _kcc_ir_emit_fpround:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_emit_fptosi ---------------------------------------------------
+// -- kcc_ir_emit_fptosi ---
 // uint64_t kcc_ir_emit_fptosi(uint64_t src_vreg)
 // Emits IR_FPTOSI: converts a double vreg to a signed integer vreg.
 .text
@@ -653,7 +653,7 @@ _kcc_ir_emit_fptosi:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_convert -------------------------------------------------------
+// -- kcc_ir_convert ---
 // uint64_t kcc_ir_convert(uint64_t vreg, type *from, type *to)
 // Inserts an int↔double conversion when the value crosses the boundary
 // between the integer and floating domains; otherwise returns the vreg
@@ -766,7 +766,7 @@ _kcc_ir_convert:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_fill_param_classes --------------------------------------------
+// -- kcc_ir_fill_param_classes ---
 // void kcc_ir_fill_param_classes(ir_func *fn, node *func_decl)
 //   Allocates IRF_PARAM_CLS: one AAPCS64 class per incoming parameter, in
 //   order, so the codegen prologue can spill each from the right register.
@@ -854,7 +854,7 @@ that descriptor.  In neither case is the operand expression evaluated
 at run time.
 
 @d IR: build sizeof @{
-// -- kcc_ir_build_sizeof --------------------------------------------------
+// -- kcc_ir_build_sizeof ---
 // uint64_t kcc_ir_build_sizeof(node *expr)
 //   x0 = AST_SIZEOF_EXPR (F0=operand, F1=is_type)
 // Returns vreg holding the size constant.
@@ -917,7 +917,7 @@ _kcc_ir_build_sizeof:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_build_alignof -------------------------------------------------
+// -- kcc_ir_build_alignof ---
 // uint64_t kcc_ir_build_alignof(node *expr)
 //   x0 = AST_ALIGNOF_EXPR (F0 = type node)
 // The _Alignof operator (\stdref{6.5.3.4}) mirrors sizeof but yields the
@@ -1080,7 +1080,7 @@ subscript's element step now comes from the element's real size, not from a
 slot count.
 
 @d IR: build subscript @{
-// -- kcc_ir_type_slots ----------------------------------------------------
+// -- kcc_ir_type_slots ---
 // uint64_t kcc_ir_type_slots(type_desc *ty)
 //   Number of 8-byte all-spill slots a value of this type occupies.
 .text
@@ -1125,7 +1125,7 @@ full 64-bit slot: it returns $1/2/4$ for unsigned \texttt{LDRB}/\texttt{LDRH}/%
 $-1$ rather than $2^{32}-1$.
 
 @d IR: access width @{
-// -- kcc_ir_store_width ---------------------------------------------------
+// -- kcc_ir_store_width ---
 // uint64_t kcc_ir_store_width(type_desc *ty)
 //   Store access-size override: 1/2/4 for a narrow scalar, 0 for the
 //   natural 8-byte slot (pointers, long, aggregates).
@@ -1167,7 +1167,7 @@ _kcc_ir_store_width:
     mov x0, #0
     ret
 
-// -- kcc_ir_load_width ----------------------------------------------------
+// -- kcc_ir_load_width ---
 // uint64_t kcc_ir_load_width(type_desc *ty)
 //   Load access-size override: 1/2/4 unsigned, 5/6/7 signed, 0 = 8-byte.
 .text
@@ -1233,7 +1233,7 @@ _kcc_ir_load_width:
 @}
 
 @d IR: build subscript @{
-// -- kcc_ir_build_subscript_addr ------------------------------------------
+// -- kcc_ir_build_subscript_addr ---
 // uint64_t kcc_ir_build_subscript_addr(node *subscript)
 //   x0 = AST_SUBSCRIPT (F0=array ident, F1=index expr)
 // Returns vreg holding the element address (GEP result).
@@ -1562,7 +1562,7 @@ row \texttt{g->strcache[i]}, so a load there scribbled the cache with
 garbage and \texttt{luaS\_new} later dereferenced a null slot.
 
 @d IR: build subscript @{
-// -- kcc_ir_build_subscript -----------------------------------------------
+// -- kcc_ir_build_subscript ---
 // uint64_t kcc_ir_build_subscript(node *subscript)
 //   x0 = AST_SUBSCRIPT (F0=array, F1=index)
 // Returns vreg holding the loaded value (or the element address for an
@@ -1766,7 +1766,7 @@ rewriting the member node's object field to the bare inner expression
 (the parens carry no runtime meaning) before dispatching.
 
 @d IR: build member @{
-// -- kcc_ir_build_member_addr ---------------------------------------------
+// -- kcc_ir_build_member_addr ---
 // uint64_t kcc_ir_build_member_addr(node *member)
 //   x0 = AST_MEMBER (F0=object, F1=name_ptr, F3=resolved type)
 // Returns vreg holding the field address (GEP result).
@@ -2059,7 +2059,7 @@ array member---into a load of the buffer's first eight bytes, which
 address.
 
 @d IR: build member @{
-// -- kcc_ir_build_member --------------------------------------------------
+// -- kcc_ir_build_member ---
 // uint64_t kcc_ir_build_member(node *member)
 //   x0 = AST_MEMBER (F0=object, F1=name_ptr, F3=field_index)
 // Returns vreg holding the loaded value (or the field address for an
@@ -2219,7 +2219,7 @@ compound bit-field store paths of \texttt{\_kcc\_ir\_assign\_through} route
 their result through it.
 
 @d IR: bitfield access @{
-// -- kcc_ir_emit_const ----------------------------------------------------
+// -- kcc_ir_emit_const ---
 // uint64_t kcc_ir_emit_const(uint64_t value) → result vreg
 .text
 .p2align 2
@@ -2246,7 +2246,7 @@ _kcc_ir_emit_const:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_emit_binop ----------------------------------------------------
+// -- kcc_ir_emit_binop ---
 // uint64_t kcc_ir_emit_binop(int op, uint64_t a_vreg, uint64_t b_vreg) → vreg
 .p2align 2
 _kcc_ir_emit_binop:
@@ -2283,7 +2283,7 @@ _kcc_ir_emit_binop_typed:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_compound_apply ----------------------------------------------------
+// -- kcc_ir_compound_apply ---
 // uint64_t kcc_ir_compound_apply(op x0, old x1, L x2, rhs x3, R x4)
 // Compute `old OP rhs` for a compound assignment E1 op= E2 under the usual
 // arithmetic conversions.  When either operand is floating the operation is
@@ -2437,7 +2437,7 @@ _kcc_ir_compound_apply:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_ir_bf_code -------------------------------------------------------
+// -- kcc_ir_bf_code ---
 // int kcc_ir_bf_code(uint64_t container_bytes) → access-size override
 // (unsigned): 8→0 (full 64-bit), 4→4, 2→2, 1→1.
 .p2align 2
@@ -2460,7 +2460,7 @@ _kcc_ir_bf_code:
     mov x0, #1
     ret
 
-// -- kcc_ir_bf_mask -------------------------------------------------------
+// -- kcc_ir_bf_mask ---
 // uint64_t kcc_ir_bf_mask(uint64_t width) → (1<<width)-1, saturating at ~0.
 .p2align 2
 _kcc_ir_bf_mask:
@@ -2474,7 +2474,7 @@ _kcc_ir_bf_mask:
     mov x0, #-1
     ret
 
-// -- kcc_ir_bitfield_load -------------------------------------------------
+// -- kcc_ir_bitfield_load ---
 // uint64_t kcc_ir_bitfield_load(uint64_t addr_vreg, node *field) → value vreg
 //   addr_vreg = container address, field = the bit-field decl node.
 .globl _kcc_ir_bitfield_load
@@ -2558,7 +2558,7 @@ _kcc_ir_bitfield_load:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_ir_bitfield_store ------------------------------------------------
+// -- kcc_ir_bitfield_store ---
 // uint64_t kcc_ir_bitfield_store(uint64_t addr, uint64_t value, node *field)
 //   → the stored value vreg.  Read-modify-write of the container.
 .globl _kcc_ir_bitfield_store
@@ -2641,7 +2641,7 @@ _kcc_ir_bitfield_store:
     ldp x29, x30, [sp], #80
     ret
 
-// -- kcc_ir_emit_load / kcc_ir_emit_store ---------------------------------
+// -- kcc_ir_emit_load / kcc_ir_emit_store ---
 // vreg kcc_ir_emit_load(addr_vreg, size_code); void kcc_ir_emit_store(value,
 // addr, size_code).  Thin wrappers around IR_LOAD / IR_STORE with an
 // access-size override, used by the bit-field synthesis.  Each is a stub that
@@ -2716,7 +2716,7 @@ _kcc_ir_emit_store_t:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_bf_container_type ---------------------------------------------
+// -- kcc_ir_bf_container_type ---
 // type *kcc_ir_bf_container_type(type *field_type)
 //   The IR type to stamp on a bit-field's container load/store: the canonical
 //   unsigned long, or---when the field (or its object) is volatile---a cached
@@ -2776,7 +2776,7 @@ _kcc_ir_bf_container_type:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_type_layout_size ----------------------------------------------
+// -- kcc_ir_type_layout_size ---
 // uint64_t kcc_ir_type_layout_size(type *t) → size in bytes (forces layout).
 .p2align 2
 _kcc_ir_type_layout_size:
@@ -2786,7 +2786,7 @@ _kcc_ir_type_layout_size:
     mov x0, #0
     ret
 
-// -- kcc_ir_emit_gep_const ------------------------------------------------
+// -- kcc_ir_emit_gep_const ---
 // uint64_t kcc_ir_emit_gep_const(base_vreg, byte_offset) → address vreg
 .p2align 2
 _kcc_ir_emit_gep_const:
@@ -2818,7 +2818,7 @@ _kcc_ir_emit_gep_const:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_store_elem ----------------------------------------------------
+// -- kcc_ir_store_elem ---
 // void kcc_ir_store_elem(base_vreg, byte_offset, value_vreg, width)
 // Writes one initializer element.  If the field just resolved by
 // _kcc_ir_elem_off_width (published in _kcc_ir_member_field) is a bit-field,
@@ -2860,7 +2860,7 @@ _kcc_ir_store_elem:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_emit_string_init ----------------------------------------------
+// -- kcc_ir_emit_string_init ---
 // void kcc_ir_emit_string_init(base, str_ptr, str_len, array_len, zero_first)
 // Copies min(str_len, array_len) bytes of a compile-time string into an array
 // as per-byte constant stores; the NUL and tail come from the zero-fill/BSS.
@@ -2916,7 +2916,7 @@ _kcc_ir_emit_string_init:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_ir_emit_bool_norm ------------------------------------------------
+// -- kcc_ir_emit_bool_norm ---
 // uint64_t kcc_ir_emit_bool_norm(uint64_t vreg) → (vreg != 0) as 0/1
 .globl _kcc_ir_emit_bool_norm
 .p2align 2
@@ -2935,7 +2935,7 @@ _kcc_ir_emit_bool_norm:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_tok_to_binop --------------------------------------------------
+// -- kcc_ir_tok_to_binop ---
 // int kcc_ir_tok_to_binop(int compound_assign_tok) → IR opcode
 .p2align 2
 _kcc_ir_tok_to_binop:
@@ -2978,7 +2978,7 @@ _kcc_ir_tok_to_binop:
 .Ltb_shr: mov x0, #IR_ASHR
     ret
 
-// -- kcc_ir_bf_trunc_value ------------------------------------------------
+// -- kcc_ir_bf_trunc_value ---
 // uint64_t kcc_ir_bf_trunc_value(uint64_t value_vreg, node *field) → vreg
 // The value of a bit-field assignment expression is what was *stored* --- the
 // low `width` bits of the assigned value, read back at the field's type
@@ -3042,7 +3042,7 @@ _kcc_ir_bf_trunc_value:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_ir_assign_through ------------------------------------------------
+// -- kcc_ir_assign_through ---
 // uint64_t kcc_ir_assign_through(addr, rhs, op_tok, field, type) → result vreg
 // Stores `rhs` (simple `=`) or `old op rhs` (compound) through the address
 // vreg `addr`.  `field` non-null with a packed AST_F2 selects a bit-field
@@ -3204,7 +3204,7 @@ symbol table for \texttt{TY\_ARRAY} and returns the address vreg
 directly.
 
 @d IR: build ident @{
-// -- kcc_ir_build_ident ---------------------------------------------------
+// -- kcc_ir_build_ident ---
 // uint64_t kcc_ir_build_ident(node *ident)
 //   x0 = AST_IDENT_EXPR (F0=name_ptr)
 // Looks up the variable in locals and emits a load.
@@ -3537,7 +3537,7 @@ the other operand is \texttt{double}, the common type is \texttt{double} and the
 exact value is right, so it is left alone.
 
 @d IR: build binary @{
-// -- kcc_ir_build_binary --------------------------------------------------
+// -- kcc_ir_build_binary ---
 // uint64_t kcc_ir_build_binary(node *expr)
 //   x0 = AST_BINARY_EXPR (F0=op token, F1=lhs, F2=rhs)
 // Returns vreg.
@@ -4122,7 +4122,7 @@ $-1$ against~$1$ and read false, where C converts $-1$ to a large unsigned
 value and the answer is true.
 
 @d IR: build binary @{
-// -- kcc_ir_cmp_unsigned --------------------------------------------------
+// -- kcc_ir_cmp_unsigned ---
 // int kcc_ir_cmp_unsigned(node *lhs, node *rhs)
 //   x0 = lhs AST node, x1 = rhs AST node
 // Returns x0 = 1 when the comparison's common type is unsigned, else 0.
@@ -4202,7 +4202,7 @@ that never leave 32-bit range the extension is a no-op, so nothing else
 changes.
 
 @d IR: build binary @{
-// -- kcc_ir_norm32 --------------------------------------------------------
+// -- kcc_ir_norm32 ---
 // uint64_t kcc_ir_norm32(vreg, opcode, lhs_type, rhs_type)
 //   x0 = op result vreg, x1 = IR opcode, x2 = lhs sema type, x3 = rhs sema type
 // For width-growing ops (ADD/SUB/MUL/SHL/NEG/NOT) whose operands are both
@@ -4341,7 +4341,7 @@ targets swapped and the short-circuit value set to one; its
 (\stdref{6.5.14}).
 
 @d IR: build binary @{
-// -- Short-circuit && ----------------------------------------------------
+// -- Short-circuit && ---
 .Libb_short_and:
     // Allocate temporary for merge result
     mov x0, #IR_ALLOCA
@@ -4469,7 +4469,7 @@ targets swapped and the short-circuit value set to one; its
     mov x0, x21
     b .Libb_done
 
-// -- Short-circuit || ----------------------------------------------------
+// -- Short-circuit || ---
 .Libb_short_or:
     // Allocate temporary for merge result
     mov x0, #IR_ALLOCA
@@ -4680,7 +4680,7 @@ Dereference (\texttt{*p}) evaluates the pointer operand and emits an
 \texttt{IR\_LOAD} from the resulting address.
 
 @d IR: build unary @{
-// -- kcc_ir_build_unary ---------------------------------------------------
+// -- kcc_ir_build_unary ---
 // uint64_t kcc_ir_build_unary(node *expr)
 //   x0 = AST_UNARY_EXPR (F0=op, F1=operand, F2=prefix/postfix)
 .text
@@ -5142,7 +5142,7 @@ all-zero pattern became the smallest denormal), so a loop as ordinary as
 otherwise unranked operand keeps the \texttt{int} default.
 
 @d IR: build increment/decrement @{
-// -- kcc_ir_build_inc_dec -------------------------------------------------
+// -- kcc_ir_build_inc_dec ---
 // uint64_t kcc_ir_build_inc_dec(node *expr)
 //   x0 = AST_UNARY_EXPR (F0=op, F1=operand, F2=prefix(1)/postfix(0))
 // Lowers i++, ++i, i--, --i into a load-add/sub-store sequence.

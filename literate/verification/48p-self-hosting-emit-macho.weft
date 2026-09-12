@@ -232,7 +232,7 @@ bytes match including their embedded NULs.
 
 @l c
 @d Selfhost: emit-macho header @{
-    /* ---- Mach-O header ---- */
+    /* --- Mach-O header --- */
     kcc_macho_write32(0xFEEDFACF);                  /* magic */
     kcc_macho_write32(0x0100000C);                  /* cputype ARM64 */
     kcc_macho_write32(0);                           /* cpusubtype */
@@ -242,7 +242,7 @@ bytes match including their embedded NULs.
     kcc_macho_write32(0x2000);                       /* MH_SUBSECTIONS_VIA_SYMBOLS */
     kcc_macho_write32(0);                            /* reserved */
 
-    /* ---- LC_SEGMENT_64 ---- */
+    /* --- LC_SEGMENT_64 --- */
     kcc_macho_write32(0x19);                         /* cmd */
     {
         unsigned long segcmdsz = 232;
@@ -281,7 +281,7 @@ bytes match including their embedded NULs.
     }
     kcc_macho_write32(0);                            /* flags */
 
-    /* ---- Section: __text ---- */
+    /* --- Section: __text --- */
     kcc_macho_write64(0x0000747865745F5FUL);        /* "__text\0\0" */
     kcc_macho_write64(0);
     kcc_macho_write64(0x0000545845545F5FUL);        /* "__TEXT\0\0" */
@@ -297,7 +297,7 @@ bytes match including their embedded NULs.
     kcc_macho_write32(0);
     kcc_macho_write32(0);
 
-    /* ---- Section: __DATA,__common (S_ZEROFILL) ---- */
+    /* --- Section: __DATA,__common (S_ZEROFILL) --- */
     kcc_macho_write64(0x6E6F6D6D6F635F5FUL);        /* "__common" */
     kcc_macho_write64(0);
     kcc_macho_write64(0x0000415441445F5FUL);        /* "__DATA\0\0" */
@@ -323,7 +323,7 @@ whose one \texttt{ARM64\_RELOC\_UNSIGNED} relocation supplies its value.
 
 @l c
 @d Selfhost: emit-macho sections @{
-    /* ---- Section: __DATA_CONST,__const ---- */
+    /* --- Section: __DATA_CONST,__const --- */
     if (kcc_rodata_const_present) {
         kcc_macho_write64(0x0074736E6F635F5FUL);    /* "__const\0" */
         kcc_macho_write64(0);
@@ -350,7 +350,7 @@ whose one \texttt{ARM64\_RELOC\_UNSIGNED} relocation supplies its value.
         kcc_macho_write32(0);
     }
 
-    /* ---- Section: __DATA,__mod_init_func ---- */
+    /* --- Section: __DATA,__mod_init_func --- */
     if (kcc_modinit_present) {
         kcc_macho_write64(0x6E695F646F6D5F5FUL);    /* "__mod_in" */
         kcc_macho_write64(0x0063756E665F7469UL);    /* "it_func\0" */
@@ -383,7 +383,7 @@ fields zero.
 
 @l c
 @d Selfhost: emit-macho auxcmds @{
-    /* ---- LC_BUILD_VERSION ---- */
+    /* --- LC_BUILD_VERSION --- */
     kcc_macho_write32(0x32);                        /* cmd */
     kcc_macho_write32(24);                          /* cmdsize */
     kcc_macho_write32(1);                           /* PLATFORM_MACOS */
@@ -391,7 +391,7 @@ fields zero.
     kcc_macho_write32(14 << 16);                    /* sdk 14.0.0 */
     kcc_macho_write32(0);                           /* ntools */
 
-    /* ---- LC_SYMTAB ---- */
+    /* --- LC_SYMTAB --- */
     kcc_macho_write32(0x02);                        /* cmd */
     kcc_macho_write32(24);                          /* cmdsize */
     kcc_macho_write32(symoff);
@@ -399,7 +399,7 @@ fields zero.
     kcc_macho_write32(stroff);
     kcc_macho_write32(strsize);
 
-    /* ---- LC_DYSYMTAB ---- */
+    /* --- LC_DYSYMTAB --- */
     kcc_macho_write32(0x0B);                        /* cmd */
     kcc_macho_write32(80);                          /* cmdsize */
     kcc_macho_write32(0);                           /* ilocalsym */
@@ -426,22 +426,22 @@ in the same order.  One \texttt{write} flushes it all.
 
 @l c
 @d Selfhost: emit-macho body @{
-    /* ---- DWARF segment (under -g) ---- */
+    /* --- DWARF segment (under -g) --- */
     if (kcc_dwarf_enabled)
         kcc_dwarf_emit_macho(text_offset + code_size, code_size + globals_size);
 
-    /* ---- Code bytes ---- */
+    /* --- Code bytes --- */
     kcc_macho_write_bytes(kcc_code_buf, code_size);
 
     if (kcc_dwarf_enabled) kcc_dwarf_append_blob();
 
-    /* ---- Module-init pointer (8 zero bytes) ---- */
+    /* --- Module-init pointer (8 zero bytes) --- */
     if (kcc_modinit_present) {
         kcc_macho_pad_to(8);
         kcc_macho_write64(0);
     }
 
-    /* ---- __const section data (zeros; values come from relocations) ---- */
+    /* --- __const section data (zeros; values come from relocations) --- */
     if (kcc_rodata_const_present) {
         kcc_macho_pad_to(8);
         unsigned long rem = kcc_rodata_const_size;
@@ -450,7 +450,7 @@ in the same order.  One \texttt{write} flushes it all.
 
     kcc_macho_pad_to(4);
 
-    /* ---- Symbol index remap: defined first, then undefined ---- */
+    /* --- Symbol index remap: defined first, then undefined --- */
     unsigned long *remap = (unsigned long *)kcc_arena_alloc((long)(nsyms * 8));
     unsigned long out = 0;
     for (unsigned long i = 0; i < nsyms; i++) {
@@ -462,7 +462,7 @@ in the same order.  One \texttt{write} flushes it all.
         if (s->section == 0) remap[i] = out++;
     }
 
-    /* ---- Text relocations ---- */
+    /* --- Text relocations --- */
     for (unsigned long i = 0; i < nrelocs; i++) {
         unsigned long *r = (unsigned long *)kcc_vec_get(kcc_linker_relocs, i);
         kcc_macho_write32(r[0]);                    /* r_address = offset */
@@ -477,7 +477,7 @@ in the same order.  One \texttt{write} flushes it all.
         kcc_macho_write32(info);
     }
 
-    /* ---- Module-init pointer relocation ---- */
+    /* --- Module-init pointer relocation --- */
     if (kcc_modinit_present) {
         kcc_macho_write32(0);                       /* r_address */
         unsigned long rsym = remap[kcc_modinit_sym - 1];
@@ -485,7 +485,7 @@ in the same order.  One \texttt{write} flushes it all.
         kcc_macho_write32(info);                    /* UNSIGNED, length 3, extern */
     }
 
-    /* ---- __const relocations ---- */
+    /* --- __const relocations --- */
     if (kcc_rodata_const_present) {
         struct Vec *cr = (struct Vec *)kcc_rodata_const_relocs;
         for (unsigned long i = 0; i < cr->count; i++) {
@@ -497,7 +497,7 @@ in the same order.  One \texttt{write} flushes it all.
         }
     }
 
-    /* ---- Symbol table: nlist_64, defined then undefined ---- */
+    /* --- Symbol table: nlist_64, defined then undefined --- */
     unsigned long strpos = 1;
     for (unsigned long i = 0; i < nsyms; i++) {
         struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
@@ -529,7 +529,7 @@ in the same order.  One \texttt{write} flushes it all.
         strpos += kcc_strlen(s->name) + 1;
     }
 
-    /* ---- String table ---- */
+    /* --- String table --- */
     kcc_macho_write8(0);                            /* leading NUL */
     for (unsigned long i = 0; i < nsyms; i++) {
         struct MSym *s = (struct MSym *)kcc_vec_get(kcc_linker_syms, i);
@@ -542,7 +542,7 @@ in the same order.  One \texttt{write} flushes it all.
         kcc_macho_write_bytes(s->name, kcc_strlen(s->name) + 1);
     }
 
-    /* ---- Flush ---- */
+    /* --- Flush --- */
     kcc_sys_write(kcc_macho_fd, kcc_macho_buf, kcc_macho_pos);
     kcc_sys_close(kcc_macho_fd);
 }

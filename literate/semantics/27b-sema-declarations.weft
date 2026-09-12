@@ -55,7 +55,7 @@ is needed in the statement checker, since enums may be declared
 inside function bodies.
 
 @d Sema: check declaration @{
-// -- kcc_sema_check_decl --------------------------------------------------
+// -- kcc_sema_check_decl ---
 // void kcc_sema_check_decl(node *decl)
 //   x0 = declaration AST node
 // Processes declarations, registers symbols.
@@ -357,7 +357,7 @@ containing itself by value, so the recursion always terminates.
 aggregates, and recursing through the element type of an array.
 
 @d Sema: struct layout @{
-// -- kcc_type_align -------------------------------------------------------
+// -- kcc_type_align ---
 // uint64_t kcc_type_align(type_desc *ty)
 //   Alignment in bytes; 8 for null/unknown.  Arrays inherit element align.
 .text
@@ -378,7 +378,7 @@ _kcc_type_align:
     mov x0, #8
     ret
 
-// -- kcc_type_layout ------------------------------------------------------
+// -- kcc_type_layout ---
 // uint64_t kcc_type_layout(type_desc *ty)
 //   Ensures ty (and any aggregate it transitively contains) has a
 //   byte-accurate TY_SIZE/TY_ALIGN, and stores each struct/union member's

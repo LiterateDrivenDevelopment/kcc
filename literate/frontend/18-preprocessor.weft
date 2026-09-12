@@ -35,7 +35,7 @@ expansion by saving and restoring the lexer's scanning state.  The
 groups.
 
 @d PP: constants @{
-// -- Preprocessor constants -----------------------------------------
+// -- Preprocessor constants ---
 
 // Macro definition layout (arena-allocated)
 .equ PP_MACRO_NAME,      0    // pointer to macro name text
@@ -92,7 +92,7 @@ predefined macros required by \stdref{6.10.8}.
 
 @d PP: init @{
 .text
-// -- kcc_pp_init ----------------------------------------------------
+// -- kcc_pp_init ---
 // void kcc_pp_init(void)
 // Initializes the preprocessor: creates macro table, sets up
 // predefined macros, clears all state.
@@ -162,7 +162,7 @@ with the line of the previous token returned to the caller.
 
 @d PP: next token @{
 .text
-// -- kcc_pp_next ----------------------------------------------------
+// -- kcc_pp_next ---
 // void kcc_pp_next(void)
 // Returns next preprocessed token in _kcc_tok_* globals.
 .globl _kcc_pp_next
@@ -195,10 +195,10 @@ _kcc_pp_next:
     add  x0, x0, _kcc_tok_line@@PAGEOFF
     ldr  x21, [x0]            // x21 = tok_line
 
-    // ----- Handle EOF -----
+    // --- Handle EOF ---
     cbz  x20, .Lpp_eof
 
-    // ----- Conditional skip -----
+    // --- Conditional skip ---
     adrp x0, _kcc_pp_cond_depth@@PAGE
     add  x0, x0, _kcc_pp_cond_depth@@PAGEOFF
     ldr  x0, [x0]
@@ -234,7 +234,7 @@ _kcc_pp_next:
     str  x21, [x0]
     b .Lpp_loop
 
-    // ----- Active processing -----
+    // --- Active processing ---
 .Lpp_active:
     // Check for # directive at BOL
     cmp  x20, #TOK_HASH
@@ -328,7 +328,7 @@ by comparing the name against the twelve C17 directives.
 
 @d PP: directive dispatch @{
 .text
-// -- _kcc_pp_dispatch -----------------------------------------------
+// -- _kcc_pp_dispatch ---
 // Internal: dispatches a preprocessing directive.
 // Called after '#' has been consumed. Reads directive name and routes.
 .p2align 2
@@ -552,7 +552,7 @@ expansion) clears the anti-recursion flag on the expanded macro.
 
 @d PP: context @{
 .text
-// -- _kcc_pp_ctx_push -----------------------------------------------
+// -- _kcc_pp_ctx_push ---
 // Push include context. x0 = type (PP_CTX_INCLUDE)
 .p2align 2
 _kcc_pp_ctx_push:
@@ -639,7 +639,7 @@ _kcc_pp_ctx_push:
     mov  x0, #1
     bl _kcc_sys_exit
 
-// -- _kcc_pp_ctx_push_expand ----------------------------------------
+// -- _kcc_pp_ctx_push_expand ---
 // Push expansion context.
 // x0=type(PP_CTX_EXPAND), x1=macro_def, x2=buffer, x3=buflen
 .p2align 2
@@ -700,7 +700,7 @@ include contexts, the saved source buffer and path are restored in
 addition to the lexer cursor.
 
 @d PP: context @{
-// -- _kcc_pp_ctx_pop ------------------------------------------------
+// -- _kcc_pp_ctx_pop ---
 // Pop context stack. Restores lexer state. Unmarks macro if expand.
 .p2align 2
 _kcc_pp_ctx_pop:
@@ -797,7 +797,7 @@ bodies and \texttt{\#if} expressions can be extracted cleanly.
 
 @d PP: helpers @{
 .text
-// -- _kcc_pp_skip_line ----------------------------------------------
+// -- _kcc_pp_skip_line ---
 // Advances the lexer cursor past the end of the current line, skipping any
 // block comment that spans the newline so the logical directive line ends
 // where the comment does (not at the first physical newline inside it).
@@ -873,7 +873,7 @@ _kcc_pp_skip_line:
     str  x1, [x0]
     ret
 
-// -- _kcc_pp_rest_of_line -------------------------------------------
+// -- _kcc_pp_rest_of_line ---
 // Returns rest of directive line from cursor.
 // x0 = text start (after leading whitespace), x1 = text length
 // Advances cursor to the newline (lexer will skip it).
@@ -1114,7 +1114,7 @@ to stdout, one token per line, in the same format as
 
 @d PP: dump @{
 .text
-// -- kcc_pp_dump_all ------------------------------------------------
+// -- kcc_pp_dump_all ---
 // void kcc_pp_dump_all(void)
 // Calls kcc_pp_next in a loop and dumps each token.
 .globl _kcc_pp_dump_all
@@ -1151,7 +1151,7 @@ and branch state.  The \texttt{prev\_line} variable enables
 beginning-of-line detection for directive recognition.
 
 @d PP: data @{
-// -- Preprocessor global state --------------------------------------
+// -- Preprocessor global state ---
 .data
 .p2align 3
 .globl _kcc_pp_macros
@@ -1178,7 +1178,7 @@ _kcc_pp_ctx_stack:   .space 20480
 .p2align 3
 _kcc_pp_cond_stack:  .space 64
 
-// -- Directive name strings -----------------------------------------
+// -- Directive name strings ---
 .section __TEXT,__cstring,cstring_literals
 _kcc_pp_s_define:    .asciz "define"
 _kcc_pp_s_undef:     .asciz "undef"
@@ -1196,7 +1196,7 @@ _kcc_pp_s_push_macro: .asciz "push_macro"
 _kcc_pp_s_pop_macro:  .asciz "pop_macro"
 _kcc_pp_s_defined:   .asciz "defined"
 
-// -- Predefined macro name strings ----------------------------------
+// -- Predefined macro name strings ---
 _kcc_pp_pre_stdc:     .asciz "__STDC__"
 _kcc_pp_pre_stdc_ver: .asciz "__STDC_VERSION__"
 _kcc_pp_pre_hosted:   .asciz "__STDC_HOSTED__"
@@ -1223,7 +1223,7 @@ _kcc_pp_pre_v1234:    .asciz "1234"
 _kcc_pp_pre_v4321:    .asciz "4321"
 _kcc_pp_pre_v3412:    .asciz "3412"
 
-// -- Error messages -------------------------------------------------
+// -- Error messages ---
 _kcc_pp_err_unknown_dir:  .asciz "unknown preprocessing directive"
 _kcc_pp_err_def_name:     .asciz "expected identifier after #define"
 _kcc_pp_err_def_param:    .asciz "expected parameter name or ')' in macro parameter list"

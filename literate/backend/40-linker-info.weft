@@ -41,7 +41,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d Linker: constants @{
-// -- Linker data structure layout ---------------------------------------------
+// -- Linker data structure layout ---
 .equ RELOC_OFFSET,     0
 .equ RELOC_TYPE,       8
 .equ RELOC_SYM,       16
@@ -53,14 +53,14 @@ Offset & Field & Description \\
 .equ SYM_FLAGS,      24
 .equ SYM_ENTRY_SIZE, 32
 
-// -- Mach-O relocation types --------------------------------------------------
+// -- Mach-O relocation types ---
 .equ ARM64_RELOC_BRANCH26,          2
 .equ ARM64_RELOC_PAGE21,            3
 .equ ARM64_RELOC_PAGEOFF12,         4
 .equ ARM64_RELOC_GOT_LOAD_PAGE21,   5
 .equ ARM64_RELOC_GOT_LOAD_PAGEOFF12, 6
 
-// -- Mach-O symbol flags ------------------------------------------------------
+// -- Mach-O symbol flags ---
 .equ N_UNDF,   0x00
 .equ N_EXT,    0x01
 .equ N_SECT,   0x0E
@@ -71,7 +71,7 @@ Offset & Field & Description \\
 The linker module maintains three data structures: a \emph{relocation vector} (24-byte entries), a \emph{symbol vector} (32-byte entries), and a \emph{hash table} for deduplicating external symbol references. Each vector is arena-allocated with an initial capacity of 32~entries.
 
 @d Linker: init @{
-// -- kcc_linker_init ----------------------------------------------------------
+// -- kcc_linker_init ---
 // void kcc_linker_init(void)
 // Allocates relocation vec, symbol vec, and string table buffer.
 .text
@@ -134,7 +134,7 @@ _kcc_linker_init:
 Each call appends a 32-byte entry to the symbol vector and returns the new symbol's zero-based index. The caller fills in the name pointer, section number, value, and Mach-O flags. Index~0 is the first symbol added, not a reserved sentinel.
 
 @d Linker: add symbol @{
-// -- kcc_linker_add_sym -------------------------------------------------------
+// -- kcc_linker_add_sym ---
 // uint64_t kcc_linker_add_sym(const char *name, uint64_t section,
 //                             uint64_t value, uint64_t flags)
 //   x0=name, x1=section, x2=value, x3=flags
@@ -178,7 +178,7 @@ _kcc_linker_add_sym:
 A relocation records three pieces of information: the byte offset within the code section where the instruction lives, the relocation type (one of \texttt{BRANCH26}, \texttt{PAGE21}, or \texttt{PAGEOFF12}), and the index of the target symbol. The Mach-O writer later packs these into the 8-byte \texttt{relocation\_info} format the linker expects.
 
 @d Linker: add reloc @{
-// -- kcc_linker_add_reloc -----------------------------------------------------
+// -- kcc_linker_add_reloc ---
 // void kcc_linker_add_reloc(uint64_t offset, uint64_t type, uint64_t sym_index)
 //   x0=offset, x1=type, x2=sym_index
 .text
@@ -213,7 +213,7 @@ library function), we need to add it to the symbol table as undefined
 and return its index.  We deduplicate using a hash table.
 
 @d Linker: lookup or add extern @{
-// -- kcc_linker_extern --------------------------------------------------------
+// -- kcc_linker_extern ---
 // uint64_t kcc_linker_extern(const char *name)
 //   x0 = null-terminated symbol name
 // Returns the symbol index, adding a new N_UNDF|N_EXT entry if needed.
@@ -317,7 +317,7 @@ If it was previously registered as an extern, we upgrade it to defined
 and allocate the requested number of bytes.
 
 @d Linker: global sym @{
-// -- kcc_linker_global_sym ----------------------------------------------------
+// -- kcc_linker_global_sym ---
 // uint64_t kcc_linker_global_sym(const char *name, uint64_t size, uint64_t extflag)
 //   x0 = null-terminated symbol name (already prefixed with '_')
 //   x1 = allocation size in bytes (typically 8 for scalars, N*8 for structs)
@@ -435,7 +435,7 @@ _kcc_linker_global_sym:
 Module-level state: pointers to the relocation and symbol vectors, the extern deduplication hash table, and the running total of bytes allocated in the global data section (used as the \texttt{n\_value} for new \texttt{\_\_DATA,\_\_common} symbols).
 
 @d Linker: data @{
-// -- Linker module data -------------------------------------------------------
+// -- Linker module data ---
 .data
 .p2align 3
 .globl _kcc_linker_relocs

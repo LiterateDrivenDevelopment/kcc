@@ -18,14 +18,14 @@ instructions are fixed-width (4 bytes), we always append in 4-byte
 increments.
 
 @d Backend: constants @{
-// -- Backend constants --------------------------------------------------------
+// -- Backend constants ---
 .equ CODEBUF_INIT_CAP, 4096     // initial code buffer capacity (bytes)
 @}
 
 The buffer provides four operations: \texttt{init} allocates a 4\,KB arena block; \texttt{emit32} appends one instruction (doubling the buffer when full); \texttt{current\_pos} returns the write offset (used to compute branch distances and record relocation sites); and \texttt{patch32} overwrites an already-emitted instruction (used to resolve forward branches).
 
 @d Backend: code buffer @{
-// -- kcc_code_init ------------------------------------------------------------
+// -- kcc_code_init ---
 // void kcc_code_init(void)
 // Allocates the initial code buffer.
 .text
@@ -54,7 +54,7 @@ _kcc_code_init:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_code_emit32 ----------------------------------------------------------
+// -- kcc_code_emit32 ---
 // void kcc_code_emit32(uint32_t word)
 //   x0 = 32-bit instruction word
 // Appends a 4-byte instruction to the code buffer.
@@ -123,7 +123,7 @@ _kcc_code_emit32:
 The remaining two operations read or modify the buffer rather than appending to it. \texttt{kcc\_code\_current\_pos} returns the byte offset where the next instruction will be written---the codegen uses this to compute branch distances and to record relocation sites for the linker. \texttt{kcc\_code\_patch32} overwrites an already-emitted 32-bit word at a given offset, which is how forward branches are resolved once the target address becomes known.
 
 @d Backend: code buffer @{
-// -- kcc_code_current_pos -----------------------------------------------------
+// -- kcc_code_current_pos ---
 // uint64_t kcc_code_current_pos(void)
 // Returns the current offset in the code buffer.
 .text
@@ -135,7 +135,7 @@ _kcc_code_current_pos:
     ldr x0, [x0]
     ret
 
-// -- kcc_code_patch32 ---------------------------------------------------------
+// -- kcc_code_patch32 ---
 // void kcc_code_patch32(uint64_t offset, uint32_t word)
 //   x0 = offset in code buffer
 //   x1 = new 32-bit word
@@ -158,7 +158,7 @@ _kcc_code_patch32:
 All register-form arithmetic instructions share a common encoding: the \texttt{sf} bit (bit~31) selects 64-bit vs.\ 32-bit operation, \texttt{Rm} occupies bits [20:16], \texttt{Rn} bits [9:5], and \texttt{Rd} bits [4:0]. The opcode prefix distinguishes the operation (e.g., \texttt{0x0B} for \textsc{add}, \texttt{0x4B} for \textsc{sub}). Multiply uses the three-source \textsc{madd} form with \texttt{Ra\,=\,xzr}, and the modulo helper \textsc{msub} computes $R_d = R_a - R_n \times R_m$.
 
 @d Backend: encode arithmetic reg @{
-// -- kcc_enc_add_reg ----------------------------------------------------------
+// -- kcc_enc_add_reg ---
 // uint32_t kcc_enc_add_reg(uint32_t rd, uint32_t rn, uint32_t rm, uint32_t sf)
 //   x0=rd, x1=rn, x2=rm, x3=sf (1=64-bit, 0=32-bit)
 .text
@@ -174,7 +174,7 @@ _kcc_enc_add_reg:
     mov w0, w4
     ret
 
-// -- kcc_enc_sub_reg ----------------------------------------------------------
+// -- kcc_enc_sub_reg ---
 .text
 .globl _kcc_enc_sub_reg
 .p2align 2
@@ -188,7 +188,7 @@ _kcc_enc_sub_reg:
     mov w0, w4
     ret
 
-// -- kcc_enc_mul --------------------------------------------------------------
+// -- kcc_enc_mul ---
 .text
 .globl _kcc_enc_mul
 .p2align 2
@@ -203,7 +203,7 @@ _kcc_enc_mul:
     mov w0, w4
     ret
 
-// -- kcc_enc_sdiv -------------------------------------------------------------
+// -- kcc_enc_sdiv ---
 .text
 .globl _kcc_enc_sdiv
 .p2align 2
@@ -218,7 +218,7 @@ _kcc_enc_sdiv:
     mov w0, w4
     ret
 
-// -- kcc_enc_udiv -------------------------------------------------------------
+// -- kcc_enc_udiv ---
 .text
 .globl _kcc_enc_udiv
 .p2align 2
@@ -233,7 +233,7 @@ _kcc_enc_udiv:
     mov w0, w4
     ret
 
-// -- kcc_enc_msub -------------------------------------------------------------
+// -- kcc_enc_msub ---
 // MSUB Rd, Rn, Rm, Ra: Rd = Ra - Rn*Rm
 // x0=rd, x1=rn, x2=rm, x3=ra, x4=sf
 .text
@@ -263,7 +263,7 @@ _kcc_enc_msub:
 Immediate-form arithmetic encodes a 12-bit unsigned immediate in bits [21:10]. \textsc{movz} and \textsc{movk} together materialise arbitrary 64-bit constants: \textsc{movz} zeroes the register and inserts a 16-bit chunk at the half-word position selected by \texttt{hw}, while \textsc{movk} overwrites one 16-bit lane without disturbing the rest.
 
 @d Backend: encode arithmetic imm @{
-// -- kcc_enc_add_imm ----------------------------------------------------------
+// -- kcc_enc_add_imm ---
 // uint32_t kcc_enc_add_imm(uint32_t rd, uint32_t rn, uint32_t imm12, uint32_t sf)
 .text
 .globl _kcc_enc_add_imm
@@ -278,7 +278,7 @@ _kcc_enc_add_imm:
     mov w0, w4
     ret
 
-// -- kcc_enc_sub_imm ----------------------------------------------------------
+// -- kcc_enc_sub_imm ---
 .text
 .globl _kcc_enc_sub_imm
 .p2align 2
@@ -292,7 +292,7 @@ _kcc_enc_sub_imm:
     mov w0, w4
     ret
 
-// -- kcc_enc_movz -------------------------------------------------------------
+// -- kcc_enc_movz ---
 // uint32_t kcc_enc_movz(uint32_t rd, uint32_t imm16, uint32_t hw, uint32_t sf)
 //   hw = shift amount / 16 (0,1,2,3)
 .text
@@ -308,7 +308,7 @@ _kcc_enc_movz:
     mov w0, w4
     ret
 
-// -- kcc_enc_movk -------------------------------------------------------------
+// -- kcc_enc_movk ---
 .text
 .globl _kcc_enc_movk
 .p2align 2
@@ -332,7 +332,7 @@ _kcc_enc_movk:
 Logical register operations use the same $(\mathit{sf}, R_m, R_n, R_d)$ layout as arithmetic, with opcode prefixes \texttt{0x0A} (\textsc{and}), \texttt{0x2A} (\textsc{orr}), and \texttt{0x4A} (\textsc{eor}). Bitwise \textsc{not} is encoded as \textsc{orn}\;$R_d, \mathit{xzr}, R_m$ (the \texttt{N}~bit at position~21 selects the inverted second operand). The variable-distance shifts (\textsc{lslv}, \textsc{lsrv}, \textsc{asrv}) live in the Data Processing (2-source) space with distinct sub-opcodes in bits [11:10].
 
 @d Backend: encode logical @{
-// -- kcc_enc_and_reg ----------------------------------------------------------
+// -- kcc_enc_and_reg ---
 .text
 .globl _kcc_enc_and_reg
 .p2align 2
@@ -346,7 +346,7 @@ _kcc_enc_and_reg:
     mov w0, w4
     ret
 
-// -- kcc_enc_orr_reg ----------------------------------------------------------
+// -- kcc_enc_orr_reg ---
 .text
 .globl _kcc_enc_orr_reg
 .p2align 2
@@ -360,7 +360,7 @@ _kcc_enc_orr_reg:
     mov w0, w4
     ret
 
-// -- kcc_enc_eor_reg ----------------------------------------------------------
+// -- kcc_enc_eor_reg ---
 .text
 .globl _kcc_enc_eor_reg
 .p2align 2
@@ -374,7 +374,7 @@ _kcc_enc_eor_reg:
     mov w0, w4
     ret
 
-// -- kcc_enc_mvn --------------------------------------------------------------
+// -- kcc_enc_mvn ---
 // MVN Rd, Rm → ORN Rd, XZR, Rm
 // x0=rd, x1=rm, x2=sf
 .text
@@ -402,7 +402,7 @@ _kcc_enc_mvn:
 The variable-distance shift instructions \texttt{LSLV}, \texttt{LSRV}, and \texttt{ASRV} belong to a different ARM64 instruction class---Data Processing (2-source)---rather than the Logical Shifted Register group above. They share the same opcode prefix \texttt{0x1AC0} (with \texttt{sf} at bit~31) and differ only in the sub-opcode at bits [11:10]: \texttt{0x2000} for left shift, \texttt{0x2400} for logical right shift, and \texttt{0x2800} for arithmetic right shift. The shift amount comes from register \texttt{Rm} rather than an immediate.
 
 @d Backend: encode logical @{
-// -- kcc_enc_lsl_reg ----------------------------------------------------------
+// -- kcc_enc_lsl_reg ---
 // LSLV: x0=rd, x1=rn, x2=rm, x3=sf
 .text
 .globl _kcc_enc_lsl_reg
@@ -418,7 +418,7 @@ _kcc_enc_lsl_reg:
     mov w0, w4
     ret
 
-// -- kcc_enc_lsr_reg ----------------------------------------------------------
+// -- kcc_enc_lsr_reg ---
 .text
 .globl _kcc_enc_lsr_reg
 .p2align 2
@@ -433,7 +433,7 @@ _kcc_enc_lsr_reg:
     mov w0, w4
     ret
 
-// -- kcc_enc_asr_reg ----------------------------------------------------------
+// -- kcc_enc_asr_reg ---
 .text
 .globl _kcc_enc_asr_reg
 .p2align 2
@@ -457,7 +457,7 @@ _kcc_enc_asr_reg:
 Comparison is encoded as \texttt{SUBS\;xzr,\;Rn,\;Rm}---a subtract whose result is discarded but whose flags are set. \textsc{cset} is a pseudo-instruction for \texttt{CSINC\;Rd,\;xzr,\;xzr,\;inv(cond)}: if the \emph{inverted} condition is false (meaning the original condition is true), the result increments zero to one; otherwise it stays zero. Bit~10 distinguishes \textsc{csinc} from \textsc{csel}.
 
 @d Backend: encode compare @{
-// -- kcc_enc_cmp_reg ----------------------------------------------------------
+// -- kcc_enc_cmp_reg ---
 // CMP Rn, Rm → SUBS XZR, Rn, Rm
 // x0=rn, x1=rm, x2=sf
 .text
@@ -474,7 +474,7 @@ _kcc_enc_cmp_reg:
     mov w0, w3
     ret
 
-// -- kcc_enc_cset -------------------------------------------------------------
+// -- kcc_enc_cset ---
 // CSET Rd, cond → CSINC Rd, XZR, XZR, inv(cond)
 // x0=rd, x1=cond (already inverted!), x2=sf
 .text
@@ -503,7 +503,7 @@ _kcc_enc_cset:
 Load and store use the unsigned-offset form: the 12-bit immediate is pre-scaled by the access size (divided by~8 for 64-bit, by~4 for 32-bit). The load encoder also provides the three sign-extending narrow forms \textsc{ldrsb}, \textsc{ldrsh}, and \textsc{ldrsw} (size codes 5, 6, 4), which set \texttt{opc}\;$=$\;\texttt{10} to extend a byte, halfword, or word into the full 64-bit register---needed now that packed struct fields and array elements are addressed at their natural width and a signed narrow value must keep its sign in the eight-byte spill slot. \textsc{stp} (pre-index) and \textsc{ldp} (post-index) use a 7-bit signed immediate scaled by~8, encoded in bits [21:15]. \textsc{mov}\;$R_d, R_m$ is encoded as \texttt{ORR\;Rd,\;xzr,\;Rm}.
 
 @d Backend: encode memory @{
-// -- kcc_enc_str_imm ----------------------------------------------------------
+// -- kcc_enc_str_imm ---
 // STR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled,
 //   x3=size(0=32,1=64,2=byte,3=half)
 .text
@@ -532,7 +532,7 @@ _kcc_enc_str_imm:
     mov w0, w4
     ret
 
-// -- kcc_enc_ldr_imm ----------------------------------------------------------
+// -- kcc_enc_ldr_imm ---
 // LDR (unsigned offset): x0=rt, x1=rn, x2=imm12_scaled,
 //   x3=size(0=32,1=64,2=byte,3=half,4=LDRSW,5=LDRSB,6=LDRSH)
 // Codes 4--6 sign-extend a narrow load into the full 64-bit register
@@ -586,7 +586,7 @@ _kcc_enc_ldr_imm:
 The \textsc{stp} (store pair, pre-index) and \textsc{ldp} (load pair, post-index) instructions transfer two 64-bit registers in a single operation. They are used almost exclusively in function prologues and epilogues to save and restore \texttt{x29}/\texttt{x30}. The 7-bit signed immediate in bits [21:15] is scaled by~8, giving a $\pm$512-byte range from the base register.
 
 @d Backend: encode memory @{
-// -- kcc_enc_stp_pre ----------------------------------------------------------
+// -- kcc_enc_stp_pre ---
 // STP (pre-index, 64-bit): x0=rt1, x1=rt2, x2=rn, x3=imm7 (signed, scaled by 8)
 // Encoding: 0xA9800000 | (imm7&0x7F)<<15 | rt2<<10 | rn<<5 | rt1
 .text
@@ -602,7 +602,7 @@ _kcc_enc_stp_pre:
     mov w0, w4
     ret
 
-// -- kcc_enc_ldp_post ---------------------------------------------------------
+// -- kcc_enc_ldp_post ---
 // LDP (post-index, 64-bit): x0=rt1, x1=rt2, x2=rn, x3=imm7 (signed, scaled by 8)
 // Encoding: 0xA8C00000 | (imm7&0x7F)<<15 | rt2<<10 | rn<<5 | rt1
 .text
@@ -626,7 +626,7 @@ _kcc_enc_ldp_post:
 \textsc{mov}\;$R_d, R_m$ is not a first-class ARM64 instruction but an alias for \texttt{ORR\;Rd, XZR, Rm}---a bitwise OR with the zero register that simply copies \texttt{Rm} into \texttt{Rd}. We encode it as a logical operation with \texttt{Rn\,=\,31} (the zero register), opcode prefix \texttt{0x2A000000}, and \texttt{sf} at bit~31.
 
 @d Backend: encode memory @{
-// -- kcc_enc_mov_reg ----------------------------------------------------------
+// -- kcc_enc_mov_reg ---
 // MOV Rd, Rm → ORR Rd, XZR, Rm
 // x0=rd, x1=rm, x2=sf
 .text
@@ -660,7 +660,7 @@ SIMD\&FP unsigned-offset \textsc{ldr}/\textsc{str} (bit~26, the
 \texttt{V} bit, distinguishes them from the general-register forms).
 
 @d Backend: encode floating point @{
-// -- kcc_enc_fp_dp2 -----------------------------------------------------------
+// -- kcc_enc_fp_dp2 ---
 // Double-precision 2-source op: FADD/FSUB/FMUL/FDIV.
 //   x0=Rd, x1=Rn, x2=Rm, x3=opcode (fmul=0,fdiv=1,fadd=2,fsub=3)
 .text
@@ -676,7 +676,7 @@ _kcc_enc_fp_dp2:
     mov w0, w4
     ret
 
-// -- kcc_enc_scvtf ------------------------------------------------------------
+// -- kcc_enc_scvtf ---
 // SCVTF Dd, Xn — signed 64-bit integer → double.  x0=Rd(fp), x1=Rn(int)
 .text
 .globl _kcc_enc_scvtf
@@ -688,7 +688,7 @@ _kcc_enc_scvtf:
     mov w0, w2
     ret
 
-// -- kcc_enc_ucvtf ------------------------------------------------------------
+// -- kcc_enc_ucvtf ---
 // UCVTF Dd, Xn — UNSIGNED 64-bit integer → double.  x0=Rd(fp), x1=Rn(int)
 // Identical to SCVTF but for the opcode field (011 vs 010): base 0x9E63.
 .text
@@ -701,7 +701,7 @@ _kcc_enc_ucvtf:
     mov w0, w2
     ret
 
-// -- kcc_enc_fcvtzs -----------------------------------------------------------
+// -- kcc_enc_fcvtzs ---
 // FCVTZS Xd, Dn — double → signed 64-bit integer (round toward zero).
 //   x0=Rd(int), x1=Rn(fp)
 .text
@@ -714,7 +714,7 @@ _kcc_enc_fcvtzs:
     mov w0, w2
     ret
 
-// -- kcc_enc_fcvt_s_d / kcc_enc_fcvt_d_s --------------------------------------
+// -- kcc_enc_fcvt_s_d / kcc_enc_fcvt_d_s ---
 // FCVT Sd, Dn (double → single, rounds) and FCVT Dd, Sn (single → double).
 // Rounding a double through single and back is how a value is truncated to
 // single precision at a conversion to float.  x0=Rd, x1=Rn.
@@ -740,7 +740,7 @@ _kcc_enc_fcvt_d_s:
     mov w0, w2
     ret
 
-// -- kcc_enc_fmov_d_x / kcc_enc_fmov_x_d --------------------------------------
+// -- kcc_enc_fmov_d_x / kcc_enc_fmov_x_d ---
 // Move the raw 64 bits between a general register and a double register, so a
 // register-allocated value (which lives in a GP register) can be read or
 // written by the floating-point paths.  x0=Rd, x1=Rn.
@@ -766,7 +766,7 @@ _kcc_enc_fmov_x_d:
     mov w0, w2
     ret
 
-// -- kcc_enc_fmov_d_d ---------------------------------------------------------
+// -- kcc_enc_fmov_d_d ---
 // FMOV Dd, Dn — copy one double register to another (register-to-register), so
 // a value already allocated to a d-register can be moved into a scratch d-reg.
 // x0=Rd, x1=Rn.
@@ -781,7 +781,7 @@ _kcc_enc_fmov_d_d:
     mov w0, w2
     ret
 
-// -- kcc_enc_fneg_d -----------------------------------------------------------
+// -- kcc_enc_fneg_d ---
 // FNEG Dd, Dn — negate a double (flips the sign bit in the FP unit).  x0=Rd, x1=Rn.
 .text
 .globl _kcc_enc_fneg_d
@@ -794,7 +794,7 @@ _kcc_enc_fneg_d:
     mov w0, w2
     ret
 
-// -- kcc_enc_fcmp -------------------------------------------------------------
+// -- kcc_enc_fcmp ---
 // FCMP Dn, Dm — set NZCV from a double comparison.  x0=Rn, x1=Rm
 .text
 .globl _kcc_enc_fcmp
@@ -807,7 +807,7 @@ _kcc_enc_fcmp:
     mov w0, w2
     ret
 
-// -- kcc_enc_ldr_fp / kcc_enc_str_fp ------------------------------------------
+// -- kcc_enc_ldr_fp / kcc_enc_str_fp ---
 // LDR/STR Dt, [Xn, #imm12*8] — SIMD&FP unsigned offset (64-bit double).
 //   x0=Rt(fp), x1=Rn, x2=imm12 (already scaled by 8)
 .text
@@ -832,7 +832,7 @@ _kcc_enc_str_fp:
     mov w0, w3
     ret
 
-// -- kcc_enc_ldr_fp_s / kcc_enc_str_fp_s --------------------------------------
+// -- kcc_enc_ldr_fp_s / kcc_enc_str_fp_s ---
 // LDR/STR St, [Xn, #imm12*4] — SIMD&FP unsigned offset, single precision (32
 // bits).  A `float` in memory is a 4-byte IEEE-754 single; these move it to and
 // from an `s`-register (which aliases the low half of the matching `d`), so the
@@ -867,7 +867,7 @@ _kcc_enc_str_fp_s:
 Unconditional branches (\textsc{b}, \textsc{bl}) encode a 26-bit signed offset in instruction units (divide byte offset by~4). Conditional \textsc{b.cond} uses a 19-bit offset with the condition code in bits [3:0]. \textsc{cbz} and \textsc{cbnz} combine a register test with a 19-bit branch offset. \textsc{ret} is hard-coded to branch to the address in \texttt{x30}.
 
 @d Backend: encode branch @{
-// -- kcc_enc_b ----------------------------------------------------------------
+// -- kcc_enc_b ---
 // B imm26: x0 = offset in bytes (will be divided by 4)
 .text
 .globl _kcc_enc_b
@@ -879,7 +879,7 @@ _kcc_enc_b:
     orr w0, w0, w1
     ret
 
-// -- kcc_enc_bl ---------------------------------------------------------------
+// -- kcc_enc_bl ---
 // BL imm26: x0 = offset in bytes
 .text
 .globl _kcc_enc_bl
@@ -899,7 +899,7 @@ _kcc_enc_bl:
 Conditional branches use a narrower 19-bit signed offset (still in instruction units). \textsc{b.cond} tests the NZCV flags against a 4-bit condition code in bits [3:0]; the codegen emits a \textsc{cmp} immediately before it. \textsc{cbz} and \textsc{cbnz} combine a zero/non-zero register test with the branch, avoiding a separate compare---useful for loop exits and null checks. \textsc{ret} is a fixed encoding (\texttt{0xD65F03C0}) that branches to the address in \texttt{x30}.
 
 @d Backend: encode branch @{
-// -- kcc_enc_b_cond -----------------------------------------------------------
+// -- kcc_enc_b_cond ---
 // B.cond imm19: x0 = offset in bytes, x1 = condition code
 .text
 .globl _kcc_enc_b_cond
@@ -913,7 +913,7 @@ _kcc_enc_b_cond:
     mov w0, w2
     ret
 
-// -- kcc_enc_cbz --------------------------------------------------------------
+// -- kcc_enc_cbz ---
 // CBZ Rt, imm19: x0 = rt, x1 = offset in bytes, x2 = sf
 .text
 .globl _kcc_enc_cbz
@@ -928,7 +928,7 @@ _kcc_enc_cbz:
     mov w0, w3
     ret
 
-// -- kcc_enc_cbnz -------------------------------------------------------------
+// -- kcc_enc_cbnz ---
 // CBNZ Rt, imm19: x0 = rt, x1 = offset in bytes, x2 = sf
 .text
 .globl _kcc_enc_cbnz
@@ -943,7 +943,7 @@ _kcc_enc_cbnz:
     mov w0, w3
     ret
 
-// -- kcc_enc_ret --------------------------------------------------------------
+// -- kcc_enc_ret ---
 .text
 .globl _kcc_enc_ret
 .p2align 2
@@ -951,7 +951,7 @@ _kcc_enc_ret:
     movz w0, #0xD65F, lsl #16
     movk w0, #0x03C0
     ret
-// -- kcc_enc_blr --------------------------------------------------------------
+// -- kcc_enc_blr ---
 // uint32_t kcc_enc_blr(uint32_t rn)
 //   Encodes BLR Xn: 0xD63F0000 | (rn << 5)
 .text
@@ -976,7 +976,7 @@ _kcc_enc_blr:
 Two fixed-encoding system instructions: \textsc{nop} (\texttt{0xD503201F}) for alignment or placeholder purposes, and \textsc{brk} for software breakpoints (the 16-bit immediate identifies the breakpoint to the debugger).
 
 @d Backend: encode system @{
-// -- kcc_enc_nop --------------------------------------------------------------
+// -- kcc_enc_nop ---
 .text
 .globl _kcc_enc_nop
 .p2align 2
@@ -985,7 +985,7 @@ _kcc_enc_nop:
     movk w0, #0x201F
     ret
 
-// -- kcc_enc_brk --------------------------------------------------------------
+// -- kcc_enc_brk ---
 // BRK #imm16: x0 = imm16
 .text
 .globl _kcc_enc_brk
@@ -1003,7 +1003,7 @@ _kcc_enc_brk:
 The \textsc{adrp} instruction loads a PC-relative page address into a register. The 21-bit immediate is split: bits [1:0] go to \texttt{immlo} at instruction bits [30:29], and bits [20:2] to \texttt{immhi} at bits [23:5]. The linker fills in the actual page offset via an \texttt{ARM64\_RELOC\_PAGE21} relocation; we emit zero as a placeholder.
 
 @d Backend: encode adrp @{
-// -- kcc_enc_adrp -------------------------------------------------------------
+// -- kcc_enc_adrp ---
 // ADRP Rd, imm21: x0=rd, x1=imm21 (page offset in 4KB pages)
 // Encoding: 1|immlo(2)|10000|immhi(19)|Rd(5)
 // immlo = imm21[1:0], immhi = imm21[20:2]
@@ -1028,7 +1028,7 @@ _kcc_enc_adrp:
 Three words of mutable state track the code buffer: a pointer to the arena-allocated memory, the current write position, and the capacity.
 
 @d Backend: emit data @{
-// -- Code buffer state --------------------------------------------------------
+// -- Code buffer state ---
 .data
 .p2align 3
 .globl _kcc_code_buf

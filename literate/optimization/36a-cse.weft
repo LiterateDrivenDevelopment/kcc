@@ -49,7 +49,7 @@ left alone---rewriting them is possible but fiddly, and skipping them only
 forgoes an optimization, never correctness.
 
 @d Opt: common subexpression elimination @{
-// -- kcc_cse_canon --------------------------------------------------------
+// -- kcc_cse_canon ---
 // uint64_t kcc_cse_canon(uint64_t vreg) -> the register that supersedes it.
 // Reads x20 = vreg_n bound, x21 = replacement map.  Leaf; touches x0 only.
 .text
@@ -61,7 +61,7 @@ _kcc_cse_canon:
 .Lcsc_ret:
     ret
 
-// -- kcc_cse_canon_ops ----------------------------------------------------
+// -- kcc_cse_canon_ops ---
 // void kcc_cse_canon_ops(ir_instr *instr)
 // Rewrite the instruction's virtual-register operands through the map, in
 // place.  x20 = vreg_n, x21 = map (canon reads them).
@@ -73,7 +73,7 @@ _kcc_cse_canon_ops:
     mov x1, x0                    // x1 = instr (survives the leaf canon calls)
     ldr x9, [x1, #IR_OP]
 
-    // ---- src1: a vreg for every op except these ----
+    // --- src1: a vreg for every op except these ---
     cmp x9, #IR_CONST
     b.eq .Lcco_src1_done
     cmp x9, #IR_CALL
@@ -97,7 +97,7 @@ _kcc_cse_canon_ops:
     str x0, [x1, #IR_SRC1]
 .Lcco_src1_done:
 
-    // ---- src2: a vreg only for binary arith/logic/cmp, GEP, and store ----
+    // --- src2: a vreg only for binary arith/logic/cmp, GEP, and store ---
     ldr x9, [x1, #IR_OP]
     cmp x9, #IR_GEP
     b.eq .Lcco_do_src2
@@ -122,7 +122,7 @@ _kcc_cse_canon_ops:
     str x0, [x1, #IR_SRC2]
 .Lcco_src2_done:
 
-    // ---- br_cond condition lives in dest; ret value in src1 ----
+    // --- br_cond condition lives in dest; ret value in src1 ---
     ldr x9, [x1, #IR_OP]
     cmp x9, #IR_BR_COND
     b.ne .Lcco_done
@@ -133,7 +133,7 @@ _kcc_cse_canon_ops:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_opt_cse ----------------------------------------------------------
+// -- kcc_opt_cse ---
 // uint64_t kcc_opt_cse(ir_func *func) -> number of redundancies removed.
 .text
 .globl _kcc_opt_cse
@@ -175,7 +175,7 @@ _kcc_opt_cse:
     b .Lcse_init
 .Lcse_init_done:
 
-    // ---- Walk basic blocks ----
+    // --- Walk basic blocks ---
     ldr x0, [x19, #IRF_BLOCKS]
     ldr x25, [x0, #VEC_COUNT]     // bb count
     mov x24, #0                    // bb index
@@ -339,7 +339,7 @@ _kcc_opt_cse:
     ldp x29, x30, [sp], #160
     ret
 
-// -- kcc_opt_copyprop -----------------------------------------------------
+// -- kcc_opt_copyprop ---
 // uint64_t kcc_opt_copyprop(ir_func *func) -> number of forwards.
 // Store-to-load forwarding = copy propagation + constant propagation for the
 // memory-backed locals this IR uses.  It is deliberately airtight: within one

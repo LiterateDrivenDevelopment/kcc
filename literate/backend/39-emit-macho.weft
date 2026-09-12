@@ -23,7 +23,7 @@ All values are for the 64-bit ARM64 object file format
 (\texttt{MH\_OBJECT}).
 
 @d MachO: constants @{
-// -- Mach-O constants ---------------------------------------------------------
+// -- Mach-O constants ---
 .equ MH_MAGIC_64,              0xFEEDFACF
 .equ CPU_TYPE_ARM64,           0x0100000C   // CPU_TYPE_ARM64
 .equ CPU_SUBTYPE_ALL,          0x00000000
@@ -86,7 +86,7 @@ values; \texttt{write\_bytes} copies raw data (and holds the guard);
 the given power of two.
 
 @d MachO: output buffer @{
-// -- kcc_macho_init -----------------------------------------------------------
+// -- kcc_macho_init ---
 // void kcc_macho_init(const char *filename)
 //   x0 = output file path
 // Opens the file for writing and allocates the output buffer.
@@ -179,7 +179,7 @@ bump the offset.  Because they never call another function, they are
 leaf routines with no stack frame.
 
 @d MachO: output buffer @{
-// -- kcc_macho_write8 ---------------------------------------------------------
+// -- kcc_macho_write8 ---
 .text
 .globl _kcc_macho_write8
 .p2align 2
@@ -195,7 +195,7 @@ _kcc_macho_write8:
     str x3, [x2]
     ret
 
-// -- kcc_macho_write16 --------------------------------------------------------
+// -- kcc_macho_write16 ---
 .text
 .globl _kcc_macho_write16
 .p2align 2
@@ -211,7 +211,7 @@ _kcc_macho_write16:
     str x3, [x2]
     ret
 
-// -- kcc_macho_write32 --------------------------------------------------------
+// -- kcc_macho_write32 ---
 .text
 .globl _kcc_macho_write32
 .p2align 2
@@ -227,7 +227,7 @@ _kcc_macho_write32:
     str x3, [x2]
     ret
 
-// -- kcc_macho_write64 --------------------------------------------------------
+// -- kcc_macho_write64 ---
 .text
 .globl _kcc_macho_write64
 .p2align 2
@@ -260,7 +260,7 @@ alignment---needed because Mach-O relocations must be 4-byte aligned
 and the code section size is not guaranteed to be a multiple of~4.
 
 @d MachO: output buffer @{
-// -- kcc_macho_write_bytes ----------------------------------------------------
+// -- kcc_macho_write_bytes ---
 // void kcc_macho_write_bytes(const void *src, uint64_t len)
 .text
 .globl _kcc_macho_write_bytes
@@ -317,7 +317,7 @@ _kcc_macho_write_bytes:
     mov x0, #1
     bl _kcc_sys_exit
 
-// -- kcc_macho_pad_to ---------------------------------------------------------
+// -- kcc_macho_pad_to ---
 // void kcc_macho_pad_to(uint64_t alignment)
 // Pads with zeros until position is aligned to given boundary.
 .text
@@ -395,7 +395,7 @@ These offsets are stored in callee-saved registers and stack slots
 for use by subsequent phases.
 
 @d MachO: finalize @{
-// -- kcc_macho_finalize -------------------------------------------------------
+// -- kcc_macho_finalize ---
 // void kcc_macho_finalize(void)
 // Assembles and writes the complete Mach-O object file.
 .text
@@ -410,7 +410,7 @@ _kcc_macho_finalize:
     stp x25, x26, [sp, #64]
     stp x27, x28, [sp, #80]
 
-    // ---- Compute layout sizes ----
+    // --- Compute layout sizes ---
     // Get code size
     adrp x0, _kcc_code_pos@@PAGE
     add  x0, x0, _kcc_code_pos@@PAGEOFF
@@ -622,7 +622,7 @@ bytes from local atoms, which caused subtle bugs in earlier
 versions.
 
 @d MachO: finalize @{
-    // ---- Write Mach-O header ----
+    // --- Write Mach-O header ---
     // magic
     mov w0, #0xFACF
     movk w0, #0xFEED, lsl #16
@@ -656,7 +656,7 @@ versions.
     mov w0, #0
     bl _kcc_macho_write32
 
-    // ---- LC_SEGMENT_64 ----
+    // --- LC_SEGMENT_64 ---
     // cmd
     mov w0, #LC_SEGMENT_64
     bl _kcc_macho_write32
@@ -791,7 +791,7 @@ emitted only when \texttt{\_kcc\_modinit\_present} is set, leaving the
 common two-section object byte-for-byte unchanged.
 
 @d MachO: finalize @{
-    // ---- Section: __text ----
+    // --- Section: __text ---
     // sectname (16 bytes): "__text" + 10 null bytes
     // Little-endian: "__text\0\0" = 0x0000747865745F5F
     mov x0, #0x5F5F
@@ -838,7 +838,7 @@ common two-section object byte-for-byte unchanged.
     mov w0, #0
     bl _kcc_macho_write32
 
-    // ---- Section: __DATA,__common (S_ZEROFILL) ----
+    // --- Section: __DATA,__common (S_ZEROFILL) ---
     // sectname (16 bytes): "__common" + 8 null bytes
     // Little-endian: "__common" = 0x6E6F6D6D6F635F5F
     mov x0, #0x5F5F
@@ -885,7 +885,7 @@ common two-section object byte-for-byte unchanged.
     mov w0, #0
     bl _kcc_macho_write32
 
-    // ---- Section: __DATA_CONST,__const (const pointer tables, section 3) ----
+    // --- Section: __DATA_CONST,__const (const pointer tables, section 3) ---
     adrp x0, _kcc_rodata_const_present@@PAGE
     add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
     ldr  x0, [x0]
@@ -963,7 +963,7 @@ common two-section object byte-for-byte unchanged.
     bl _kcc_macho_write32
 .Lmf_no_const_sect:
 
-    // ---- Section: __DATA,__mod_init_func (only for a module-init unit) ----
+    // --- Section: __DATA,__mod_init_func (only for a module-init unit) ---
     adrp x0, _kcc_modinit_present@@PAGE
     add  x0, x0, _kcc_modinit_present@@PAGEOFF
     ldr  x0, [x0]
@@ -1038,7 +1038,7 @@ efficiently---most of its 80~bytes are zero because our object file
 has no indirect or module tables.
 
 @d MachO: finalize @{
-    // ---- LC_BUILD_VERSION ----
+    // --- LC_BUILD_VERSION ---
     // cmd = 0x32
     mov w0, #LC_BUILD_VERSION
     bl _kcc_macho_write32
@@ -1060,7 +1060,7 @@ has no indirect or module tables.
     mov w0, #0
     bl _kcc_macho_write32
 
-    // ---- LC_SYMTAB ----
+    // --- LC_SYMTAB ---
     // cmd
     mov w0, #LC_SYMTAB
     bl _kcc_macho_write32
@@ -1080,7 +1080,7 @@ has no indirect or module tables.
     mov w0, w27
     bl _kcc_macho_write32
 
-    // ---- LC_DYSYMTAB ----
+    // --- LC_DYSYMTAB ---
     // cmd
     mov w0, #LC_DYSYMTAB
     bl _kcc_macho_write32
@@ -1153,7 +1153,7 @@ number (24~bits), \texttt{pcrel} flag, length code, extern flag,
 and relocation type.
 
 @d MachO: finalize @{
-    // ---- __DWARF LC_SEGMENT_64 (under -g) ----
+    // --- __DWARF LC_SEGMENT_64 (under -g) ---
     // Still part of the load commands (fills x22's reserved 312 bytes so the
     // file position reaches text_offset).  The debug blob itself is laid down
     // right after the code bytes; its file base = text_offset + code_size.
@@ -1167,7 +1167,7 @@ and relocation type.
     bl _kcc_dwarf_emit_macho
 .Lmf_dw_seg_done:
 
-    // ---- Write code bytes ----
+    // --- Write code bytes ---
     // Pad to text_offset if needed (should already be there)
     adrp x0, _kcc_code_buf@@PAGE
     add  x0, x0, _kcc_code_buf@@PAGEOFF
@@ -1175,7 +1175,7 @@ and relocation type.
     mov x1, x19                    // code_size
     bl _kcc_macho_write_bytes
 
-    // ---- Append the DWARF debug blob (under -g) ----
+    // --- Append the DWARF debug blob (under -g) ---
     // It sits between the code and the LINKEDIT region so relocs/symtab/strtab
     // stay last in the file, matching the offsets reserved in the layout above.
     adrp x0, _kcc_dwarf_enabled@@PAGE
@@ -1185,7 +1185,7 @@ and relocation type.
     bl   _kcc_dwarf_append_blob
 .Lmf_dw_blob_done:
 
-    // ---- Write the __mod_init_func pointer (8 zero bytes; value from reloc) ----
+    // --- Write the __mod_init_func pointer (8 zero bytes; value from reloc) ---
     // Aligning to 8 lands the file position exactly on the reserved slot.
     adrp x0, _kcc_modinit_present@@PAGE
     add  x0, x0, _kcc_modinit_present@@PAGEOFF
@@ -1197,8 +1197,8 @@ and relocation type.
     bl _kcc_macho_write64
 .Lmf_no_modinit_data:
 
-    // ---- Write the __const section data (const_size zero bytes; pointer values
-    // come from the relocations) ----
+    // --- Write the __const section data (const_size zero bytes; pointer values
+    // come from the relocations) ---
     adrp x0, _kcc_rodata_const_present@@PAGE
     add  x0, x0, _kcc_rodata_const_present@@PAGEOFF
     ldr  x0, [x0]
@@ -1220,7 +1220,7 @@ and relocation type.
     mov x0, #4
     bl _kcc_macho_pad_to
 
-    // ---- Build symbol index remapping (original → sorted output) ----
+    // --- Build symbol index remapping (original → sorted output) ---
     // Output order: defined first, then undefined. Need remap[old] = new.
     lsl x0, x20, #3               // nsyms * 8 bytes
     bl _kcc_arena_alloc
@@ -1293,7 +1293,7 @@ an 8-byte, non-PC-relative fixup (\texttt{r\_length}~=~3) against the
 module-init function symbol.
 
 @d MachO: finalize @{
-    // ---- Write relocations ----
+    // --- Write relocations ---
     // For each reloc: pack into relocation_info format
     // r_address (32 bits) | r_symbolnum(24)|r_pcrel(1)|r_length(2)|r_extern(1)|r_type(4)
     mov x28, #0
@@ -1340,7 +1340,7 @@ module-init function symbol.
     b .Lmf_reloc_loop
 .Lmf_reloc_done:
 
-    // ---- Module-init pointer relocation ----
+    // --- Module-init pointer relocation ---
     // One ARM64_RELOC_UNSIGNED (length 3 = 8 bytes, not pc-relative) binding the
     // __mod_init_func pointer to the local kcc.module_init symbol.  It trails the
     // text relocations, matching the reloff recorded in that section header.
@@ -1365,7 +1365,7 @@ module-init function symbol.
     bl _kcc_macho_write32
 .Lmf_no_modinit_reloc_emit:
 
-    // ---- __const section relocations ----
+    // --- __const section relocations ---
     // One ARM64_RELOC_UNSIGNED (length 3, not pc-relative) per pointer slot,
     // binding it to its string-literal symbol.  They trail the modinit reloc,
     // matching the reloff recorded in the __const section header.
@@ -1427,7 +1427,7 @@ descriptor with a single \texttt{write} system call, and the
 file is closed.
 
 @d MachO: finalize @{
-    // ---- Write symbol table (nlist_64 entries) ----
+    // --- Write symbol table (nlist_64 entries) ---
     // First: defined symbols, then undefined
     // We need to write in order: defined first, then undefined
     // Pass 1: defined symbols
@@ -1605,7 +1605,7 @@ descriptor is closed.  The callee-saved registers are restored and
 the function returns.
 
 @d MachO: finalize @{
-    // ---- Write string table ----
+    // --- Write string table ---
     // Leading NUL byte
     mov w0, #0
     bl _kcc_macho_write8
@@ -1667,7 +1667,7 @@ the function returns.
     b .Lmf_str_undef_loop
 .Lmf_str_undef_done:
 
-    // ---- Flush to file ----
+    // --- Flush to file ---
     adrp x0, _kcc_macho_fd@@PAGE
     add  x0, x0, _kcc_macho_fd@@PAGEOFF
     ldr x0, [x0]                   // fd
@@ -1702,7 +1702,7 @@ and the current buffer position.  The error string lives in the
 \texttt{kcc\_io\_err}.
 
 @d MachO: data @{
-// -- Mach-O module data -------------------------------------------------------
+// -- Mach-O module data ---
 .data
 .p2align 3
 .globl _kcc_macho_fd

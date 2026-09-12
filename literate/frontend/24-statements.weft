@@ -24,7 +24,7 @@ An identifier at the start could be either a label (if followed by
 \texttt{:}) or an expression statement.
 
 @d Stmt: parse statement @{
-// -- kcc_parse_stmt ----------------------------------------------------
+// -- kcc_parse_stmt ---
 // node *kcc_parse_stmt(void)
 // Parses a single statement.
 // Returns AST node for the statement.
@@ -284,7 +284,7 @@ beyond \texttt{"memory"}/\texttt{"cc"}; the back end validates the constraints i
 can honour and rejects the rest, so an unsupported form never miscompiles.
 
 @d Stmt: parse asm @{
-// -- kcc_parse_asm_opsec ----------------------------------------------------
+// -- kcc_parse_asm_opsec ---
 // void kcc_parse_asm_opsec(node *asm_stmt, uint64_t is_output)
 // Parse one colon-section of operands, appending AST_ASM_OPERAND nodes to the
 // statement's AST_F2 chain.  Stops at the next ':' or ')'.
@@ -367,7 +367,7 @@ _kcc_parse_asm_opsec:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_parse_asm_clobbers -------------------------------------------------
+// -- kcc_parse_asm_clobbers ---
 // void kcc_parse_asm_clobbers(void)
 // Consume the comma-separated clobber string literals up to ':' or ')'.
 .globl _kcc_parse_asm_clobbers
@@ -396,7 +396,7 @@ _kcc_parse_asm_clobbers:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_parse_asm_extended -------------------------------------------------
+// -- kcc_parse_asm_extended ---
 // node *kcc_parse_asm_extended(const char *tmpl, uint64_t len)
 // Build the AST_ASM_STMT and consume any operand/clobber lists plus ')'.
 .globl _kcc_parse_asm_extended
@@ -474,7 +474,7 @@ finishes parsing any binary, ternary, assignment, or comma operators
 that follow.
 
 @d Stmt: parse statement @{
-// -- kcc_parse_expr_rest -----------------------------------------------
+// -- kcc_parse_expr_rest ---
 // node *kcc_parse_expr_rest(node *lhs)
 //   x0 = already-parsed left-hand side
 // Continues parsing binary/assignment/ternary after an identifier+postfix.
@@ -632,7 +632,7 @@ terminated by \texttt{;}) and moves on; the label names still bind through the
 ordinary label/\texttt{goto} machinery.
 
 @d Stmt: parse compound @{
-// -- kcc_parse_compound ------------------------------------------------
+// -- kcc_parse_compound ---
 // node *kcc_parse_compound(void)
 // Parses a compound statement { items... }
 // Returns AST_COMPOUND node with F0 = first item.
@@ -794,7 +794,7 @@ dangling-else ambiguity is resolved by greedy binding: the else
 always associates with the nearest preceding if.
 
 @d Stmt: parse if @{
-// -- kcc_parse_if ------------------------------------------------------
+// -- kcc_parse_if ---
 // node *kcc_parse_if(void)
 // Parses: if ( expr ) stmt [else stmt]
 .globl _kcc_parse_if
@@ -864,7 +864,7 @@ resulting \texttt{AST\_SWITCH\_STMT} node stores the controlling expression
 and the body.
 
 @d Stmt: parse switch @{
-// -- kcc_parse_switch --------------------------------------------------
+// -- kcc_parse_switch ---
 // node *kcc_parse_switch(void)
 // Parses: switch ( expr ) stmt
 .globl _kcc_parse_switch
@@ -913,7 +913,7 @@ statement.  The resulting \texttt{AST\_WHILE\_STMT} node stores the condition
 in \texttt{F0} and the body in \texttt{F1}.
 
 @d Stmt: parse while @{
-// -- kcc_parse_while ---------------------------------------------------
+// -- kcc_parse_while ---
 // node *kcc_parse_while(void)
 // Parses: while ( expr ) stmt
 .globl _kcc_parse_while
@@ -964,7 +964,7 @@ body in \texttt{F0} and the condition in \texttt{F1}, reversing the order
 from the while loop to reflect the evaluation sequence.
 
 @d Stmt: parse do @{
-// -- kcc_parse_do ------------------------------------------------------
+// -- kcc_parse_do ---
 // node *kcc_parse_do(void)
 // Parses: do stmt while ( expr ) ;
 .globl _kcc_parse_do
@@ -1019,7 +1019,7 @@ init clause can be a declaration (introducing a new scope) or an
 expression.
 
 @d Stmt: parse for @{
-// -- kcc_parse_for -----------------------------------------------------
+// -- kcc_parse_for ---
 // node *kcc_parse_for(void)
 // Parses: for ( [init] ; [cond] ; [incr] ) stmt
 // init can be a declaration or expression.
@@ -1148,7 +1148,7 @@ table, and expects a terminating semicolon.  The resulting
 later resolution during semantic analysis.
 
 @d Stmt: parse goto @{
-// -- kcc_parse_goto ----------------------------------------------------
+// -- kcc_parse_goto ---
 // node *kcc_parse_goto(void)
 // Parses: goto ident ;
 .globl _kcc_parse_goto
@@ -1198,7 +1198,7 @@ The resulting \texttt{AST\_RETURN\_STMT} node stores the expression (or zero)
 in \texttt{F0}.
 
 @d Stmt: parse return @{
-// -- kcc_parse_return --------------------------------------------------
+// -- kcc_parse_return ---
 // node *kcc_parse_return(void)
 // Parses: return [expr] ;
 .globl _kcc_parse_return
@@ -1247,7 +1247,7 @@ high bound is parsed into \texttt{F3} (null for an ordinary single-value case).
 The kernel uses this heavily, e.g.\ \texttt{case '0'\,\ldots\,'7':}.
 
 @d Stmt: parse labeled @{
-// -- kcc_parse_case ----------------------------------------------------
+// -- kcc_parse_case ---
 // node *kcc_parse_case(void)
 // Parses: case expr : stmt
 .globl _kcc_parse_case
@@ -1297,7 +1297,7 @@ _kcc_parse_case:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_parse_default -------------------------------------------------
+// -- kcc_parse_default ---
 // node *kcc_parse_default(void)
 // Parses: default : stmt
 .globl _kcc_parse_default
@@ -1337,6 +1337,6 @@ statement parser requires no additional data beyond what is defined inline
 within each parsing function.
 
 @d Stmt: data @{
-// -- Statement parser data (reserved) ----------------------------------
+// -- Statement parser data (reserved) ---
 // No additional data needed for statement parsing.
 @}

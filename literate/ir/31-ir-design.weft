@@ -29,7 +29,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d IR: constants @{
-// -- IR instruction layout ------------------------------------------------
+// -- IR instruction layout ---
 .equ IR_OP,          0     // opcode
 .equ IR_DEST,        8     // destination vreg number
 .equ IR_SRC1,       16     // source 1 (vreg or immediate)
@@ -38,7 +38,7 @@ Offset & Field & Description \\
 .equ IR_NEXT,       40     // next instruction in BB
 .equ IR_INSTR_SIZE, 48
 
-// -- Basic block layout ---------------------------------------------------
+// -- Basic block layout ---
 .equ BB_ID,          0     // block label number
 .equ BB_FIRST,       8     // first instruction
 .equ BB_LAST,       16     // last instruction
@@ -46,7 +46,7 @@ Offset & Field & Description \\
 .equ BB_FLAGS,      32     // bit 0 = terminated
 .equ IR_BB_SIZE,    48
 
-// -- IR function layout ---------------------------------------------------
+// -- IR function layout ---
 .equ IRF_NAME,       0     // function name string pointer
 .equ IRF_ENTRY,      8     // entry basic block
 .equ IRF_BLOCKS,    16     // vec of BB pointers
@@ -61,10 +61,10 @@ Offset & Field & Description \\
 .equ IRF_VARIADIC,  88     // 1 if the function is variadic (affects stack-arg layout)
 .equ IR_FUNC_SIZE,  96
 
-// -- BB flags -------------------------------------------------------------
+// -- BB flags ---
 .equ BB_FLAG_TERMINATED, 1
 
-// -- IR opcodes -----------------------------------------------------------
+// -- IR opcodes ---
 // Arithmetic: 1-8
 .equ IR_ADD,      1
 .equ IR_SUB,      2
@@ -132,7 +132,7 @@ The IR module maintains a global state: the current function being built,
 the current basic block, and a vector of all IR functions.
 
 @d IR: init @{
-// -- kcc_ir_init ----------------------------------------------------------
+// -- kcc_ir_init ---
 // void kcc_ir_init(void)
 // Initializes the IR module.  Must be called before any IR construction.
 .text
@@ -223,7 +223,7 @@ Three allocation functions arena-allocate and zero-initialise the core IR
 data structures.  Each returns a pointer to the freshly allocated node.
 
 @d IR: alloc instruction @{
-// -- kcc_ir_alloc_instr ---------------------------------------------------
+// -- kcc_ir_alloc_instr ---
 // ir_instr *kcc_ir_alloc_instr(uint64_t opcode)
 //   x0 = opcode
 // Returns a zeroed IR instruction with the given opcode.
@@ -257,7 +257,7 @@ Basic blocks are allocated with a unique ID drawn from a per-function
 counter.
 
 @d IR: alloc basic block @{
-// -- kcc_ir_alloc_bb ------------------------------------------------------
+// -- kcc_ir_alloc_bb ---
 // ir_bb *kcc_ir_alloc_bb(void)
 // Returns a new basic block with a unique ID.
 .text
@@ -299,7 +299,7 @@ the builder from the declaration's storage class---that later tells the
 emitter to give a \texttt{static} function local Mach-O linkage.
 
 @d IR: alloc function @{
-// -- kcc_ir_alloc_func ----------------------------------------------------
+// -- kcc_ir_alloc_func ---
 // ir_func *kcc_ir_alloc_func(const char *name, type_desc *ret_type)
 //   x0 = function name pointer
 //   x1 = return type descriptor
@@ -380,7 +380,7 @@ initialising store stays at the declaration point; only the address
 reservation moves.
 
 @d IR: emit @{
-// -- kcc_ir_emit ----------------------------------------------------------
+// -- kcc_ir_emit ---
 // void kcc_ir_emit(ir_instr *instr)
 // Appends an instruction to the current basic block.
 // If the BB is already terminated, the instruction is silently dropped.
@@ -423,7 +423,7 @@ _kcc_ir_emit:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_emit_entry ----------------------------------------------------
+// -- kcc_ir_emit_entry ---
 // void kcc_ir_emit_entry(ir_instr *instr)
 // Inserts an instruction at the HEAD of the current function's entry block,
 // ahead of everything already there.  Used for allocas, whose address must
@@ -468,7 +468,7 @@ _kcc_ir_emit_entry:
 Each function maintains a monotonically increasing vreg counter.
 
 @d IR: next vreg @{
-// -- kcc_ir_next_vreg -----------------------------------------------------
+// -- kcc_ir_next_vreg ---
 // uint64_t kcc_ir_next_vreg(void)
 // Returns the next virtual register number for the current function.
 .text
@@ -506,7 +506,7 @@ new block.  The old current-block pointer is not saved---the builder is
 responsible for managing block references in callee-saved registers.
 
 @d IR: set current bb @{
-// -- kcc_ir_set_bb --------------------------------------------------------
+// -- kcc_ir_set_bb ---
 // void kcc_ir_set_bb(ir_bb *bb)
 // Sets bb as the current insertion point and appends it to the
 // current function's block list.
@@ -562,7 +562,7 @@ symbol.  Like \texttt{locals} it is re-initialised for each function so
 that a static's name is visible only within its defining function.
 
 @d IR: data @{
-// -- IR module data -------------------------------------------------------
+// -- IR module data ---
 .data
 .p2align 3
 .globl _kcc_ir_cur_func

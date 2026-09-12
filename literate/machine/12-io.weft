@@ -22,7 +22,7 @@ buffer base address, the current write position, and the capacity.
 For Phase~0, we use a single static buffer writing to \texttt{stdout}.
 
 @d IO: data @{
-// -- I/O global state -----------------------------------------------
+// -- I/O global state ---
 .data
 .p2align 3
 _kcc_io_fd:   .quad 1            // file descriptor (1 = stdout)
@@ -46,7 +46,7 @@ automatically when the buffer fills, and explicitly before program
 exit.
 
 @d IO: flush @{
-// -- kcc_io_flush ---------------------------------------------------
+// -- kcc_io_flush ---
 // void kcc_io_flush(void)
 // Writes buffered data to the file descriptor, resets position.
 .globl _kcc_io_flush
@@ -90,7 +90,7 @@ _kcc_io_flush:
 the buffer is full, it flushes first.
 
 @d IO: putc @{
-// -- kcc_io_putc ----------------------------------------------------
+// -- kcc_io_putc ---
 // void kcc_io_putc(int c)
 //   x0 = character to write (low 8 bits)
 FUNC kcc_io_putc
@@ -139,7 +139,7 @@ This is the primary output function used by the compiler driver,
 the diagnostic engine, and (eventually) the code emitter.
 
 @d IO: puts @{
-// -- kcc_io_puts ----------------------------------------------------
+// -- kcc_io_puts ---
 // void kcc_io_puts(const char *s)
 //   x0 = pointer to null-terminated string
 // Writes all bytes (excluding the null terminator) to the buffer.
@@ -198,7 +198,7 @@ printing token text, which is a \texttt{(pointer, length)} pair into the
 source buffer rather than a null-terminated string.
 
 @d IO: write @{
-// -- kcc_io_write ---------------------------------------------------
+// -- kcc_io_write ---
 // void kcc_io_write(const void *ptr, size_t len)
 //   x0 = pointer to data
 //   x1 = byte count
@@ -255,7 +255,7 @@ The algorithm divides repeatedly by~10, storing digits in reverse order
 in a small stack buffer, then writes them out with \texttt{kcc\_io\_write}.
 
 @d IO: putu @{
-// -- kcc_io_putu ----------------------------------------------------
+// -- kcc_io_putu ---
 // void kcc_io_putu(uint64_t n)
 //   x0 = unsigned integer to print
 // Outputs the decimal representation to the buffered output.
@@ -308,7 +308,7 @@ is used --- diagnostic messages should appear immediately, even if
 the program crashes afterwards.
 
 @d IO: err @{
-// -- kcc_io_err -----------------------------------------------------
+// -- kcc_io_err ---
 // void kcc_io_err(const char *s)
 //   x0 = null-terminated string
 // Writes directly to stderr (fd=2), unbuffered.

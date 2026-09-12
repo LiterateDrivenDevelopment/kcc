@@ -15,7 +15,7 @@ func @main() -> i32:
 \end{verbatim}
 
 @d IR: dump @{
-// -- kcc_ir_dump ----------------------------------------------------------
+// -- kcc_ir_dump ---
 // void kcc_ir_dump(void)
 // Prints all IR functions in textual form.
 .text
@@ -152,7 +152,7 @@ argument list, and side-effect-only instructions (\textsc{store},
 \textsc{ret}, \textsc{br}) omit the destination.
 
 @d IR: dump instruction @{
-// -- kcc_ir_dump_instr ----------------------------------------------------
+// -- kcc_ir_dump_instr ---
 // void kcc_ir_dump_instr(ir_instr *instr)
 //   x0 = instruction pointer
 // Prints one instruction line with leading "    " indent.
@@ -306,7 +306,7 @@ from \texttt{IR\_SRC1} and \texttt{IR\_SRC2}.  Arithmetic opcodes
 predicates (\textsc{cmp\_eq} through \textsc{cmp\_sge}).
 
 @d IR: dump instruction @{
-// -- Binary ops: "op type %src1, %src2" -----------------------------------
+// -- Binary ops: "op type %src1, %src2" ---
 .Lidi_add:
     adrp x0, _kcc_ir_op_add@@PAGE
     add  x0, x0, _kcc_ir_op_add@@PAGEOFF
@@ -427,7 +427,7 @@ the backend can select the correct ARM64 widening instruction
 (\texttt{SXTW} versus \texttt{UXTW}).
 
 @d IR: dump instruction @{
-// -- Unary ops: "op type %src1" -------------------------------------------
+// -- Unary ops: "op type %src1" ---
 .Lidi_neg:
     adrp x0, _kcc_ir_op_neg@@PAGE
     add  x0, x0, _kcc_ir_op_neg@@PAGEOFF
@@ -499,7 +499,7 @@ appends a newline and restores callee-saved registers before
 returning.
 
 @d IR: dump instruction @{
-// -- load: "load type, ptr %src1" -----------------------------------------
+// -- load: "load type, ptr %src1" ---
 .Lidi_load:
     adrp x0, _kcc_ir_op_load@@PAGE
     add  x0, x0, _kcc_ir_op_load@@PAGEOFF
@@ -513,7 +513,7 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- store: "store type %src1, ptr %src2" ---------------------------------
+// -- store: "store type %src1, ptr %src2" ---
 .Lidi_store:
     adrp x0, _kcc_ir_op_store@@PAGE
     add  x0, x0, _kcc_ir_op_store@@PAGEOFF
@@ -533,7 +533,7 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- alloca: "alloca type" ------------------------------------------------
+// -- alloca: "alloca type" ---
 .Lidi_alloca:
     adrp x0, _kcc_ir_op_alloca@@PAGE
     add  x0, x0, _kcc_ir_op_alloca@@PAGEOFF
@@ -542,7 +542,7 @@ returning.
     bl _kcc_ir_dump_type_short
     b .Lidi_nl
 
-// -- gep: "gep %base, %index" ---------------------------------------------
+// -- gep: "gep %base, %index" ---
 .Lidi_gep:
     adrp x0, _kcc_ir_op_gep@@PAGE
     add  x0, x0, _kcc_ir_op_gep@@PAGEOFF
@@ -558,7 +558,7 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- br: "br bb<N>" -------------------------------------------------------
+// -- br: "br bb<N>" ---
 .Lidi_br:
     adrp x0, _kcc_ir_op_br@@PAGE
     add  x0, x0, _kcc_ir_op_br@@PAGEOFF
@@ -567,7 +567,7 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- br_cond: "br_cond %cond, bb<T>, bb<F>" ------------------------------
+// -- br_cond: "br_cond %cond, bb<T>, bb<F>" ---
 .Lidi_br_cond:
     adrp x0, _kcc_ir_op_br_cond@@PAGE
     add  x0, x0, _kcc_ir_op_br_cond@@PAGEOFF
@@ -588,7 +588,7 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- ret: "ret type %src1" or "ret void" ----------------------------------
+// -- ret: "ret type %src1" or "ret void" ---
 .Lidi_ret:
     adrp x0, _kcc_ir_op_ret@@PAGE
     add  x0, x0, _kcc_ir_op_ret@@PAGEOFF
@@ -610,7 +610,7 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- call: "call type @@name(%src1, ...)" ---------------------------------
+// -- call: "call type @@name(%src1, ...)" ---
 .Lidi_call:
     adrp x0, _kcc_ir_op_call@@PAGE
     add  x0, x0, _kcc_ir_op_call@@PAGEOFF
@@ -627,7 +627,7 @@ returning.
     bl _kcc_io_puts
     b .Lidi_nl
 
-// -- call_ind: "call_ind type %<vreg>(...)" --------------------------------
+// -- call_ind: "call_ind type %<vreg>(...)" ---
 .Lidi_call_ind:
     adrp x0, _kcc_ir_op_call_ind@@PAGE
     add  x0, x0, _kcc_ir_op_call_ind@@PAGEOFF
@@ -643,7 +643,7 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- const: "const type <imm>" -------------------------------------------
+// -- const: "const type <imm>" ---
 .Lidi_const:
     adrp x0, _kcc_ir_op_const@@PAGE
     add  x0, x0, _kcc_ir_op_const@@PAGEOFF
@@ -656,14 +656,14 @@ returning.
     bl _kcc_io_putu
     b .Lidi_nl
 
-// -- nop ------------------------------------------------------------------
+// -- nop ---
 .Lidi_nop:
     adrp x0, _kcc_ir_op_nop@@PAGE
     add  x0, x0, _kcc_ir_op_nop@@PAGEOFF
     bl _kcc_io_puts
     b .Lidi_nl
 
-// -- global_ref: "global_ref type @@name" ---------------------------------
+// -- global_ref: "global_ref type @@name" ---
 .Lidi_global_ref:
     adrp x0, _kcc_ir_op_global_ref@@PAGE
     add  x0, x0, _kcc_ir_op_global_ref@@PAGEOFF
@@ -679,7 +679,7 @@ returning.
     bl _kcc_io_puts
     b .Lidi_nl
 
-// -- string_lit: "string_lit \"<data>\"" ----------------------------------
+// -- string_lit: "string_lit \"<data>\"" ---
 .Lidi_string_lit:
     adrp x0, _kcc_ir_op_string_lit@@PAGE
     add  x0, x0, _kcc_ir_op_string_lit@@PAGEOFF
@@ -717,7 +717,7 @@ For IR output we print compact type names: \texttt{i32}, \texttt{i64},
 \texttt{void}, \texttt{ptr}, etc.
 
 @d IR: dump type short @{
-// -- kcc_ir_dump_type_short -----------------------------------------------
+// -- kcc_ir_dump_type_short ---
 // void kcc_ir_dump_type_short(type_desc *t)
 //   x0 = type descriptor (may be NULL)
 // Prints a short type label.

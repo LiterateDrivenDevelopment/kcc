@@ -52,7 +52,7 @@ by~3.  Otherwise, a single \texttt{?} is written and the read pointer
 advances by~1.
 
 @d Encoding: translate @{
-// -- kcc_source_encode --------------------------------------------------
+// -- kcc_source_encode ---
 // void kcc_source_encode(void)
 // Translation Phase 1: replaces trigraphs in the source buffer.
 // Allocates a writable arena copy of the mmap'd source, performs

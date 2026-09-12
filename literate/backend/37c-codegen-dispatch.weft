@@ -48,7 +48,7 @@ cstring buffer, creates a local symbol, and emits an
 pointer to the data.
 
 @d CodeGen: instruction dispatch @{
-// -- kcc_codegen_instr --------------------------------------------------------
+// -- kcc_codegen_instr ---
 // void kcc_codegen_instr(ir_instr *instr, ht *bb_labels, vec *patches)
 //   x0 = instruction, x1 = bb label ht, x2 = patch vec
 .text
@@ -241,7 +241,7 @@ loads the lowest 16~bits and zeroes the rest; each subsequent
 This produces 1--4 instructions depending on the value.
 
 @d CodeGen: instruction dispatch @{
-// ---- IR_CONST: load immediate into x11, store to dest slot ----
+// --- IR_CONST: load immediate into x11, store to dest slot ---
 .Lcgi_const:
     ldr x23, [x19, #IR_SRC1]      // immediate value
     ldr x24, [x19, #IR_DEST]      // dest vreg
@@ -332,7 +332,7 @@ shifts, and \textsc{not}) use the same load--compute--store pattern
 with logical-class encoders.
 
 @d CodeGen: instruction dispatch @{
-// ---- Binary arithmetic: load src1→x9, src2→x10, op→x11, store ----
+// --- Binary arithmetic: load src1→x9, src2→x10, op→x11, store ---
 .Lcgi_add:
     ldr x0, [x19, #IR_SRC1]
     mov x1, #CG_REG_SRC1
@@ -571,7 +571,7 @@ a vreg.  The unary \textsc{not} (\texttt{IR\_NOT}) uses
 \textsc{mvn} with a single source operand.
 
 @d CodeGen: instruction dispatch @{
-// ---- Bitwise operations ----
+// --- Bitwise operations ---
 .Lcgi_and:
     ldr x0, [x19, #IR_SRC1]
     mov x1, #CG_REG_SRC1
@@ -747,7 +747,7 @@ IR opcode & ARM64 cond & Inverted \\
 \end{center}
 
 @d CodeGen: instruction dispatch @{
-// ---- Compare operations ----
+// --- Compare operations ---
 // Pattern: load src1→x9, src2→x10, CMP x9,x10, CSET x11,<inv_cond>
 
 .Lcgi_cmp_eq:
@@ -835,7 +835,7 @@ or~31).  \texttt{IR\_ZEXT} zero-extends analogously using
 without changing any bits---a no-op in the all-spill strategy.
 
 @d CodeGen: instruction dispatch @{
-// ---- Type conversions ----
+// --- Type conversions ---
 
 .Lcgi_trunc:
     ldr x0, [x19, #IR_SRC1]
@@ -1054,7 +1054,7 @@ only in the opcode field.  The distinction is invisible for values that fit in
 opcode from the source integer's signedness.
 
 @d CodeGen: floating point @{
-// ---- Floating-point arithmetic: src1→d0, src2→d1, fOP→d2, store ----
+// --- Floating-point arithmetic: src1→d0, src2→d1, fOP→d2, store ---
 .Lcgi_fadd:
     mov x23, #2                    // fp dp2 opcode: fadd
     b .Lcgi_fp_arith
@@ -1085,7 +1085,7 @@ opcode from the source integer's signedness.
     bl _kcc_cg_store_vreg_fp
     b .Lcgi_done
 
-// ---- Floating-point comparison: fcmp d0,d1 then cset x11,<inv_cond> ----
+// --- Floating-point comparison: fcmp d0,d1 then cset x11,<inv_cond> ---
 .Lcgi_fcmp:
     mov x23, #1                    // EQ  → inv NE (1)
     cmp x22, #IR_CMP_EQ
@@ -1125,7 +1125,7 @@ opcode from the source integer's signedness.
     bl _kcc_cg_store_vreg          // result is an integer 0/1
     b .Lcgi_done
 
-// ---- Conversions between the integer and floating register files ----
+// --- Conversions between the integer and floating register files ---
 .Lcgi_sitofp:
     ldr x0, [x19, #IR_SRC1]
     mov x1, #CG_REG_SRC1           // x9
@@ -1220,7 +1220,7 @@ aggregates---whose fields and elements are no longer eight bytes apart---be
 addressed correctly.
 
 @d CodeGen: instruction dispatch @{
-// ---- Memory operations ----
+// --- Memory operations ---
 .Lcgi_load:
     // If the address is a promoted scalar local (mem2reg), its value lives in a
     // register: read it directly, extending per the width/sign code, instead of
@@ -1644,7 +1644,7 @@ emits the function epilogue: \texttt{LDP\;x29,\;x30,\;[sp],\;\#frame\_size}
 followed by \textsc{ret}.
 
 @d CodeGen: instruction dispatch @{
-// ---- Control flow ----
+// --- Control flow ---
 .Lcgi_br:
     // Unconditional branch to BB (SRC1 = target BB_ID)
     ldr x23, [x19, #IR_SRC1]      // target BB_ID
@@ -2143,7 +2143,7 @@ described in \S\ref{sec:emit-strings}.
 
     b .Lcgi_done
 
-// -- kcc_cg_normalize_ret -----------------------------------------------------
+// -- kcc_cg_normalize_ret ---
 // void kcc_cg_normalize_ret(type_desc *ret_type)
 // Emits a sign/zero extension of the return register x0 to the declared width,
 // so a sub-word integer return (from an external function, which sets only w0)
@@ -2412,7 +2412,7 @@ a third live operand currently collides in the register file, so it is refused.
 _kcc_cg_asm_err:
     .asciz "kcc: error: unsupported extended asm (only r/=r/+r/i constraints, up to 2 operands)\n"
 .text
-// -- kcc_cg_asm_validate ------------------------------------------------------
+// -- kcc_cg_asm_validate ---
 // uint64_t kcc_cg_asm_validate(node *asm_stmt) — 0 if the operands are within
 // the supported subset, else emit a diagnostic and return 1.
 .globl _kcc_cg_asm_validate
@@ -2457,7 +2457,7 @@ _kcc_cg_asm_validate:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_cg_asm_subst ---------------------------------------------------------
+// -- kcc_cg_asm_subst ---
 // (char*, uint64_t) kcc_cg_asm_subst(node *asm_stmt)
 // Build a copy of the template with %N / %wN / %xN replaced by the operand's
 // register name (operand N -> x/w (9+N)) and %% -> %.  Returns ptr in x0, len
@@ -2560,7 +2560,7 @@ _kcc_cg_asm_subst:
     ldp x29, x30, [sp], #96
     ret
 
-// -- kcc_cg_asm_extended ------------------------------------------------------
+// -- kcc_cg_asm_extended ---
 // void kcc_cg_asm_extended(node *asm_stmt)
 // Load inputs into x9..x11, splice the substituted template, store outputs.
 .globl _kcc_cg_asm_extended

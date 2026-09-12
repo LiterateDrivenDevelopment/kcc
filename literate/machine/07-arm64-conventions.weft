@@ -74,7 +74,7 @@ mandatory frame pointer.  \texttt{ENDFUNC} tears down the frame
 and returns.  \texttt{SYSCALL} invokes a macOS system call.
 
 @d ARM64: common macros @{
-// -- kcc common macros ----------------------------------------------
+// -- kcc common macros ---
 // FUNC name — standard function prologue (Apple ARM64 ABI)
 // Saves frame pointer (x29) and link register (x30).
 // The function is exported with the Mach-O underscore prefix.

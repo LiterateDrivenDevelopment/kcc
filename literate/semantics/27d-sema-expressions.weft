@@ -19,7 +19,7 @@ access, casts, sizeof) are delegated to dedicated subroutines
 described in the following subsections.
 
 @d Sema: check expression @{
-// -- kcc_sema_expr --------------------------------------------------------
+// -- kcc_sema_expr ---
 // type_desc *kcc_sema_expr(node *expr)
 //   x0 = expression AST node
 // Type-checks the expression, stores result in AST_F3.
@@ -306,7 +306,7 @@ its type becomes the type of the whole selection.  A selection that matches
 nothing and has no default is a diagnosed error.
 
 @d Sema: check expression @{
-// -- kcc_sema_expr_generic ------------------------------------------------
+// -- kcc_sema_expr_generic ---
 // uint64_t kcc_sema_expr_generic(node *generic)
 // Resolve a _Generic selection: type the (unevaluated) controlling expression,
 // pick the association whose type is compatible with it---or the default---and
@@ -418,7 +418,7 @@ symbol lookup at link time.  This rewrite is safe because the node
 will never be examined as an identifier again.
 
 @d Sema: expr ident @{
-// -- kcc_sema_expr_ident --------------------------------------------------
+// -- kcc_sema_expr_ident ---
 // type_desc *kcc_sema_expr_ident(node *expr)
 //   x19 = expression node (already loaded by caller)
 // Looks up identifier in symbol table, returns its type.
@@ -516,7 +516,7 @@ _kcc_sema_expr_ident:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_build_named -------------------------------------------------
+// -- kcc_sema_build_named ---
 // char *kcc_sema_build_named(const char *name, const char *prefix)
 //   x0 = name, x1 = prefix ; returns x0 = arena "<prefix>name'"
 // Builds the quoted message body once (the prefix supplies its own opening
@@ -562,7 +562,7 @@ _kcc_sema_build_named:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_sema_err_named ---------------------------------------------------
+// -- kcc_sema_err_named ---
 // void kcc_sema_err_named(uint64_t line, uint64_t col,
 //                         const char *name, const char *prefix)
 // Emits "<prefix>name'" as an error at line:col.  Shared by the
@@ -586,7 +586,7 @@ _kcc_sema_err_named:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_warn_named --------------------------------------------------
+// -- kcc_sema_warn_named ---
 // void kcc_sema_warn_named(uint64_t line, uint64_t col,
 //                          const char *name, const char *prefix)
 // Same message body as err_named, emitted as a warning.  Used by the
@@ -610,7 +610,7 @@ _kcc_sema_warn_named:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_check_unused_scope ------------------------------------------
+// -- kcc_sema_check_unused_scope ---
 // void kcc_sema_check_unused_scope(void)
 // Under -Wall, walk the innermost ordinary scope and warn for each SYM_VAR
 // that was declared but never referenced.  Called just before a block or
@@ -665,7 +665,7 @@ _kcc_sema_check_unused_scope:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_sema_check_redef -------------------------------------------------
+// -- kcc_sema_check_redef ---
 // void kcc_sema_check_redef(node *decl, const char *name)
 // At block scope (depth >= 2; file scope is depth 1) a name already present
 // in the current scope is a redefinition, since a block has no tentative
@@ -701,7 +701,7 @@ _kcc_sema_check_redef:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_agg_leaf_count ---------------------------------------------------
+// -- kcc_agg_leaf_count ---
 // uint64_t kcc_agg_leaf_count(type *ty)
 // Number of scalar leaves a fully brace-elided initializer fills for `ty`
 // (\stdref{6.7.9p20}): 1 for a scalar, length*leaves for an array, the sum of
@@ -774,7 +774,7 @@ _kcc_agg_leaf_count:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_infer_arr_elems --------------------------------------------------
+// -- kcc_infer_arr_elems ---
 // uint64_t kcc_infer_arr_elems(node *head, type *elem)
 // Count how many array elements a brace-elided initializer list `head..`
 // forms when each element has aggregate type `elem`: an item with its own
@@ -822,7 +822,7 @@ _kcc_infer_arr_elems:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_sema_infer_array_len ---------------------------------------------
+// -- kcc_sema_infer_array_len ---
 // void kcc_sema_infer_array_len(node *decl)
 // If the declaration's type is an incomplete array (an AST_TYPE_ARRAY with no
 // size expression) and it has an initializer, synthesise an AST_INT_LIT
@@ -933,7 +933,7 @@ its descent at any nested loop or \texttt{switch}, whose own
 \texttt{break}s bind there instead.
 
 @d Sema: return path @{
-// -- kcc_sema_const_true --------------------------------------------------
+// -- kcc_sema_const_true ---
 // int kcc_sema_const_true(node *expr)
 // 1 iff expr is (parenthesised) integer/char constant with a non-zero value.
 .text
@@ -963,7 +963,7 @@ _kcc_sema_const_true:
     mov x0, #0
     ret
 
-// -- kcc_sema_has_toplevel_break ------------------------------------------
+// -- kcc_sema_has_toplevel_break ---
 // int kcc_sema_has_toplevel_break(node *s)
 // 1 iff s contains a break that would exit the *enclosing* loop, i.e. a
 // break not itself inside a nested loop or switch.
@@ -1031,7 +1031,7 @@ _kcc_sema_has_toplevel_break:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_is_noreturn_call --------------------------------------------
+// -- kcc_sema_is_noreturn_call ---
 // int kcc_sema_is_noreturn_call(node *expr)
 // 1 iff expr is a direct call to a known _Noreturn library function.
 .p2align 2
@@ -1071,7 +1071,7 @@ _kcc_sema_is_noreturn_call:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_falls_through -----------------------------------------------
+// -- kcc_sema_falls_through ---
 // int kcc_sema_falls_through(node *s)
 // 1 iff control can be *proven* to reach the bottom of statement s.
 .p2align 2
@@ -1173,7 +1173,7 @@ _kcc_sema_falls_through:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_check_return_path -------------------------------------------
+// -- kcc_sema_check_return_path ---
 // void kcc_sema_check_return_path(node *func)
 // Under -Wall, warn if a non-void, non-main function can fall off its end.
 // The return type is read from _kcc_sema_cur_ret, which the body handler set
@@ -1234,7 +1234,7 @@ separate value-directed rule.  String literals have type \texttt{char~*}
 array that decays to a pointer.
 
 @d Sema: expr literal @{
-// -- kcc_sema_expr_literal ------------------------------------------------
+// -- kcc_sema_expr_literal ---
 // type_desc *kcc_sema_expr_literal(node *expr)
 //   x19 = expression node, x20 = tag (set by caller)
 .text
@@ -1368,7 +1368,7 @@ that is not one of those integers (a pointer, a float) is unranked and
 the check is skipped.
 
 @d Sema: expr binary @{
-// -- kcc_sema_expr_binary -------------------------------------------------
+// -- kcc_sema_expr_binary ---
 // type_desc *kcc_sema_expr_binary(node *expr)
 //   x19 = expression node
 .text
@@ -1501,7 +1501,7 @@ _kcc_sema_expr_binary:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_sema_int_signedness ----------------------------------------------
+// -- kcc_sema_int_signedness ---
 // int kcc_sema_int_signedness(type_desc *t)
 // 1 = signed integer, 0 = unsigned integer, -1 = not an integer we rank.
 // Integer kinds CHAR..LLONG carry signedness in TY_F0; an enum is signed int.
@@ -1525,7 +1525,7 @@ _kcc_sema_int_signedness:
     mov x0, #-1
     ret
 
-// -- kcc_sema_is_nonneg_const ---------------------------------------------
+// -- kcc_sema_is_nonneg_const ---
 // int kcc_sema_is_nonneg_const(node *e)
 // 1 iff e is a (parenthesised) integer/char literal.  In this AST such a
 // literal is always non-negative -- a negative value is a unary-minus
@@ -1554,7 +1554,7 @@ _kcc_sema_is_nonneg_const:
     mov x0, #0
     ret
 
-// -- kcc_sema_check_sign_compare ------------------------------------------
+// -- kcc_sema_check_sign_compare ---
 // void kcc_sema_check_sign_compare(node *expr, type_desc *lt, type_desc *rt)
 // Under -Wall, warn when a comparison mixes a signed and an unsigned integer
 // operand, unless one operand is a known non-negative constant (the common,
@@ -1619,7 +1619,7 @@ pointer, the checker falls back to \texttt{int}.  Logical not
 the operand type.
 
 @d Sema: expr unary @{
-// -- kcc_sema_expr_unary --------------------------------------------------
+// -- kcc_sema_expr_unary ---
 // type_desc *kcc_sema_expr_unary(node *expr)
 //   x19 = expression node
 .text
@@ -1737,7 +1737,7 @@ covered, because the function type descriptor does not yet carry its
 parameter types.
 
 @d Sema: expr assign @{
-// -- kcc_sema_expr_assign -------------------------------------------------
+// -- kcc_sema_expr_assign ---
 // type_desc *kcc_sema_expr_assign(node *expr)
 //   x19 = expression node
 // Type of assignment = type of LHS.
@@ -1793,7 +1793,7 @@ _kcc_sema_expr_assign:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_sema_ptr_int_class -----------------------------------------------
+// -- kcc_sema_ptr_int_class ---
 // int kcc_sema_ptr_int_class(type_desc *t)
 // 1 = pointer, 2 = integer (bool..long long, enum), 0 = anything else.
 .p2align 2
@@ -1820,7 +1820,7 @@ _kcc_sema_ptr_int_class:
     mov x0, #0
     ret
 
-// -- kcc_sema_is_null_const -----------------------------------------------
+// -- kcc_sema_is_null_const ---
 // int kcc_sema_is_null_const(node *e)
 // 1 iff e is a (parenthesised) integer literal equal to zero -- the null
 // pointer constant, which converts to any pointer without complaint.
@@ -1845,7 +1845,7 @@ _kcc_sema_is_null_const:
     mov x0, #0
     ret
 
-// -- kcc_sema_check_int_ptr -----------------------------------------------
+// -- kcc_sema_check_int_ptr ---
 // void kcc_sema_check_int_ptr(node *loc, type *dst, type *src, node *srcexpr)
 // Under -Wall, warn when an integer is converted to a pointer or vice versa
 // without a cast (assignment, initialisation, return).  A null pointer
@@ -1927,7 +1927,7 @@ the callee-saved \texttt{x22}; the C port keeps it in the local
 \texttt{callee\_implicit}.
 
 @d Sema: expr call @{
-// -- kcc_sema_expr_call ---------------------------------------------------
+// -- kcc_sema_expr_call ---
 // type_desc *kcc_sema_expr_call(node *expr)
 //   x19 = expression node
 .text
@@ -2056,7 +2056,7 @@ so type-checking and code generation agree on both the resolved field
 and its offset.
 
 @d Sema: expr member @{
-// -- kcc_type_find_member -------------------------------------------------
+// -- kcc_type_find_member ---
 // (AST_FIELD_DECL, uint64_t offset) kcc_type_find_member(type *sty, char *name)
 //   x0 = struct/union type, x1 = member name
 // Returns x0 = matching field decl (0 if none), x1 = its byte offset within
@@ -2120,7 +2120,7 @@ _kcc_type_find_member:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_sema_expr_member -------------------------------------------------
+// -- kcc_sema_expr_member ---
 // type_desc *kcc_sema_expr_member(node *expr)
 //   x19 = expression node (AST_MEMBER)
 // F0=object, F1=name_ptr, F2=arrow(1)/dot(0)
@@ -2264,7 +2264,7 @@ result.  No conversion code is emitted at this stage; the IR builder
 handles actual truncation and extension.
 
 @d Sema: expr cast @{
-// -- kcc_sema_expr_cast ---------------------------------------------------
+// -- kcc_sema_expr_cast ---
 // type_desc *kcc_sema_expr_cast(node *expr)
 //   x19 = expression node
 // F0=type, F1=expr
@@ -2317,7 +2317,7 @@ them---silently truncated every string to the pointer size, corrupting
 memory downstream.
 
 @d Sema: expr sizeof @{
-// -- kcc_sema_expr_sizeof -------------------------------------------------
+// -- kcc_sema_expr_sizeof ---
 // type_desc *kcc_sema_expr_sizeof(node *expr)
 //   x19 = expression node
 // F0=operand (type node or expr), F1=is_type

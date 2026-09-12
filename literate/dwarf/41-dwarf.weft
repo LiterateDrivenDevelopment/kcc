@@ -33,7 +33,7 @@ The DWARF tag, attribute, and form codes we use, plus the standard
 line-number opcodes.
 
 @d DWARF: constants @{
-// -- DWARF v4 constants -------------------------------------------------
+// -- DWARF v4 constants ---
 .equ DW_TAG_compile_unit, 0x11
 .equ DW_TAG_subprogram,   0x2e
 .equ DW_CHILDREN_no,      0
@@ -70,7 +70,7 @@ encoding), raw strings, and---for the two length-prefixed sections---a
 back-patch of a previously reserved \texttt{u32}.
 
 @d DWARF: emit @{
-// -- dwarf byte emitters ------------------------------------------------
+// -- dwarf byte emitters ---
 // All append to _kcc_dwarf_buf at _kcc_dwarf_pos (bounds-guarded).
 .text
 .p2align 2
@@ -257,7 +257,7 @@ builder).  A function's \texttt{high\_pc} is the next function's entry
 (functions are laid out in order), or the total code size for the last.
 
 @d DWARF: build @{
-// -- kcc_dwarf_build ----------------------------------------------------
+// -- kcc_dwarf_build ---
 // void kcc_dwarf_build(void)
 // No-op unless -g.  Builds .debug_abbrev/.debug_info/.debug_line into
 // _kcc_dwarf_buf and records per-section offset/length globals.
@@ -288,7 +288,7 @@ _kcc_dwarf_build:
     ldp x29, x30, [sp], #16
     ret
 
-// -- .debug_abbrev ------------------------------------------------------
+// -- .debug_abbrev ---
 .p2align 2
 _kcc_dwarf_build_abbrev:
     stp x29, x30, [sp, #-16]!
@@ -378,7 +378,7 @@ _kcc_dwarf_build_abbrev:
     ldp x29, x30, [sp], #16
     ret
 
-// -- .debug_info --------------------------------------------------------
+// -- .debug_info ---
 // x19 = length-field patch position, x20 = func index, x21 = func count,
 // x22 = funcs vec, x23 = current func, x24 = code size.
 .p2align 2
@@ -492,7 +492,7 @@ _kcc_dwarf_build_info:
     ldp x29, x30, [sp], #64
     ret
 
-// -- .debug_line --------------------------------------------------------
+// -- .debug_line ---
 // x19 = unit_length patch pos, x20 = header_length patch pos,
 // x21 = func index, x22 = funcs vec, x23 = func count, x24 = cur line reg.
 .p2align 2
@@ -577,7 +577,7 @@ _kcc_dwarf_build_line:
     sub x1, x0, x1
     mov x0, x20
     bl _kcc_dw_patch32
-    // ---- line-number program ----
+    // --- line-number program ---
     mov x24, #1                              // line register starts at 1
     adrp x0, _kcc_ir_funcs@@PAGE
     add x0, x0, _kcc_ir_funcs@@PAGEOFF
@@ -689,7 +689,7 @@ sections take addresses running upward from there while their \emph{file}
 offsets stay in the blob's own span.
 
 @d DWARF: macho @{
-// -- kcc_dwarf_sect64 ---------------------------------------------------
+// -- kcc_dwarf_sect64 ---
 // Write one 80-byte section_64 in the __DWARF segment.
 //   x0 = 16-byte section name ptr, x1 = addr, x2 = size, x3 = file offset
 .text
@@ -734,7 +734,7 @@ _kcc_dwarf_sect64:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_dwarf_emit_macho -----------------------------------------------
+// -- kcc_dwarf_emit_macho ---
 // void kcc_dwarf_emit_macho(uint64_t dwarf_file_base, uint64_t vmaddr)
 // Emit the __DWARF LC_SEGMENT_64 + 3 section_64 records.  vmaddr is placed
 // past the __TEXT segment so the segments' VM ranges do not overlap (the
@@ -760,7 +760,7 @@ _kcc_dwarf_emit_macho:
     ldr x22, [x0]
     add x23, x20, x21
     add x23, x23, x22    // total blob size
-    // ---- LC_SEGMENT_64 (__DWARF) ----
+    // --- LC_SEGMENT_64 (__DWARF) ---
     mov w0, #LC_SEGMENT_64
     bl _kcc_macho_write32
     mov w0, #(72 + 80*3)
@@ -813,7 +813,7 @@ _kcc_dwarf_emit_macho:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_dwarf_total_len ------------------------------------------------
+// -- kcc_dwarf_total_len ---
 // uint64_t kcc_dwarf_total_len(void) -> abbrev_len + info_len + line_len.
 // The Mach-O layout uses this to reserve the debug blob's file span between
 // the code bytes and the LINKEDIT region (relocs/symtab/strtab).
@@ -833,7 +833,7 @@ _kcc_dwarf_total_len:
     add x0, x0, x1
     ret
 
-// -- kcc_dwarf_append_blob ----------------------------------------------
+// -- kcc_dwarf_append_blob ---
 // void kcc_dwarf_append_blob(void)
 // Copy the built debug sections into the Mach-O output.  Called right after
 // the code bytes so the blob precedes the LINKEDIT region.
@@ -864,7 +864,7 @@ _kcc_dwarf_append_blob:
 \section{Global State}
 
 @d DWARF: data @{
-// -- DWARF global state -------------------------------------------------
+// -- DWARF global state ---
 .data
 .p2align 3
 .globl _kcc_dwarf_enabled

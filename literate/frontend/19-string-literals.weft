@@ -57,7 +57,7 @@ token's start pointer is updated to the new arena buffer, and the
 length is updated to the processed length.
 
 @d StringLit: process @{
-// -- String literal escape processing ----------------------------------
+// -- String literal escape processing ---
 // kcc_strlit_process()
 // Processes all pending string and char literal tokens.
 // Called after preprocessing completes.
@@ -365,7 +365,7 @@ or parser calls \texttt{kcc\_strlit\_process} on individual token buffers
 as needed.  Full stream processing is deferred to the parser phase.
 
 @d StringLit: data @{
-// -- String literal data (reserved for future use) ---------------------
+// -- String literal data (reserved for future use) ---
 .data
 .p2align 3
 @}

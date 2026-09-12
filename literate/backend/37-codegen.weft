@@ -39,7 +39,7 @@ scratch register, and x12 as an additional scratch for
 The code generator's fixed parameters---slot size, scratch register assignments, and patch-entry layout---are defined here as assembler equates so they can be referenced symbolically throughout the backend.
 
 @d CodeGen: constants @{
-// -- CodeGen constants --------------------------------------------------------
+// -- CodeGen constants ---
 .equ CG_SLOT_SIZE,   8           // each vreg occupies 8 bytes on stack
 .equ CG_REG_SRC1,   9           // x9 = first source scratch
 .equ CG_REG_SRC2,  10           // x10 = second source scratch
@@ -65,7 +65,7 @@ instructions have been lowered, the fixup pass
 appends the raw string data to the code section.
 
 @d CodeGen: init @{
-// -- kcc_codegen_init ---------------------------------------------------------
+// -- kcc_codegen_init ---
 .text
 .globl _kcc_codegen_init
 .p2align 2
@@ -218,7 +218,7 @@ itself is copied by the shared aggregate-fill machinery
 flexible member.
 
 @d CodeGen: preregister globals @{
-// -- kcc_cg_fam_extra ---------------------------------------------------------
+// -- kcc_cg_fam_extra ---
 // uint64_t kcc_cg_fam_extra(node *decl, type *ty)
 // The extra storage bytes an initialized trailing flexible array member needs
 // beyond the struct's nominal size.  Returns 0 unless `ty` is a struct, `decl`
@@ -304,7 +304,7 @@ _kcc_cg_fam_extra:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_preregister_globals --------------------------------------------------
+// -- kcc_preregister_globals ---
 // void kcc_preregister_globals(node *trans_unit)
 //   x0 = AST_TRANS_UNIT node
 // Walks top-level variable declarations, resolves their types, and
@@ -437,7 +437,7 @@ _kcc_preregister_globals:
     bl _kcc_cg_prereg_stmt       // recurse the whole body, at any block depth
     b .Lprg_fn_next
 
-// -- kcc_cg_prereg_static -------------------------------------------------
+// -- kcc_cg_prereg_static ---
 // void kcc_cg_prereg_static(node *decl)
 //   Reserve backing storage for one `static` local (block-scoped, static
 //   storage duration) and record it as defined in this TU.
@@ -545,7 +545,7 @@ _kcc_cg_prereg_static:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_cg_prereg_stmt ---------------------------------------------------
+// -- kcc_cg_prereg_stmt ---
 // void kcc_cg_prereg_stmt(node *stmt)
 //   Walk a statement (and its AST_F4 sibling chain) and reserve storage for
 //   every `static` local declaration at any block depth, descending into
@@ -651,7 +651,7 @@ and then writes each initialiser element at its member's recorded byte offset
 laid out byte-accurately.
 
 @d CodeGen: preregister globals @{
-// -- kcc_rodata_leaf_bits -----------------------------------------------------
+// -- kcc_rodata_leaf_bits ---
 // uint64_t kcc_rodata_leaf_bits(node *n, uint64_t kind)
 // Raw initializer bits for a leaf.  An integer element is a symtab-free constant
 // expression (kcc_rodata_const_intexpr accepted it), so it folds through
@@ -708,7 +708,7 @@ _kcc_rodata_leaf_bits:
 @}
 
 @d CodeGen: preregister globals @{
-// -- kcc_emit_struct_fields ---------------------------------------------------
+// -- kcc_emit_struct_fields ---
 // void kcc_emit_struct_fields(type *sty, node *init, char *buf, uint64_t base)
 // Lay one struct's fields into buf at byte offset `base`, positionally from the
 // brace list `init`.  The region is assumed already zeroed, so a short list
@@ -753,7 +753,7 @@ _kcc_emit_struct_fields:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_emit_rodata_global ---------------------------------------------------
+// -- kcc_emit_rodata_global ---
 // void kcc_emit_rodata_global(node *decl, char *uname)
 //   decl  = AST_VAR_DECL accepted by kcc_global_const_rodata
 //   uname = linker symbol name ("_"+source or "_"+mangled), arena-owned
@@ -1015,7 +1015,7 @@ _kcc_emit_rodata_global:
     ldp x29, x30, [sp], #112
     ret
 
-// -- kcc_emit_rodata_ptrarr ---------------------------------------------------
+// -- kcc_emit_rodata_ptrarr ---
 // void kcc_emit_rodata_ptrarr(node *decl, char *uname)
 //   decl accepted by kcc_global_const_ptrarr (a const array of const pointers
 //        initialised with string literals / NULL)
@@ -1151,7 +1151,7 @@ referenced before its definition failed to link.  The subsequent
 \texttt{SYM\_VALUE} to the real code offset.
 
 @d CodeGen: compile all @{
-// -- kcc_cg_preregister_funcs -------------------------------------------------
+// -- kcc_cg_preregister_funcs ---
 // void kcc_cg_preregister_funcs(void)
 // Registers a defined (value=0) linker symbol for every IR function, records
 // the index in IRF_SYMIDX, and enters non-modinit functions into the extern
@@ -1256,7 +1256,7 @@ _kcc_cg_preregister_funcs:
 @}
 
 @d CodeGen: compile all @{
-// -- kcc_codegen_all ----------------------------------------------------------
+// -- kcc_codegen_all ---
 // void kcc_codegen_all(void)
 // Iterates all IR functions and generates code for each.
 .text
@@ -1318,7 +1318,7 @@ We distinguish the two by reading the existing instruction and
 checking bit~24.
 
 @d CodeGen: patch branches @{
-// -- kcc_codegen_patch_branches -----------------------------------------------
+// -- kcc_codegen_patch_branches ---
 // void kcc_codegen_patch_branches(ht *bb_labels, vec *patches)
 //   x0 = bb_labels hash table
 //   x1 = patch vec
@@ -1483,7 +1483,7 @@ transparent.  This also closes a latent overflow: a translation unit with more
 than 4\,KB of string data previously wrote past the block.
 
 @d CodeGen: emit strings @{
-// -- kcc_cstr_reserve ---------------------------------------------------------
+// -- kcc_cstr_reserve ---
 // void kcc_cstr_reserve(uint64_t need)
 // Ensure the cstring buffer holds at least `need` bytes; grow (allocate 2x or
 // `need`, whichever is larger, and copy the live prefix) otherwise.  Preserves
@@ -1539,7 +1539,7 @@ _kcc_cstr_reserve:
 @}
 
 @d CodeGen: emit strings @{
-// -- kcc_emit_cstring ---------------------------------------------------------
+// -- kcc_emit_cstring ---
 // uint64_t kcc_emit_cstring(const char *data, uint64_t len)
 // Copy a string into the read-only cstring buffer (NUL-terminated), mint a
 // local l_.str.N symbol at its offset with a fixup (value patched to
@@ -1662,7 +1662,7 @@ _kcc_emit_cstring:
 @}
 
 @d CodeGen: emit strings @{
-// -- kcc_codegen_string_lit ---------------------------------------------------
+// -- kcc_codegen_string_lit ---
 // void kcc_codegen_string_lit(ir_instr *instr)
 // Handles IR_STRING_LIT: copies string to cstring buffer, creates a
 // local symbol with ADRP+ADD relocations, stores pointer to dest vreg.
@@ -1865,7 +1865,7 @@ cstring buffer to the tail of the code buffer, growing the
 buffer if the combined size exceeds its capacity.
 
 @d CodeGen: emit strings @{
-// -- kcc_codegen_emit_strings -------------------------------------------------
+// -- kcc_codegen_emit_strings ---
 // void kcc_codegen_emit_strings(void)
 // Fixes up string symbol values and appends cstring data to code buffer.
 // Must be called after kcc_codegen_all() and before kcc_macho_init().
@@ -1994,7 +1994,7 @@ the cstring subsystem---the data buffer, write position, literal
 counter, and fixup vector pointer.
 
 @d CodeGen: data @{
-// -- CodeGen data -------------------------------------------------------------
+// -- CodeGen data ---
 .data
 .p2align 3
 .globl _kcc_cg_frame_size

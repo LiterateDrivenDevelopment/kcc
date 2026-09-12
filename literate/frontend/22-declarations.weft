@@ -47,7 +47,7 @@ honoured in code generation, which is enough for the header declarations a
 kernel build pulls in.
 
 @d Decl: parse declaration @{
-// -- kcc_parse_decl ----------------------------------------------------
+// -- kcc_parse_decl ---
 // node *kcc_parse_decl(void)
 // Parses a declaration or function definition.
 // Returns AST node (VarDecl, FuncDecl, TypedefDecl, StructDecl, etc.)
@@ -421,7 +421,7 @@ alignments past sixteen, dynamically realigning the stack pointer; that
 refinement is deferred.
 
 @d Decl: parse specifiers @{
-// -- kcc_parse_skip_attributes -----------------------------------------
+// -- kcc_parse_skip_attributes ---
 // void kcc_parse_skip_attributes(void)
 // GNU attributes (\texttt{\_\_attribute\_\_((...))}) and \texttt{\_\_extension\_\_}
 // may appear at many points in a declaration; real system headers use them
@@ -542,7 +542,7 @@ _kcc_parse_skip_attributes:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_parse_typeof --------------------------------------------------
+// -- kcc_parse_typeof ---
 // node *kcc_parse_typeof(void)
 // GNU \texttt{typeof} (and \texttt{\_\_typeof\_\_}): a type-specifier whose value
 // is the type of a parenthesised type-name or expression.  It disambiguates the
@@ -656,7 +656,7 @@ token text pointer is held in the callee-saved \texttt{x21} because
 @}
 
 @d Decl: parse specifiers @{
-// -- kcc_parse_decl_specs ----------------------------------------------
+// -- kcc_parse_decl_specs ---
 // (node*, uint64_t) kcc_parse_decl_specs(void)
 // Parses declaration specifiers.
 // Returns: x0 = type node, x1 = storage class
@@ -1128,7 +1128,7 @@ discards them.  The kernel headers rely on this---\texttt{extern char~*
 \texttt{*} and the name.
 
 @d Decl: parse declarator @{
-// -- kcc_parse_declarator ----------------------------------------------
+// -- kcc_parse_declarator ---
 // node *kcc_parse_declarator(node *base_type)
 //   x0 = base type node
 // Parses a declarator and returns a declaration node
@@ -1234,7 +1234,7 @@ adjusts to pointer-to-function (\stdref{6.7.6.3}) and which is directly callable
 as a function designator.
 
 @d Decl: parse declaration @{
-// -- kcc_parse_typedef_funcfix ----------------------------------------------
+// -- kcc_parse_typedef_funcfix ---
 // void kcc_parse_typedef_funcfix(node *decl)
 //   If decl is an AST_FUNC_DECL, replace its F0 (currently the bare return
 //   type) with an AST_TYPE_FUNC type node built from the return type and the
@@ -1279,7 +1279,7 @@ these are parsed and discarded rather than modelled, so declarations like
 \texttt{int x[static 5]} or \texttt{int x[const *]} are accepted.
 
 @d Decl: parse direct declarator @{
-// -- kcc_parse_direct_declarator ---------------------------------------
+// -- kcc_parse_direct_declarator ---
 // node *kcc_parse_direct_declarator(node *type)
 //   x0 = type built so far
 // Returns a VarDecl or FuncDecl node.
@@ -1744,7 +1744,7 @@ is a closing parenthesis, comma, or ellipsis, the parameter is unnamed ---
 an abstract parameter consisting of a type alone.
 
 @d Decl: parse direct declarator @{
-// -- kcc_parse_param_decl ----------------------------------------------
+// -- kcc_parse_param_decl ---
 // node *kcc_parse_param_decl(void)
 // Parses a parameter declaration.
 .globl _kcc_parse_param_decl
@@ -1817,7 +1817,7 @@ or \texttt{[N]} suffix by splicing it in place of the base type
 (\texttt{\_kcc\_abst\_splice}), yielding \texttt{ptr(func(void)$\rightarrow$void)}.
 
 @d Decl: parse abstract @{
-// -- kcc_parse_abstract_declarator -------------------------------------
+// -- kcc_parse_abstract_declarator ---
 // node *kcc_parse_abstract_declarator(node *base_type)
 //   x0 = base type
 // Returns a type node (possibly wrapped in pointers/arrays).
@@ -2042,7 +2042,7 @@ _kcc_parse_abstract_declarator:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_abst_splice ------------------------------------------------------
+// -- kcc_abst_splice ---
 // node *kcc_abst_splice(node *chain, node *old_base, node *new_type)
 // Replace old_base with new_type inside `chain`'s AST_F0 type links (as for a
 // grouped concrete declarator), implementing inside-out declarator semantics
@@ -2085,7 +2085,7 @@ anonymous struct/union members.  The result is wrapped in a
 specifier loop can accumulate.
 
 @d Decl: parse struct @{
-// -- kcc_parse_struct_or_union -----------------------------------------
+// -- kcc_parse_struct_or_union ---
 // node *kcc_parse_struct_or_union(void)
 // Parses: struct/union [ident] [{ field-list }]
 .globl _kcc_parse_struct_or_union
@@ -2404,7 +2404,7 @@ wrapped in a \texttt{TYPE\_ENUM} wrapper so it can be returned as a type
 specifier to the declaration specifier loop.
 
 @d Decl: parse enum @{
-// -- kcc_parse_enum ----------------------------------------------------
+// -- kcc_parse_enum ---
 // node *kcc_parse_enum(void)
 // Parses: enum [ident] [{ enumerator-list }]
 .globl _kcc_parse_enum
@@ -2557,7 +2557,7 @@ It consists of specifier-qualifiers followed by an optional abstract
 declarator (which can include pointers and array brackets but no name).
 
 @d Decl: parse type name @{
-// -- kcc_parse_type_name -----------------------------------------------
+// -- kcc_parse_type_name ---
 // node *kcc_parse_type_name(void)
 // Parses a type-name (for casts, sizeof, _Alignof).
 // Returns a type node.
@@ -2605,7 +2605,7 @@ specifier.  It returns 1 for type keywords (char, int, etc.), type
 qualifiers (const, volatile, etc.), and typedef names.
 
 @d Decl: is type token @{
-// -- kcc_parse_is_type_token -------------------------------------------
+// -- kcc_parse_is_type_token ---
 // int kcc_parse_is_type_token(void)
 // Returns 1 if the current token can start a type specifier.
 .globl _kcc_parse_is_type_token
@@ -2752,7 +2752,7 @@ evaluated when the initializer is lowered.  The IR builder
 constant-expression evaluator, where literals and enum constants alike resolve.
 
 @d Decl: parse init @{
-// -- kcc_parse_initializer ---------------------------------------------
+// -- kcc_parse_initializer ---
 // node *kcc_parse_initializer(void)
 // Parses an initializer: assignment-expr or { init-list }
 .globl _kcc_parse_initializer
@@ -2833,7 +2833,7 @@ _kcc_parse_initializer:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_parse_designated_element --------------------------------------
+// -- kcc_parse_designated_element ---
 // node *kcc_parse_designated_element(void)
 // One initializer-list element.  If it starts with a designation---a
 // *sequence* of `.member` and `[index]` designators (\stdref{6.7.9p6}:
@@ -2975,7 +2975,7 @@ buffer is not null-terminated at the token's end, so passing the pointer alone
 first exercised this path) ran the intern hash off the mapping and faulted.
 
 @d Decl: parse static assert @{
-// -- kcc_parse_static_assert -------------------------------------------
+// -- kcc_parse_static_assert ---
 // node *kcc_parse_static_assert(void)
 // Parses: _Static_assert ( expr , string ) ;
 .globl _kcc_parse_static_assert
@@ -3042,6 +3042,6 @@ additional data is required beyond what the individual parsing functions use
 locally.
 
 @d Decl: data @{
-// -- Declaration parser data (reserved) --------------------------------
+// -- Declaration parser data (reserved) ---
 // No additional data needed for declaration parsing.
 @}

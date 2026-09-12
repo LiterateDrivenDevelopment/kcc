@@ -16,7 +16,7 @@ to \texttt{int} (or \texttt{unsigned int} if the original type's values
 cannot be represented in \texttt{int}).
 
 @d Conv: integer promotions @{
-// -- kcc_conv_promote -----------------------------------------------------
+// -- kcc_conv_promote ---
 // type_desc *kcc_conv_promote(type_desc *type)
 //   x0 = original type
 // Returns promoted type (int or unsigned int if rank < int, else unchanged).
@@ -64,7 +64,7 @@ Per \stdref{6.3.1.8}: given two arithmetic operands, find the common
 type to which both are converted.
 
 @d Conv: usual arithmetic @{
-// -- kcc_conv_usual -------------------------------------------------------
+// -- kcc_conv_usual ---
 // type_desc *kcc_conv_usual(type_desc *t1, type_desc *t2)
 //   x0 = left type, x1 = right type
 // Returns the common type for binary arithmetic.
@@ -199,7 +199,7 @@ a pointer-to-function (\stdref{6.3.2.1p4}).  Both functions check the
 \texttt{kcc\_type\_ptr} to wrap it; otherwise they return the type unchanged.
 
 @d Conv: array decay @{
-// -- kcc_conv_array_decay -------------------------------------------------
+// -- kcc_conv_array_decay ---
 // type_desc *kcc_conv_array_decay(type_desc *type)
 //   x0 = type (may be TY_ARRAY or not)
 // If array: returns pointer-to-element type.
@@ -233,7 +233,7 @@ This allows a function name to be used directly in a call expression
 without the explicit \texttt{\&} operator.
 
 @d Conv: func decay @{
-// -- kcc_conv_func_decay --------------------------------------------------
+// -- kcc_conv_func_decay ---
 // type_desc *kcc_conv_func_decay(type_desc *type)
 //   x0 = type (may be TY_FUNC or not)
 // If function: returns pointer-to-function type.
@@ -268,7 +268,7 @@ no-op stub that returns the descriptor unchanged, since qualifier
 enforcement is handled separately during semantic analysis.
 
 @d Conv: lvalue @{
-// -- kcc_conv_lvalue ------------------------------------------------------
+// -- kcc_conv_lvalue ---
 // type_desc *kcc_conv_lvalue(type_desc *type)
 //   x0 = type descriptor
 // Strips qualifiers for rvalue conversion.
@@ -298,7 +298,7 @@ The check is intentionally permissive so that sema can issue warnings
 rather than hard errors for narrowing or sign-changing conversions.
 
 @d Conv: implicit @{
-// -- kcc_conv_implicit ----------------------------------------------------
+// -- kcc_conv_implicit ---
 // int kcc_conv_implicit(type_desc *from, type_desc *to)
 //   x0 = source type, x1 = target type
 // Returns 1 if implicit conversion from→to is valid, 0 otherwise.

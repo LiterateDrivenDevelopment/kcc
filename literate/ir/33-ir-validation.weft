@@ -54,7 +54,7 @@ false rejections and belong to a later, dataflow-aware pass.
 \section{The Verifier}
 
 @d IR: validate @{
-// -- kcc_ir_validate ------------------------------------------------------
+// -- kcc_ir_validate ---
 // uint64_t kcc_ir_validate(void)
 // Structural check of every IR function: valid opcodes, terminated blocks,
 // and finite (acyclic) instruction lists.  Returns 0 on success, 1 on the

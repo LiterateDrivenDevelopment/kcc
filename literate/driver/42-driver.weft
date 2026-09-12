@@ -35,7 +35,7 @@ straight-line function.  Given a source path and an output path it:
 \end{enumerate}
 
 @d Driver: compile @{
-// -- kcc_driver_compile -------------------------------------------------------
+// -- kcc_driver_compile ---
 // void kcc_driver_compile(const char *src_path, const char *out_path)
 //   x0 = source file path
 //   x1 = output file path
@@ -187,7 +187,7 @@ _kcc_driver_compile:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_driver_emit_asm_object -----------------------------------------------
+// -- kcc_driver_emit_asm_object ---
 // int kcc_driver_emit_asm_object(const char *out_path)
 // Renders the generated code to "<out_path>.s", then runs the platform
 // assembler (`as -o <out_path> <out_path>.s`) to produce the object file.
@@ -247,7 +247,7 @@ _kcc_driver_emit_asm_object:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_driver_x86_object ----------------------------------------------------
+// -- kcc_driver_x86_object ---
 // int kcc_driver_x86_object(const char *out_path)
 // Renders the x86-64 assembly to "<out_path>.s", then runs the platform
 // assembler for x86-64 (`as -arch x86_64 -o <out_path> <out_path>.s`) to
@@ -406,7 +406,7 @@ switches such as \texttt{-DNDEBUG} or a library's \texttt{-DLUA\_USE\_POSIX}
 behave as they do under any C compiler.
 
 @d Driver: compile @{
-// -- kcc_driver_I -------------------------------------------------------------
+// -- kcc_driver_I ---
 // uint64_t kcc_driver_I(const char *arg, const char *next, uint64_t do_register)
 //   Detect a -I option: attached "-Idir" or separated "-I dir".
 //   Returns slots consumed: 0 = not -I, 1 = attached, 2 = separated.
@@ -455,7 +455,7 @@ _kcc_driver_I:
 @}
 
 @d Driver: compile @{
-// -- kcc_driver_D -------------------------------------------------------------
+// -- kcc_driver_D ---
 // uint64_t kcc_driver_D(const char *arg, const char *next, uint64_t do_register)
 //   Detect a -D option: attached "-DNAME"/"-DNAME=VALUE" or separated "-D NAME".
 //   Returns slots consumed: 0 = not -D, 1 = attached, 2 = separated.  With
@@ -520,7 +520,7 @@ four-gigabyte reach those models allow.  It returns 1 for a flag to skip and 0
 for anything else, leaving unrelated arguments to the caller.
 
 @d Driver: compile @{
-// -- kcc_driver_mflag ---------------------------------------------------------
+// -- kcc_driver_mflag ---
 // uint64_t kcc_driver_mflag(const char *arg)
 //   Recognise the x86 code-model / red-zone flags.  Returns 1 if arg is one
 //   kcc honours (skip it), 0 if it is not an -m flag we handle.  An -mcmodel=
@@ -604,7 +604,7 @@ that passes \texttt{-w} (doomgeneric's \texttt{build\_ref.sh}, most autotools
 projects) compiles with \kcc{} directly, with no wrapper to strip the flag.
 
 @d Driver: compile @{
-// -- kcc_driver_xflag ---------------------------------------------------------
+// -- kcc_driver_xflag ---
 // uint64_t kcc_driver_xflag(const char *arg)
 //   1 if arg is a single-slot tuning/warning/optimisation flag kcc tolerates as
 //   a no-op, matched by prefix; 0 otherwise.
@@ -670,7 +670,7 @@ _kcc_driver_xflag:
 @}
 
 @d Driver: compile @{
-// -- kcc_driver_skipopt -------------------------------------------------------
+// -- kcc_driver_skipopt ---
 // uint64_t kcc_driver_skipopt(const char *arg)
 //   1 if arg is a code-model / red-zone / tuning flag to skip as a non-source
 //   option (mflag may exit for an unsupported code model); 0 otherwise.
@@ -714,7 +714,7 @@ _kcc_driver_skipopt:
 @}
 
 @d Driver: compile @{
-// -- kcc_driver_obj_name ------------------------------------------------------
+// -- kcc_driver_obj_name ---
 // char *kcc_driver_obj_name(const char *src)
 //   x0 = source path → arena path with ".c" rewritten to ".o"
 .text
@@ -775,7 +775,7 @@ _kcc_driver_obj_name:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_driver_compile_all ---------------------------------------------------
+// -- kcc_driver_compile_all ---
 // void kcc_driver_compile_all(int argc, char **argv)
 //   x0 = argc, x1 = argv.  Handles "-c": compiles every source argument
 //   (argv[2..]) to an object file, honouring "-o <file>" only when there is
@@ -1086,7 +1086,7 @@ source regardless of its position on the command line; the compile pass then
 skips those flags rather than mistaking them for source files.
 
 @d Driver: link @{
-// -- kcc_getenv ---------------------------------------------------------------
+// -- kcc_getenv ---
 // char *kcc_getenv(const char *name, uint64_t namelen)
 //   Returns the value (text after '=') of environment variable name, or 0.
 .text
@@ -1128,7 +1128,7 @@ _kcc_getenv:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_dir_exists -----------------------------------------------------------
+// -- kcc_dir_exists ---
 // int kcc_dir_exists(const char *path) — 1 if it can be opened, else 0.
 .text
 .globl _kcc_dir_exists
@@ -1150,7 +1150,7 @@ _kcc_dir_exists:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_driver_sdkroot -------------------------------------------------------
+// -- kcc_driver_sdkroot ---
 // char *kcc_driver_sdkroot(void) — SDK path for `ld -syslibroot`.
 .text
 .globl _kcc_driver_sdkroot
@@ -1190,7 +1190,7 @@ _kcc_driver_sdkroot:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_driver_spawn ---------------------------------------------------------
+// -- kcc_driver_spawn ---
 // int kcc_driver_spawn(const char *path, char *const argv[])
 //   fork+execve+wait4; returns the child's exit status (or -1 on fork error).
 .text
@@ -1234,7 +1234,7 @@ _kcc_driver_spawn:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_driver_link_all ------------------------------------------------------
+// -- kcc_driver_link_all ---
 // void kcc_driver_link_all(int argc, char **argv)
 //   Compile every source argument to a .o, link them into an executable
 //   (output from "-o" or "a.out"), remove the objects, and exit with the
@@ -1586,7 +1586,7 @@ _kcc_driver_link_all:
 @}
 
 @d Driver: data @{
-// -- Driver string constants --------------------------------------------------
+// -- Driver string constants ---
 .section __TEXT,__cstring,cstring_literals
 .globl _kcc_opt_compile
 _kcc_opt_compile:

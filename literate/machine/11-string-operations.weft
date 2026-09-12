@@ -22,7 +22,7 @@ Compute the length of a null-terminated string by scanning for the
 zero byte.  This is the moral equivalent of \texttt{strlen(3)}.
 
 @d String: strlen @{
-// -- kcc_strlen -----------------------------------------------------
+// -- kcc_strlen ---
 // size_t kcc_strlen(const char *s)
 //   x0 = pointer to null-terminated string
 // Returns length (not counting the null terminator) in x0.
@@ -43,7 +43,7 @@ regions produce undefined results (as with \texttt{memcpy}, not
 \texttt{memmove}).
 
 @d String: memcpy @{
-// -- kcc_memcpy -----------------------------------------------------
+// -- kcc_memcpy ---
 // void *kcc_memcpy(void *dst, const void *src, size_t n)
 //   x0 = destination
 //   x1 = source
@@ -69,7 +69,7 @@ differing byte in \texttt{s1} is less than in \texttt{s2}, positive
 otherwise.
 
 @d String: memcmp @{
-// -- kcc_memcmp -----------------------------------------------------
+// -- kcc_memcmp ---
 // int kcc_memcmp(const void *s1, const void *s2, size_t n)
 //   x0 = first buffer
 //   x1 = second buffer
@@ -98,7 +98,7 @@ ENDFUNC
 Fill \texttt{n} bytes of memory with the value \texttt{c}.
 
 @d String: memset @{
-// -- kcc_memset -----------------------------------------------------
+// -- kcc_memset ---
 // void *kcc_memset(void *s, int c, size_t n)
 //   x0 = destination
 //   x1 = fill byte (only low 8 bits used)
@@ -124,7 +124,7 @@ in \texttt{s2}, a positive value otherwise --- the same contract as
 \texttt{strcmp(3)}.
 
 @d String: strcmp @{
-// -- kcc_strcmp ------------------------------------------------------
+// -- kcc_strcmp ---
 // int kcc_strcmp(const char *s1, const char *s2)
 //   x0 = first string (null-terminated)
 //   x1 = second string (null-terminated)

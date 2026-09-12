@@ -46,7 +46,7 @@ Compiling one IR function proceeds in nine steps:
 \end{enumerate}
 
 @d CodeGen: compile function @{
-// -- kcc_codegen_func ---------------------------------------------------------
+// -- kcc_codegen_func ---
 // void kcc_codegen_func(ir_func *func)
 //   x0 = pointer to IR function
 .text
@@ -299,7 +299,7 @@ any size is addressed correctly.
 
 @d CodeGen: large immediate adjust @{
 .text
-// -- _kcc_cg_emit_add_imm -----------------------------------------------
+// -- _kcc_cg_emit_add_imm ---
 // void _kcc_cg_emit_add_imm(uint64_t rd, uint64_t rn, uint64_t imm)
 // Emit `add rd, rn, #imm`, splitting into shifted-high + low when imm
 // exceeds the 12-bit immediate (4095).  imm==0 emits a single `add rd,rn,#0`.
@@ -339,7 +339,7 @@ _kcc_cg_emit_add_imm:
     ldp x29, x30, [sp], #48
     ret
 
-// -- _kcc_cg_emit_sub_imm -----------------------------------------------
+// -- _kcc_cg_emit_sub_imm ---
 // void _kcc_cg_emit_sub_imm(uint64_t rd, uint64_t rn, uint64_t imm)
 // Emit `sub rd, rn, #imm`, splitting the same way as the add helper.
 .p2align 2
@@ -378,7 +378,7 @@ _kcc_cg_emit_sub_imm:
     ldp x29, x30, [sp], #48
     ret
 
-// -- _kcc_cg_emit_frame_ldst --------------------------------------------
+// -- _kcc_cg_emit_frame_ldst ---
 // void _kcc_cg_emit_frame_ldst(uint64_t rt, uint64_t byte_off, uint64_t kind)
 //   kind: 0 = LDR int, 1 = STR int, 2 = LDR fp, 3 = STR fp
 // Emit a transfer between register rt and [x29 + byte_off].  A frame-relative
@@ -757,7 +757,7 @@ model is unchanged), then adds the constant~2.  Every spill site---the
 spill---routes through it, so no caller ever assumes slot~$=$~vreg.
 
 @d CodeGen: vreg slot offset @{
-// -- kcc_cg_slot_offset -------------------------------------------------------
+// -- kcc_cg_slot_offset ---
 // uint64_t kcc_cg_slot_offset(uint64_t vreg)
 // Returns the scaled imm12 value for a 64-bit LDR/STR to the vreg's spill slot:
 // imm12_scaled = slotmap[vreg] + 2 (or vreg + 2 when no colouring map exists).
@@ -788,7 +788,7 @@ to the slot.  Both use \texttt{x29} as the base register and the
 scaled immediate computed by \texttt{\_kcc\_cg\_slot\_offset}.
 
 @d CodeGen: vreg slot offset @{
-// -- kcc_cg_load_vreg ---------------------------------------------------------
+// -- kcc_cg_load_vreg ---
 // void kcc_cg_load_vreg(uint64_t vreg, uint64_t reg)
 //   x0 = vreg number, x1 = target register number (9, 10, or 11)
 // If the vreg is register-allocated (see the allocation map), emits a
@@ -844,7 +844,7 @@ _kcc_cg_load_vreg:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_cg_store_vreg --------------------------------------------------------
+// -- kcc_cg_store_vreg ---
 // void kcc_cg_store_vreg(uint64_t vreg, uint64_t reg)
 //   x0 = vreg number, x1 = source register number
 // If the vreg is register-allocated, emits a register move into its physical
@@ -900,7 +900,7 @@ _kcc_cg_store_vreg:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_cg_promoted_reg ------------------------------------------------------
+// -- kcc_cg_promoted_reg ---
 // uint64_t kcc_cg_promoted_reg(uint64_t vreg)
 //   x0 = vreg number
 // Returns the physical register holding a promoted scalar local's contents
@@ -921,7 +921,7 @@ _kcc_cg_promoted_reg:
     mov x0, #0
     ret
 
-// -- kcc_cg_load_vreg_fp / kcc_cg_store_vreg_fp -------------------------------
+// -- kcc_cg_load_vreg_fp / kcc_cg_store_vreg_fp ---
 // Move a double between a vreg and a floating-point register.
 //   x0 = vreg number, x1 = FP register number (0, 1, or 2)
 // A register-allocated vreg lives in a general register even when its value
@@ -1024,7 +1024,7 @@ _kcc_cg_store_vreg_fp:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_cg_callee_transfer ---------------------------------------------------
+// -- kcc_cg_callee_transfer ---
 // void kcc_cg_callee_transfer(uint64_t restore)
 //   x0 = 0 → save (STR), non-zero → restore (LDR).  Walks _kcc_cg_callee_mask
 //   and emits one transfer per used callee-saved register (x19..x28) at
@@ -1134,7 +1134,7 @@ correct bits for floating arguments even though those now travel in
 \texttt{d} registers.
 
 @d CodeGen: marshal args @{
-// -- kcc_cg_marshal_args ------------------------------------------------------
+// -- kcc_cg_marshal_args ---
 // uint64_t kcc_cg_marshal_args(uint64_t *args, uint64_t count, uint64_t fsi)
 //   args = [count, vreg0, class0, ...]; returns the stack_adj subtracted from sp.
 .text
@@ -1156,7 +1156,7 @@ _kcc_cg_marshal_args:
     mov x24, #0                  // stack_adj (return value)
     cbz x20, .Lma_done
 
-    // ---- register phase: NGRN (x22) / NSRN (x23) ----
+    // --- register phase: NGRN (x22) / NSRN (x23) ---
     mov x21, #0                  // arg index
     mov x22, #0                  // NGRN
     mov x23, #0                  // NSRN
@@ -1233,7 +1233,7 @@ _kcc_cg_marshal_args:
     b .Lma_reg_loop
 
 .Lma_stack:
-    // ---- stack image: args[fsi..count-1] at [sp,#(k-fsi)*8] ----
+    // --- stack image: args[fsi..count-1] at [sp,#(k-fsi)*8] ---
     cmp x20, x25
     b.le .Lma_done
     sub x0, x20, x25

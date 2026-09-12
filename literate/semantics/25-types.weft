@@ -29,7 +29,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d Types: constants @{
-// -- Type descriptor layout -----------------------------------------------
+// -- Type descriptor layout ---
 .equ TY_KIND,       0
 .equ TY_SIZE,       8
 .equ TY_ALIGN,     16
@@ -38,7 +38,7 @@ Offset & Field & Description \\
 .equ TY_F1,        40
 .equ TY_DESC_SIZE, 48
 
-// -- Type kind constants --------------------------------------------------
+// -- Type kind constants ---
 .equ TY_VOID,       1
 .equ TY_BOOL,       2
 .equ TY_CHAR,       3    // F0=signed(1)/unsigned(0)
@@ -57,7 +57,7 @@ Offset & Field & Description \\
 .equ TY_ENUM,      16    // F0=enum_decl AST
 .equ TY_INT128,    17    // __int128, F0=signed(1)/unsigned(0); size 16, align 16
 
-// -- Specifier bitmask constants (from parser) ----------------------------
+// -- Specifier bitmask constants (from parser) ---
 .equ SPEC_VOID,       (1 << 0)
 .equ SPEC_CHAR,       (1 << 1)
 .equ SPEC_SHORT,      (1 << 2)
@@ -85,7 +85,7 @@ notably inside the \texttt{union \_\_u128\_halves} the Linux kernel's
 type.
 
 @d Types: init @{
-// -- kcc_types_init --------------------------------------------------------
+// -- kcc_types_init ---
 // void kcc_types_init(void)
 // Pre-allocates singleton type descriptors for all basic types.
 .text
@@ -417,7 +417,7 @@ width on ARM64).  The pointee type descriptor is stored in \texttt{TY\_F0}
 so that later phases can dereference through the pointer chain.
 
 @d Types: make pointer @{
-// -- kcc_type_ptr ---------------------------------------------------------
+// -- kcc_type_ptr ---
 // type_desc *kcc_type_ptr(type_desc *pointee)
 //   x0 = pointee type descriptor
 // Returns pointer to TY_PTR descriptor.
@@ -460,7 +460,7 @@ performs the adjustment; it is applied wherever a parameter's type is
 resolved (symbol registration, the alloca, and AAPCS64 classification).
 
 @d Types: make pointer @{
-// -- kcc_type_param_adjust ------------------------------------------------
+// -- kcc_type_param_adjust ---
 // type_desc *kcc_type_param_adjust(type_desc *t)
 //   x0 = resolved parameter type; returns the adjusted type: an array or
 //   function type becomes a pointer (to element / to function); any other
@@ -503,7 +503,7 @@ out first; layout is idempotent, so this is safe for scalar elements too and
 merely returns their already-known size.
 
 @d Types: make array @{
-// -- kcc_type_array -------------------------------------------------------
+// -- kcc_type_array ---
 // type_desc *kcc_type_array(type_desc *elem, uint64_t len)
 //   x0 = element type, x1 = length (0 = incomplete)
 // Returns TY_ARRAY descriptor.
@@ -553,7 +553,7 @@ types are not object types, so both size and alignment are set to zero
 (K\&R-style) declarations.
 
 @d Types: make function @{
-// -- kcc_type_func --------------------------------------------------------
+// -- kcc_type_func ---
 // type_desc *kcc_type_func(type_desc *ret, vec *params)
 //   x0 = return type, x1 = parameter type vec (or 0)
 // Returns TY_FUNC descriptor.
@@ -595,7 +595,7 @@ between the two constructors is the kind constant (\texttt{TY\_STRUCT}
 versus \texttt{TY\_UNION}).
 
 @d Types: make struct @{
-// -- kcc_type_struct ------------------------------------------------------
+// -- kcc_type_struct ---
 // type_desc *kcc_type_struct(node *decl_node)
 //   x0 = AST struct/union declaration node
 // Returns TY_STRUCT descriptor.
@@ -638,7 +638,7 @@ _kcc_type_struct:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_type_union -------------------------------------------------------
+// -- kcc_type_union ---
 // type_desc *kcc_type_union(node *decl_node)
 .globl _kcc_type_union
 .p2align 2
@@ -681,7 +681,7 @@ to~4.  The AST enum declaration node is stored in \texttt{TY\_F0} for later
 reference during enumerator constant evaluation.
 
 @d Types: make enum @{
-// -- kcc_type_enum --------------------------------------------------------
+// -- kcc_type_enum ---
 // type_desc *kcc_type_enum(node *decl_node)
 //   x0 = AST enum declaration node
 // Returns TY_ENUM descriptor (underlying type is int).
@@ -722,7 +722,7 @@ type descriptor.  Besides the standard widths it accepts the GNU
 the unsigned one.
 
 @d Types: resolve specmask @{
-// -- kcc_type_from_specmask -----------------------------------------------
+// -- kcc_type_from_specmask ---
 // type_desc *kcc_type_from_specmask(uint64_t mask)
 //   x0 = specifier bitmask from parser
 // Returns type descriptor pointer, or 0 on invalid combination.
@@ -1013,7 +1013,7 @@ then compares kind constants and, for basic types, the signedness field in
 classify a type by checking its kind against the relevant set of constants.
 
 @d Types: compatible @{
-// -- kcc_type_compatible --------------------------------------------------
+// -- kcc_type_compatible ---
 // int kcc_type_compatible(type_desc *t1, type_desc *t2)
 //   x0 = first type, x1 = second type
 // Returns 1 if types are compatible per §6.2.7, else 0.
@@ -1066,7 +1066,7 @@ enumerated types.  The check is a linear scan of kind constants ---
 seven comparisons at most.
 
 @d Types: is integer @{
-// -- kcc_type_is_integer --------------------------------------------------
+// -- kcc_type_is_integer ---
 // int kcc_type_is_integer(type_desc *t)
 // Returns 1 if t is an integer type (bool, char, short, int, long, llong, enum).
 .text
@@ -1104,7 +1104,7 @@ delegates to \texttt{kcc\_type\_is\_integer}; if that returns false, it
 checks for \texttt{float}, \texttt{double}, and \texttt{long double}.
 
 @d Types: is arithmetic @{
-// -- kcc_type_is_arithmetic -----------------------------------------------
+// -- kcc_type_is_arithmetic ---
 // int kcc_type_is_arithmetic(type_desc *t)
 // Returns 1 if t is an arithmetic type (integer or floating).
 .text
@@ -1146,7 +1146,7 @@ for example, the controlling expression of \texttt{if}, \texttt{while},
 and \texttt{for} statements.
 
 @d Types: is scalar @{
-// -- kcc_type_is_scalar ---------------------------------------------------
+// -- kcc_type_is_scalar ---
 // int kcc_type_is_scalar(type_desc *t)
 // Returns 1 if t is a scalar type (arithmetic or pointer).
 .text
@@ -1187,7 +1187,7 @@ the rank as an unsigned integer so that callers can compare two types with
 a simple greater-than test.
 
 @d Types: rank @{
-// -- kcc_type_rank --------------------------------------------------------
+// -- kcc_type_rank ---
 // uint64_t kcc_type_rank(type_desc *t)
 // Returns integer conversion rank per §6.3.1.1.
 // Higher rank = wider type for UAC purposes.
@@ -1244,7 +1244,7 @@ _kcc_type_rank:
 Print a human-readable representation of a type descriptor.
 
 @d Types: dump @{
-// -- kcc_type_dump --------------------------------------------------------
+// -- kcc_type_dump ---
 // void kcc_type_dump(type_desc *t)
 //   x0 = type descriptor
 // Prints the type as a readable string (e.g., "int", "const char *").
@@ -1495,7 +1495,7 @@ literals in \texttt{\_\_TEXT,\_\_cstring} provide human-readable names used
 by \texttt{kcc\_type\_dump} for diagnostic output.
 
 @d Types: data @{
-// -- Type singleton pointers ----------------------------------------------
+// -- Type singleton pointers ---
 .data
 .globl _kcc_type_void
 _kcc_type_void:       .quad 0
@@ -1532,7 +1532,7 @@ _kcc_type_double:     .quad 0
 .globl _kcc_type_ldouble
 _kcc_type_ldouble:    .quad 0
 
-// -- Type name strings ----------------------------------------------------
+// -- Type name strings ---
 .section __TEXT,__cstring,cstring_literals
 _kcc_ty_str_void:     .asciz "void"
 _kcc_ty_str_bool:     .asciz "_Bool"

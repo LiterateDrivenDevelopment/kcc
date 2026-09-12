@@ -47,7 +47,7 @@ Offset & Field & Description \\
 \end{center}
 
 @d Parser: AST constants @{
-// -- AST node layout ---------------------------------------------------
+// -- AST node layout ---
 .equ AST_TAG,    0        // node type constant
 .equ AST_LINE,   8        // source line
 .equ AST_COL,   16        // source column
@@ -58,7 +58,7 @@ Offset & Field & Description \\
 .equ AST_F4,    56        // field 4 (usually: next sibling)
 .equ AST_SIZE,  64        // total node size
 
-// -- AST node type constants -------------------------------------------
+// -- AST node type constants ---
 
 // Translation unit
 .equ AST_TRANS_UNIT,      1   // F0=first decl
@@ -142,7 +142,7 @@ the lexer's token globals).  Every parse function that creates a node
 calls this helper first.
 
 @d Parser: AST alloc @{
-// -- kcc_ast_alloc -----------------------------------------------------
+// -- kcc_ast_alloc ---
 // node *kcc_ast_alloc(uint64_t tag)
 //   x0 = AST node type constant
 // Returns pointer to zeroed, tagged 64-byte node.
@@ -198,7 +198,7 @@ the given type.  \texttt{kcc\_parse\_expect} consumes and asserts the type,
 emitting a diagnostic on mismatch.
 
 @d Parser: helpers @{
-// -- kcc_parse_peek ----------------------------------------------------
+// -- kcc_parse_peek ---
 // uint64_t kcc_parse_peek(void)
 // Returns the current token type without consuming it.
 .globl _kcc_parse_peek
@@ -214,7 +214,7 @@ _kcc_parse_peek:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_parse_advance -------------------------------------------------
+// -- kcc_parse_advance ---
 // void kcc_parse_advance(void)
 // Consumes the current token by calling pp_next.
 .globl _kcc_parse_advance
@@ -228,7 +228,7 @@ _kcc_parse_advance:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_parse_match ---------------------------------------------------
+// -- kcc_parse_match ---
 // int kcc_parse_match(uint64_t tok_type)
 //   x0 = expected token type
 // If current token matches, consume it and return 1.  Otherwise return 0.
@@ -261,7 +261,7 @@ _kcc_parse_match:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_parse_expect --------------------------------------------------
+// -- kcc_parse_expect ---
 // void kcc_parse_expect(uint64_t tok_type)
 //   x0 = expected token type
 // If current token matches, consume it.  Otherwise emit error.
@@ -325,7 +325,7 @@ emits a diagnostic and sets the global error flag.
 point: a semicolon, closing brace, or end of file.
 
 @d Parser: error recovery @{
-// -- kcc_parse_error ---------------------------------------------------
+// -- kcc_parse_error ---
 // void kcc_parse_error(const char *msg)
 //   x0 = error message string
 // Emits an error diagnostic at the current token location.
@@ -359,7 +359,7 @@ _kcc_parse_error:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_parse_sync ----------------------------------------------------
+// -- kcc_parse_sync ---
 // void kcc_parse_sync(void)
 // Skips tokens until ';', '}', or EOF is found.
 // Consumes ';' if that is the sync point.
@@ -409,7 +409,7 @@ stack of hash tables.  Each compound statement pushes a new scope, and
 scope.  Lookup searches from top to bottom.
 
 @d Parser: typedef table @{
-// -- kcc_typedef_init --------------------------------------------------
+// -- kcc_typedef_init ---
 // void kcc_typedef_init(void)
 // Initializes the typedef scope stack with a global scope.
 .globl _kcc_typedef_init
@@ -456,7 +456,7 @@ When the block ends, \texttt{kcc\_typedef\_pop\_scope} simply decrements the
 vector's count---the hash table memory is reclaimed when the arena is freed.
 
 @d Parser: typedef table @{
-// -- kcc_typedef_push_scope --------------------------------------------
+// -- kcc_typedef_push_scope ---
 // void kcc_typedef_push_scope(void)
 // Pushes a new empty scope onto the typedef stack.
 .globl _kcc_typedef_push_scope
@@ -483,7 +483,7 @@ _kcc_typedef_push_scope:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_typedef_pop_scope ---------------------------------------------
+// -- kcc_typedef_pop_scope ---
 // void kcc_typedef_pop_scope(void)
 // Pops the topmost scope from the typedef stack.
 .globl _kcc_typedef_pop_scope
@@ -522,7 +522,7 @@ opaque eight-byte pointer sema hands back
 (Section~\ref{sec:variadic-defs}).
 
 @d Parser: typedef table @{
-// -- kcc_typedef_add ---------------------------------------------------
+// -- kcc_typedef_add ---
 // void kcc_typedef_add(const char *name, uint64_t len)
 //   x0 = pointer to name
 //   x1 = name length
@@ -560,7 +560,7 @@ _kcc_typedef_add:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_typedef_lookup ------------------------------------------------
+// -- kcc_typedef_lookup ---
 // int kcc_typedef_lookup(const char *name, uint64_t len)
 //   x0 = pointer to name
 //   x1 = name length
@@ -659,7 +659,7 @@ every declarator but the first silently dropped (they would never reach
 semantic analysis and their names would be ``undeclared'').
 
 @d Parser: translation unit @{
-// -- kcc_parse ---------------------------------------------------------
+// -- kcc_parse ---
 // node *kcc_parse(void)
 // Parses a complete translation unit.
 // Returns AST_TRANS_UNIT node with F0 = first external declaration.
@@ -743,7 +743,7 @@ a textual representation of the AST.  Each node is printed with its tag
 name and field values, indented by depth.
 
 @d Parser: dump AST @{
-// -- kcc_ast_dump ------------------------------------------------------
+// -- kcc_ast_dump ---
 // void kcc_ast_dump(node *root)
 //   x0 = root node pointer
 // Recursively prints the AST tree.
@@ -1339,7 +1339,7 @@ Small helper functions used by the AST dump: tag name lookup, indentation
 printing, and name field printing.
 
 @d Parser: dump helpers @{
-// -- kcc_ast_tag_name --------------------------------------------------
+// -- kcc_ast_tag_name ---
 // const char *kcc_ast_tag_name(uint64_t tag)
 //   x0 = AST tag constant
 // Returns pointer to tag name string.
@@ -1375,7 +1375,7 @@ _kcc_ast_tag_name:
     ldp x29, x30, [sp], #16
     ret
 
-// -- kcc_ast_print_indent ----------------------------------------------
+// -- kcc_ast_print_indent ---
 // void kcc_ast_print_indent(void)
 // Prints spaces for the current indentation level (2 spaces per level).
 .globl _kcc_ast_print_indent
@@ -1402,7 +1402,7 @@ _kcc_ast_print_indent:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ast_indent_inc ------------------------------------------------
+// -- kcc_ast_indent_inc ---
 .globl _kcc_ast_indent_inc
 .p2align 2
 _kcc_ast_indent_inc:
@@ -1413,7 +1413,7 @@ _kcc_ast_indent_inc:
     str  x1, [x0]
     ret
 
-// -- kcc_ast_indent_dec ------------------------------------------------
+// -- kcc_ast_indent_dec ---
 .globl _kcc_ast_indent_dec
 .p2align 2
 _kcc_ast_indent_dec:
@@ -1424,7 +1424,7 @@ _kcc_ast_indent_dec:
     str  x1, [x0]
     ret
 
-// -- kcc_ast_print_name_field ------------------------------------------
+// -- kcc_ast_print_name_field ---
 // void kcc_ast_print_name_field(const char *name_ptr)
 //   x0 = interned name pointer (null-terminated)
 // Prints " 'name'" if name_ptr is non-null.
@@ -1464,7 +1464,7 @@ _kcc_ast_print_name_field:
 Global variables and string constants for the parser.
 
 @d Parser: data @{
-// -- Parser global state -----------------------------------------------
+// -- Parser global state ---
 .data
 .p2align 3
 .globl _kcc_parse_error_flag
@@ -1492,7 +1492,7 @@ These include the ``expected token'' error message, the location separator
 indicators for dot versus arrow syntax.
 
 @d Parser: data @{
-// -- Parser string constants -------------------------------------------
+// -- Parser string constants ---
 .section __TEXT,__cstring,cstring_literals
 
 _kcc_parse_msg_expected:
@@ -1564,7 +1564,7 @@ pairs terminated by a zero sentinel.  The corresponding name strings live in the
 \texttt{\_\_TEXT,\_\_cstring} section so the linker can deduplicate them.
 
 @d Parser: data @{
-// -- AST tag name table ------------------------------------------------
+// -- AST tag name table ---
 // Each entry: .quad tag, .quad name_string_ptr
 .p2align 3
 .data

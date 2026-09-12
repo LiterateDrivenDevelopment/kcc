@@ -602,7 +602,7 @@ void kcc_cg_regalloc(void *func) {
     void *blocks = (void *)IL(func, IRF_BLOCKS);
     unsigned long nbb = IL(blocks, VEC_COUNT);
 
-    /* ---- pass 1: liveness / candidates ---- */
+    /* --- pass 1: liveness / candidates --- */
     unsigned long pos = 0, calls = 0;
     for (unsigned long b = 0; b < nbb; b++) {
         void *bb = *(void **)kcc_vec_get(blocks, b);
@@ -675,7 +675,7 @@ void kcc_cg_regalloc(void *func) {
         }
     }
 
-    /* ---- promotability (mem2reg) ---- */
+    /* --- promotability (mem2reg) --- */
     for (unsigned long b = 0; b < nbb; b++) {
         void *bb = *(void **)kcc_vec_get(blocks, b);
         for (void *i = (void *)IL(bb, BB_FIRST); i; i = (void *)IL(i, IR_NEXT)) {
@@ -727,7 +727,7 @@ void kcc_cg_regalloc(void *func) {
         }
     }
 
-    /* ---- loop detection ---- */
+    /* --- loop detection --- */
     int has_loop = 0;
     for (unsigned long b = 0; b < nbb; b++) {
         void *bb = *(void **)kcc_vec_get(blocks, b);
@@ -741,7 +741,7 @@ void kcc_cg_regalloc(void *func) {
         }
     }
 
-    /* ---- integer linear scan ---- */
+    /* --- integer linear scan --- */
     long reg_end[13];
     for (int i = 0; i < 13; i++) reg_end[i] = -1;
     if (has_loop) {
@@ -788,7 +788,7 @@ void kcc_cg_regalloc(void *func) {
         }
     }
 
-    /* ---- FP linear scan ---- */
+    /* --- FP linear scan --- */
     long reg_end_fp[24];
     for (int i = 0; i < 24; i++) reg_end_fp[i] = -1;
     if (has_loop) {
@@ -832,7 +832,7 @@ void kcc_cg_regalloc(void *func) {
     kcc_cg_fpregmap = fpmap;
     { unsigned long m = kcc_cg_fp_callee_mask, c = 0; while (m) { c += m & 1; m >>= 1; } kcc_cg_fp_save_count = c; }
 
-    /* ---- promotion map ---- */
+    /* --- promotion map --- */
     for (unsigned long v = 0; v < vreg_n; v++)
         if ((flags[v] & 0x100) && map[v]) promoted[v] = map[v];
     kcc_cg_promoted = promoted;

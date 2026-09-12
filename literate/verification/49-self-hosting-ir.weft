@@ -3267,7 +3267,7 @@ static unsigned long bin_short_or(void *e) {
     return res;
 }
 
-/* --- __int128 arithmetic ------------------------------------------------
+/* --- __int128 arithmetic ---
    A 128-bit value is the address of a fresh two-slot (16-byte) alloca, low
    half at offset 0 and high half at offset 8.  All arithmetic below is built
    from ordinary 64-bit IR ops on the two halves. */
@@ -5471,7 +5471,7 @@ static unsigned long kcc_ir_ffs(unsigned long val, unsigned long nbits) {
     return kcc_ir_emit_binop(IR_MUL, tp1, nz);
 }
 
-/* --- always_inline expansion ------------------------------------------------
+/* --- always_inline expansion ---
    An `always_inline` function is inlined at each call by building a clone of its
    body with the parameters replaced by the call's arguments.  This is what makes
    a constant the CALLER knows fold through the callee---the kernel's

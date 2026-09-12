@@ -50,13 +50,13 @@ Level & Operators & Associativity \\
 \end{center}
 
 @d Expr: precedence table @{
-// -- Operator precedence lookup ----------------------------------------
+// -- Operator precedence lookup ---
 // Given a token type t in the punctuator range (60+), the precedence
 // is stored at _kcc_prec_table[t - 60].  Zero means "not a binary op".
 
 .text
 
-// -- _kcc_prec_lookup --------------------------------------------------
+// -- _kcc_prec_lookup ---
 // uint64_t _kcc_prec_lookup(uint64_t tok_type)
 //   x0 = token type
 // Returns precedence level (0 = not a binary op).
@@ -90,7 +90,7 @@ parses an assignment expression, then checks for the comma operator
 (\stdref{6.5.17}).
 
 @d Expr: parse expression @{
-// -- kcc_parse_expr ----------------------------------------------------
+// -- kcc_parse_expr ---
 // node *kcc_parse_expr(void)
 // Parses a full expression (handles comma operator).
 // Returns AST node.
@@ -144,7 +144,7 @@ the next token is an assignment operator (\texttt{=}, \texttt{+=},
 \texttt{-=}, etc.), recurse on the right-hand side.
 
 @d Expr: parse assign @{
-// -- kcc_parse_assign_expr ---------------------------------------------
+// -- kcc_parse_assign_expr ---
 // node *kcc_parse_assign_expr(void)
 // Parses an assignment expression (right-associative).
 .globl _kcc_parse_assign_expr
@@ -203,7 +203,7 @@ expression, and if the next token is \texttt{?}, parse the ``then''
 expression, expect \texttt{:}, and parse the ``else'' conditional.
 
 @d Expr: parse conditional @{
-// -- kcc_parse_cond_expr -----------------------------------------------
+// -- kcc_parse_cond_expr ---
 // node *kcc_parse_cond_expr(void)
 // Parses a conditional expression (ternary ? :).
 .globl _kcc_parse_cond_expr
@@ -281,7 +281,7 @@ parse the right-hand side with \texttt{(prec + 1)} (for left-associativity),
 and build an \texttt{AST\_BINARY\_EXPR} node.
 
 @d Expr: parse binary @{
-// -- kcc_parse_binary_expr ---------------------------------------------
+// -- kcc_parse_binary_expr ---
 // node *kcc_parse_binary_expr(uint64_t min_prec)
 //   x0 = minimum precedence level
 // Returns AST node for the binary expression.
@@ -350,7 +350,7 @@ Unary expressions (\stdref{6.5.3}): prefix operators \texttt{++},
 \texttt{\~{}}, \texttt{!}, plus \texttt{sizeof} and \texttt{\_Alignof}.
 
 @d Expr: parse unary @{
-// -- kcc_parse_unary_expr ----------------------------------------------
+// -- kcc_parse_unary_expr ---
 // node *kcc_parse_unary_expr(void)
 // Parses a unary expression.
 .globl _kcc_parse_unary_expr
@@ -516,7 +516,7 @@ We check: if the current token is \texttt{(} and the next token starts
 a type specifier, it's a cast; otherwise fall through to unary.
 
 @d Expr: parse cast @{
-// -- kcc_parse_cast_expr -----------------------------------------------
+// -- kcc_parse_cast_expr ---
 // node *kcc_parse_cast_expr(void)
 // Parses a cast expression or falls through to unary.
 .globl _kcc_parse_cast_expr
@@ -664,7 +664,7 @@ so the result is an integer constant.  The existing constant folder then reduces
 it to the member's byte offset, so no new evaluation path is needed.
 
 @d Expr: parse postfix @{
-// -- kcc_parse_postfix_expr --------------------------------------------
+// -- kcc_parse_postfix_expr ---
 // node *kcc_parse_postfix_expr(void)
 // Parses a primary expression followed by postfix operations.
 .globl _kcc_parse_postfix_expr
@@ -685,7 +685,7 @@ _kcc_parse_postfix_expr:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_parse_postfix_tail --------------------------------------------
+// -- kcc_parse_postfix_tail ---
 // node *kcc_parse_postfix_tail(node *expr)
 //   x0 = expression to apply postfix operations to
 // Returns the final expression node.
@@ -832,7 +832,7 @@ _kcc_parse_postfix_tail:
     mov x19, x0
     b .Lpostfix_loop
 
-// -- kcc_parse_builtin_offsetof ----------------------------------------
+// -- kcc_parse_builtin_offsetof ---
 // node *kcc_parse_builtin_offsetof(void)
 // On entry the current token is the '(' of __builtin_offsetof(T, desig).
 // Synthesises the AST for `&((T*)0)->desig` (arrow for the first designator
@@ -1050,7 +1050,7 @@ quotes, run the escape processor, and read the first byte of the
 result.  This means \verb|'\n'| correctly evaluates to~10.
 
 @d Expr: parse primary @{
-// -- kcc_parse_primary_expr --------------------------------------------
+// -- kcc_parse_primary_expr ---
 // node *kcc_parse_primary_expr(void)
 // Parses a primary expression.
 .globl _kcc_parse_primary_expr
@@ -1517,7 +1517,7 @@ final type's flags.  Sema and the IR builder are unchanged; they simply read
 the upgraded flags.
 
 @d Expr: parse primary @{
-// -- kcc_parse_atoi ----------------------------------------------------
+// -- kcc_parse_atoi ---
 // uint64_t kcc_parse_atoi(const char *str, uint64_t len)
 //   x0 = pointer to digit string
 //   x1 = length
@@ -1708,7 +1708,7 @@ its bit pattern (via \texttt{fmov}), ready to be stored verbatim in the
 literal's AST node and, later, materialised as an \texttt{IR\_CONST}.
 
 @d Expr: parse float @{
-// -- kcc_is_float_literal ---------------------------------------------
+// -- kcc_is_float_literal ---
 // uint64_t kcc_is_float_literal(const char *str, uint64_t len)
 //   Returns 1 if the pp-number is a floating constant, else 0.
 .text
@@ -1767,7 +1767,7 @@ _kcc_is_float_literal:
     mov x0, #0
     ret
 
-// -- kcc_parse_atof ---------------------------------------------------
+// -- kcc_parse_atof ---
 // uint64_t kcc_parse_atof(const char *str, uint64_t len)
 //   x0 = digit string, x1 = length
 // Returns the IEEE-754 double bit pattern of the decimal constant.
@@ -2015,7 +2015,7 @@ _kcc_parse_atof:
     fmov x0, d0                  // return the double's bit pattern
     ret
 
-// -- kcc_round_to_float -------------------------------------------------------
+// -- kcc_round_to_float ---
 // uint64_t kcc_round_to_float(uint64_t double_bits)
 //   Rounds a double to single precision and returns it back in double format,
 //   so an `f`-suffixed literal such as 16777217.0f holds exactly the value a
@@ -2039,7 +2039,7 @@ assignment expressions for function call arguments.  Returns a
 linked list of nodes via \texttt{F4}.
 
 @d Expr: parse arg list @{
-// -- kcc_parse_arg_list ------------------------------------------------
+// -- kcc_parse_arg_list ---
 // node *kcc_parse_arg_list(void)
 // Parses a comma-separated list of assignment expressions.
 // Returns first argument node (linked via F4), or null if empty.
@@ -2112,7 +2112,7 @@ token type~60, one byte per punctuator slot, with nonzero entries for the
 binary operators at their C17 precedence levels.
 
 @d Expr: data @{
-// -- Expression parser data --------------------------------------------
+// -- Expression parser data ---
 .section __TEXT,__cstring,cstring_literals
 
 _kcc_expr_msg_expected:
@@ -2127,7 +2127,7 @@ _kcc_str_types_compat:
 _kcc_str_builtin_offsetof:
     .asciz "__builtin_offsetof"
 
-// -- Precedence table --------------------------------------------------
+// -- Precedence table ---
 // Indexed by (tok_type - 60).  48 entries covering all punctuators.
 // Value = precedence level (0 = not a binary operator).
 .data

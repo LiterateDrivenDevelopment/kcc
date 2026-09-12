@@ -28,7 +28,7 @@ referenced somewhere in the function.  The bitmap is zeroed before the
 mark pass begins.
 
 @d Opt: dead code elimination @{
-// -- kcc_opt_dce ----------------------------------------------------------
+// -- kcc_opt_dce ---
 // uint64_t kcc_opt_dce(ir_func *func)
 // Eliminates dead instructions.  Returns number of eliminations.
 .text

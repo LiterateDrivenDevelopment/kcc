@@ -38,7 +38,7 @@ and supplies what such headers would declare---for instance the
 
 @d PP: resolve include @{
 .text
-// -- _kcc_pp_file_exists --------------------------------------------
+// -- _kcc_pp_file_exists ---
 // uint64_t _kcc_pp_file_exists(const char *path)
 //   x0 = null-terminated path → 1 if it can be opened, else 0
 .p2align 2
@@ -59,7 +59,7 @@ _kcc_pp_file_exists:
     ldp x29, x30, [sp], #16
     ret
 
-// -- _kcc_pp_resolve_include ----------------------------------------
+// -- _kcc_pp_resolve_include ---
 // char *_kcc_pp_resolve_include(const char *name)
 //   x0 = include name → openable path (arena), or 0 if not found.
 // Searches the including file's directory first, then the name as given.
@@ -231,7 +231,7 @@ translation unit.
 
 @d PP: include path @{
 .text
-// -- _kcc_pp_add_include_dir ----------------------------------------
+// -- _kcc_pp_add_include_dir ---
 // void _kcc_pp_add_include_dir(const char *dir)
 //   Appends dir (normalised with a trailing '/') to the include search list.
 //   Silently ignored once the fixed-size list is full.
@@ -275,7 +275,7 @@ _kcc_pp_add_include_dir:
     ldp x29, x30, [sp], #48
     ret
 
-// -- _kcc_pp_add_default_includes -----------------------------------
+// -- _kcc_pp_add_default_includes ---
 // void _kcc_pp_add_default_includes(const char *argv0)
 //   Derives the compiler's own include directory as dirname(argv0) +
 //   "include" and registers it.  With no directory prefix in argv0 the bare
@@ -339,7 +339,7 @@ _kcc_str_include: .asciz "include"
 
 @d PP: include @{
 .text
-// -- _kcc_pp_do_include ---------------------------------------------
+// -- _kcc_pp_do_include ---
 .p2align 2
 _kcc_pp_do_include:
     stp x29, x30, [sp, #-64]!
@@ -1361,7 +1361,7 @@ line as the message.
 
 @d PP: error directive @{
 .text
-// -- _kcc_pp_do_error -----------------------------------------------
+// -- _kcc_pp_do_error ---
 .p2align 2
 _kcc_pp_do_error:
     stp x29, x30, [sp, #-32]!

@@ -26,7 +26,7 @@ skips the \emph{else\_bb} and branches either to \emph{then\_bb} or
 directly to \emph{merge\_bb}.
 
 @d IR: build if @{
-// -- kcc_ir_build_if ------------------------------------------------------
+// -- kcc_ir_build_if ---
 // void kcc_ir_build_if(node *stmt)
 //   x0 = AST_IF_STMT (F0=cond, F1=then, F2=else)
 .text
@@ -193,7 +193,7 @@ continue=cond\_bb)} so that \texttt{break} and \texttt{continue}
 inside the body emit the correct branch target.
 
 @d IR: build while @{
-// -- kcc_ir_build_while ---------------------------------------------------
+// -- kcc_ir_build_while ---
 // void kcc_ir_build_while(node *stmt)
 //   x0 = AST_WHILE_STMT (F0=cond, F1=body)
 .text
@@ -305,7 +305,7 @@ The loop stack entries are \texttt{(break=exit\_bb,
 continue=cond\_bb)}, just as with \texttt{while}.
 
 @d IR: build do @{
-// -- kcc_ir_build_do ------------------------------------------------------
+// -- kcc_ir_build_do ---
 // void kcc_ir_build_do(node *stmt)
 //   x0 = AST_DO_STMT (F0=body, F1=cond)
 .text
@@ -418,7 +418,7 @@ to \emph{cond\_bb}.  Note that \texttt{continue} targets
 before the next condition test.
 
 @d IR: build for @{
-// -- kcc_ir_build_for -----------------------------------------------------
+// -- kcc_ir_build_for ---
 // void kcc_ir_build_for(node *stmt)
 //   x0 = AST_FOR_STMT (F0=init, F1=cond, F2=incr, F3=body)
 .text
@@ -694,7 +694,7 @@ be resolved, so \texttt{\_kcc\_eval\_addr} type-checks it on demand, exactly as
 the \texttt{sizeof} case does.
 
 @d IR: build switch @{
-// -- kcc_eval_const_int ---------------------------------------------------
+// -- kcc_eval_const_int ---
 // int64_t kcc_eval_const_int(node *n)
 //   Evaluate an integer constant expression (\stdref{6.6}): literals,
 //   parentheses, casts, sizeof, an enum-constant identifier, and the common
@@ -940,7 +940,7 @@ _kcc_eval_const_int:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_eval_addr --------------------------------------------------------
+// -- kcc_eval_addr ---
 // uint64_t kcc_eval_addr(node *n)
 //   The integer value of a null-based address constant --- the address of an
 //   lvalue whose ultimate base is a constant pointer, as produced by
@@ -1025,7 +1025,7 @@ _kcc_eval_addr:
     ldp x29, x30, [sp], #64
     ret
 
-// -- kcc_expr_is_ice ------------------------------------------------------
+// -- kcc_expr_is_ice ---
 // uint64_t kcc_expr_is_ice(node *n)
 //   1 if n is an integer constant expression (\stdref{6.6}) --- literals,
 //   sizeof/_Alignof, an enum-constant identifier, and const-ops thereof ---
@@ -1122,7 +1122,7 @@ _kcc_expr_is_ice:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_addr_is_iconst ---------------------------------------------------
+// -- kcc_addr_is_iconst ---
 // uint64_t kcc_addr_is_iconst(node *n)
 //   Whether the address of the lvalue `n` reduces to an integer constant
 //   expression: its ultimate base must be a constant pointer, as in the
@@ -1171,14 +1171,14 @@ _kcc_addr_is_iconst:
     ldp x29, x30, [sp], #32
     ret
 
-// -- Switch scan state (shared by the two recursive walkers below) --------
+// -- Switch scan state (shared by the two recursive walkers below) ---
 .data
 .p2align 3
 _kcc_sw_default_bb: .quad 0
 _kcc_sw_cond_vreg:  .quad 0
 .text
 
-// -- kcc_ir_sw_scan -------------------------------------------------------
+// -- kcc_ir_sw_scan ---
 // void kcc_ir_sw_scan(node *stmt)
 // Allocate a basic block for every case/default label reachable as a
 // sub-statement of a switch body, stashing it in the label (F2 for a case,
@@ -1255,7 +1255,7 @@ _kcc_ir_sw_scan:
     ldp x29, x30, [sp], #32
     ret
 
-// -- kcc_ir_sw_disp -------------------------------------------------------
+// -- kcc_ir_sw_disp ---
 // void kcc_ir_sw_disp(node *stmt)
 // Emit the dispatch comparison for every case label, in source order, testing
 // the controlling value in _kcc_sw_cond_vreg.  Same traversal as the scan; a
@@ -1505,7 +1505,7 @@ _kcc_ir_sw_disp:
     ldp x29, x30, [sp], #48
     ret
 
-// -- kcc_ir_build_switch --------------------------------------------------
+// -- kcc_ir_build_switch ---
 // void kcc_ir_build_switch(node *stmt)
 //   x0 = AST_SWITCH_STMT (F0=expr, F1=body)
 // Lowers to: dispatch chain → body (labels placed by build_stmt) → exit_bb
@@ -1665,7 +1665,7 @@ body correctly restarts the surrounding loop rather than branching to a
 non-existent target.
 
 @d IR: build break @{
-// -- Loop Stack -----------------------------------------------------------
+// -- Loop Stack ---
 // Tracks break/continue BB targets for nested loops.
 // Max 16 nesting levels. Each entry: {break_bb_id, continue_bb_id} (8 bytes each).
 .text
@@ -1711,7 +1711,7 @@ pointing at that block, and marks the current basic block as terminated
 so that no further instructions are appended to it (\stdref{6.8.6.3}).
 
 @d IR: build break @{
-// -- kcc_ir_build_break ---------------------------------------------------
+// -- kcc_ir_build_break ---
 // void kcc_ir_build_break(node *stmt)
 // Emits unconditional branch to current loop's break target (exit BB).
 .globl _kcc_ir_build_break
@@ -1757,7 +1757,7 @@ that it reads the continue target (offset~+8) from the loop stack
 entry instead of the break target (offset~+0).
 
 @d IR: build continue @{
-// -- kcc_ir_build_continue ------------------------------------------------
+// -- kcc_ir_build_continue ---
 // void kcc_ir_build_continue(node *stmt)
 // Emits unconditional branch to current loop's continue target (cond BB).
 .text

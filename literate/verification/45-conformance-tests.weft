@@ -17,7 +17,7 @@ identified, and that identifiers resembling keyword prefixes are
 \emph{not} misidentified.
 
 @d Test: lex keywords @{
-// -- test_lex_keywords --------------------------------------------------
+// -- test_lex_keywords ---
 // Source: "auto int return _Static_assert foo"
 // Expected: AUTO, INT, RETURN, _STATIC_ASSERT, IDENT, EOF
 .text
@@ -72,7 +72,7 @@ Tests that decimal, hexadecimal, floating-point, and scientific
 notation numbers are all classified as \texttt{TOK\_NUMBER} (pp-number).
 
 @d Test: lex numbers @{
-// -- test_lex_numbers ---------------------------------------------------
+// -- test_lex_numbers ---
 // Source: "42 0xFF 3.14 1e10 0x1p2"
 // Expected: NUMBER, NUMBER, NUMBER, NUMBER, NUMBER, EOF
 .text
@@ -127,7 +127,7 @@ Tests that string literals and character constants are correctly
 classified.
 
 @d Test: lex strings @{
-// -- test_lex_strings ---------------------------------------------------
+// -- test_lex_strings ---
 // Source: "hello" 'x'
 // (The outer quotes in the .asciz are assembler string delimiters;
 //  the inner \" produce the actual " character in the test source.)
@@ -172,7 +172,7 @@ Tests that single-character and multi-character punctuators are
 correctly recognized.
 
 @d Test: lex punctuators @{
-// -- test_lex_punctuators -----------------------------------------------
+// -- test_lex_punctuators ---
 // Source: "(){};,+-*/"
 // Expected: LPAREN RPAREN LBRACE RBRACE SEMI COMMA PLUS MINUS STAR SLASH EOF
 .text
@@ -247,7 +247,7 @@ Tests that both line comments (\texttt{//}) and block comments
 (\texttt{/* */}) are correctly skipped by the lexer.
 
 @d Test: lex comments @{
-// -- test_lex_comments --------------------------------------------------
+// -- test_lex_comments ---
 // Source: "x /* comment */ y // line\nz"
 // Expected: IDENT(x) IDENT(y) IDENT(z) EOF
 .text
@@ -295,7 +295,7 @@ tokenization.  The source \texttt{??=} becomes \texttt{\#},
 which the lexer should tokenize as \texttt{TOK\_HASH}.
 
 @d Test: lex trigraphs @{
-// -- test_lex_trigraphs -------------------------------------------------
+// -- test_lex_trigraphs ---
 // Source: "??= x ??( ??) ??< ??>"
 // After trigraph replacement: "# x [ ] { }"
 // Expected: HASH IDENT LBRACKET RBRACKET LBRACE RBRACE EOF
@@ -357,7 +357,7 @@ after the backslash) becomes \texttt{int x} after splicing, so
 \texttt{int} is recognized as a keyword.
 
 @d Test: lex line splice @{
-// -- test_lex_line_splice -----------------------------------------------
+// -- test_lex_line_splice ---
 // Source: "in\<newline>t x" (stored as bytes: i n \ 0x0A t space x)
 // After line splicing: "int x"
 // Expected: INT IDENT(x) EOF
@@ -402,7 +402,7 @@ terminated by a null sentinel.  The test runner in
 Chapter~\ref{ch:test-harness} iterates through this table.
 
 @d Test: registration @{
-// -- Test registration table --------------------------------------------
+// -- Test registration table ---
 .data
 .p2align 3
 .globl _kcc_test_table
@@ -433,7 +433,7 @@ Each string has a companion \texttt{.equ} that computes its length
 (excluding the null terminator) for passing to \texttt{kcc\_lex\_init}.
 
 @d Test: lex data @{
-// -- Test source strings ------------------------------------------------
+// -- Test source strings ---
 .section __TEXT,__cstring,cstring_literals
 
 _test_src_kw:       .asciz "auto int return _Static_assert foo"

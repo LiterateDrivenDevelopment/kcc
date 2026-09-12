@@ -21,8 +21,18 @@ correct but beautiful.
 
 \section*{Literate Programming: Narrator and Engineer at Once}
 
-Donald Knuth's literate programming inverted the relationship between a
-program and its explanation.  A literate program is not code with comments;
+\begin{quote}
+\itshape
+Let us \textbf{change our traditional attitude to the construction of
+programs}.  Instead of imagining that our main task is to instruct a computer
+what to do, let us concentrate rather on \textbf{explaining to human beings
+what we want a computer to do}.
+\upshape\par\medskip
+\normalfont\hfill---Donald Knuth, \emph{Literate Programming}, 1984
+\end{quote}
+
+\noindent This is the key to everything that follows.  Donald Knuth's literate
+programming inverted the relationship between a program and its explanation.  A literate program is not code with comments;
 it is an essay---a human narrative---with code woven into it, presented in
 whatever order best serves understanding and mechanically extracted into
 something a machine can run.  Knuth's aim was frankly aesthetic: to produce

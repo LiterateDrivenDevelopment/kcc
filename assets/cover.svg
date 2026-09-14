@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1754" viewBox="0 0 1240 1754" font-family="'Helvetica Neue','Helvetica','Arial',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#0A0E17"/>
+      <stop offset="0.55" stop-color="#0E1526"/>
+      <stop offset="1" stop-color="#121C33"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.44" r="0.6">
+      <stop offset="0" stop-color="#3A6EA5" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#3A6EA5" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- background -->
+  <rect width="1240" height="1754" fill="url(#bg)"/>
+  <rect width="1240" height="1754" fill="url(#halo)"/>
+
+  <!-- faint assembly wallpaper: the book IS ARM64 assembly -->
+  <g font-family="'Menlo','Monaco','Consolas',monospace" font-size="21" fill="#7FA0D0" opacity="0.06">
+    <text x="96" y="150">_kcc_main:</text>
+    <text x="96" y="184">    stp   x29, x30, [sp, #-16]!</text>
+    <text x="96" y="218">    mov   x29, sp</text>
+    <text x="96" y="252">    bl    _kcc_lex_next</text>
+    <text x="96" y="286">    bl    _kcc_parse_translation_unit</text>
+    <text x="96" y="320">    bl    _kcc_sema_check</text>
+    <text x="96" y="354">    bl    _kcc_ir_build</text>
+    <text x="96" y="388">    bl    _kcc_opt_run</text>
+    <text x="96" y="422">    bl    _kcc_cg_compile_all</text>
+    <text x="96" y="456">    bl    _kcc_emit_macho</text>
+    <text x="96" y="490">    mov   x0, #0</text>
+    <text x="96" y="524">    ldp   x29, x30, [sp], #16</text>
+    <text x="96" y="558">    ret</text>
+    <text x="96" y="1236">// x86-64: same IR, second back end</text>
+    <text x="96" y="1270">.Lkcc_x86:</text>
+    <text x="96" y="1304">    movq  %rbp, %rsp</text>
+    <text x="96" y="1338">    call  kcc_emit_x86_text</text>
+    <text x="96" y="1372">    // as -&gt; ld -&gt; ELF / Mach-O</text>
+    <text x="96" y="1406">    ret</text>
+  </g>
+
+  <!-- elegant inset frame -->
+  <rect x="54" y="54" width="1132" height="1646" rx="3" fill="none" stroke="#ECAC55" stroke-width="1.5" opacity="0.55"/>
+  <rect x="66" y="66" width="1108" height="1622" rx="2" fill="none" stroke="#7FA0D0" stroke-width="0.8" opacity="0.18"/>
+
+  <!-- series -->
+  <text x="620" y="322" text-anchor="middle" fill="#ECAC55" font-size="34" font-weight="600" letter-spacing="11">LITERATE DRIVEN DEVELOPMENT</text>
+  <line x1="470" y1="360" x2="770" y2="360" stroke="#ECAC55" stroke-width="1.4" opacity="0.7"/>
+  <text x="620" y="404" text-anchor="middle" fill="#9AA6BF" font-size="24" letter-spacing="14">VOLUME ONE</text>
+
+  <!-- hero: kcc with a terminal cursor (unit centred on the page) -->
+  <text x="300" y="820" text-anchor="start" font-family="'Menlo','Monaco','Consolas',monospace" font-size="300" font-weight="700" fill="#F5F1E6">kcc</text>
+  <rect x="872" y="614" width="56" height="206" rx="3" fill="#ECAC55"/>
+  <line x1="308" y1="900" x2="852" y2="900" stroke="#ECAC55" stroke-width="2.5"/>
+
+  <!-- subtitle -->
+  <text x="620" y="1010" text-anchor="middle" fill="#F5F1E6" font-size="50" font-weight="300" letter-spacing="3">A Formal C17 Compiler</text>
+  <text x="620" y="1074" text-anchor="middle" fill="#F5F1E6" font-size="50" font-weight="300" letter-spacing="3">in ARM64 Assembly</text>
+
+  <!-- x86 line -->
+  <text x="620" y="1160" text-anchor="middle" fill="#9AA6BF" font-size="30" letter-spacing="4">with x86-64 support via cross-compiler</text>
+
+  <!-- authors -->
+  <line x1="500" y1="1486" x2="740" y2="1486" stroke="#ECAC55" stroke-width="1.2" opacity="0.6"/>
+  <text x="620" y="1512" text-anchor="middle" fill="#9AA6BF" font-size="22" letter-spacing="7">CO-AUTHORED BY</text>
+  <text x="620" y="1566" text-anchor="middle" fill="#F5F1E6" font-size="40" font-weight="400" letter-spacing="2">Cuauht&#233;moc Pacheco</text>
+  <text x="620" y="1616" text-anchor="middle" fill="#F5F1E6" font-size="34" font-weight="300" letter-spacing="2">&amp; an Artificial Intelligence &#183; Claude</text>
+
+  <!-- version badge -->
+  <text x="620" y="1668" text-anchor="middle" font-family="'Menlo','Monaco','Consolas',monospace" font-size="26" fill="#ECAC55" letter-spacing="4">kcc 1.0.0</text>
+</svg>

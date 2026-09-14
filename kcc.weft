@@ -40,6 +40,8 @@
 % Code listings
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{graphicx}   % for the SVG-derived cover (assets/cover.pdf)
+\usepackage{tikz}       % full-bleed cover placement (overlay node)
 
 % Cross-references and links
 \usepackage{hyperref}
@@ -152,7 +154,19 @@
 
 %\WEFTlstsetup
 \begin{document}
-\maketitle
+
+% ═══════════════════════════════════════════════════════════════════
+% Front cover.  The design lives in assets/cover.svg (the editable
+% vector asset); the build renders it to assets/cover.pdf, which is placed
+% full-bleed as the first page via a TikZ overlay node anchored to the page.
+% ═══════════════════════════════════════════════════════════════════
+\thispagestyle{empty}
+\begin{tikzpicture}[remember picture, overlay]
+  \node[inner sep=0pt] at (current page.center)
+       {\includegraphics[width=\paperwidth, height=\paperheight]{assets/cover}};
+\end{tikzpicture}%
+\null
+\clearpage
 
 % ═══════════════════════════════════════════════════════════════════
 % Preface (before the table of contents)

@@ -270,7 +270,10 @@ weave:
 	weft -w tex -d -r kcc.weft
 
 # PDF: compile the woven LaTeX to kcc.pdf (lualatex for native Unicode).
+# The cover is edited as assets/cover.svg; regenerate assets/cover.pdf from it
+# when rsvg-convert is available, else fall back to the committed cover.pdf.
 pdf: weave
+	command -v rsvg-convert >/dev/null 2>&1 && rsvg-convert -f pdf -o assets/cover.pdf assets/cover.svg || true
 	latexmk -lualatex -interaction=nonstopmode -f kcc.tex
 
 # Clean generated files

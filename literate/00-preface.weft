@@ -12,7 +12,18 @@ The compiler is real.  It reads C17, checks it against the Standard,
 optimises it, allocates its registers, and emits native ARM64 machine code
 and a Mach-O object that Apple's linker accepts; it compiles itself to a
 byte-identical binary; it passes an exhaustive battery of conformance tests
-against a reference compiler.  The argument is this: that literate
+against a reference compiler.  It is also a genuine cross-compiler: from that
+same Apple-silicon binary it \emph{generates} x86-64 code---a different
+instruction set, object format, and calling convention---that runs on
+Linux/x86-64 and, on the Mac itself, under Apple's \emph{Rosetta} translator.
+The distinction matters and is worth stating plainly: the code generation is
+entirely \kcc{}'s work; Rosetta (and, for Linux binaries, QEMU) only
+\emph{runs} the result on the ARM machine, so that x86-64 output can be
+executed and checked against a reference without a second computer.  It
+generates x86-64 the way \texttt{gcc} does---selecting the instructions,
+laying out the stack, obeying the System~V ABI, and printing assembly for the
+system assembler to encode---not by translating one machine's assembly into
+another's.  The argument is this: that literate
 programming, practised with an artificial-intelligence collaborator, is a
 way of building software that is at once more \emph{certain}, more
 \emph{tractable}, \emph{faster}, and \emph{cheaper} than the way most

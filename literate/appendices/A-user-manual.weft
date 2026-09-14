@@ -279,6 +279,24 @@ kcc --target=x86_64 add.c -o add
 ./add                 # runs under Rosetta; echo $? shows the exit status
 \end{verbatim}
 
+\paragraph{Rosetta runs the code; \kcc{} generates it.}  It is worth being
+precise about the division of labour, because ``runs under Rosetta'' can be
+misread as though Rosetta did the porting.  It does not.  \emph{All} of the
+x86-64 code generation is \kcc{}'s: from the target-neutral IR it selects the
+x86-64 instructions, lays out the stack frame, and obeys the calling
+convention, then prints x86-64 assembly for the system \texttt{as} to encode
+into an object and \texttt{ld} to link---the same ``emit assembly, hand it to
+the assembler'' model \texttt{gcc} uses, and genuine code generation for a
+second instruction set, not a translation of ARM64 into x86-64.  Rosetta enters
+only \emph{after} the executable exists: \kcc{} runs on Apple silicon (ARM64)
+but produces an x86-64 binary, and Rosetta---Apple's x86-64-to-ARM64 binary
+translator---is what lets that binary \emph{execute} on the same machine, so its
+output and exit status can be checked against a mainstream x86-64 compiler
+without a separate Intel box.  For the Linux/ELF binaries (\S\ref{sec:um-sqlite},
+\S\ref{sec:um-kernelboot}) that execution layer is QEMU instead; either way it
+is a runtime convenience, invisible to and independent of how the code was
+produced.
+
 The x86-64 back end has grown well past its scalar beginnings.  It handles
 integer, pointer, and \emph{floating-point} arithmetic, the full set of
 operators and comparisons, control flow (\texttt{if}, \texttt{while},

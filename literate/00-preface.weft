@@ -78,6 +78,19 @@ understanding and the executable follow.  The prose is not
 documentation bolted onto a finished program; it is the place the program is
 thought, and a change is not finished until the story and the code agree.
 
+The practice brings its own instruments, made for this way of working.
+\weft{}\footnote{\weft{} is open-source software:
+\url{https://github.com/temo-pacheco/weft}.}, the literate metalanguage in
+which this book is composed, is built to
+be authored and read by human and artificial collaborators alike---prose and
+code fragments woven into one text that either kind of author can follow and
+revise.  And a growing repertoire of \emph{skills}---reusable, codified
+procedures the AI co-author can invoke---carries the recurring work of the
+craft, from keeping the prose and the code in agreement to running the
+verifications that check both against the world, so that the collaboration is
+guided by method rather than left to improvisation.  The tools are new; what
+they make practical is the old discipline, finally without its loneliness.
+
 \section*{Four Things It Did}
 
 This book is the demonstration.  In building \kcc{}, Literate Driven

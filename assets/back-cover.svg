@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1754" viewBox="0 0 1240 1754">
+  <!-- Back cover — same Swiss / Bauhaus system as the front -->
+  <rect width="1240" height="1754" fill="#EFE9DB"/>
+
+  <!-- ── header row (mirrors the front) ─────────────────────────── -->
+  <text x="130" y="152" font-family="'Menlo','Monaco',monospace" font-size="25" letter-spacing="5" fill="#17140F">LITERATE DRIVEN DEVELOPMENT</text>
+  <text x="1110" y="152" text-anchor="end" font-family="'Menlo','Monaco',monospace" font-size="25" letter-spacing="3" fill="#17140F">VOL. 1</text>
+  <rect x="130" y="176" width="980" height="3" fill="#17140F"/>
+
+  <!-- ── lead line ──────────────────────────────────────────────── -->
+  <text x="130" y="320" font-family="'Georgia','Times New Roman',serif" font-size="58" font-weight="700" fill="#17140F">A compiler you can read.</text>
+
+  <!-- ── blurb, elegant serif ───────────────────────────────────── -->
+  <g font-family="'Georgia','Times New Roman',serif" font-size="31" fill="#17140F">
+    <text x="130" y="430">kcc is a formal C17 compiler written entirely in ARM64</text>
+    <text x="130" y="474">assembly, set down as one literate program in weft —</text>
+    <text x="130" y="518">a metalanguage that weaves prose and code together,</text>
+    <text x="130" y="562">every instruction explained before it is written.</text>
+
+    <text x="130" y="646">It checks C against the Standard, optimises it, allocates</text>
+    <text x="130" y="690">registers, and emits native machine code. It compiles</text>
+    <text x="130" y="734">itself to a byte-identical binary, and cross-compiles</text>
+    <text x="130" y="778">x86-64 for Linux and macOS. It builds and runs Lua,</text>
+    <text x="130" y="822">SQLite, and DOOM — and boots a Linux kernel.</text>
+  </g>
+
+  <!-- ── highlights, monospace with crimson square bullets ──────── -->
+  <text x="130" y="946" font-family="'Menlo','Monaco',monospace" font-size="22" letter-spacing="4" fill="#17140F">kcc AT A GLANCE</text>
+  <g font-family="'Menlo','Monaco',monospace" font-size="26" fill="#17140F">
+    <rect x="130" y="988" width="17" height="17" fill="#C21E33"/>
+    <text x="172" y="1004">Formal C17, checked against the Standard</text>
+    <rect x="130" y="1032" width="17" height="17" fill="#C21E33"/>
+    <text x="172" y="1048">Written in ARM64 assembly &#183; self-hosting</text>
+    <rect x="130" y="1076" width="17" height="17" fill="#C21E33"/>
+    <text x="172" y="1092">Cross-compiles to x86-64 &#183; Linux and macOS</text>
+    <rect x="130" y="1120" width="17" height="17" fill="#C21E33"/>
+    <text x="172" y="1136">Runs Lua &#183; SQLite &#183; DOOM &#183; the Linux kernel</text>
+  </g>
+
+  <!-- ── closing line, italic serif (the thesis) ────────────────── -->
+  <g font-family="'Georgia','Times New Roman',serif" font-style="italic" font-size="29" fill="#17140F">
+    <text x="130" y="1264">The case for Literate Driven Development: that software</text>
+    <text x="130" y="1306">built in the open, with an AI collaborator, and explained</text>
+    <text x="130" y="1348">as it is made, can be more certain and more humane —</text>
+    <text x="130" y="1390">and can aspire to be a work of art.</text>
+  </g>
+
+  <!-- ── learn-more call to action ──────────────────────────────── -->
+  <text x="130" y="1462" font-family="'Menlo','Monaco',monospace" font-size="23" fill="#17140F">Learn more about Literate Driven Development</text>
+  <text x="130" y="1500" font-family="'Menlo','Monaco',monospace" font-size="26" fill="#C21E33">literatedriven.com</text>
+
+  <!-- ── ISBN barcode (placeholder) ─────────────────────────────── -->
+  <g>
+    <rect x="838" y="1398" width="272" height="132" fill="#FFFFFF" stroke="#17140F" stroke-width="1.5"/>
+    <g fill="#17140F">
+      <rect x="860" y="1416" width="4" height="82"/>
+      <rect x="868" y="1416" width="2" height="82"/>
+      <rect x="876" y="1416" width="6" height="82"/>
+      <rect x="888" y="1416" width="3" height="82"/>
+      <rect x="896" y="1416" width="8" height="82"/>
+      <rect x="908" y="1416" width="2" height="82"/>
+      <rect x="914" y="1416" width="4" height="82"/>
+      <rect x="924" y="1416" width="6" height="82"/>
+      <rect x="936" y="1416" width="3" height="82"/>
+      <rect x="944" y="1416" width="2" height="82"/>
+      <rect x="950" y="1416" width="7" height="82"/>
+      <rect x="962" y="1416" width="4" height="82"/>
+      <rect x="972" y="1416" width="2" height="82"/>
+      <rect x="980" y="1416" width="6" height="82"/>
+      <rect x="990" y="1416" width="3" height="82"/>
+      <rect x="998" y="1416" width="9" height="82"/>
+      <rect x="1012" y="1416" width="2" height="82"/>
+      <rect x="1018" y="1416" width="4" height="82"/>
+      <rect x="1028" y="1416" width="3" height="82"/>
+      <rect x="1036" y="1416" width="6" height="82"/>
+      <rect x="1048" y="1416" width="2" height="82"/>
+      <rect x="1054" y="1416" width="5" height="82"/>
+      <rect x="1064" y="1416" width="3" height="82"/>
+      <rect x="1072" y="1416" width="7" height="82"/>
+      <rect x="1084" y="1416" width="4" height="82"/>
+    </g>
+    <text x="974" y="1520" text-anchor="middle" font-family="'Menlo','Monaco',monospace" font-size="16" letter-spacing="2" fill="#17140F">ISBN &#8212; TO BE ASSIGNED</text>
+  </g>
+
+  <!-- ── footer ─────────────────────────────────────────────────── -->
+  <rect x="130" y="1560" width="980" height="3" fill="#17140F"/>
+  <text x="130" y="1616" font-family="'Georgia','Times New Roman',serif" font-size="34" fill="#17140F">Cuauht&#233;moc Pacheco</text>
+  <text x="130" y="1656" font-family="'Menlo','Monaco',monospace" font-size="22" letter-spacing="1" fill="#17140F" opacity="0.7">co-authored with an AI &#183; Claude &#183; Independently published</text>
+  <text x="1110" y="1616" text-anchor="end" font-family="'Menlo','Monaco',monospace" font-size="30" font-weight="700" fill="#17140F">kcc {{VERSION}}</text>
+</svg>

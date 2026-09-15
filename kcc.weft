@@ -9,7 +9,7 @@
 
 @W tex
 
-\documentclass[11pt,a4paper,twoside,openright,DIV=15]{scrbook}
+\documentclass[11pt,a4paper,twoside,openright,DIV=15,cleardoublepage=empty]{scrbook}
 \usepackage{multicol}
 
 % Page layout: DIV=15 gives a wider/taller type area suited to
@@ -156,6 +156,18 @@
 \begin{document}
 
 % ═══════════════════════════════════════════════════════════════════
+% Front matter (preliminaries) begins here — before the cover — so that
+% the roman page counter and the physical page parity stay in step.
+% Everything from \frontmatter to \mainmatter is numbered in lowercase
+% roman (invisibly, on the empty-styled preliminaries) and carries no
+% chapter numbers.  The cleardoublepage=empty class option guarantees the
+% blank versos that the openright layout inserts are truly blank — no
+% page number and no running head — so the courtesy leaf reads as respite,
+% not as an omission.
+% ═══════════════════════════════════════════════════════════════════
+\frontmatter
+
+% ═══════════════════════════════════════════════════════════════════
 % Front cover.  The design lives in assets/cover.svg (the editable
 % vector asset); the build renders it to assets/cover.pdf, which is placed
 % full-bleed as the first page via a TikZ overlay node anchored to the page.
@@ -166,6 +178,130 @@
        {\includegraphics[width=\paperwidth, height=\paperheight]{assets/cover}};
 \end{tikzpicture}%
 \null
+\clearpage
+
+% The preliminaries flow one page after another with no blank leaves:
+% open=any lets the unnumbered chapters (Acknowledgments, Preface) begin
+% on whichever side comes next instead of forcing a recto and leaving a
+% blank verso behind.  open=right is restored just before \mainmatter so
+% the body keeps its conventional recto chapter openings.
+\KOMAoptions{open=any}
+
+% --- Portadilla / Anteportada (half-title) --------------------------
+% The abbreviated title, and nothing else: the work announces itself by
+% name before it states its full business.
+\thispagestyle{empty}
+\begin{center}
+  \vspace*{0.30\textheight}
+  {\sffamily\bfseries\fontsize{80}{80}\selectfont kcc}\\[1.4em]
+  {\sffamily\large\MakeUppercase{Literate Driven Development}}\\[0.5em]
+  {\sffamily Volume~1}
+\end{center}
+\clearpage
+
+% --- Página de créditos / Legal -------------------------------------
+% On the verso of the half-title: edition, copyright, the licence under
+% which the work and its source are released (MIT — the most permissive
+% of the common licences), and the customary bibliographic identifiers.
+\thispagestyle{empty}
+\footnotesize
+\noindent \emph{Literate Driven Development}, Volume~1.\\
+\kcc{}: A Formal C17 Compiler in ARM64 Assembly
+that cross-compiles to x86-64.\\[1em]
+
+\noindent First edition, 2026.\\[0.5em]
+\noindent Copyright \textcopyright{} 2026 Cuauht\'emoc Pacheco.\\
+Co-authored with an artificial-intelligence collaborator
+(Claude, Anthropic).\\[1em]
+
+\noindent This book and the \kcc{} source it contains are released under the
+\textbf{MIT License}.\\[0.6em]
+\noindent Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation files (the
+``Software''), to deal in the Software without restriction, including without
+limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom
+the Software is furnished to do so, subject to the following conditions:\\[0.4em]
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.\\[0.4em]
+THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.\\[1em]
+
+\noindent ISBN: \emph{to be assigned}.\\
+Legal deposit / Dep\'osito legal: \emph{to be assigned}.\\[0.5em]
+\noindent Independently published.\\[1em]
+
+\noindent Learn more about Literate Driven Development at
+\url{https://literatedriven.com}.\\[1em]
+
+\noindent Typeset with Lua\LaTeX{} from a \weft{} literate program.  The cover
+is generated from \texttt{assets/cover.svg}.  The complete source, including
+this book, lives in the \kcc{} repository.
+\normalsize
+\clearpage
+
+% --- Portada interior (full title page) -----------------------------
+% The formal title page: full title, subtitle, series, authorship, and
+% imprint.
+\clearpage
+\thispagestyle{empty}
+\begin{center}
+  \vspace*{0.12\textheight}
+  {\sffamily\bfseries\fontsize{92}{92}\selectfont kcc}\\[1.5em]
+  {\Large A Formal C17 Compiler in ARM64 Assembly}\\[0.6em]
+  {\large that cross-compiles to x86-64}\\[0.7em]
+  {\itshape A Literate Program}\\[3.2em]
+  {\sffamily\MakeUppercase{Literate Driven Development}
+     \quad\textbullet\quad Volume~1}
+  \vfill
+  {\large Cuauht\'emoc Pacheco}\\[0.4em]
+  {\small co-authored with an AI \quad\textbullet\quad Claude}\\[2.4em]
+  {\sffamily\small Independently published \quad\textbullet\quad 2026}\\[1.4em]
+  {\sffamily\small\href{https://literatedriven.com}{literatedriven.com}}
+\end{center}
+\clearpage
+
+% --- Dedicatoria ----------------------------------------------------
+\clearpage
+\thispagestyle{empty}
+\begin{flushright}
+  \vspace*{0.26\textheight}
+  \itshape
+  For everyone who believes\\
+  that a program should be able\\
+  to explain itself.\\[2.2em]
+  And for the friends, colleagues,\\
+  and all those who make programming,\\
+  artificial intelligence, and everything\\
+  we achieve with them into tools\\
+  for a better society.
+\end{flushright}
+\clearpage
+
+% --- Agradecimientos ------------------------------------------------
+\clearpage
+\chapter*{Acknowledgments}
+\addcontentsline{toc}{chapter}{Acknowledgments}
+
+This book stands on Donald~Knuth's single idea: that a program can be written
+to be read by people first and machines second.  Every page here is an attempt
+to honour it.
+
+I am grateful to the \weft{} literate-programming tool, without which the
+source and the prose could not have been kept as one document; to the free
+software that builds and checks \kcc{}---the assembler, the linker, \LaTeX{},
+and the reference compilers that serve as its oracle; and to the artificial
+intelligence that worked alongside me on this volume, turning long stretches
+of assembly and exposition into a dialogue rather than a solitary labour.
+
+Finally, to the readers who open a compiler expecting to be told how it
+works, and are willing to be shown: this book is for you.
+
 \clearpage
 
 % ═══════════════════════════════════════════════════════════════════
@@ -188,6 +324,21 @@
 \makeatletter
 \newcommand{\forwardlabel}[1]{\immediate\write\@@auxout{\string\newlabel{#1}{{??}{??}{}{}{}}}}
 \makeatother
+
+% Single source of truth for the version string: this fragment is defined
+% once here and expanded (via @<version@>) wherever the build emits a version.
+\noindent The compiler's version is defined once, here, and expanded into every
+place the build emits it:
+
+@d version @{1.0.0@}
+
+% ═══════════════════════════════════════════════════════════════════
+% Main matter begins: arabic page numbering restarts at 1 and chapters
+% are numbered again.  Restore recto chapter openings for the body.
+% ═══════════════════════════════════════════════════════════════════
+\KOMAoptions{open=right}
+\mainmatter
+
 % ═══════════════════════════════════════════════════════════════════
 % Part: Orientation — the practical front matter (manual, playbook,
 % output routing), placed first so a reader can arrive quickly.
@@ -685,6 +836,23 @@ the binaries, and verify that the exit code matches the expected value.
 @m
 @u
 \end{multicols}
+
+% ═══════════════════════════════════════════════════════════════════
+% Back cover.  Like the front, the design lives in assets/back-cover.svg
+% (the editable vector asset).  It is embedded as a high-resolution PNG
+% (assets/back-cover.png, 300 dpi) rather than a PDF: rsvg-convert's PDF
+% backend mis-positions the glyph after an italic ``f'' (dropping the
+% following letter or space), which the italic serif blurb would hit; its
+% PNG backend renders the same text correctly.  Placed full-bleed as the
+% final page via the same TikZ overlay node anchored to the page.
+% ═══════════════════════════════════════════════════════════════════
+\clearpage
+\thispagestyle{empty}
+\begin{tikzpicture}[remember picture, overlay]
+  \node[inner sep=0pt] at (current page.center)
+       {\includegraphics[width=\paperwidth, height=\paperheight]{assets/back-cover.png}};
+\end{tikzpicture}%
+\null
 
 
 \end{document}

@@ -286,17 +286,129 @@ the flagship does.  Each rung was small, and each was verified before the
 next was begun.
 
 \paragraph{As realized for x86-64.}  This ladder is not hypothetical: it is
-exactly the path the x86-64 back end of Chapter~\ref{ch:emit-x86} follows.
-Rung one stood up emission and the minimal instruction set together
-(\texttt{const}\,+\,\texttt{ret}, proving the pipeline with
+exactly the path the x86-64 back end of Chapter~\ref{ch:emit-x86} walked---and
+walked to the end.  Rung one stood up emission and the minimal instruction set
+together (\texttt{const}\,+\,\texttt{ret}, proving the pipeline with
 \texttt{int main(void)\{return N;\}}); rung two grew selection across the whole
 integer ALU and the memory operations over an all-spill frame; rung three added
 comparisons, branches, and the System~V calling convention, including
-stack-passed arguments.  Each was committed only once its programs ran
-exit-identically to \texttt{clang -arch x86\_64} under Rosetta and the ARM64
-oracle stayed byte-identical.  The remaining rungs---data emission, floating
-point, and the by-value aggregate ABI---are what stand between the current
-scalar subset and the full difference corpus.
+stack-passed arguments; the later rungs completed the frame, the data section,
+floating point, and the runtime.  Each was committed only once its programs ran
+exit-identically to \texttt{clang -arch x86\_64} and the ARM64 oracle stayed
+byte-identical to the last bit.
+
+\paragraph{A complete second target.}  What began as one rung is now a full
+second target.  x86-64 emits AT\&T assembly from the same neutral IR and lets
+the system \texttt{as} and \texttt{ld} encode and link it, on both Mach-O
+(macOS) and ELF (Linux); it implements the whole System~V AMD64 ABI---integer
+and floating arguments, variadic \texttt{va\_list}, stack-passed and by-value
+aggregate arguments, computed \texttt{goto}---and passes the difference corpus.
+It compiles real, unmodified software: Lua, SQLite, and Linux-kernel
+translation units---one of which, a \kcc{}-compiled \texttt{init/main.o}, boots
+a tiny-config Linux~6.6 to the point of executing \texttt{init}.  On Linux the
+target \emph{self-hosts}: \kcc{} compiled by \kcc{} reproduces every one of its
+own modules to a three-way byte-identical fixpoint, and drives \texttt{as} and
+\texttt{ld} itself, so that \texttt{kcc file.c -o out} yields an ELF executable
+in a single command.  Throughout, the code generation is entirely \kcc{}'s
+work; Rosetta on the Mac and a user-mode emulator on Linux only \emph{run} the
+output so it can be checked against the oracle (\S\ref{sec:testing-cross}), and
+the ARM64 target stayed byte-identical to the bit.  The playbook is therefore
+not a hope but a demonstrated path: a back end built to its shape reaches all
+the way to real, running software---not a subset.
+
+\section{A Target Skeleton}
+\label{sec:target-skeleton}
+
+The interface of \S\ref{sec:target-interface} and the ladder of
+\S\ref{sec:porting-playbook} describe the work; this section names it as a
+concrete list of artifacts to create, in the shape they take inside \kcc{}.
+Treat the x86-64 back end (Chapter~\ref{ch:emit-x86}) as the worked template:
+every item below already exists there in full, and the fastest way to write a
+new target is to read x86-64's version of each and transcribe it for the new
+machine.  Nothing above the emitter is touched.
+
+\paragraph{1. Selection and identity.}  Add the architecture to the
+\texttt{\_kcc\_target} selector and route \texttt{--target=\emph{name}} to it in
+the driver, leaving ARM64/Mach-O the default.  Fix the symbol convention (an
+underscore prefix for the Mach-O world, none for ELF) and, if the target serves
+two object formats, an OS selector---\texttt{\_kcc\_x86\_os} is the precedent
+for a single emitter that produces both Mach-O and ELF.
+
+\paragraph{2. Register banks (pure data).}  Declare, as arrays, the
+allocatable general registers split into caller-saved and callee-saved, the
+floating bank likewise, and the reserved registers (stack pointer, frame
+pointer, the argument registers, any zero register).  A legal shortcut for
+bring-up is to declare \emph{no} allocatable registers and spill every value to
+the frame; this is exactly how x86-64 first came up, and it lets selection be
+written and tested before the banks are tuned.
+
+\paragraph{3. ABI classifier and argument marshaller.}  Extend the type
+classifier (\texttt{\_kcc\_ir\_classify\_type}) with this machine's rules for
+where each value is passed and returned, and the marshaller
+(\texttt{\_kcc\_cg\_marshal\_args}) that places arguments in their registers and
+stack slots and reads the result back.  This is the ABI, transcribed from its
+specification in one place rather than scattered through selection.
+
+\paragraph{4. Instruction selection.}  One case per IR opcode, printing the
+mnemonic and operands for this machine.  This is the bulk of the new lines but
+each case is small and independently testable; x86-64's per-opcode emitter is
+the direct model.
+
+\paragraph{5. Prologue, epilogue, and frame.}  Lay out the stack frame---spill
+slots, \texttt{alloca} storage, the callee-saved save area, incoming stack
+arguments---and emit the entry and exit sequences.  The \emph{shape} is yours;
+the \emph{contents} (slot count, which callee-saved registers were claimed)
+come from the shared allocator (\S\ref{sec:regalloc-portable}).
+
+\paragraph{6. Emission and toolchain.}  Spell the assembly preamble (section
+directives, label and global syntax), then invoke the system \texttt{as} to
+encode it and \texttt{ld} to link it, with the platform's startup files.  A
+direct target instead encodes bytes and writes the object itself, as ARM64 does
+(Chapters~\ref{ch:emit-arm64}--\ref{ch:emit-macho}).
+
+\paragraph{7. Runtime.}  Supply the target's system-call convention and a
+\texttt{\_start} for freestanding programs, so the driver can turn a source
+file into a runnable executable in one command.
+
+\section{A Porting Checklist}
+\label{sec:porting-checklist}
+
+Each rung of the playbook pairs one deliverable with one proof.  Do them in
+order, and never begin a rung until the previous one runs exit-identically to
+the oracle (\S\ref{sec:testing-cross}); a divergence is then localised to the
+single rung just added.
+
+\begin{center}
+\begin{tabular}{@@{}p{2.1cm}p{5.1cm}p{5.1cm}@@{}}
+\hline
+Rung & What you write & How you prove it \\
+\hline
+1. Dispatch & target added to \texttt{\_kcc\_target}; \texttt{--target} wired &
+\texttt{kcc --target=\emph{name}} reaches the back end; ARM64 default unchanged \\
+2. Banks & register-bank arrays (or none, all-spill) &
+compiles; the allocator consumes the banks \\
+3. Emission & \texttt{.s} preamble \,+\, \texttt{as}/\texttt{ld} wiring &
+an empty \texttt{.s} assembles and links to an object \\
+4. Minimal ISA & materialise a constant, the return, the simplest prologue &
+\texttt{int main(void)\{return N;\}} exits with \texttt{N} \\
+5. Grow ISA & ALU, then loads/stores, then compares/branches, then jumps &
+one difftest program per opcode passes \\
+6. Calls & argument marshalling and the return value &
+multi-argument calls and \texttt{printf} match the oracle \\
+7. Frame & \texttt{alloca}, spills, stack arguments, large frames &
+many-locals and deep-expression programs match \\
+8. Floating & FP bank, FP selection, the FP half of the ABI &
+the floating-point difference corpus passes \\
+9. Runtime & syscalls, \texttt{\_start}, the exact link line &
+\texttt{kcc file.c -o out} runs in one step \\
+\hline
+\end{tabular}
+\end{center}
+
+When the last row is green the new target passes the same difference corpus the
+flagship does, and every row before it was verified in isolation.  That is the
+whole promise of the seam: retargeting is transcription against a checklist, not
+invention.
 
 \section{Testing a Cross Target}
 \label{sec:testing-cross}

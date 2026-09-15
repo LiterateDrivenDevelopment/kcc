@@ -365,7 +365,7 @@ int main(void) {
 \section{Verification}
 \label{sec:selfhost-lexer-verify}
 
-\texttt{make selfhost-lexer} compiles \texttt{tmp/selfhost/lexer.c} with
+\texttt{make selfhost-lexer} compiles \texttt{gen/selfhost/lexer.c} with
 \kcc{}, links it freestanding (entry \texttt{\_main}, no libc), and runs
 it: exit~0 means every assertion held.  It then compiles the identical
 source with \texttt{clang} and confirms the two binaries agree---%
@@ -375,14 +375,15 @@ table-driven program.
 
 @d Selfhost: lexer verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-lexer — compile the C tokenizer with kcc, self-test, diff clang.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 
 echo "[1/2] compiling + running the tokenizer built by kcc"
-tmp/kcc -c "$SH/lexer.c" -o "$SH/lexer_kcc.o" >/dev/null
+$BASE/kcc -c "$SH/lexer.c" -o "$SH/lexer_kcc.o" >/dev/null
 ld "$SH/lexer_kcc.o" -o "$SH/lexer_kcc" -lSystem -syslibroot "$SDK" -e _main -arch arm64
 set +e
 "$SH/lexer_kcc"; kcc_rc=$?

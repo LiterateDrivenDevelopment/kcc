@@ -131,32 +131,33 @@ recognition correctly; the diagnostic suite additionally exercises
 
 @d Selfhost: lexer-tables verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-lexer-tables — compile kcc's lexer tables in C with kcc,
 # relink, run the suite.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/3] compiling tmp/selfhost/lexer_tables.c with kcc"
-tmp/kcc -c "$SH/lexer_tables.c" -o "$SH/lexer_tables_c.o" >/dev/null
+echo "[1/3] compiling $BASE/selfhost/lexer_tables.c with kcc"
+$BASE/kcc -c "$SH/lexer_tables.c" -o "$SH/lexer_tables_c.o" >/dev/null
 
-echo "[2/3] linking tmp/kcc_selfhost_lexer_tables (lexer_tables.o -> C)"
+echo "[2/3] linking $BASE/kcc_selfhost_lexer_tables (lexer_tables.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "lexer_tables" ]; then OBJ="$OBJ $SH/lexer_tables_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "lexer_tables" ]; then OBJ="$OBJ $SH/lexer_tables_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_lexer_tables $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_lexer_tables $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
 echo "[3/3] running codegen + diagtest with the self-hosted lexer tables"
-cp tmp/kcc "$SH/kcc_asm_backup_lexer_tables"
-cp tmp/kcc_selfhost_lexer_tables tmp/kcc
+cp $BASE/kcc "$SH/kcc_asm_backup_lexer_tables"
+cp $BASE/kcc_selfhost_lexer_tables $BASE/kcc
 set +e
-bash tmp/tests/test_codegen.sh; s1=$?
-bash tmp/tests/diagtest.sh;      s2=$?
-cp "$SH/kcc_asm_backup_lexer_tables" tmp/kcc
+bash $BASE/tests/test_codegen.sh; s1=$?
+bash $BASE/tests/diagtest.sh;      s2=$?
+cp "$SH/kcc_asm_backup_lexer_tables" $BASE/kcc
 [ $s1 -eq 0 ] && [ $s2 -eq 0 ]
 @}

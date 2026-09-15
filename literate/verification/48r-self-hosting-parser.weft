@@ -477,25 +477,26 @@ output against the assembly writer's, so the tree printer is verified too.
 
 @d Selfhost: parser verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-parser — compile kcc's parser spine in C with kcc, relink, run
 # the codegen suite and check --dump-ast byte-identical.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/4] compiling tmp/selfhost/parser.c with kcc"
-tmp/kcc -c "$SH/parser.c" -o "$SH/parser_c.o" >/dev/null
+echo "[1/4] compiling $BASE/selfhost/parser.c with kcc"
+$BASE/kcc -c "$SH/parser.c" -o "$SH/parser_c.o" >/dev/null
 
-echo "[2/4] linking tmp/kcc_selfhost_parser (parser.o -> C)"
+echo "[2/4] linking $BASE/kcc_selfhost_parser (parser.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "parser" ]; then OBJ="$OBJ $SH/parser_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "parser" ]; then OBJ="$OBJ $SH/parser_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_parser $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_parser $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
 echo "[3/4] --dump-ast byte-identical check"
 cat > "$SH/dump_probe.c" <<'PROBE'
@@ -509,19 +510,19 @@ int main(void) {
     return arr[0] > 5 ? sizeof(int) : arr[0];
 }
 PROBE
-tmp/kcc --dump-ast "$SH/dump_probe.c" > "$SH/dump_asm.txt" 2>/dev/null || true
-tmp/kcc_selfhost_parser --dump-ast "$SH/dump_probe.c" > "$SH/dump_c.txt" 2>/dev/null || true
+$BASE/kcc --dump-ast "$SH/dump_probe.c" > "$SH/dump_asm.txt" 2>/dev/null || true
+$BASE/kcc_selfhost_parser --dump-ast "$SH/dump_probe.c" > "$SH/dump_c.txt" 2>/dev/null || true
 if ! diff -q "$SH/dump_asm.txt" "$SH/dump_c.txt" >/dev/null; then
     echo "  --dump-ast MISMATCH:"; diff "$SH/dump_asm.txt" "$SH/dump_c.txt" | head -20; exit 1
 fi
 echo "  --dump-ast identical"
 
 echo "[4/4] running the codegen suite with the self-hosted parser spine"
-cp tmp/kcc "$SH/kcc_asm_backup_parser"
-cp tmp/kcc_selfhost_parser tmp/kcc
+cp $BASE/kcc "$SH/kcc_asm_backup_parser"
+cp $BASE/kcc_selfhost_parser $BASE/kcc
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_parser" tmp/kcc
+cp "$SH/kcc_asm_backup_parser" $BASE/kcc
 exit $status
 @}

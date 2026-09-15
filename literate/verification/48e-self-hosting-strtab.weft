@@ -59,7 +59,7 @@ const char *kcc_strtab_intern(const char *s, unsigned long len) {
 \label{sec:selfhost-strtab-verify}
 
 \texttt{make selfhost-strtab} runs the drop-in loop: compile
-\texttt{tmp/selfhost/strtab.c} with the assembly-built \kcc{}, relink a second
+\texttt{gen/selfhost/strtab.c} with the assembly-built \kcc{}, relink a second
 compiler with the hand-written \texttt{strtab.o} replaced by the kcc-compiled
 \texttt{strtab\_c.o}, and re-run the code-generation suite.  Because every
 identifier and keyword the lexer sees is interned through this layer, a green
@@ -67,32 +67,33 @@ run means \kcc{} compiled its own name-canonicalisation correctly.
 
 @d Selfhost: strtab verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-strtab — compile kcc's string interner in C with kcc, relink,
 # run the suite.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/3] compiling tmp/selfhost/strtab.c with kcc"
-tmp/kcc -c "$SH/strtab.c" -o "$SH/strtab_c.o" >/dev/null
+echo "[1/3] compiling $BASE/selfhost/strtab.c with kcc"
+$BASE/kcc -c "$SH/strtab.c" -o "$SH/strtab_c.o" >/dev/null
 
-echo "[2/3] linking tmp/kcc_selfhost_strtab (strtab.o -> kcc-compiled strtab_c.o)"
+echo "[2/3] linking $BASE/kcc_selfhost_strtab (strtab.o -> kcc-compiled strtab_c.o)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "strtab" ]; then OBJ="$OBJ $SH/strtab_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "strtab" ]; then OBJ="$OBJ $SH/strtab_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_strtab $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_strtab $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
 echo "[3/3] running the codegen suite with the self-hosted interner"
-cp tmp/kcc "$SH/kcc_asm_backup_strtab"
-cp tmp/kcc_selfhost_strtab tmp/kcc
+cp $BASE/kcc "$SH/kcc_asm_backup_strtab"
+cp $BASE/kcc_selfhost_strtab $BASE/kcc
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_strtab" tmp/kcc
+cp "$SH/kcc_asm_backup_strtab" $BASE/kcc
 exit $status
 @}

@@ -632,27 +632,28 @@ test.
 
 @d Selfhost: emit_arm64 verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-emit-arm64 — compile kcc's ARM64 encoder + .s renderer in C with
 # kcc, relink, and verify both halves (difftest + --emit-asm byte-compare).
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/5] compiling tmp/selfhost/emit_arm64.c with kcc"
-tmp/kcc -c "$SH/emit_arm64.c" -o "$SH/emit_arm64_c.o" >/dev/null
+echo "[1/5] compiling $BASE/selfhost/emit_arm64.c with kcc"
+$BASE/kcc -c "$SH/emit_arm64.c" -o "$SH/emit_arm64_c.o" >/dev/null
 
-echo "[2/5] linking tmp/kcc_selfhost_emit_arm64 (emit_arm64.o -> C)"
+echo "[2/5] linking $BASE/kcc_selfhost_emit_arm64 (emit_arm64.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "emit_arm64" ]; then OBJ="$OBJ $SH/emit_arm64_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "emit_arm64" ]; then OBJ="$OBJ $SH/emit_arm64_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_emit_arm64 $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_emit_arm64 $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
-cp tmp/kcc "$SH/kcc_asm_backup_emit_arm64"
+cp $BASE/kcc "$SH/kcc_asm_backup_emit_arm64"
 
 echo "[3/5] --emit-asm functional check: C renderer -> as -> runnable program"
 cat > "$SH/emit_probe.c" <<'PROBE'
@@ -666,30 +667,30 @@ int main(void) {
 }
 PROBE
 # Ground truth: the direct-encoder object, built by the assembly compiler.
-tmp/kcc "$SH/emit_probe.c" -o "$SH/emit_probe_ref" >/dev/null
+$BASE/kcc "$SH/emit_probe.c" -o "$SH/emit_probe_ref" >/dev/null
 set +e; "$SH/emit_probe_ref"; ref=$?; set -e
 # The C renderer, driving --emit-asm through the platform assembler.
-cp tmp/kcc_selfhost_emit_arm64 tmp/kcc
-tmp/kcc --emit-asm "$SH/emit_probe.c" -o "$SH/emit_probe_c" >/dev/null
+cp $BASE/kcc_selfhost_emit_arm64 $BASE/kcc
+$BASE/kcc --emit-asm "$SH/emit_probe.c" -o "$SH/emit_probe_c" >/dev/null
 set +e; "$SH/emit_probe_c"; got=$?; set -e
 if [ "$ref" != "$got" ]; then
-    cp "$SH/kcc_asm_backup_emit_arm64" tmp/kcc
+    cp "$SH/kcc_asm_backup_emit_arm64" $BASE/kcc
     echo "FAIL: --emit-asm program (C renderer) exit $got != direct-encoder $ref"; exit 1
 fi
 echo "  --emit-asm program runs identically (exit $got)"
 
 echo "[4/5] difftest (byte-compares every encoder against clang)"
 set +e
-bash tmp/tests/difftest.sh >/tmp/emit_arm64_difftest.log 2>&1
+bash $BASE/tests/difftest.sh >/$BASE/emit_arm64_difftest.log 2>&1
 dstatus=$?
-tail -1 /tmp/emit_arm64_difftest.log
+tail -1 /$BASE/emit_arm64_difftest.log
 set -e
-if [ $dstatus -ne 0 ]; then cp "$SH/kcc_asm_backup_emit_arm64" tmp/kcc; exit $dstatus; fi
+if [ $dstatus -ne 0 ]; then cp "$SH/kcc_asm_backup_emit_arm64" $BASE/kcc; exit $dstatus; fi
 
 echo "[5/5] running the codegen suite with the self-hosted encoder"
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_emit_arm64" tmp/kcc
+cp "$SH/kcc_asm_backup_emit_arm64" $BASE/kcc
 exit $status
 @}

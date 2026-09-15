@@ -366,43 +366,44 @@ line-number program exactly.
 
 @d Selfhost: dwarf verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-dwarf — compile kcc's DWARF emitter in C with kcc, relink,
 # run the codegen suite, and byte-compare a -g object against the asm build.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/4] compiling tmp/selfhost/dwarf.c with kcc"
-tmp/kcc -c "$SH/dwarf.c" -o "$SH/dwarf_c.o" >/dev/null
+echo "[1/4] compiling $BASE/selfhost/dwarf.c with kcc"
+$BASE/kcc -c "$SH/dwarf.c" -o "$SH/dwarf_c.o" >/dev/null
 
-echo "[2/4] linking tmp/kcc_selfhost_dwarf (dwarf.o -> C)"
+echo "[2/4] linking $BASE/kcc_selfhost_dwarf (dwarf.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "dwarf" ]; then OBJ="$OBJ $SH/dwarf_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "dwarf" ]; then OBJ="$OBJ $SH/dwarf_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_dwarf $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_dwarf $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
 echo "[3/4] byte-comparing a -g object: asm emitter vs C emitter"
 printf 'int add(int a,int b){return a+b;}\nint main(void){return add(2,3);}\n' > "$SH/dwarf_probe.c"
-tmp/kcc -c -g "$SH/dwarf_probe.c" -o "$SH/dwarf_probe_asm.o" >/dev/null
-cp tmp/kcc "$SH/kcc_asm_backup_dwarf"
-cp tmp/kcc_selfhost_dwarf tmp/kcc
-tmp/kcc -c -g "$SH/dwarf_probe.c" -o "$SH/dwarf_probe_c.o" >/dev/null
-cp "$SH/kcc_asm_backup_dwarf" tmp/kcc
+$BASE/kcc -c -g "$SH/dwarf_probe.c" -o "$SH/dwarf_probe_asm.o" >/dev/null
+cp $BASE/kcc "$SH/kcc_asm_backup_dwarf"
+cp $BASE/kcc_selfhost_dwarf $BASE/kcc
+$BASE/kcc -c -g "$SH/dwarf_probe.c" -o "$SH/dwarf_probe_c.o" >/dev/null
+cp "$SH/kcc_asm_backup_dwarf" $BASE/kcc
 if ! cmp "$SH/dwarf_probe_asm.o" "$SH/dwarf_probe_c.o"; then
     echo "FAIL: -g object differs between asm and C DWARF emitter"; exit 1
 fi
 echo "  -g objects byte-identical"
 
 echo "[4/4] running the codegen suite with the self-hosted DWARF emitter"
-cp tmp/kcc_selfhost_dwarf tmp/kcc
+cp $BASE/kcc_selfhost_dwarf $BASE/kcc
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_dwarf" tmp/kcc
+cp "$SH/kcc_asm_backup_dwarf" $BASE/kcc
 exit $status
 @}

@@ -110,7 +110,7 @@ int kcc_strcmp(const char *s1, const char *s2) {
 
 \section{Assembling the Translation Unit}
 
-The five fragments compose into \texttt{tmp/selfhost/strings.c}, routed by
+The five fragments compose into \texttt{gen/selfhost/strings.c}, routed by
 \texttt{assembly.weft}.
 
 @l c
@@ -126,7 +126,7 @@ The five fragments compose into \texttt{tmp/selfhost/strings.c}, routed by
 \label{sec:selfhost-strings-verify}
 
 \texttt{make selfhost-strings} runs the drop-in loop: compile
-\texttt{tmp/selfhost/strings.c} with the assembly-built \kcc{}, relink a second
+\texttt{gen/selfhost/strings.c} with the assembly-built \kcc{}, relink a second
 compiler with the hand-written \texttt{strings.o} replaced by the freshly
 compiled \texttt{strings\_c.o}, and re-run the code-generation suite through it.
 Because these primitives underlie every allocation, copy, and name comparison
@@ -136,32 +136,33 @@ whole suite, byte for byte.
 
 @d Selfhost: strings verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-strings — compile kcc's string primitives in C with kcc,
 # relink, run the suite.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/3] compiling tmp/selfhost/strings.c with kcc"
-tmp/kcc -c "$SH/strings.c" -o "$SH/strings_c.o" >/dev/null
+echo "[1/3] compiling $BASE/selfhost/strings.c with kcc"
+$BASE/kcc -c "$SH/strings.c" -o "$SH/strings_c.o" >/dev/null
 
-echo "[2/3] linking tmp/kcc_selfhost_strings (strings.o -> kcc-compiled strings_c.o)"
+echo "[2/3] linking $BASE/kcc_selfhost_strings (strings.o -> kcc-compiled strings_c.o)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "strings" ]; then OBJ="$OBJ $SH/strings_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "strings" ]; then OBJ="$OBJ $SH/strings_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_strings $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_strings $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
 echo "[3/3] running the codegen suite with the self-hosted string primitives"
-cp tmp/kcc "$SH/kcc_asm_backup_strings"
-cp tmp/kcc_selfhost_strings tmp/kcc
+cp $BASE/kcc "$SH/kcc_asm_backup_strings"
+cp $BASE/kcc_selfhost_strings $BASE/kcc
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_strings" tmp/kcc
+cp "$SH/kcc_asm_backup_strings" $BASE/kcc
 exit $status
 @}

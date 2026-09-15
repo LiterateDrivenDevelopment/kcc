@@ -517,7 +517,7 @@ Each is null-terminated for use with \texttt{kcc\_io\_puts}.
 // -- Driver string constants ---
 .section __TEXT,__cstring,cstring_literals
 _kcc_banner:
-    .asciz "kcc v0.1.0 - a formal C17 compiler for ARM64\n"
+    .asciz "kcc v@<version@> - a formal C17 compiler for ARM64\n"
 _kcc_msg_source:
     .asciz "source: "
 _kcc_msg_usage:

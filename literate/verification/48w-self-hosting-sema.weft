@@ -1614,49 +1614,50 @@ of a diagnostic, changed.
 
 @d Selfhost: sema verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-sema — compile kcc's semantic analyzer in C with kcc, relink,
 # run codegen + difftest + diagtest + warntest.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/5] compiling tmp/selfhost/sema.c with kcc"
-tmp/kcc -c "$SH/sema.c" -o "$SH/sema_c.o" >/dev/null
+echo "[1/5] compiling $BASE/selfhost/sema.c with kcc"
+$BASE/kcc -c "$SH/sema.c" -o "$SH/sema_c.o" >/dev/null
 
-echo "[2/5] linking tmp/kcc_selfhost_sema (sema.o -> C)"
+echo "[2/5] linking $BASE/kcc_selfhost_sema (sema.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "sema" ]; then OBJ="$OBJ $SH/sema_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "sema" ]; then OBJ="$OBJ $SH/sema_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_sema $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_sema $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
-cp tmp/kcc "$SH/kcc_asm_backup_sema"
-cp tmp/kcc_selfhost_sema tmp/kcc
+cp $BASE/kcc "$SH/kcc_asm_backup_sema"
+cp $BASE/kcc_selfhost_sema $BASE/kcc
 
 echo "[3/5] difftest (byte-compare generated objects against clang)"
 set +e
-bash tmp/tests/difftest.sh >/tmp/sema_difftest.log 2>&1
+bash $BASE/tests/difftest.sh >/$BASE/sema_difftest.log 2>&1
 dstatus=$?
-tail -1 /tmp/sema_difftest.log
+tail -1 /$BASE/sema_difftest.log
 set -e
-if [ $dstatus -ne 0 ]; then cp "$SH/kcc_asm_backup_sema" tmp/kcc; exit $dstatus; fi
+if [ $dstatus -ne 0 ]; then cp "$SH/kcc_asm_backup_sema" $BASE/kcc; exit $dstatus; fi
 
 echo "[4/5] diagtest + warntest (pin the -Wall message text)"
 set +e
-bash tmp/tests/diagtest.sh >/tmp/sema_diag.log 2>&1; diagst=$?
-bash tmp/tests/warntest.sh >/tmp/sema_warn.log 2>&1; warnst=$?
-tail -1 /tmp/sema_diag.log; tail -1 /tmp/sema_warn.log
+bash $BASE/tests/diagtest.sh >/$BASE/sema_diag.log 2>&1; diagst=$?
+bash $BASE/tests/warntest.sh >/$BASE/sema_warn.log 2>&1; warnst=$?
+tail -1 /$BASE/sema_diag.log; tail -1 /$BASE/sema_warn.log
 set -e
-if [ $diagst -ne 0 ] || [ $warnst -ne 0 ]; then cp "$SH/kcc_asm_backup_sema" tmp/kcc; exit 1; fi
+if [ $diagst -ne 0 ] || [ $warnst -ne 0 ]; then cp "$SH/kcc_asm_backup_sema" $BASE/kcc; exit 1; fi
 
 echo "[5/5] codegen suite with the self-hosted semantic analyzer"
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_sema" tmp/kcc
+cp "$SH/kcc_asm_backup_sema" $BASE/kcc
 exit $status
 @}

@@ -2321,27 +2321,28 @@ lowers the whole implemented opcode set correctly.
 
 @d Selfhost: emit_x86 verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-emit-x86 — compile kcc's x86-64 back end in C with kcc, relink,
 # and verify functionally (arm64 codegen unbroken + x86 programs run correctly).
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/4] compiling tmp/selfhost/emit_x86.c with kcc"
-tmp/kcc -c "$SH/emit_x86.c" -o "$SH/emit_x86_c.o" >/dev/null
+echo "[1/4] compiling $BASE/selfhost/emit_x86.c with kcc"
+$BASE/kcc -c "$SH/emit_x86.c" -o "$SH/emit_x86_c.o" >/dev/null
 
-echo "[2/4] linking tmp/kcc_selfhost_emit_x86 (emit_x86.o -> C)"
+echo "[2/4] linking $BASE/kcc_selfhost_emit_x86 (emit_x86.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "emit_x86" ]; then OBJ="$OBJ $SH/emit_x86_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "emit_x86" ]; then OBJ="$OBJ $SH/emit_x86_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_emit_x86 $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_emit_x86 $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
-cp tmp/kcc "$SH/kcc_asm_backup_emit_x86"
+cp $BASE/kcc "$SH/kcc_asm_backup_emit_x86"
 
 echo "[3/4] x86-64 functional check: C emitter -> as -> Rosetta run vs reference"
 mkdir -p "$SH/x86probes"
@@ -2375,12 +2376,12 @@ status=0
 for p in p1 p2 p3 p4; do
     src="$SH/x86probes/$p.c"
     # ARM64 reference (assembly compiler, native default target).
-    cp "$SH/kcc_asm_backup_emit_x86" tmp/kcc
-    tmp/kcc "$src" -o "$SH/x86probes/${p}_ref" >/dev/null 2>&1
+    cp "$SH/kcc_asm_backup_emit_x86" $BASE/kcc
+    $BASE/kcc "$src" -o "$SH/x86probes/${p}_ref" >/dev/null 2>&1
     set +e; "$SH/x86probes/${p}_ref"; ref=$?; set -e
     # x86-64 via the C emitter, run under Rosetta.
-    cp tmp/kcc_selfhost_emit_x86 tmp/kcc
-    tmp/kcc --target=x86_64 "$src" -o "$SH/x86probes/${p}_x86" >/dev/null 2>&1
+    cp $BASE/kcc_selfhost_emit_x86 $BASE/kcc
+    $BASE/kcc --target=x86_64 "$src" -o "$SH/x86probes/${p}_x86" >/dev/null 2>&1
     set +e; "$SH/x86probes/${p}_x86"; got=$?; set -e
     if [ "$ref" != "$got" ]; then
         echo "  FAIL $p: x86(C emitter) exit $got != arm64 reference $ref"; status=1
@@ -2388,14 +2389,14 @@ for p in p1 p2 p3 p4; do
         echo "  ok   $p: exit $got (x86 C emitter == arm64 reference)"
     fi
 done
-cp "$SH/kcc_asm_backup_emit_x86" tmp/kcc
+cp "$SH/kcc_asm_backup_emit_x86" $BASE/kcc
 if [ $status -ne 0 ]; then exit 1; fi
 
 echo "[4/4] codegen suite with the self-hosted x86 back end linked in (arm64 path)"
-cp tmp/kcc_selfhost_emit_x86 tmp/kcc
+cp $BASE/kcc_selfhost_emit_x86 $BASE/kcc
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_emit_x86" tmp/kcc
+cp "$SH/kcc_asm_backup_emit_x86" $BASE/kcc
 exit $status
 @}

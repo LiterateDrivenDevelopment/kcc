@@ -53,8 +53,8 @@ prints a banner, and exits cleanly.  No C source is compiled yet.
 \begin{enumerate}
 \item \texttt{make tangle} succeeds with no errors.
 \item \texttt{make build} assembles and links with no errors.
-\item \texttt{tmp/kcc} prints its banner and exits 0.
-\item \texttt{tmp/kcc hello.c} echoes the source file name.
+\item \texttt{gen/kcc} prints its banner and exits 0.
+\item \texttt{gen/kcc hello.c} echoes the source file name.
 \end{enumerate}
 
 \textbf{Status.} Complete.
@@ -86,7 +86,7 @@ a stream of C17 preprocessing tokens (\stdref{6.4}).
 
 \textbf{Acceptance.}
 \begin{enumerate}
-\item \texttt{tmp/kcc --dump-tokens hello.c} prints every token
+\item \texttt{gen/kcc --dump-tokens hello.c} prints every token
       with its source location.
 \item All 44 C17 keywords are recognized.
 \item Integer, floating, character, and string literals are
@@ -167,7 +167,7 @@ build the diagnostic engine required by \stdref{5.1.1.3}.
 
 \textbf{Acceptance.}
 \begin{enumerate}
-\item \texttt{tmp/kcc -E file.c} outputs the preprocessed token
+\item \texttt{gen/kcc -E file.c} outputs the preprocessed token
       stream (translation phases 1--6 complete).
 \item Recursive and self-referential macros terminate correctly
       per \stdref{6.10.3.4}.
@@ -226,7 +226,7 @@ tree (AST) for every C17 construct.
 
 \textbf{Acceptance.}
 \begin{enumerate}
-\item \texttt{tmp/kcc --dump-ast file.c} prints the AST in a
+\item \texttt{gen/kcc --dump-ast file.c} prints the AST in a
       readable tree format.
 \item All syntactically valid C17 programs parse without error.
 \item Syntax errors produce useful diagnostics with the
@@ -287,7 +287,7 @@ checks all constraints.
 \begin{enumerate}
 \item Type errors produce clear diagnostics citing the
       relevant Standard clause.
-\item \texttt{tmp/kcc --dump-types file.c} prints every
+\item \texttt{gen/kcc --dump-types file.c} prints every
       expression with its resolved type.
 \item Implicit conversions (integer promotions, UAC, pointer
       decay) are inserted automatically.
@@ -341,7 +341,7 @@ essential optimization passes.
 
 \textbf{Acceptance.}
 \begin{enumerate}
-\item \texttt{tmp/kcc --dump-ir file.c} prints the IR in a
+\item \texttt{gen/kcc --dump-ir file.c} prints the IR in a
       readable textual format.
 \item IR validation passes with no errors for all valid programs.
 \item Constant expressions evaluate at compile time.
@@ -404,7 +404,7 @@ introduce linear-scan register allocation.
 
 \textbf{Acceptance.}
 \begin{enumerate}
-\item \texttt{tmp/kcc -c file.c -o file.o} produces a valid
+\item \texttt{gen/kcc -c file.c -o file.o} produces a valid
       Mach-O object file.
 \item \texttt{ld file.o -o file -lSystem ...} links the object
       file into a working executable.
@@ -1452,7 +1452,7 @@ A production compiler needs more than correct code generation.
       source-level breakpoints and variable inspection.
 \item[\mkOpen] The compiler accepts at least two \texttt{-O} levels and
       produces measurably better code at \texttt{-O1} than \texttt{-O0}.
-\item[\mkDone] \texttt{tmp/kcc hello.c -o hello} compiles, links, and runs
+\item[\mkDone] \texttt{gen/kcc hello.c -o hello} compiles, links, and runs
       without a manual \texttt{ld} invocation.
 \item[\mkPart] \kcc{} compiles a $>5000$-line program (its own source) to a
       correct executable; the remaining ``\emph{debuggable}'' clause is gated
@@ -1468,7 +1468,7 @@ A production compiler needs more than correct code generation.
 \hline
 Phase & Status & Milestone & Key Output & \texttt{.weft} Files \\
 \hline
-0 & \mkDone & Skeleton boots        & \texttt{tmp/kcc} runs         & 01, 02, 07--09, 11, 12, 43 \\
+0 & \mkDone & Skeleton boots        & \texttt{gen/kcc} runs         & 01, 02, 07--09, 11, 12, 43 \\
 1 & \mkDone & Lexer                 & \texttt{--dump-tokens}        & 10, 14, 17 \\
 2 & \mkDone & Diagnostics + tests   & \texttt{make test}            & 13, 15, 16, 44, 45 \\
 3 & \mkDone & Preprocessor          & \texttt{-E}                   & 18, 19, 20 \\
@@ -1489,7 +1489,7 @@ remaining language and optimization work are what stand between it and
 
 Total: 45+ \texttt{.weft} source files (growing to ${\sim}55$ by
 Phase~9), approximately 30 tangled assembly files, producing a
-single native \texttt{tmp/kcc} binary that compiles C17 to ARM64
+single native \texttt{gen/kcc} binary that compiles C17 to ARM64
 Mach-O --- with no dependency on any existing C compiler.
 
 \section{Production Readiness}

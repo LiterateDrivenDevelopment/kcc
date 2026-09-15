@@ -1797,36 +1797,37 @@ assembly it replaces.
 
 @d Selfhost: codegen verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-codegen — compile kcc's ARM64 code generator in C with kcc,
 # relink, run difftest + diagtest + codegen.
 set -euo pipefail
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
-echo "[1/4] compiling tmp/selfhost/codegen.c with kcc"
-tmp/kcc -c "$SH/codegen.c" -o "$SH/codegen_c.o" >/dev/null
-echo "[2/4] linking tmp/kcc_selfhost_codegen (codegen.o -> C)"
+echo "[1/4] compiling $BASE/selfhost/codegen.c with kcc"
+$BASE/kcc -c "$SH/codegen.c" -o "$SH/codegen_c.o" >/dev/null
+echo "[2/4] linking $BASE/kcc_selfhost_codegen (codegen.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "codegen" ]; then OBJ="$OBJ $SH/codegen_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "codegen" ]; then OBJ="$OBJ $SH/codegen_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_codegen $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
-cp tmp/kcc "$SH/kcc_asm_backup_codegen"
-cp tmp/kcc_selfhost_codegen tmp/kcc
+ld -o $BASE/kcc_selfhost_codegen $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+cp $BASE/kcc "$SH/kcc_asm_backup_codegen"
+cp $BASE/kcc_selfhost_codegen $BASE/kcc
 echo "[3/4] difftest (byte-compare) + diagtest"
 set +e
-bash tmp/tests/difftest.sh >/tmp/cg_difftest.log 2>&1; dstatus=$?
-tail -1 /tmp/cg_difftest.log
-bash tmp/tests/diagtest.sh >/tmp/cg_diag.log 2>&1; diagst=$?
-tail -1 /tmp/cg_diag.log
+bash $BASE/tests/difftest.sh >/$BASE/cg_difftest.log 2>&1; dstatus=$?
+tail -1 /$BASE/cg_difftest.log
+bash $BASE/tests/diagtest.sh >/$BASE/cg_diag.log 2>&1; diagst=$?
+tail -1 /$BASE/cg_diag.log
 set -e
-if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_codegen" tmp/kcc; exit 1; fi
+if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_codegen" $BASE/kcc; exit 1; fi
 echo "[4/4] codegen suite with the self-hosted code generator"
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_codegen" tmp/kcc
+cp "$SH/kcc_asm_backup_codegen" $BASE/kcc
 exit $status
 @}

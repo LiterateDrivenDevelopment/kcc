@@ -1,4 +1,7 @@
-tmp/
+# Tangle output: `weft -p gen/ --mkdirs kcc.weft` generates everything here,
+# including the Makefile at the repo root. Sources of truth are the .weft files.
+gen/
+/Makefile
 *.aux
 *.log
 *.toc

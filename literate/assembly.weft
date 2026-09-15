@@ -37,13 +37,13 @@ two never drift, because the file the machine consumes is generated from exactly
 these lists.
 
 The directives below route code fragments to their physical assembly files under
-\texttt{tmp/src/}.
+\texttt{gen/src/}.
 
 \bigskip
 
 \noindent\textbf{main.s} --- the compiler entry point:
 
-@o tmp/src/main.s @{
+@o src/main.s @{
 @<ARM64: common macros@>
 @<Main: entry point@>
 @<Main: data@>
@@ -51,7 +51,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{syscalls.s} --- macOS system call wrappers:
 
-@o tmp/src/syscalls.s @{
+@o src/syscalls.s @{
 @<ARM64: common macros@>
 @<Syscall: constants@>
 @<Syscall: exit@>
@@ -66,7 +66,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{arena.s} --- arena memory allocator:
 
-@o tmp/src/arena.s @{
+@o src/arena.s @{
 @<ARM64: common macros@>
 @<Syscall: constants@>
 @<Arena: constants@>
@@ -78,7 +78,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{strings.s} --- string and memory operations:
 
-@o tmp/src/strings.s @{
+@o src/strings.s @{
 @<ARM64: common macros@>
 @<String: strlen@>
 @<String: memcpy@>
@@ -89,7 +89,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{io.s} --- buffered file I/O:
 
-@o tmp/src/io.s @{
+@o src/io.s @{
 @<ARM64: common macros@>
 @<IO: flush@>
 @<IO: putc@>
@@ -102,7 +102,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{hashtab.s} --- hash table (FNV-1a, open addressing):
 
-@o tmp/src/hashtab.s @{
+@o src/hashtab.s @{
 @<ARM64: common macros@>
 @<Hash: constants@>
 @<Hash: FNV-1a@>
@@ -113,7 +113,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{vec.s} --- dynamic vector:
 
-@o tmp/src/vec.s @{
+@o src/vec.s @{
 @<ARM64: common macros@>
 @<Vec: constants@>
 @<Vec: init@>
@@ -123,7 +123,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{strtab.s} --- string interning:
 
-@o tmp/src/strtab.s @{
+@o src/strtab.s @{
 @<ARM64: common macros@>
 @<Strtab: init@>
 @<Strtab: intern@>
@@ -132,7 +132,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{diag.s} --- diagnostic engine:
 
-@o tmp/src/diag.s @{
+@o src/diag.s @{
 @<ARM64: common macros@>
 @<Diag: constants@>
 @<Diag: putu stderr@>
@@ -148,7 +148,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{source.s} --- source file management:
 
-@o tmp/src/source.s @{
+@o src/source.s @{
 @<ARM64: common macros@>
 @<Syscall: constants@>
 @<Source: constants@>
@@ -160,7 +160,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{lexer.s} --- C17 tokenizer:
 
-@o tmp/src/lexer.s @{
+@o src/lexer.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Lexer: init@>
@@ -178,7 +178,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{lexer\_tables.s} --- keyword table and token names:
 
-@o tmp/src/lexer_tables.s @{
+@o src/lexer_tables.s @{
 @<ARM64: common macros@>
 @<Lexer: keyword data@>
 @<Lexer: keyword init@>
@@ -187,7 +187,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{preprocessor.s} --- C17 preprocessor (Phase 4):
 
-@o tmp/src/preprocessor.s @{
+@o src/preprocessor.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<PP: constants@>
@@ -218,7 +218,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{parser.s} --- recursive-descent parser core:
 
-@o tmp/src/parser.s @{
+@o src/parser.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Diag: constants@>
@@ -236,7 +236,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{expressions.s} --- expression parsing:
 
-@o tmp/src/expressions.s @{
+@o src/expressions.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Parser: AST constants@>
@@ -256,7 +256,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{statements.s} --- statement parsing:
 
-@o tmp/src/statements.s @{
+@o src/statements.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Parser: AST constants@>
@@ -276,7 +276,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{declarations.s} --- declaration parsing:
 
-@o tmp/src/declarations.s @{
+@o src/declarations.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Parser: AST constants@>
@@ -296,7 +296,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{types.s} --- type system:
 
-@o tmp/src/types.s @{
+@o src/types.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Parser: AST constants@>
@@ -319,7 +319,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{symtab.s} --- symbol table:
 
-@o tmp/src/symtab.s @{
+@o src/symtab.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Parser: AST constants@>
@@ -339,7 +339,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{conversions.s} --- type conversions:
 
-@o tmp/src/conversions.s @{
+@o src/conversions.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Parser: AST constants@>
@@ -354,7 +354,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{sema.s} --- semantic analysis:
 
-@o tmp/src/sema.s @{
+@o src/sema.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Diag: constants@>
@@ -385,7 +385,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{ir.s} --- intermediate representation:
 
-@o tmp/src/ir.s @{
+@o src/ir.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Parser: AST constants@>
@@ -446,7 +446,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{opt.s} --- optimization passes:
 
-@o tmp/src/opt.s @{
+@o src/opt.s @{
 @<ARM64: common macros@>
 @<IR: constants@>
 @<Vec: constants@>
@@ -460,7 +460,7 @@ The directives below route code fragments to their physical assembly files under
 
 \noindent\textbf{emit\_arm64.s} --- ARM64 instruction binary encoding:
 
-@o tmp/src/emit_arm64.s @{
+@o src/emit_arm64.s @{
 @<ARM64: common macros@>
 @<Backend: constants@>
 @<Backend: code buffer@>
@@ -486,7 +486,7 @@ emits textual assembly for the system assembler.  It reuses the growable text
 buffer of \textbf{emit\_arm64.s} (the \texttt{\_kcc\_as\_*} helpers), so it
 only supplies the IR walk and x86-64 instruction selection:
 
-@o tmp/src/emit_x86.s @{
+@o src/emit_x86.s @{
 @<ARM64: common macros@>
 @<IR: constants@>
 @<Vec: constants@>
@@ -498,7 +498,7 @@ only supplies the IR walk and x86-64 instruction selection:
 
 \noindent\textbf{linker.s} --- relocation and symbol table management:
 
-@o tmp/src/linker.s @{
+@o src/linker.s @{
 @<ARM64: common macros@>
 @<Vec: constants@>
 @<Linker: constants@>
@@ -512,7 +512,7 @@ only supplies the IR walk and x86-64 instruction selection:
 
 \noindent\textbf{codegen.s} --- IR to ARM64 code generation:
 
-@o tmp/src/codegen.s @{
+@o src/codegen.s @{
 @<ARM64: common macros@>
 @<IR: constants@>
 @<Vec: constants@>
@@ -539,7 +539,7 @@ only supplies the IR walk and x86-64 instruction selection:
 
 \noindent\textbf{emit\_macho.s} --- Mach-O object file writer:
 
-@o tmp/src/emit_macho.s @{
+@o src/emit_macho.s @{
 @<ARM64: common macros@>
 @<Vec: constants@>
 @<Linker: constants@>
@@ -549,7 +549,7 @@ only supplies the IR walk and x86-64 instruction selection:
 @<MachO: data@>
 @}
 
-@o tmp/src/dwarf.s @{
+@o src/dwarf.s @{
 @<ARM64: common macros@>
 @<Vec: constants@>
 @<IR: constants@>
@@ -562,7 +562,7 @@ only supplies the IR walk and x86-64 instruction selection:
 
 \noindent\textbf{driver.s} --- compilation driver:
 
-@o tmp/src/driver.s @{
+@o src/driver.s @{
 @<ARM64: common macros@>
 @<Driver: compile@>
 @<Driver: link@>
@@ -572,90 +572,90 @@ only supplies the IR walk and x86-64 instruction selection:
 \bigskip
 \noindent\textbf{include/*.h} --- hosted library header bridges.  Unlike every
 other \texttt{@@o} target these are not assembly: they are C headers tangled to
-\texttt{tmp/include/} beside the compiler binary, where the default include
+\texttt{gen/include/} beside the compiler binary, where the default include
 directory finds them (\S\ref{sec:hosted-headers}).  Section markers are
 suppressed (\texttt{-s}) so the shipped headers read cleanly:
 
-@o tmp/include/stdio.h -s @{
+@o include/stdio.h -s @{
 @<Header: stdio@>
 @}
 
-@o tmp/include/stdlib.h -s @{
+@o include/stdlib.h -s @{
 @<Header: stdlib@>
 @}
 
-@o tmp/include/string.h -s @{
+@o include/string.h -s @{
 @<Header: string@>
 @}
 
-@o tmp/include/ctype.h -s @{
+@o include/ctype.h -s @{
 @<Header: ctype@>
 @}
 
-@o tmp/include/math.h -s @{
+@o include/math.h -s @{
 @<Header: math@>
 @}
 
-@o tmp/include/assert.h -s @{
+@o include/assert.h -s @{
 @<Header: assert@>
 @}
 
-@o tmp/include/time.h -s @{
+@o include/time.h -s @{
 @<Header: time@>
 @}
 
-@o tmp/include/errno.h -s @{
+@o include/errno.h -s @{
 @<Header: errno@>
 @}
 
-@o tmp/include/inttypes.h -s @{
+@o include/inttypes.h -s @{
 @<Header: inttypes@>
 @}
 
-@o tmp/include/signal.h -s @{
+@o include/signal.h -s @{
 @<Header: signal@>
 @}
 
-@o tmp/include/setjmp.h -s @{
+@o include/setjmp.h -s @{
 @<Header: setjmp@>
 @}
 
-@o tmp/include/locale.h -s @{
+@o include/locale.h -s @{
 @<Header: locale@>
 @}
 
-@o tmp/include/fenv.h -s @{
+@o include/fenv.h -s @{
 @<Header: fenv@>
 @}
 
-@o tmp/include/wchar.h -s @{
+@o include/wchar.h -s @{
 @<Header: wchar@>
 @}
 
-@o tmp/include/wctype.h -s @{
+@o include/wctype.h -s @{
 @<Header: wctype@>
 @}
 
-@o tmp/include/uchar.h -s @{
+@o include/uchar.h -s @{
 @<Header: uchar@>
 @}
 
-@o tmp/include/fcntl.h -s @{
+@o include/fcntl.h -s @{
 @<Header: fcntl@>
 @}
 
-@o tmp/include/unistd.h -s @{
+@o include/unistd.h -s @{
 @<Header: unistd@>
 @}
 
 \bigskip
 \noindent\textbf{Test binaries} --- test runner and conformance tests
-(assembled separately; linked into \texttt{tmp/test\_kcc}):
+(assembled separately; linked into \texttt{gen/test\_kcc}):
 
 \medskip
 \noindent\textbf{test\_runner.s} --- test harness entry point:
 
-@o tmp/tests/test_runner.s @{
+@o tests/test_runner.s @{
 @<ARM64: common macros@>
 @<Test: runner entry@>
 @<Test: assert helpers@>
@@ -664,7 +664,7 @@ suppressed (\texttt{-s}) so the shipped headers read cleanly:
 
 \noindent\textbf{test\_lexer.s} --- lexer conformance tests:
 
-@o tmp/tests/test_lexer.s @{
+@o tests/test_lexer.s @{
 @<ARM64: common macros@>
 @<Lexer: token constants@>
 @<Test: lex keywords@>
@@ -680,7 +680,7 @@ suppressed (\texttt{-s}) so the shipped headers read cleanly:
 
 \noindent\textbf{test\_codegen.sh} --- end-to-end code generation tests:
 
-@o tmp/tests/test_codegen.sh @{
+@o tests/test_codegen.sh @{
 @<Test: codegen runner@>
 @<Test: codegen constants@>
 @<Test: codegen locals@>
@@ -718,312 +718,312 @@ suppressed (\texttt{-s}) so the shipped headers read cleanly:
 \noindent\textbf{arena.c} --- \kcc{}'s arena allocator, ported to C
 (Chapter~\ref{ch:self-hosting-arena}):
 
-@o tmp/selfhost/arena.c @{
+@o selfhost/arena.c @{
 @<Selfhost: arena@>
 @}
 
 \noindent\textbf{selfhost.sh} --- compile it with \kcc{}, relink, and
 re-run the codegen suite:
 
-@o tmp/selfhost/selfhost.sh @{
+@o selfhost/selfhost.sh @{
 @<Selfhost: verify@>
 @}
 
 \noindent\textbf{lexer.c} --- a tokenizer in C
 (Chapter~\ref{ch:self-hosting-lexer}), with its self-test:
 
-@o tmp/selfhost/lexer.c @{
+@o selfhost/lexer.c @{
 @<Selfhost: lexer@>
 @}
 
 \noindent\textbf{lexer\_verify.sh} --- compile it with \kcc{}, run the
 self-test, and diff against clang:
 
-@o tmp/selfhost/lexer_verify.sh @{
+@o selfhost/lexer_verify.sh @{
 @<Selfhost: lexer verify@>
 @}
 
 \noindent\textbf{vec.c} --- the growable vector in C
 (Chapter~\ref{ch:self-hosting-vec}), a drop-in replacement:
 
-@o tmp/selfhost/vec.c @{
+@o selfhost/vec.c @{
 @<Selfhost: vec@>
 @}
 
 \noindent\textbf{vec\_verify.sh} --- compile it with \kcc{}, relink the
 compiler with it, and re-run the code-generation suite:
 
-@o tmp/selfhost/vec_verify.sh @{
+@o selfhost/vec_verify.sh @{
 @<Selfhost: vec verify@>
 @}
 
 \noindent\textbf{strings.c} --- the string/memory primitives in C
 (Chapter~\ref{ch:self-hosting-strings}), a drop-in replacement:
 
-@o tmp/selfhost/strings.c @{
+@o selfhost/strings.c @{
 @<Selfhost: strings@>
 @}
 
 \noindent\textbf{strings\_verify.sh} --- compile them with \kcc{}, relink the
 compiler with them, and re-run the code-generation suite:
 
-@o tmp/selfhost/strings_verify.sh @{
+@o selfhost/strings_verify.sh @{
 @<Selfhost: strings verify@>
 @}
 
 \noindent\textbf{hashtab.c} --- the FNV-1a hash table in C
 (Chapter~\ref{ch:self-hosting-hashtab}), a drop-in replacement:
 
-@o tmp/selfhost/hashtab.c @{
+@o selfhost/hashtab.c @{
 @<Selfhost: hashtab@>
 @}
 
 \noindent\textbf{hashtab\_verify.sh} --- compile it with \kcc{}, relink the
 compiler with it, and re-run the code-generation suite:
 
-@o tmp/selfhost/hashtab_verify.sh @{
+@o selfhost/hashtab_verify.sh @{
 @<Selfhost: hashtab verify@>
 @}
 
 \noindent\textbf{strtab.c} --- the string interner in C
 (Chapter~\ref{ch:self-hosting-strtab}), a drop-in replacement:
 
-@o tmp/selfhost/strtab.c @{
+@o selfhost/strtab.c @{
 @<Selfhost: strtab@>
 @}
 
-@o tmp/selfhost/strtab_verify.sh @{
+@o selfhost/strtab_verify.sh @{
 @<Selfhost: strtab verify@>
 @}
 
 \noindent\textbf{io.c} --- the buffered output layer in C
 (Chapter~\ref{ch:self-hosting-io}), a drop-in replacement:
 
-@o tmp/selfhost/io.c @{
+@o selfhost/io.c @{
 @<Selfhost: io@>
 @}
 
-@o tmp/selfhost/io_verify.sh @{
+@o selfhost/io_verify.sh @{
 @<Selfhost: io verify@>
 @}
 
 \noindent\textbf{source.c} --- the source manager and translation phases 1--2 in
 C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 
-@o tmp/selfhost/source.c @{
+@o selfhost/source.c @{
 @<Selfhost: source@>
 @}
 
-@o tmp/selfhost/source_verify.sh @{
+@o selfhost/source_verify.sh @{
 @<Selfhost: source verify@>
 @}
 
 \noindent\textbf{diag.c} --- the diagnostic engine in C
 (Chapter~\ref{ch:self-hosting-diag}), a drop-in replacement:
 
-@o tmp/selfhost/diag.c @{
+@o selfhost/diag.c @{
 @<Selfhost: diag@>
 @}
 
-@o tmp/selfhost/diag_verify.sh @{
+@o selfhost/diag_verify.sh @{
 @<Selfhost: diag verify@>
 @}
 
 \noindent\textbf{symtab.c} --- the symbol table in C
 (Chapter~\ref{ch:self-hosting-symtab}), a drop-in replacement:
 
-@o tmp/selfhost/symtab.c @{
+@o selfhost/symtab.c @{
 @<Selfhost: symtab@>
 @}
 
-@o tmp/selfhost/symtab_verify.sh @{
+@o selfhost/symtab_verify.sh @{
 @<Selfhost: symtab verify@>
 @}
 
 \noindent\textbf{conversions.c} --- the standard conversions in C
 (Chapter~\ref{ch:self-hosting-conversions}), a drop-in replacement:
 
-@o tmp/selfhost/conversions.c @{
+@o selfhost/conversions.c @{
 @<Selfhost: conversions@>
 @}
 
-@o tmp/selfhost/conversions_verify.sh @{
+@o selfhost/conversions_verify.sh @{
 @<Selfhost: conversions verify@>
 @}
 
 \noindent The type system itself, ported to C
 (Chapter~\ref{ch:self-hosting-types}), a drop-in replacement:
 
-@o tmp/selfhost/types.c @{
+@o selfhost/types.c @{
 @<Selfhost: types@>
 @}
 
-@o tmp/selfhost/types_verify.sh @{
+@o selfhost/types_verify.sh @{
 @<Selfhost: types verify@>
 @}
 
 \noindent The optimizer, ported to C
 (Chapter~\ref{ch:self-hosting-opt}), a drop-in replacement:
 
-@o tmp/selfhost/opt.c @{
+@o selfhost/opt.c @{
 @<Selfhost: opt@>
 @}
 
-@o tmp/selfhost/opt_verify.sh @{
+@o selfhost/opt_verify.sh @{
 @<Selfhost: opt verify@>
 @}
 
 \noindent The lexer's keyword and token-name tables, ported to C
 (Chapter~\ref{ch:self-hosting-lexer-tables}), a drop-in replacement:
 
-@o tmp/selfhost/lexer_tables.c @{
+@o selfhost/lexer_tables.c @{
 @<Selfhost: lexer-tables@>
 @}
 
-@o tmp/selfhost/lexer_tables_verify.sh @{
+@o selfhost/lexer_tables_verify.sh @{
 @<Selfhost: lexer-tables verify@>
 @}
 
 \noindent The linker-information tables, ported to C
 (Chapter~\ref{ch:self-hosting-linker}), a drop-in replacement:
 
-@o tmp/selfhost/linker.c @{
+@o selfhost/linker.c @{
 @<Selfhost: linker@>
 @}
 
-@o tmp/selfhost/linker_verify.sh @{
+@o selfhost/linker_verify.sh @{
 @<Selfhost: linker verify@>
 @}
 
 \noindent The statement parser, ported to C
 (Chapter~\ref{ch:self-hosting-statements}), a drop-in replacement:
 
-@o tmp/selfhost/statements.c @{
+@o selfhost/statements.c @{
 @<Selfhost: statements@>
 @}
 
-@o tmp/selfhost/statements_verify.sh @{
+@o selfhost/statements_verify.sh @{
 @<Selfhost: statements verify@>
 @}
 
 \noindent The Mach-O object writer, ported to C
 (Chapter~\ref{ch:self-hosting-emit-macho}), a drop-in replacement:
 
-@o tmp/selfhost/emit_macho.c @{
+@o selfhost/emit_macho.c @{
 @<Selfhost: emit-macho@>
 @}
 
-@o tmp/selfhost/emit_macho_verify.sh @{
+@o selfhost/emit_macho_verify.sh @{
 @<Selfhost: emit-macho verify@>
 @}
 
 \noindent The expression parser, ported to C
 (Chapter~\ref{ch:self-hosting-expressions}), a drop-in replacement:
 
-@o tmp/selfhost/expressions.c @{
+@o selfhost/expressions.c @{
 @<Selfhost: expressions@>
 @}
 
-@o tmp/selfhost/expressions_verify.sh @{
+@o selfhost/expressions_verify.sh @{
 @<Selfhost: expressions verify@>
 @}
 
 \noindent The parser spine, ported to C
 (Chapter~\ref{ch:self-hosting-parser}), a drop-in replacement:
 
-@o tmp/selfhost/parser.c @{
+@o selfhost/parser.c @{
 @<Selfhost: parser@>
 @}
 
-@o tmp/selfhost/parser_verify.sh @{
+@o selfhost/parser_verify.sh @{
 @<Selfhost: parser verify@>
 @}
 
 \noindent The compilation driver, ported to C
 (Chapter~\ref{ch:self-hosting-driver}), a drop-in replacement:
 
-@o tmp/selfhost/driver.c @{
+@o selfhost/driver.c @{
 @<Selfhost: driver@>
 @}
 
-@o tmp/selfhost/driver_verify.sh @{
+@o selfhost/driver_verify.sh @{
 @<Selfhost: driver verify@>
 @}
 
 \noindent The declaration parser, ported to C
 (Chapter~\ref{ch:self-hosting-declarations}), a drop-in replacement:
 
-@o tmp/selfhost/declarations.c @{
+@o selfhost/declarations.c @{
 @<Selfhost: declarations@>
 @}
 
-@o tmp/selfhost/declarations_verify.sh @{
+@o selfhost/declarations_verify.sh @{
 @<Selfhost: declarations verify@>
 @}
 
 \noindent The DWARF debug-info emitter, ported to C
 (Chapter~\ref{ch:self-hosting-dwarf}), a drop-in replacement:
 
-@o tmp/selfhost/dwarf.c @{
+@o selfhost/dwarf.c @{
 @<Selfhost: dwarf@>
 @}
 
-@o tmp/selfhost/dwarf_verify.sh @{
+@o selfhost/dwarf_verify.sh @{
 @<Selfhost: dwarf verify@>
 @}
 
 \noindent The ARM64 encoder and textual-\texttt{.s} renderer, ported to C
 (Chapter~\ref{ch:self-hosting-emit-arm64}), a drop-in replacement:
 
-@o tmp/selfhost/emit_arm64.c @{
+@o selfhost/emit_arm64.c @{
 @<Selfhost: emit_arm64@>
 @}
 
-@o tmp/selfhost/emit_arm64_verify.sh @{
+@o selfhost/emit_arm64_verify.sh @{
 @<Selfhost: emit_arm64 verify@>
 @}
 
 \noindent The semantic analyzer, ported to C
 (Chapter~\ref{ch:self-hosting-sema}), a drop-in replacement:
 
-@o tmp/selfhost/sema.c @{
+@o selfhost/sema.c @{
 @<Selfhost: sema@>
 @}
 
-@o tmp/selfhost/sema_verify.sh @{
+@o selfhost/sema_verify.sh @{
 @<Selfhost: sema verify@>
 @}
 
 \noindent The x86-64 back end, ported to C
 (Chapter~\ref{ch:self-hosting-emit-x86}), a drop-in replacement:
 
-@o tmp/selfhost/emit_x86.c @{
+@o selfhost/emit_x86.c @{
 @<Selfhost: emit_x86@>
 @}
 
-@o tmp/selfhost/emit_x86_verify.sh @{
+@o selfhost/emit_x86_verify.sh @{
 @<Selfhost: emit_x86 verify@>
 @}
 
 \noindent The preprocessor, ported to C
 (Chapter~\ref{ch:self-hosting-preprocessor}), a drop-in replacement:
 
-@o tmp/selfhost/preprocessor.c @{
+@o selfhost/preprocessor.c @{
 @<Selfhost: preprocessor@>
 @}
 
-@o tmp/selfhost/preprocessor_verify.sh @{
+@o selfhost/preprocessor_verify.sh @{
 @<Selfhost: preprocessor verify@>
 @}
 
 \noindent The ARM64 code generator, ported to C
 (Chapter~\ref{ch:self-hosting-codegen}), a drop-in replacement:
 
-@o tmp/selfhost/codegen.c @{
+@o selfhost/codegen.c @{
 @<Selfhost: codegen@>
 @}
 
-@o tmp/selfhost/codegen_verify.sh @{
+@o selfhost/codegen_verify.sh @{
 @<Selfhost: codegen verify@>
 @}
 
@@ -1031,11 +1031,11 @@ C (Chapter~\ref{ch:self-hosting-source}), a drop-in replacement:
 (Chapter~\ref{ch:self-hosting-ir}), a drop-in replacement --- the last
 subsystem to leave assembly:
 
-@o tmp/selfhost/ir.c @{
+@o selfhost/ir.c @{
 @<Selfhost: ir@>
 @}
 
-@o tmp/selfhost/ir_verify.sh @{
+@o selfhost/ir_verify.sh @{
 @<Selfhost: ir verify@>
 @}
 
@@ -1043,11 +1043,11 @@ subsystem to leave assembly:
 (Chapter~\ref{ch:self-hosting-main}) --- the last compiler code to leave
 assembly, and the shared entry for both targets:
 
-@o tmp/selfhost/main.c @{
+@o selfhost/main.c @{
 @<Selfhost: main@>
 @}
 
-@o tmp/selfhost/main_verify.sh @{
+@o selfhost/main_verify.sh @{
 @<Selfhost: main verify@>
 @}
 
@@ -1055,11 +1055,11 @@ assembly, and the shared entry for both targets:
 (Chapter~\ref{ch:self-hosting-lexer}) --- a drop-in for the module whose token
 stream the whole front end consumes:
 
-@o tmp/selfhost/lexer_core.c @{
+@o selfhost/lexer_core.c @{
 @<Selfhost: lexcore@>
 @}
 
-@o tmp/selfhost/lexer_core_verify.sh @{
+@o selfhost/lexer_core_verify.sh @{
 @<Selfhost: lexcore verify@>
 @}
 
@@ -1070,23 +1070,23 @@ ELF entry point and Linux syscall wrappers, assembled on Linux, that \kcc{}'s
 \texttt{--target=x86\_64-linux} output links against.  It is not part of the
 ARM64 compiler, so it routes to its own directory:
 
-@o tmp/runtime/os_linux.s @{
+@o runtime/os_linux.s @{
 @<Runtime-linux: file@>
 @}
 
-@o tmp/runtime/demo_util.c @{
+@o runtime/demo_util.c @{
 @<Runtime-linux: demo util@>
 @}
 
-@o tmp/runtime/demo_main.c @{
+@o runtime/demo_main.c @{
 @<Runtime-linux: demo main@>
 @}
 
-@o tmp/runtime/meta_a_verify.sh @{
+@o runtime/meta_a_verify.sh @{
 @<Runtime-linux: meta-a verify@>
 @}
 
-@o tmp/runtime/meta_c_verify.sh @{
+@o runtime/meta_c_verify.sh @{
 @<Runtime-linux: meta-c verify@>
 @}
 
@@ -1095,7 +1095,7 @@ ARM64 compiler, so it routes to its own directory:
 \noindent\textbf{difftest.sh} --- compile each program with \kcc{} and
 \texttt{clang}, run both, compare (Chapter~\ref{ch:differential-testing}):
 
-@o tmp/tests/difftest.sh @{
+@o tests/difftest.sh @{
 @<Difftest: runner@>
 @<Difftest: arithmetic@>
 @<Difftest: control@>
@@ -1115,7 +1115,7 @@ ARM64 compiler, so it routes to its own directory:
 the other with \texttt{clang}, link, run, compare to the all-\texttt{clang}
 oracle (Chapter~\ref{ch:interop-testing}):
 
-@o tmp/tests/interop.sh @{
+@o tests/interop.sh @{
 @<Interop: runner@>
 @<Interop: cases@>
 @<Interop: results@>
@@ -1124,14 +1124,14 @@ oracle (Chapter~\ref{ch:interop-testing}):
 \noindent\textbf{e2e.sh} --- drive the whole toolchain like a user:
 \texttt{kcc src.c -o out} then run \texttt{out} (Section~\ref{sec:e2e-tests}):
 
-@o tmp/tests/e2e.sh @{
+@o tests/e2e.sh @{
 @<E2E: runner@>
 @}
 
 \noindent\textbf{diagtest.sh} --- feed the compiler invalid programs and
 check the diagnostics (Section~\ref{sec:diag-tests}):
 
-@o tmp/tests/diagtest.sh @{
+@o tests/diagtest.sh @{
 @<Diag: tests@>
 @}
 
@@ -1139,7 +1139,7 @@ check the diagnostics (Section~\ref{sec:diag-tests}):
 check that \texttt{-Wall} warns while the default build stays silent
 (Section~\ref{sec:warn-tests}):
 
-@o tmp/tests/warntest.sh @{
+@o tests/warntest.sh @{
 @<Warn: tests@>
 @}
 
@@ -1148,13 +1148,339 @@ check that \texttt{-Wall} warns while the default build stays silent
 The capstone demonstration of \S\ref{sec:um-kernelboot}---\kcc{} compiling
 \texttt{init/main.o} of a Linux~6.6 kernel that boots to a BusyBox login
 shell---tangles to a Docker build recipe and five numbered scripts under
-\texttt{tmp/repro/}, with \texttt{run-all.sh} to chain the build steps.  The
+\texttt{gen/repro/}, with \texttt{run-all.sh} to chain the build steps.  The
 prose for each lives with the manual section; here we only route the output.
 
-@o tmp/repro/Dockerfile @{@<Repro: Dockerfile@>@}
-@o tmp/repro/01-image.sh @{@<Repro: 01 build image@>@}
-@o tmp/repro/02-build-kcc.sh @{@<Repro: 02 build kcc@>@}
-@o tmp/repro/03-kernel.sh @{@<Repro: 03 build kernel@>@}
-@o tmp/repro/04-initramfs.sh @{@<Repro: 04 initramfs@>@}
-@o tmp/repro/05-boot.sh @{@<Repro: 05 boot@>@}
-@o tmp/repro/run-all.sh @{@<Repro: run all@>@}
+@o repro/Dockerfile @{@<Repro: Dockerfile@>@}
+@o repro/01-image.sh @{@<Repro: 01 build image@>@}
+@o repro/02-build-kcc.sh @{@<Repro: 02 build kcc@>@}
+@o repro/03-kernel.sh @{@<Repro: 03 build kernel@>@}
+@o repro/04-initramfs.sh @{@<Repro: 04 initramfs@>@}
+@o repro/05-boot.sh @{@<Repro: 05 boot@>@}
+@o repro/run-all.sh @{@<Repro: run all@>@}
+
+
+\section*{The build recipe}
+
+The build is not described in a file kept separately from the book---it is
+itself a tangled artifact.  The chunk below emits the project \texttt{Makefile}
+into the repository root (the \texttt{../} escapes the \texttt{gen/} prefix that
+\texttt{-p} prepends to every other output), so the one command
+\begin{quote}\ttfamily weft -p gen/ -{}-mkdirs kcc.weft\end{quote}
+\noindent tangles the compiler's sources, the verification scripts, and the
+\texttt{Makefile} that drives them, all into \texttt{gen/} (and the root
+\texttt{Makefile}).  From there, ordinary \texttt{make} targets do the rest.
+The generated sources live under \texttt{gen/} and are never edited by hand;
+\texttt{make clean} removes the whole directory, and the command above
+regenerates it.
+
+The version string \emph{itself} is single-sourced from the \texttt{version}
+fragment defined in the master document.  Tangling it to a plain
+\texttt{gen/VERSION} file lets non-\weft{} artifacts share that one value: the
+\texttt{pdf} target below substitutes it into the cover \texttt{.svg}
+templates (which carry a \texttt{\{\{VERSION\}\}} placeholder) before
+rasterising them, so the covers, the compiler's banner, and this book never
+disagree about which version they describe.
+
+@o VERSION -s @{@<version@>@}
+
+@o ../Makefile -t -s @{
+# kcc — A Formal C17 Compiler in ARM64 Assembly
+# Build pipeline: .weft → weft tangle → .s → as → .o → ld → kcc
+#
+# This Makefile is itself a tangled artifact: it is generated into the repo
+# root by `weft -p gen/ --mkdirs kcc.weft` (the @@o ../Makefile chunk in
+# literate/assembly.weft). Do not edit it here; edit the book.
+#
+# Written for the system make (GNU Make 3.81), which
+# lacks .ONESHELL/.SHELLFLAGS, so each multi-command recipe is a single logical
+# line (joined with \) that begins with `set -e` for fail-fast behaviour.
+# Command echo is silenced (.SILENT) to match the original `set quiet`.
+
+SHELL := /bin/bash
+.SILENT:
+
+# All assembly source basenames (order doesn't matter for linking)
+sources := main syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver
+
+# Library sources (everything except main — shared with the test binary)
+lib_sources := syscalls arena strings io hashtab vec strtab source lexer lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver
+
+# Test source basenames (in gen/tests/)
+test_sources := test_runner test_lexer
+
+# SDK root for the linker
+SDKROOT := $(shell xcrun --show-sdk-path)
+LDFLAGS := -lSystem -syslibroot $(SDKROOT) -e _main -arch arm64
+
+.DEFAULT_GOAL := build
+
+.PHONY: all default ci tangle assemble build test selfhost selfhost-lexer \
+        selfhost-types selfhost-opt selfhost-lexer-tables selfhost-linker \
+        selfhost-statements selfhost-emit-macho selfhost-expressions selfhost-parser selfhost-driver \
+        selfhost-declarations selfhost-dwarf selfhost-emit-arm64 selfhost-sema \
+        selfhost-emit-x86 selfhost-preprocessor selfhost-codegen selfhost-ir selfhost-main selfhost-lexer-core meta-a meta-c \
+        difftest interop e2e diagtest warntest test-codegen weave pdf clean \
+        run map
+
+# Default: build everything
+all default: build
+
+# CI: the complete verification suite, in one entry point. Fast native checks
+# run first (fail fast); the meta-* self-host milestones run last and need
+# Docker + qemu-user. Prerequisites share `build`, so it is assembled once.
+ci: build test difftest interop e2e diagtest warntest test-codegen meta-a meta-c
+	echo "=== ci: all suites passed ==="
+
+# Tangle: weave the literate sources into gen/ (sources, scripts, and this
+# Makefile itself). -p prepends gen/ to every @@o path; --mkdirs creates the
+# output directories. This target regenerates the very Makefile that defines
+# it, so the build description never drifts from the book.
+tangle:
+	weft -p gen/ --mkdirs kcc.weft
+
+# Assemble: compile each .s to .o
+assemble: tangle
+	set -e; for f in $(sources); do as -o gen/src/$${f}.o gen/src/$${f}.s; done
+
+# Link: produce the kcc binary
+build: assemble
+	set -e; OBJ=""; for f in $(sources); do OBJ="$$OBJ gen/src/$${f}.o"; done; \
+	ld -o gen/kcc $$OBJ $(LDFLAGS)
+
+# Test: build and run the unit-test suite
+test: tangle
+	set -e; \
+	for f in $(lib_sources); do as -o gen/src/$${f}.o gen/src/$${f}.s; done; \
+	for f in $(test_sources); do as -o gen/tests/$${f}.o gen/tests/$${f}.s; done; \
+	OBJ=""; \
+	for f in $(lib_sources); do OBJ="$$OBJ gen/src/$${f}.o"; done; \
+	for f in $(test_sources); do OBJ="$$OBJ gen/tests/$${f}.o"; done; \
+	ld -o gen/test_kcc $$OBJ $(LDFLAGS); \
+	echo ""; \
+	./gen/test_kcc
+
+# Self-hosting (Stage 8b): compile kcc's arena in C with kcc, relink, run suite
+selfhost: build
+	chmod +x gen/selfhost/selfhost.sh
+	gen/selfhost/selfhost.sh
+
+# Self-hosting (Stage 8b): compile a C tokenizer with kcc, self-test, diff clang
+selfhost-lexer: build
+	chmod +x gen/selfhost/lexer_verify.sh
+	gen/selfhost/lexer_verify.sh
+
+# Self-hosting (Stage 8c): compile kcc's vector in C with kcc, relink, run suite
+selfhost-vec: build
+	chmod +x gen/selfhost/vec_verify.sh
+	gen/selfhost/vec_verify.sh
+
+# Self-hosting (Stage 8d): compile kcc's string primitives in C, relink, run suite
+selfhost-strings: build
+	chmod +x gen/selfhost/strings_verify.sh
+	gen/selfhost/strings_verify.sh
+
+# Self-hosting (Stage 8e): compile kcc's hash table in C, relink, run suite
+selfhost-hashtab: build
+	chmod +x gen/selfhost/hashtab_verify.sh
+	gen/selfhost/hashtab_verify.sh
+
+# Self-hosting (Stage 8f): compile kcc's string interner in C, relink, run suite
+selfhost-strtab: build
+	chmod +x gen/selfhost/strtab_verify.sh
+	gen/selfhost/strtab_verify.sh
+
+# Self-hosting (Stage 8g): compile kcc's buffered output in C, relink, run suite
+selfhost-io: build
+	chmod +x gen/selfhost/io_verify.sh
+	gen/selfhost/io_verify.sh
+
+# Self-hosting (Stage 8h): compile kcc's source manager in C, relink, run suite
+selfhost-source: build
+	chmod +x gen/selfhost/source_verify.sh
+	gen/selfhost/source_verify.sh
+
+# Self-hosting (Stage 8i): compile kcc's diagnostic engine in C, relink, run suites
+selfhost-diag: build
+	chmod +x gen/selfhost/diag_verify.sh
+	gen/selfhost/diag_verify.sh
+
+# Self-hosting (Stage 8j): compile kcc's symbol table in C, relink, run suite
+selfhost-symtab: build
+	chmod +x gen/selfhost/symtab_verify.sh
+	gen/selfhost/symtab_verify.sh
+
+# Self-hosting (Stage 8k): compile kcc's conversions in C, relink, run suite
+selfhost-conversions: build
+	chmod +x gen/selfhost/conversions_verify.sh
+	gen/selfhost/conversions_verify.sh
+
+# Self-hosting (Stage 8l): compile kcc's type system in C, relink, run suite
+selfhost-types: build
+	chmod +x gen/selfhost/types_verify.sh
+	gen/selfhost/types_verify.sh
+
+# Self-hosting (Stage 8m): compile kcc's optimizer in C, relink, run suite
+selfhost-opt: build
+	chmod +x gen/selfhost/opt_verify.sh
+	gen/selfhost/opt_verify.sh
+
+# Self-hosting (Stage 8n): compile kcc's lexer tables in C, relink, run suites
+selfhost-lexer-tables: build
+	chmod +x gen/selfhost/lexer_tables_verify.sh
+	gen/selfhost/lexer_tables_verify.sh
+
+# Self-hosting (Stage 8o): compile kcc's linker info in C, relink, run suite
+selfhost-linker: build
+	chmod +x gen/selfhost/linker_verify.sh
+	gen/selfhost/linker_verify.sh
+
+# Self-hosting (Stage 8p): compile kcc's statement parser in C, relink, run suite
+selfhost-statements: build
+	chmod +x gen/selfhost/statements_verify.sh
+	gen/selfhost/statements_verify.sh
+
+# Self-hosting (Stage 8q): compile kcc's Mach-O writer in C, relink, run suite
+selfhost-emit-macho: build
+	chmod +x gen/selfhost/emit_macho_verify.sh
+	gen/selfhost/emit_macho_verify.sh
+
+# Self-hosting (Stage 8r): compile kcc's expression parser in C, relink, run suite
+selfhost-expressions: build
+	chmod +x gen/selfhost/expressions_verify.sh
+	gen/selfhost/expressions_verify.sh
+
+# Self-hosting (Stage 8s): compile kcc's parser spine in C, relink, run suite
+selfhost-parser: build
+	chmod +x gen/selfhost/parser_verify.sh
+	gen/selfhost/parser_verify.sh
+
+# Self-hosting (Stage 8t): compile kcc's driver in C, relink, run codegen+e2e
+selfhost-driver: build
+	chmod +x gen/selfhost/driver_verify.sh
+	gen/selfhost/driver_verify.sh
+
+# Self-hosting (Stage 8u): compile kcc's declaration parser in C, relink, run codegen
+selfhost-declarations: build
+	chmod +x gen/selfhost/declarations_verify.sh
+	gen/selfhost/declarations_verify.sh
+
+# Self-hosting (Stage 8v): compile kcc's DWARF emitter in C, relink,
+# run codegen + a -g byte-compare against the asm build
+selfhost-dwarf: build
+	chmod +x gen/selfhost/dwarf_verify.sh
+	gen/selfhost/dwarf_verify.sh
+
+# Self-hosting (Stage 8w): compile kcc's ARM64 encoder + .s renderer in C,
+# relink, verify both halves (difftest + --emit-asm functional check)
+selfhost-emit-arm64: build
+	chmod +x gen/selfhost/emit_arm64_verify.sh
+	gen/selfhost/emit_arm64_verify.sh
+
+# Self-hosting (Stage 8x): compile kcc's semantic analyzer in C, relink,
+# verify with difftest + diagtest + warntest + codegen
+selfhost-sema: build
+	chmod +x gen/selfhost/sema_verify.sh
+	gen/selfhost/sema_verify.sh
+
+# Self-hosting (Stage 8y): compile kcc's x86-64 back end in C, relink,
+# verify functionally (arm64 codegen + x86 programs run under Rosetta)
+selfhost-emit-x86: build
+	chmod +x gen/selfhost/emit_x86_verify.sh
+	gen/selfhost/emit_x86_verify.sh
+
+# Self-hosting (Stage 8z): compile kcc's preprocessor in C, relink,
+# verify with difftest + diagtest + codegen
+selfhost-preprocessor: build
+	chmod +x gen/selfhost/preprocessor_verify.sh
+	gen/selfhost/preprocessor_verify.sh
+
+# Self-hosting: compile kcc's ARM64 code generator in C, relink, verify
+selfhost-codegen: build
+	chmod +x gen/selfhost/codegen_verify.sh
+	gen/selfhost/codegen_verify.sh
+
+# Self-hosting: compile kcc's middle-end IR builder in C, relink, verify
+selfhost-ir: build
+	chmod +x gen/selfhost/ir_verify.sh
+	gen/selfhost/ir_verify.sh
+
+# Self-hosting: compile kcc's entry point in C, relink in place of main.o, verify
+selfhost-main: build
+	chmod +x gen/selfhost/main_verify.sh
+	gen/selfhost/main_verify.sh
+
+# Self-hosting: compile the compiler's lexer in C, relink in place of lexer.o, verify
+selfhost-lexer-core: build
+	chmod +x gen/selfhost/lexer_core_verify.sh
+	gen/selfhost/lexer_core_verify.sh
+
+# Milestone A: cross-compile a multi-TU C program to Linux/x86-64 with kcc,
+# link against the Linux runtime (no libc), run it natively (Chapter: Runtime).
+meta-a: build
+	chmod +x gen/runtime/meta_a_verify.sh
+	gen/runtime/meta_a_verify.sh
+
+# Milestone C: cross-compile kcc's own source to Linux, link it, and prove the
+# Linux-native compiler self-hosts (and re-hosts itself) in a single command.
+meta-c: build
+	chmod +x gen/runtime/meta_c_verify.sh
+	gen/runtime/meta_c_verify.sh
+
+# Differential tests: compile each program with kcc AND clang, compare
+difftest: build
+	chmod +x gen/tests/difftest.sh
+	gen/tests/difftest.sh
+
+# ABI interop: compile one TU with kcc and the other with clang, link, run
+interop: build
+	chmod +x gen/tests/interop.sh
+	gen/tests/interop.sh
+
+# End-to-end: kcc compiles AND links to an executable, then runs it
+e2e: build
+	chmod +x gen/tests/e2e.sh
+	gen/tests/e2e.sh
+
+# Diagnostics: invalid programs must be rejected with clear errors (no hang)
+diagtest: build
+	chmod +x gen/tests/diagtest.sh
+	gen/tests/diagtest.sh
+
+# Warnings: -Wall must warn while the default build stays silent
+warntest: build
+	chmod +x gen/tests/warntest.sh
+	gen/tests/warntest.sh
+
+# Code generation tests: compile with kcc, link, run, check exit codes
+test-codegen: build
+	chmod +x gen/tests/test_codegen.sh
+	gen/tests/test_codegen.sh
+
+# Weave: literate .weft sources -> LaTeX (kcc.tex). Mirrors `tangle`, which
+# produces the code to compile; `weave` produces the document source.
+weave:
+	weft -w tex -o -d -r kcc.weft
+
+# PDF: compile the woven LaTeX to kcc.pdf (lualatex for native Unicode).
+# The covers are edited as assets/cover.svg and assets/back-cover.svg, which
+# carry a {{VERSION}} placeholder; substitute the single-sourced version from
+# gen/VERSION, rasterise to assets/cover.pdf + assets/back-cover.png (when
+# rsvg-convert is available), then typeset.
+pdf: weave
+	test -f gen/VERSION || weft -p gen/ --mkdirs kcc.weft
+	if command -v rsvg-convert >/dev/null 2>&1; then VER=$$(cat gen/VERSION); sed "s/{{VERSION}}/$$VER/g" assets/cover.svg > gen/cover.svg && rsvg-convert -f pdf -o assets/cover.pdf gen/cover.svg; sed "s/{{VERSION}}/$$VER/g" assets/back-cover.svg > gen/back-cover.svg && rsvg-convert -w 2480 -o assets/back-cover.png gen/back-cover.svg; fi
+	latexmk -lualatex -interaction=nonstopmode -f kcc.tex
+
+# Clean generated files
+clean:
+	rm -rf gen/
+
+# Run the compiler:  make run ARGS="file.c -o out"
+run: build
+	./gen/kcc $(ARGS)
+
+# Structure map (JSON)
+map:
+	weft -m kcc.weft
+@}

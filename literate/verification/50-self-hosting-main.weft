@@ -327,7 +327,7 @@ int main(int argc, char **argv) {
     kcc_pp_add_default_includes(argv[0]);
     /* The startup banner is a diagnostic, so it goes to stderr---keeping stdout
        clean for `-E` output that build-system compiler probes capture. */
-    kcc_io_err("kcc v0.1.0 - a formal C17 compiler for ARM64\n");
+    kcc_io_err("kcc v@<version@> - a formal C17 compiler for ARM64\n");
 
     if (argc < 2) {
         kcc_io_puts("usage: kcc [--dump-tokens|-E|--dump-ast|--dump-types|--check|--dump-ir|-c <src> -o <out>] <source.c>\n");
@@ -425,44 +425,45 @@ int main(int argc, char **argv) {
 \section{Composition and Verification}
 
 The assembly chapter routes the \texttt{Selfhost: main} fragment above into
-\texttt{tmp/selfhost/main.c}; nothing re-wraps it here.  What remains is to
+\texttt{gen/selfhost/main.c}; nothing re-wraps it here.  What remains is to
 \emph{verify} that entry point, which \texttt{make selfhost-main} does: it
 compiles \texttt{main.c} with \kcc{} in place of the assembly \texttt{main.o},
 relinks the compiler, and runs the difftest, diagtest, and codegen sweeps.
 
 @d Selfhost: main verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-main — compile kcc's entry point in C with kcc, relink in place
 # of the assembly main.o, and run difftest + diagtest + codegen.  Because main
 # drives the whole compiler, a clean sweep proves the dispatch is faithful.
 set -euo pipefail
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
-echo "[1/4] compiling tmp/selfhost/main.c with kcc"
-tmp/kcc -c "$SH/main.c" -o "$SH/main_c.o" >/dev/null
-echo "[2/4] linking tmp/kcc_selfhost_main (main.o -> C)"
+echo "[1/4] compiling $BASE/selfhost/main.c with kcc"
+$BASE/kcc -c "$SH/main.c" -o "$SH/main_c.o" >/dev/null
+echo "[2/4] linking $BASE/kcc_selfhost_main (main.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "main" ]; then OBJ="$OBJ $SH/main_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "main" ]; then OBJ="$OBJ $SH/main_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_main $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
-cp tmp/kcc "$SH/kcc_asm_backup_main"
-cp tmp/kcc_selfhost_main tmp/kcc
+ld -o $BASE/kcc_selfhost_main $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+cp $BASE/kcc "$SH/kcc_asm_backup_main"
+cp $BASE/kcc_selfhost_main $BASE/kcc
 echo "[3/4] difftest + diagtest"
 set +e
-bash tmp/tests/difftest.sh >/tmp/main_difftest.log 2>&1; dstatus=$?
-tail -1 /tmp/main_difftest.log
-bash tmp/tests/diagtest.sh >/tmp/main_diag.log 2>&1; diagst=$?
-tail -1 /tmp/main_diag.log
+bash $BASE/tests/difftest.sh >/$BASE/main_difftest.log 2>&1; dstatus=$?
+tail -1 /$BASE/main_difftest.log
+bash $BASE/tests/diagtest.sh >/$BASE/main_diag.log 2>&1; diagst=$?
+tail -1 /$BASE/main_diag.log
 set -e
-if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_main" tmp/kcc; exit 1; fi
+if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_main" $BASE/kcc; exit 1; fi
 echo "[4/4] codegen suite with the self-hosted entry point"
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_main" tmp/kcc
+cp "$SH/kcc_asm_backup_main" $BASE/kcc
 exit $status
 @}

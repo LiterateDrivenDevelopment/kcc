@@ -423,37 +423,38 @@ void kcc_lex_dump_all(void) {
 
 @d Selfhost: lexcore verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-lexer-core — compile the compiler's lexer in C with kcc, relink
 # in place of the assembly lexer.o, and run difftest + diagtest + codegen.  The
 # token stream drives everything, so a byte-exact difftest proves the scan.
 set -euo pipefail
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
-echo "[1/4] compiling tmp/selfhost/lexer_core.c with kcc"
-tmp/kcc -c "$SH/lexer_core.c" -o "$SH/lexer_core_c.o" >/dev/null
-echo "[2/4] linking tmp/kcc_selfhost_lexer (lexer.o -> C)"
+echo "[1/4] compiling $BASE/selfhost/lexer_core.c with kcc"
+$BASE/kcc -c "$SH/lexer_core.c" -o "$SH/lexer_core_c.o" >/dev/null
+echo "[2/4] linking $BASE/kcc_selfhost_lexer (lexer.o -> C)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "lexer" ]; then OBJ="$OBJ $SH/lexer_core_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "lexer" ]; then OBJ="$OBJ $SH/lexer_core_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_lexer $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
-cp tmp/kcc "$SH/kcc_asm_backup_lexer"
-cp tmp/kcc_selfhost_lexer tmp/kcc
+ld -o $BASE/kcc_selfhost_lexer $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+cp $BASE/kcc "$SH/kcc_asm_backup_lexer"
+cp $BASE/kcc_selfhost_lexer $BASE/kcc
 echo "[3/4] difftest + diagtest"
 set +e
-bash tmp/tests/difftest.sh >/tmp/lexer_difftest.log 2>&1; dstatus=$?
-tail -1 /tmp/lexer_difftest.log
-bash tmp/tests/diagtest.sh >/tmp/lexer_diag.log 2>&1; diagst=$?
-tail -1 /tmp/lexer_diag.log
+bash $BASE/tests/difftest.sh >/$BASE/lexer_difftest.log 2>&1; dstatus=$?
+tail -1 /$BASE/lexer_difftest.log
+bash $BASE/tests/diagtest.sh >/$BASE/lexer_diag.log 2>&1; diagst=$?
+tail -1 /$BASE/lexer_diag.log
 set -e
-if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_lexer" tmp/kcc; exit 1; fi
+if [ $dstatus -ne 0 ] || [ $diagst -ne 0 ]; then cp "$SH/kcc_asm_backup_lexer" $BASE/kcc; exit 1; fi
 echo "[4/4] codegen suite with the self-hosted lexer"
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_lexer" tmp/kcc
+cp "$SH/kcc_asm_backup_lexer" $BASE/kcc
 exit $status
 @}

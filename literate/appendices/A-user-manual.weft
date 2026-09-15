@@ -59,13 +59,13 @@ make build
 
 This tangles the literate sources into assembly, assembles each into an
 object file, and links them into the compiler binary at
-\texttt{tmp/kcc}.  That path is the compiler; everything below refers to it
+\texttt{gen/kcc}.  That path is the compiler; everything below refers to it
 as \texttt{kcc} for brevity.  To run it from anywhere, either use the full
-path \texttt{tmp/kcc} or copy the binary onto your \texttt{PATH}, for
+path \texttt{gen/kcc} or copy the binary onto your \texttt{PATH}, for
 example:
 
 \begin{verbatim}
-cp tmp/kcc /usr/local/bin/kcc
+cp gen/kcc /usr/local/bin/kcc
 \end{verbatim}
 
 There is nothing to configure: \kcc{} has no configuration file and no
@@ -468,7 +468,7 @@ Here \kcc{} is self-contained: it emits ARM64 machine code and links the
 executable itself, so a single tool takes the sources all the way to a binary.
 
 \begin{verbatim}
-KCC=/path/to/kcc/tmp/kcc
+KCC=/path/to/kcc/gen/kcc
 for f in $(ls *.c | grep -v '^luac.c$'); do
     "$KCC" -c "$f" -o "${f%.c}.o"
 done
@@ -618,7 +618,7 @@ blits the framebuffer, which pulls in the large \texttt{<SDL2/SDL.h>}.
 \begin{verbatim}
 brew install sdl2                       # the one external dependency
 # doomgeneric sources + a Freedoom IWAD in place:
-KCC=/path/to/kcc/tmp/kcc
+KCC=/path/to/kcc/gen/kcc
 for f in <every engine .c> doomgeneric.c doomgeneric_sdl.c; do
     "$KCC" -O0 -DNORMALUNIX -DLINUX -I/opt/homebrew/include/SDL2 \
            -c "$f" -o "${f%.c}.o"
@@ -676,7 +676,7 @@ adds no storage), or the kernel's \texttt{ARRAY\_SIZE} macro miscounts and
 constructor the kernel never calls, or \texttt{ramdisk\_execute\_command} stays
 \texttt{NULL} and PID~1 dereferences it.
 
-The pipeline is five small scripts under \texttt{tmp/repro/}, tangled from the
+The pipeline is five small scripts under \texttt{gen/repro/}, tangled from the
 fragments below, plus \texttt{run-all.sh} that chains them.  They drive a Docker
 image (a Debian toolchain with the Linux~6.6 tree, QEMU, and a static BusyBox
 baked in) so the build is reproducible on macOS, Linux, or Windows; a
@@ -685,8 +685,8 @@ only host prerequisites are Docker and \texttt{weft} (to tangle \kcc{}'s own
 sources).  Run the whole thing with:
 
 \begin{verbatim}
-bash tmp/repro/run-all.sh        # build image, kcc, kernel, initramfs
-bash tmp/repro/05-boot.sh        # boot to the login: prompt (root, no password)
+bash gen/repro/run-all.sh        # build image, kcc, kernel, initramfs
+bash gen/repro/05-boot.sh        # boot to the login: prompt (root, no password)
 \end{verbatim}
 
 A note on authenticity: these scripts let \texttt{gcc} compile \kcc{}'s C
@@ -771,17 +771,17 @@ set -euo pipefail
 IMG=${KCC_IMG:-kcc-kbuild:linux66}
 LINK="${1:-${KCC_LINK:-docker}}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
-work="$root/tmp/repro/work"; mkdir -p "$work"
+work="$root/gen/repro/work"; mkdir -p "$work"
 echo ">> tangling literate sources (needs weft)"
 ( cd "$root" && make tangle >/dev/null )
 MODS="arena strings io hashtab vec strtab source lexer_tables diag preprocessor parser expressions statements declarations types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver main"
 
 if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
   echo ">> host Apple silicon -- kcc(ARM) cross-compiles kcc -> x86-64 (link: $LINK)"
-  [ -x "$root/tmp/kcc" ] || ( cd "$root" && make build >/dev/null )
-  for m in $MODS; do "$root/tmp/kcc" -c "$root/tmp/selfhost/$m.c" --target=x86_64-linux -o "$work/$m.s" >/dev/null 2>&1; done
-  "$root/tmp/kcc" -c "$root/tmp/selfhost/lexer_core.c" --target=x86_64-linux -o "$work/lexer.s" >/dev/null 2>&1
-  cp "$root/tmp/runtime/os_linux.s" "$work/os_linux.s"
+  [ -x "$root/gen/kcc" ] || ( cd "$root" && make build >/dev/null )
+  for m in $MODS; do "$root/gen/kcc" -c "$root/gen/selfhost/$m.c" --target=x86_64-linux -o "$work/$m.s" >/dev/null 2>&1; done
+  "$root/gen/kcc" -c "$root/gen/selfhost/lexer_core.c" --target=x86_64-linux -o "$work/lexer.s" >/dev/null 2>&1
+  cp "$root/gen/runtime/os_linux.s" "$work/os_linux.s"
   # shared assemble+link step, honouring $AS/$LD (default GNU as/ld)
   cat > "$work/_link_kcc.sh" <<'INNER'
 set -e
@@ -803,15 +803,15 @@ INNER
       ( cd "$work" && AS="$asx" LD="$ldx" bash _link_kcc.sh ) ;;
     emit)
       echo ">> wrote x86-64 assembly to $work (no local link). Finish on an x86-64 Linux host:"
-      echo "     scp $work/*.s $work/_link_kcc.sh user@@HOST:/tmp/kccx/"
-      echo "     ssh user@@HOST 'cd /tmp/kccx && bash _link_kcc.sh'   # runs as/ld -> kcc_linux"
+      echo "     scp $work/*.s $work/_link_kcc.sh user@@HOST:/gen/kccx/"
+      echo "     ssh user@@HOST 'cd /gen/kccx && bash _link_kcc.sh'   # runs as/ld -> kcc_linux"
       exit 0 ;;
     *) echo "!! unknown LINK mode '$LINK' (use: docker | cross | emit)"; exit 1 ;;
   esac
 else
   echo ">> host $(uname -s)/$(uname -m) -- gcc bootstraps kcc -> x86-64 (portable, LINK ignored)"
-  cp "$root"/tmp/selfhost/*.c "$work"/
-  cp "$root"/tmp/runtime/os_linux.s "$work"/os_linux.s
+  cp "$root"/gen/selfhost/*.c "$work"/
+  cp "$root"/gen/runtime/os_linux.s "$work"/os_linux.s
   cat > "$work/memglue.c" <<'MEM'
 void *memcpy(void*d,const void*s,unsigned long n){char*a=d;const char*b=s;while(n--)*a++=*b++;return d;}
 void *memset(void*d,int c,unsigned long n){char*a=d;while(n--)*a++=c;return d;}
@@ -840,9 +840,9 @@ linker, which macOS does not provide.  The script's first argument (or the
 a \texttt{kcc\_linux} to copy to any x86-64 Linux box:
 
 \begin{verbatim}
-bash tmp/repro/02-build-kcc.sh docker   # (default) assemble+link in the image
-bash tmp/repro/02-build-kcc.sh cross    # use x86-64 cross-binutils on macOS
-bash tmp/repro/02-build-kcc.sh emit     # only emit .s; finish on the x86-64 host
+bash gen/repro/02-build-kcc.sh docker   # (default) assemble+link in the image
+bash gen/repro/02-build-kcc.sh cross    # use x86-64 cross-binutils on macOS
+bash gen/repro/02-build-kcc.sh emit     # only emit .s; finish on the x86-64 host
 \end{verbatim}
 
 \noindent \texttt{docker} needs no local cross-tools; \texttt{cross} wants an
@@ -851,12 +851,12 @@ bash tmp/repro/02-build-kcc.sh emit     # only emit .s; finish on the x86-64 hos
 a container; \texttt{emit} stops after the assembly and prints the two commands
 to finish the build on the target machine.  All three yield the same static
 \texttt{kcc\_linux}, which runs natively on x86-64 Linux---so
-\texttt{scp tmp/repro/work/kcc\_linux} to an x86-64 host and it compiles the
-kernel there directly (do \emph{not} copy the ARM64 \texttt{tmp/kcc}, which will
+\texttt{scp gen/repro/work/kcc\_linux} to an x86-64 host and it compiles the
+kernel there directly (do \emph{not} copy the ARM64 \texttt{gen/kcc}, which will
 not execute on x86).
 
 \emph{Native Linux:} run \texttt{make tangle}, then the \texttt{else}-branch's
-\texttt{\_gcc\_link.sh} body in \texttt{tmp/repro/work}; the result is
+\texttt{\_gcc\_link.sh} body in \texttt{gen/repro/work}; the result is
 \texttt{kcc\_linux}.  (The \texttt{Darwin} branch is what an Apple-silicon
 developer gets automatically; the detection is a plain \texttt{uname} test you
 can edit to force a route.)
@@ -875,7 +875,7 @@ it succeeds---then \texttt{bzImage} is packed.
 # Rebuild the kernel with init/main.o compiled by kcc.
 set -euo pipefail
 IMG=${KCC_IMG:-kcc-kbuild:linux66}
-work=$(cd "$(dirname "$0")/../.." && pwd)/tmp/repro/work
+work=$(cd "$(dirname "$0")/../.." && pwd)/gen/repro/work
 cat > "$work/_build_kernel.sh" <<'INNER'
 set -e
 cd /root/linux-6.6
@@ -893,10 +893,10 @@ mkdir -p /w/ldwrap; : > /w/defsyms.txt
 printf '#!/bin/bash\nexec /usr/bin/ld "$@@" $(cat /w/defsyms.txt 2>/dev/null)\n' > /w/ldwrap/ld
 chmod +x /w/ldwrap/ld; export PATH=/w/ldwrap:$PATH
 for pass in 1 2 3 4 5 6; do
-  if make -j"$(nproc)" vmlinux >/tmp/vm 2>&1; then linked=1; break; fi
-  grep -oE "undefined reference to \`[^']+'" /tmp/vm | sed "s/.*to .//;s/.$//" | sort -u > /tmp/u
-  add=0; while read -r s; do grep -qx -- "--defsym $s=0" /w/defsyms.txt || { echo "--defsym $s=0" >> /w/defsyms.txt; add=$((add+1)); }; done < /tmp/u
-  [ "$add" -eq 0 ] && { echo "link stuck:"; tail -8 /tmp/vm; exit 1; }
+  if make -j"$(nproc)" vmlinux >/gen/vm 2>&1; then linked=1; break; fi
+  grep -oE "undefined reference to \`[^']+'" /gen/vm | sed "s/.*to .//;s/.$//" | sort -u > /gen/u
+  add=0; while read -r s; do grep -qx -- "--defsym $s=0" /w/defsyms.txt || { echo "--defsym $s=0" >> /w/defsyms.txt; add=$((add+1)); }; done < /gen/u
+  [ "$add" -eq 0 ] && { echo "link stuck:"; tail -8 /gen/vm; exit 1; }
 done
 [ "${linked:-0}" = 1 ] || { echo "did not link"; exit 1; }
 make -j2 bzImage >/dev/null 2>&1
@@ -908,7 +908,7 @@ docker run --rm --platform=linux/amd64 -v "$work":/w "$IMG" bash /w/_build_kerne
 @}
 
 \emph{Native Linux:} run \texttt{\_build\_kernel.sh}'s body in your prepared
-\texttt{linux-6.6} tree with \texttt{/w} pointing at \texttt{tmp/repro/work}.
+\texttt{linux-6.6} tree with \texttt{/w} pointing at \texttt{gen/repro/work}.
 
 \subsection{An initramfs with login and a shell}
 
@@ -923,7 +923,7 @@ commands.  \texttt{gen\_init\_cpio} builds the archive---including the
 # Build a BusyBox initramfs that boots to a serial login shell.
 set -euo pipefail
 IMG=${KCC_IMG:-kcc-kbuild:linux66}
-work=$(cd "$(dirname "$0")/../.." && pwd)/tmp/repro/work
+work=$(cd "$(dirname "$0")/../.." && pwd)/gen/repro/work
 cat > "$work/inittab" <<'T'
 ::sysinit:/bin/busybox --install -s
 ::sysinit:/bin/hostname kcc
@@ -983,7 +983,7 @@ for entropy.
 # Boot the kcc-compiled kernel to a BusyBox login shell.
 set -euo pipefail
 IMG=${KCC_IMG:-kcc-kbuild:linux66}
-work=$(cd "$(dirname "$0")/../.." && pwd)/tmp/repro/work
+work=$(cd "$(dirname "$0")/../.." && pwd)/gen/repro/work
 APPEND="console=ttyS0,115200 earlycon=uart8250,io,0x3f8 keep_bootcon panic=-1 random.trust_cpu=on"
 if command -v qemu-system-x86_64 >/dev/null 2>&1; then
   # hardware acceleration only when the host arch matches the x86-64 guest
@@ -1076,6 +1076,6 @@ is generated and must never be edited by hand.
 \item \textbf{A macro does not expand as you expect.}  Run \texttt{kcc -E}
       on the file to see the preprocessed text.
 \item \textbf{\texttt{kcc} is not found.}  The built compiler lives at
-      \texttt{tmp/kcc}; invoke it by that path, or copy it onto your
+      \texttt{gen/kcc}; invoke it by that path, or copy it onto your
       \texttt{PATH} as shown in \S\ref{sec:um-building}.
 \end{itemize}

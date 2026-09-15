@@ -739,31 +739,32 @@ unchanged.
 
 @d Selfhost: opt verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make selfhost-opt — compile kcc's optimizer in C with kcc, relink, run suite.
 set -euo pipefail
 
 SDK=$(xcrun --show-sdk-path)
-SH=tmp/selfhost
+SH=$BASE/selfhost
 sources="main syscalls arena strings io hashtab vec strtab source lexer \
 lexer_tables diag preprocessor parser expressions statements declarations \
 types symtab conversions sema ir opt emit_arm64 emit_x86 linker codegen emit_macho dwarf driver"
 
-echo "[1/3] compiling tmp/selfhost/opt.c with kcc"
-tmp/kcc -c "$SH/opt.c" -o "$SH/opt_c.o" >/dev/null
+echo "[1/3] compiling $BASE/selfhost/opt.c with kcc"
+$BASE/kcc -c "$SH/opt.c" -o "$SH/opt_c.o" >/dev/null
 
-echo "[2/3] linking tmp/kcc_selfhost_opt (opt.o -> kcc-compiled opt_c.o)"
+echo "[2/3] linking $BASE/kcc_selfhost_opt (opt.o -> kcc-compiled opt_c.o)"
 OBJ=""
 for f in $sources; do
-    if [ "$f" = "opt" ]; then OBJ="$OBJ $SH/opt_c.o"; else OBJ="$OBJ tmp/src/${f}.o"; fi
+    if [ "$f" = "opt" ]; then OBJ="$OBJ $SH/opt_c.o"; else OBJ="$OBJ $BASE/src/${f}.o"; fi
 done
-ld -o tmp/kcc_selfhost_opt $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
+ld -o $BASE/kcc_selfhost_opt $OBJ -lSystem -syslibroot "$SDK" -e _main -arch arm64
 
 echo "[3/3] running the codegen suite with the self-hosted optimizer"
-cp tmp/kcc "$SH/kcc_asm_backup_opt"
-cp tmp/kcc_selfhost_opt tmp/kcc
+cp $BASE/kcc "$SH/kcc_asm_backup_opt"
+cp $BASE/kcc_selfhost_opt $BASE/kcc
 set +e
-bash tmp/tests/test_codegen.sh
+bash $BASE/tests/test_codegen.sh
 status=$?
-cp "$SH/kcc_asm_backup_opt" tmp/kcc
+cp "$SH/kcc_asm_backup_opt" $BASE/kcc
 exit $status
 @}

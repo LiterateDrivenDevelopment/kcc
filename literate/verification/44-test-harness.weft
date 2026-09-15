@@ -1,6 +1,6 @@
 % 44-test-harness.weft — Test Runner
 %
-% A separate test binary (tmp/test_kcc) that exercises the compiler's
+% A separate test binary (gen/test_kcc) that exercises the compiler's
 % subsystems.  Each test function returns 0 for pass and non-zero for
 % failure.  The runner iterates through a registration table, calls
 % each test, and reports pass/fail results.

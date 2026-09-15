@@ -305,6 +305,7 @@ int main(void) {
 
 @d Runtime-linux: meta-a verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make meta-a — cross-compile a multi-TU C program to Linux/x86-64 with kcc,
 # link it against the Linux runtime (no libc), and run it natively.
 #
@@ -315,8 +316,8 @@ int main(void) {
 # a conforming loader, which is what a real Linux kernel behaves like.
 set -euo pipefail
 
-R=tmp/runtime
-KCC=tmp/kcc
+R=$BASE/runtime
+KCC=$BASE/kcc
 
 echo "[1/3] kcc compiles the demo TUs -> Linux/x86-64 .s"
 "$KCC" -c "$R/demo_util.c" -o "$R/demo_util.s" --target=x86_64-linux >/dev/null
@@ -426,13 +427,14 @@ suite.
 
 @d Runtime-linux: meta-c verify @{
 #!/usr/bin/env bash
+BASE="$(cd "$(dirname "$0")/.." && pwd)"
 # make meta-c — cross-compile kcc's own source to Linux, link it, and prove the
 # Linux-native compiler self-hosts (and re-hosts itself) in a single command.
 set -euo pipefail
 
-KCC=tmp/kcc
-S=tmp/selfhost
-M=tmp/metac
+KCC=$BASE/kcc
+S=$BASE/selfhost
+M=$BASE/metac
 mkdir -p "$M"
 
 mods="arena strings io hashtab vec strtab source lexer_tables diag preprocessor \
@@ -446,7 +448,7 @@ for m in $mods; do
 done
 "$KCC" -c "$S/lexer_core.c" --target=x86_64-linux -o "$M/lexer.s" >/dev/null
 cp "$S/lexer_core.c" "$M/lexer.c"
-cp tmp/runtime/os_linux.s "$M/os_linux.s"
+cp $BASE/runtime/os_linux.s "$M/os_linux.s"
 printf 'int main(void){return 42;}\n' > "$M/hello.c"
 
 echo "[2/3] link kcc_linux and self-host inside linux/amd64 (qemu loader)"

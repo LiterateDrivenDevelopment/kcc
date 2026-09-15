@@ -2,6 +2,10 @@
 # including the Makefile at the repo root. Sources of truth are the .weft files.
 gen/
 /Makefile
+
+# The typeset book is a large build artifact, distributed via GitLab Releases
+# rather than committed. Build it locally with `make pdf`.
+/kcc.pdf
 *.aux
 *.log
 *.toc

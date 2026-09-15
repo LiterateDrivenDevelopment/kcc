@@ -10,8 +10,10 @@ native machine code; it compiles itself to a byte-identical binary; and it
 **cross-compiles to x86-64** (Linux and macOS). It builds and runs Lua, SQLite,
 and DOOM — and boots a Linux kernel.
 
-The whole book is the compiler: **[kcc.pdf](kcc.pdf)** (≈1000 pages). Learn more
-about Literate Driven Development at <https://literatedriven.com>.
+The whole book **is** the compiler (≈1000 pages): download the latest
+**[kcc.pdf from Releases](https://gitlab.polinesso.org/literate-programming/kcc/-/releases)**,
+or build it yourself (see below). Learn more about Literate Driven Development
+at <https://literatedriven.com>.
 
 ## The `.weft` files are the only source of truth
 
@@ -23,10 +25,12 @@ You never edit generated files; you edit the book.
 kcc.weft          master document (LaTeX preamble + @i includes)
 literate/         all the chapters (prose + code fragments)
 assets/           cover art (SVG → the PDF covers)
-kcc.pdf           the woven book (the deliverable for humans)
 README.md         this file
 LICENSE           MIT
 ```
+
+The typeset book, `kcc.pdf`, is **not** committed — it is an ~8 MB binary that
+changes on every edit. Download it from Releases, or build it with `make pdf`.
 
 ## Build
 
@@ -68,7 +72,9 @@ The verification scripts locate their own base directory, so they work under any
 
 `make pdf` weaves the `.weft` sources to `kcc.tex` and typesets `kcc.pdf` with
 LuaLaTeX. The covers are regenerated from `assets/*.svg` when `rsvg-convert` is
-available.
+available. The resulting `kcc.pdf` is git-ignored; the released book is
+published manually as a **Release** asset on GitLab, so the repository stays
+free of the large, frequently-changing binary.
 
 ## Prerequisites
 

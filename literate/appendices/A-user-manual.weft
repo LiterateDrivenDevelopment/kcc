@@ -89,34 +89,37 @@ can be run on their own when that toolchain is not available.
 \section{Your First Program}
 \label{sec:um-first}
 
-Create a file \texttt{hello.c}:
+The bootstrap tangles a first program for you, so it is ready the moment the
+compiler is built.  Its source is this very fragment, emitted to
+\texttt{gen/hello.c}:
 
-\begin{verbatim}
-int printf(const char *fmt, ...);
+@d Tutorial: hello world @{#include <stdio.h>
 
 int main(void) {
     printf("Hello from kcc!\n");
     return 0;
 }
-\end{verbatim}
+@}
 
-Compile and link it into an executable, then run it:
+\noindent Compile and link it with the compiler you just built, then run it:
 
 \begin{verbatim}
-kcc hello.c -o hello
+./gen/kcc gen/hello.c -o gen/hello
+./gen/hello
+\end{verbatim}
+
+You should see \texttt{Hello from kcc!}.  The same holds for any C file of your
+own; with \kcc{} on your \texttt{PATH} the workflow is just as short, and with
+no \texttt{-o} option the executable is named \texttt{a.out}, following long
+tradition:
+
+\begin{verbatim}
+kcc hello.c -o hello      # or simply: kcc hello.c  ->  ./a.out
 ./hello
 \end{verbatim}
 
-You should see \texttt{Hello from kcc!}.  With no \texttt{-o} option the
-executable is named \texttt{a.out}, following long tradition:
-
-\begin{verbatim}
-kcc hello.c
-./a.out
-\end{verbatim}
-
-That is the whole workflow for a simple program: one command to build, one
-to run.
+That is the whole workflow for a simple program: one command to build, one to
+run.
 
 \section{Command Reference}
 \label{sec:um-commands}

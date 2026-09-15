@@ -1184,6 +1184,11 @@ disagree about which version they describe.
 
 @o VERSION -s @{@<version@>@}
 
+The tutorial's first program (\S\ref{sec:um-first}) is tangled here too, so a
+freshly built compiler has something to compile: \texttt{gen/hello.c}.
+
+@o hello.c -s @{@<Tutorial: hello world@>@}
+
 @o ../Makefile -t -s @{
 # kcc — A Formal C17 Compiler in ARM64 Assembly
 # Build pipeline: .weft → weft tangle → .s → as → .o → ld → kcc

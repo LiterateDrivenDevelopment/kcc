@@ -3,9 +3,6 @@
 gen/
 /Makefile
 
-# The typeset book is a large build artifact, distributed via GitLab Releases
-# rather than committed. Build it locally with `make pdf`.
-/kcc.pdf
 *.aux
 *.log
 *.toc

@@ -8,7 +8,7 @@
 We implement the dump first so that we can test the builder
 incrementally.  The format mirrors LLVM IR loosely:
 \begin{verbatim}
-func @main() -> i32:
+func @@main() -> i32:
   bb0:
     %0 = const i32 42
     ret i32 %0
